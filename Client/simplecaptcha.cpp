@@ -1,0 +1,58 @@
+// captcha_simple.cpp
+#include "simplecaptcha.h"
+#include <QRandomGenerator>
+#include <QTime>
+#include <qboxlayout.h>
+
+SimpleCaptcha::SimpleCaptcha(QWidget *parent)
+    : QWidget(parent), m_codeLength(4)
+{
+    // 创建显示验证码的标签
+    m_label = new QLabel(this);
+    m_label->setAlignment(Qt::AlignCenter);
+    m_label->setStyleSheet(
+        "QLabel {"
+        "   background-color: #f0f0f0;"
+        "   border: 1px solid #ccc;"
+        "   font-family: 'Consolas', monospace;"
+        "   font-size: 18px;"
+        "   font-weight: bold;"
+        "   color: #333;"
+        "}"
+    );
+    m_label->setFixedSize(120, 40);
+
+    // 初始化随机种子（可选）
+    static bool seeded = false;
+    if (!seeded) {
+        QRandomGenerator::global()->seed(QTime::currentTime().msec());
+        seeded = true;
+    }
+
+    refreshCaptcha();
+
+    // 布局：让标签填满当前控件
+    QHBoxLayout *layout = new QHBoxLayout(this);
+    layout->addWidget(m_label);
+    layout->setContentsMargins(0, 0, 0, 0);
+    setLayout(layout);
+}
+
+void SimpleCaptcha::refreshCaptcha()
+{
+    m_code = generateRandomCode();
+    m_label->setText(m_code);
+    emit captchaRefreshed();
+}
+
+QString SimpleCaptcha::generateRandomCode()
+{
+    // 字符集：大写字母 + 数字（排除易混淆字符）
+    const QString possibleChars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    QString code;
+    for (int i = 0; i < m_codeLength; ++i) {
+        int index = QRandomGenerator::global()->bounded(possibleChars.length());
+        code.append(possibleChars.at(index));
+    }
+    return code;
+}

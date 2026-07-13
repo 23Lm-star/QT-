@@ -1,0 +1,81 @@
+#ifndef PROTOCOL_H
+#define PROTOCOL_H
+//PDU协议类型定义
+
+typedef unsigned int uint;
+
+static const uint UPLOAD_RESUME_MAGIC = 0x5253554d; // "RSUM"
+static const int UPLOAD_FILE_SIZE_OFFSET = 32;
+static const int UPLOAD_RESUME_OFFSET = 32;
+static const int UPLOAD_RESUME_MAGIC_OFFSET = 40;
+static const int UPLOAD_CHUNK_OFFSET = 0;
+
+//消息类型的枚举值
+enum ENUM_MSG_TYPE {
+    ENUM_MSG_TYPE_MIN=0,
+    ENUM_MSG_TYPE_REGIST_REQUEST,//注册请求 1
+    ENUM_MSG_TYPE_REGIST_RESPOND,//注册响应 2
+    ENUM_MSG_TYPE_LOGIN_REQUEST,//登录请求 3
+    ENUM_MSG_TYPE_LOGIN_RESPOND,//注册响应4
+    ENUM_MSG_TYPE_findUser_REQUEST,//查找指定用户请求 5
+    ENUM_MSG_TYPE_findUser_RESPOND,//查找指定用户响应 6
+    ENUM_MSG_TYPE_ONLINEUSER_REQUEST,//查找所有用户请求 7
+    ENUM_MSG_TYPE_ONLINEUSER_RESPOND,//查找所有用户响应 8
+    ENUM_MSG_TYPE_ADDFRIEND_REQUEST,//添加好友请求 9
+    ENUM_MSG_TYPE_ADDFRIEND_RESPOND,//添加好友响应 10
+    ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST,//刷新好友请求 11
+    ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND,//刷新好友响应 12
+    ENUM_MSG_TYPE_DELETEFRIEND_REQUEST,//删除好友请求 13
+    ENUM_MSG_TYPE_DELETEFRIEND_RESPOND,//删除好友响应 14
+    ENUM_MSG_TYPE_CHAT_REQUEST,//聊天 15
+    ENUM_MSG_TYPE_CHAT_RESPOND,//聊天 16
+    ENUM_MSG_TYPE_GETCHATMSG_REQUEST,//获取聊天消息 17
+    ENUM_MSG_TYPE_GETCHATMSG_RESPOND,//获取聊天消息 18
+    ENUM_MSG_TYPE_MKDIR_REQUEST,//创建目录 19
+    ENUM_MSG_TYPE_MKDIR_RESPOND,//创建目录 20
+    ENUM_MSG_TYPE_CHANGEDIR_REQUEST,//跳转目录 21
+    ENUM_MSG_TYPE_CHANGEDIR_RESPOND,//跳转目录 22
+    ENUM_MSG_TYPE_FLUSHFILE_REQUEST,//刷新文件 23
+    ENUM_MSG_TYPE_FLUSHFILE_RESPOND,//刷新文件 24
+    ENUM_MSG_TYPE_DELFILE_REQUEST,//删除文件 25
+    ENUM_MSG_TYPE_DELFILE_RESPOND,//删除文件 26
+    ENUM_MSG_TYPE_RENAMEFILE_REQUEST,//重命名文件 27
+    ENUM_MSG_TYPE_RENAMEFILE_RESPOND,//重命名文件 28
+    ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST,//上传文件初始化 29
+    ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND,//上传文件初始化 30
+    ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST,//上传文件数据 31
+    ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND,//上传文件数据 32
+    ENUM_MSG_TYPE_SHAREFILE_REQUEST,//分享文件请求 33
+    ENUM_MSG_TYPE_SHAREFILE_RESPOND,//分享文件回应 34
+    ENUM_MSG_TYPE_SHAREFILE_AGREE_REQUEST,//分享文件同意请求 35
+    ENUM_MSG_TYPE_SHAREFILE_AGREE_RESPOND,//分享文件同意回应  36
+    ENUM_MSG_TYPE_SHAREFILE_FINSH_RESPOND,//分享文件完成  36
+    ENUM_MSG_TYPE_MOVEFILE_REGUEST,//移动文件请求  36
+    ENUM_MSG_TYPE_MOVEFILE_RESPOND,//移动文件回应
+    ENUM_MSG_TYPE_MAX=99999,
+};
+
+struct PDU{//协议数据单元
+    uint uiTotalLen;    //总长度
+    uint uiMsgLen;      //柔性数组的长度(消息长度)
+    uint uiType;        //类型
+    char caData[64];    //参数，数据长度小于参数长度就放到参数里
+    char caMsg[];       //消息
+};
+//文件信息
+struct FileInfo{
+    char caName[32];
+    uint uiType;
+};
+//消息
+struct Msg{
+    uint totoalLen;
+    uint msgLen;
+    char Time[30];
+    char msg[];
+};
+
+//构建pdu协议对象的函数
+//返回pdu对象的地址
+PDU* mkPDU(uint uiMsgLen=0);
+#endif // PROTOCOL_H
