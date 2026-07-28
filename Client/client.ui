@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>493</width>
-    <height>255</height>
+    <width>600</width>
+    <height>420</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -18,199 +18,124 @@
     <normaloff>:/login.png</normaloff>:/login.png</iconset>
   </property>
   <property name="styleSheet">
-   <string notr="true">background-color: rgb(0, 170, 255);</string>
+   <string notr="true"/>
   </property>
-  <layout class="QHBoxLayout" name="horizontalLayout_3">
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="spacing">
+    <number>16</number>
+   </property>
+   <property name="leftMargin">
+    <number>60</number>
+   </property>
+   <property name="topMargin">
+    <number>30</number>
+   </property>
+   <property name="rightMargin">
+    <number>60</number>
+   </property>
+   <property name="bottomMargin">
+    <number>30</number>
+   </property>
    <item>
-    <layout class="QVBoxLayout" name="verticalLayout">
-     <item>
-      <layout class="QGridLayout" name="gridLayout">
-       <item row="0" column="0">
-        <widget class="QLabel" name="label">
-         <property name="font">
-          <font>
-           <family>Arial</family>
-           <pointsize>16</pointsize>
-          </font>
-         </property>
-         <property name="text">
-          <string>用户名：</string>
-         </property>
-        </widget>
-       </item>
-       <item row="0" column="1">
-        <widget class="QLineEdit" name="name_LE">
-         <property name="styleSheet">
-          <string notr="true">color: rgb(255, 255, 255);
-color: rgb(255, 255, 255);</string>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="0">
-        <widget class="QLabel" name="label_2">
-         <property name="font">
-          <font>
-           <family>Arial</family>
-           <pointsize>16</pointsize>
-          </font>
-         </property>
-         <property name="text">
-          <string>密    码：</string>
-         </property>
-         <property name="buddy">
-          <cstring>label_2</cstring>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="1">
-        <widget class="QLineEdit" name="pwd_LE">
-         <property name="echoMode">
-          <enum>QLineEdit::Password</enum>
-         </property>
-        </widget>
-       </item>
-       <item row="2" column="0" colspan="2">
-        <layout class="QGridLayout" name="gridLayout_2">
-         <item row="0" column="0">
-          <widget class="QLabel" name="randcode">
-           <property name="font">
-            <font>
-             <family>Arial</family>
-             <pointsize>16</pointsize>
-            </font>
-           </property>
-           <property name="text">
-            <string>验证码 ：</string>
-           </property>
-          </widget>
-         </item>
-         <item row="0" column="1">
-          <widget class="QLineEdit" name="randcode_LE"/>
-         </item>
-         <item row="0" column="2">
-          <spacer name="horizontalSpacer_2">
-           <property name="orientation">
-            <enum>Qt::Horizontal</enum>
-           </property>
-           <property name="sizeHint" stdset="0">
-            <size>
-             <width>40</width>
-             <height>20</height>
-            </size>
-           </property>
-          </spacer>
-         </item>
-         <item row="0" column="3">
-          <widget class="QLabel" name="label_randcode">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="minimumSize">
-            <size>
-             <width>60</width>
-             <height>0</height>
-            </size>
-           </property>
-           <property name="maximumSize">
-            <size>
-             <width>60</width>
-             <height>16777215</height>
-            </size>
-           </property>
-           <property name="font">
-            <font>
-             <family>Agency FB</family>
-             <pointsize>12</pointsize>
-            </font>
-           </property>
-           <property name="text">
-            <string>TextLabel</string>
-           </property>
-          </widget>
-         </item>
-         <item row="0" column="4">
-          <spacer name="horizontalSpacer_3">
-           <property name="orientation">
-            <enum>Qt::Horizontal</enum>
-           </property>
-           <property name="sizeHint" stdset="0">
-            <size>
-             <width>40</width>
-             <height>20</height>
-            </size>
-           </property>
-          </spacer>
-         </item>
-         <item row="0" column="5">
-          <widget class="QPushButton" name="pushButton">
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-             <horstretch>0</horstretch>
-             <verstretch>0</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="maximumSize">
-            <size>
-             <width>80</width>
-             <height>16777215</height>
-            </size>
-           </property>
-           <property name="text">
-            <string>刷新</string>
-           </property>
-           <property name="iconSize">
-            <size>
-             <width>13</width>
-             <height>16</height>
-            </size>
-           </property>
-          </widget>
-         </item>
-        </layout>
-       </item>
-      </layout>
+    <widget class="QLabel" name="titleLabel">
+     <property name="font">
+      <font>
+       <family>Arial</family>
+       <pointsize>22</pointsize>
+       <bold>true</bold>
+      </font>
+     </property>
+     <property name="text">
+      <string>云盘聊天系统</string>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignCenter</set>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QGridLayout" name="gridLayout">
+     <item row="0" column="0">
+      <widget class="QLabel" name="label">
+       <property name="font">
+        <font>
+         <family>Microsoft YaHei</family>
+         <pointsize>14</pointsize>
+        </font>
+       </property>
+       <property name="text">
+        <string>用户名</string>
+       </property>
+      </widget>
      </item>
-     <item>
-      <layout class="QHBoxLayout" name="horizontalLayout_2">
+     <item row="0" column="1">
+      <widget class="QLineEdit" name="name_LE">
+       <property name="placeholderText">
+        <string>请输入用户名</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="0">
+      <widget class="QLabel" name="label_2">
+       <property name="font">
+        <font>
+         <family>Microsoft YaHei</family>
+         <pointsize>14</pointsize>
+        </font>
+       </property>
+       <property name="text">
+        <string>密    码</string>
+       </property>
+      </widget>
+     </item>
+     <item row="1" column="1">
+      <widget class="QLineEdit" name="pwd_LE">
+       <property name="echoMode">
+        <enum>QLineEdit::Password</enum>
+       </property>
+       <property name="placeholderText">
+        <string>请输入密码</string>
+       </property>
+      </widget>
+     </item>
+     <item row="2" column="0" colspan="2">
+      <layout class="QHBoxLayout" name="captchaLayout">
        <item>
-        <widget class="QPushButton" name="register_PB">
+        <widget class="QLabel" name="randcode">
          <property name="font">
           <font>
-           <family>Arial</family>
-           <pointsize>18</pointsize>
+           <family>Microsoft YaHei</family>
+           <pointsize>14</pointsize>
           </font>
          </property>
          <property name="text">
-          <string>注册</string>
+          <string>验证码</string>
          </property>
         </widget>
        </item>
        <item>
-        <spacer name="horizontalSpacer">
-         <property name="orientation">
-          <enum>Qt::Horizontal</enum>
-         </property>
-         <property name="sizeHint" stdset="0">
+        <widget class="QLineEdit" name="randcode_LE">
+         <property name="maximumSize">
           <size>
-           <width>40</width>
-           <height>20</height>
+           <width>100</width>
+           <height>16777215</height>
           </size>
          </property>
-        </spacer>
+         <property name="placeholderText">
+          <string>输入验证码</string>
+         </property>
+        </widget>
        </item>
        <item>
-        <widget class="QPushButton" name="login_PB">
-         <property name="font">
-          <font>
-           <family>Arial</family>
-           <pointsize>18</pointsize>
-          </font>
+        <widget class="QPushButton" name="pushButton">
+         <property name="minimumSize">
+          <size>
+           <width>90</width>
+           <height>0</height>
+          </size>
          </property>
          <property name="text">
-          <string>登录</string>
+          <string>获取验证码</string>
          </property>
         </widget>
        </item>
@@ -218,7 +143,57 @@ color: rgb(255, 255, 255);</string>
      </item>
     </layout>
    </item>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_2">
+     <property name="spacing">
+      <number>30</number>
+     </property>
+     <item>
+      <widget class="QPushButton" name="register_PB">
+       <property name="minimumSize">
+        <size>
+         <width>120</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>注  册</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="login_PB">
+       <property name="minimumSize">
+        <size>
+         <width>120</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>登  录</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
   </layout>
+  <!-- 加载动画覆盖层 -->
+  <widget class="QLabel" name="loadingLabel">
+   <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+     <width>600</width>
+     <height>420</height>
+    </rect>
+   </property>
+   <property name="text">
+    <string/>
+   </property>
+   <property name="alignment">
+    <set>Qt::AlignCenter</set>
+   </property>
+  </widget>
  </widget>
  <resources>
   <include location="config.qrc"/>

@@ -10,7 +10,6 @@ Friend::Friend(QWidget *parent) :
 {
     ui->setupUi(this);
     m_onlineUser=new OnlineUser;
-    flushfriend();
     m_chat=new Chat;
 }
 
@@ -33,10 +32,58 @@ QListWidget *Friend::getfile_LW()
     return  ui->listWidget;
 }
 
+// flushFriend_LW：仅接管好友列表数据，不直接写 QListWidget
 void Friend::flushFriend_LW(const QStringList& q)
 {
+    qDebug() << "[Friend] flushFriend_LW: 缓存" << q.size() << "个好友条目";
+    m_friendList = q;
+    m_pendingUiRefresh = true;
+    scheduleUiRefresh();
+}
+
+// scheduleUiRefresh：合并排队——最多排入一个 UI 刷新回调
+void Friend::scheduleUiRefresh()
+{
+    // 无待处理数据则跳过
+    if (!m_pendingUiRefresh) {
+        return;
+    }
+    // 不可见时不排队，等 showEvent 触发
+    if (!isVisible()) {
+        qDebug() << "[Friend] scheduleUiRefresh: 页面不可见，延迟到 showEvent";
+        return;
+    }
+    // 已排队则跳过（合并去重）
+    if (m_uiRefreshQueued) {
+        return;
+    }
+    m_uiRefreshQueued = true;
+    qDebug() << "[Friend] scheduleUiRefresh: 排入一次 UI 刷新";
+    QTimer::singleShot(0, this, [this]() {
+        m_uiRefreshQueued = false;
+        // 回调执行时重新检查可见性与待刷新标志
+        if (isVisible() && m_pendingUiRefresh) {
+            qDebug() << "[Friend] UI 刷新：开始重建";
+            rebuildFriendList();
+            qDebug() << "[Friend] UI 刷新：完成";
+        }
+    });
+}
+
+// rebuildFriendList：唯一可写 QListWidget 的位置
+void Friend::rebuildFriendList()
+{
     ui->listWidget->clear();
-    ui->listWidget->addItems(q);
+    ui->listWidget->addItems(m_friendList);
+    m_pendingUiRefresh = false;
+}
+
+void Friend::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    qDebug() << "[Friend] showEvent: 页面变为可见，pending=" << m_pendingUiRefresh;
+    // 仅在页面可见后请求合并排队重建
+    scheduleUiRefresh();
 }
 
 void Friend::on_findUser_PB_clicked()

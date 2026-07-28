@@ -3,29 +3,55 @@
 #include "process.h"
 #include "index.h"
 #include <string.h>
+#include <QByteArray>
 #include <QFile>
 #include <QString>
 #include <QDebug>
 #include <QMessageBox>
 #include <QHostAddress>
+#include <QCryptographicHash>
+#include <QGraphicsOpacityEffect>
+#include <QTimer>
 #include <string>
+
+namespace {
+QByteArray passwordHashForProtocol(const QString &password)
+{
+    return QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Md5).toHex();
+}
+
+void copyFixedField(char *dst, int dstSize, const QByteArray &src)
+{
+    memset(dst, 0, dstSize);
+    memcpy(dst, src.constData(), qMin(src.size(), dstSize - 1));
+}
+
+void copyExactField(char *dst, int dstSize, const QByteArray &src)
+{
+    memset(dst, 0, dstSize);
+    memcpy(dst, src.constData(), qMin(src.size(), dstSize));
+}
+}
+
 Client::Client(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Client)
 {
     ui->setupUi(this);
+    setFixedSize(600,420);
     this->m_mhptr=new MsgHandler;
     //加载配置文件
     loadconfig();
-    //生成随机验证码
-    qsrand(QTime::currentTime().msec());
-    ui->label_randcode->setText(generateCaptcha());
+    //隐藏加载动画层
+    ui->loadingLabel->hide();
+    //验证码冷却定时器
+    m_captchaCooldownSec=0;
+    m_captchaCooldownTimer=new QTimer(this);
+    connect(m_captchaCooldownTimer,&QTimer::timeout,this,&Client::onCaptchaCooldownTick);
     //连接服务器
     sorket.connectToHost(QHostAddress(this->m_strlp),this->m_usPort);
     //关联连接信号和槽函数的
-    //1、监听服务器的连接信号
     connect(&sorket,&QTcpSocket::connected,this,&Client::connectsort);
-    //2、监听读取信号
     connect(&sorket,&QTcpSocket::readyRead,this,&Client::recvmsg);
 }
 
@@ -156,7 +182,7 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->sharefileagree();
         break;
     }
-    case ENUM_MSG_TYPE_SHAREFILE_FINSH_RESPOND:{//分享文件同意回应
+    case ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND:{//分享文件同意回应
         m_mhptr->sharefilefinsh();
         break;
     }
@@ -168,11 +194,38 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->uploadfileinit();
         break;
     }
+    case ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND:{
+        m_mhptr->downloadfile();
+        break;
+    }
+    case ENUM_MSG_TYPE_DOWNLOADFILE_DATA:{
+        m_mhptr->handleDownloadData();
+        break;
+    }
+    case ENUM_MSG_TYPE_DOWNLOADFILE_FINISH:{
+        m_mhptr->handleDownloadFinish();
+        break;
+    }
+    case ENUM_MSG_TYPE_CAPTCHA_RESPOND:{
+        m_mhptr->handleCaptcha();
+        break;
+    }
+    case ENUM_MSG_TYPE_MOVEFILE_RESPOND:{
+        m_mhptr->handlMoveFile();
+        break;
+    }
+    case ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND:{
+        m_mhptr->handlUserInformation();
+        break;
+    }
     default:
         break;
     }
 }
 //发送消息
+// 发送 PDU 到服务端。pdu 必须由 mkPDU() (malloc) 分配。
+// 发送完成后调用 free(pdu) 释放。
+// 调用方不得在 seedMsg 返回后再访问 pdu。
 void Client::seedMsg(PDU *pdu){
     //利用sorket对应来发送PDU协议
     sorket.write((char*)pdu,pdu->uiTotalLen);
@@ -181,9 +234,9 @@ void Client::seedMsg(PDU *pdu){
             <<"pdu->uiTotalLen"<<pdu->uiTotalLen<<" "
             <<"pdu->uiMsgLen"<<pdu->uiMsgLen<<" "
             <<"pdu->uiType"<<pdu->uiType<<" "
-            <<"pdu->caData"<<pdu->caData<<" "
-            <<"pdu->caData+32"<<pdu->caData+32<<" "
-            <<"pdu->caMsg"<<pdu->caMsg<<endl;
+            <<"pdu->caData"<<QByteArray(pdu->caData,32)<<" "
+            <<"pdu->caData+32"<<QByteArray(pdu->caData+32,32)<<" "
+            <<"pdu->caMsg"<<QByteArray(pdu->caMsg,pdu->uiMsgLen)<<endl;
     //清理资源
     free(pdu);
     pdu=nullptr;
@@ -208,9 +261,11 @@ void Client::recvmsg(){
                     <<"pdu->uiTotalLen"<<pdu->uiTotalLen<<endl
                     <<"pdu->uiMsgLen"<<pdu->uiMsgLen<<endl
                     <<"pdu->uiType"<<pdu->uiType<<endl
-                    <<"pdu->caData"<<pdu->caData<<endl
-                    <<"pdu->caData+32"<<pdu->caData+32<<endl
-                    <<"pdu->caMsg"<<pdu->caMsg<<endl;
+                    <<"pdu->caData"<<QByteArray(pdu->caData,32)<<endl
+                    <<"pdu->caData+32"<<QByteArray(pdu->caData+32,32)<<endl
+                    <<(pdu->uiType==ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND || pdu->uiType==ENUM_MSG_TYPE_DOWNLOADFILE_DATA ? "pdu->caMsg bytes" : "pdu->caMsg")
+                    <<(pdu->uiType==ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND || pdu->uiType==ENUM_MSG_TYPE_DOWNLOADFILE_DATA ? QByteArray::number(pdu->uiMsgLen).constData() : pdu->caMsg)
+                    <<endl;
             handlMsg(pdu);//消息处理 接收的pdu
             m_pdulist.remove(0,pdu->uiTotalLen);//将接受的完整PDU对象从m_pdulist中删除
         }
@@ -223,7 +278,7 @@ void Client::on_register_PB_clicked(){
     //获取用户名和密码的内容，并且检查用户名和密码是否合法
     QString strname=ui->name_LE->text();
     QString strpwd=ui->pwd_LE->text();
-    if(strname.size()<0||strpwd.size()<0||strname.size()>32||strpwd.size()>32){
+    if(strname.isEmpty()||strpwd.isEmpty()||strname.toUtf8().size()>31){
         QMessageBox::information(this,"提示","用户名或密码长度非法");
         return ;
     }
@@ -238,29 +293,116 @@ void Client::on_register_PB_clicked(){
         }
     }
     //构建注册信息的PDU协议，并且给其 类型，用户名，密码 进行赋值
-    PDU* pdu=mkPDU();
+    QByteArray captchaBytes=ui->randcode_LE->text().toUtf8();
+    PDU* pdu=mkPDU(captchaBytes.size()+1);
     pdu->uiType=ENUM_MSG_TYPE_REGIST_REQUEST;
-    memcpy(pdu->caData,strname.toStdString().c_str(),sizeof(strname.toStdString()));
-    memcpy(pdu->caData+32,strpwd.toStdString().c_str(),sizeof(strpwd.toStdString()));
+    QByteArray passwordHash=passwordHashForProtocol(strpwd);
+    copyFixedField(pdu->caData,32,strname.toUtf8());
+    copyExactField(pdu->caData+32,32,passwordHash);
+    memcpy(pdu->caMsg,captchaBytes.constData(),captchaBytes.size()+1);
+    qDebug()<<"register encrypted password"<<passwordHash;
     seedMsg(pdu);
 }
 
 //发送登录信息的槽函数
 void Client::on_login_PB_clicked(){
-    if(strcmp(ui->label_randcode->text().toStdString().c_str(),ui->randcode_LE->text().toStdString().c_str())!=0){
-        QMessageBox::information(this,"提示","验证码不正确");
+    QString captchaInput=ui->randcode_LE->text();
+    if(captchaInput.isEmpty()){
+        QMessageBox::information(this,"提示","请输入验证码");
         return;
     }
     //从输入框获取用户名和密码 并且 发送PDU给服务器
     QString strname=ui->name_LE->text();
     QString strpwd=ui->pwd_LE->text();
-    PDU* pdu=mkPDU();
+    if(strname.isEmpty()||strpwd.isEmpty()||strname.toUtf8().size()>31){
+        QMessageBox::information(this,"提示","用户名或密码长度非法");
+        return;
+    }
+    QByteArray captchaBytes=captchaInput.toUtf8();
+    PDU* pdu=mkPDU(captchaBytes.size()+1);
     pdu->uiType=ENUM_MSG_TYPE_LOGIN_REQUEST;
-    memcpy(pdu->caData,strname.toStdString().c_str(),32);
-    memcpy(pdu->caData+32,strpwd.toStdString().c_str(),32);
+    QByteArray passwordHash=passwordHashForProtocol(strpwd);
+    copyFixedField(pdu->caData,32,strname.toUtf8());
+    copyExactField(pdu->caData+32,32,passwordHash);
+    memcpy(pdu->caMsg,captchaBytes.constData(),captchaBytes.size()+1);
+    qDebug()<<"[DIAG-CLIENT] login: name="<<strname<<" raw_pwd_len="<<strpwd.size()<<" hash_hex="<<passwordHash<<" hash_len="<<passwordHash.size();
+    qDebug()<<"[DIAG-CLIENT] caData+32 raw bytes:"<<QByteArray(pdu->caData+32,32).toHex();
     seedMsg(pdu);
 }
-//生成随机码，并填充
+void Client::updateCaptchaDisplay(const QString& code){
+    QMessageBox mb(this);
+    mb.setWindowTitle("验证码");
+    mb.setText(QString("您的验证码为：\n\n    %1    \n\n请在1分钟内输入").arg(code));
+    mb.setIcon(QMessageBox::Information);
+    mb.exec();
+}
+void Client::resetCaptchaButton(){
+    ui->pushButton->setEnabled(true);
+    ui->pushButton->setText("获取验证码");
+}
+void Client::startCaptchaCooldown(){
+    m_captchaCooldownSec=60;
+    ui->pushButton->setEnabled(false);
+    ui->pushButton->setText(QString("请等待 %1 秒").arg(m_captchaCooldownSec));
+    m_captchaCooldownTimer->start(1000);
+}
+void Client::onCaptchaCooldownTick(){
+    m_captchaCooldownSec--;
+    if(m_captchaCooldownSec<=0){
+        m_captchaCooldownTimer->stop();
+        ui->pushButton->setEnabled(true);
+        ui->pushButton->setText("获取验证码");
+        return;
+    }
+    ui->pushButton->setText(QString("请等待 %1 秒").arg(m_captchaCooldownSec));
+}
+//请求服务端验证码
 void Client::on_pushButton_clicked(){
-    ui->label_randcode->setText(generateCaptcha());
+    if(sorket.state()!=QAbstractSocket::ConnectedState){
+        QMessageBox::information(this,"提示","未连接服务器，无法获取验证码");
+        return;
+    }
+    if(m_captchaCooldownSec>0){
+        QMessageBox::information(this,"提示",QString("验证码尚未过期，请等待 %1 秒后再获取").arg(m_captchaCooldownSec));
+        return;
+    }
+    ui->pushButton->setEnabled(false);
+    ui->pushButton->setText("获取中...");
+    PDU* pdu=mkPDU();
+    pdu->uiType=ENUM_MSG_TYPE_CAPTCHA_REQUEST;
+    seedMsg(pdu);
+}
+//登录/注册成功动画
+void Client::showLoadingAnimation(bool success){
+    ui->loadingLabel->raise();
+    ui->loadingLabel->setText(success ? "✓ 验证成功\n正在进入..." : "✗ 操作失败");
+    ui->loadingLabel->setStyleSheet(success
+        ? "background:rgba(11,61,94,220);color:#2ecc71;font-size:22px;font-weight:bold;"
+        : "background:rgba(11,61,94,220);color:#e74c3c;font-size:22px;font-weight:bold;");
+    QGraphicsOpacityEffect* effect=new QGraphicsOpacityEffect(this);
+    ui->loadingLabel->setGraphicsEffect(effect);
+    ui->loadingLabel->show();
+    QPropertyAnimation* anim=new QPropertyAnimation(effect,"opacity");
+    anim->setDuration(800);
+    anim->setStartValue(0.0);
+    anim->setEndValue(1.0);
+    anim->setEasingCurve(QEasingCurve::OutCubic);
+    connect(anim,&QPropertyAnimation::finished,this,[this](){
+        QTimer::singleShot(600,this,[this](){
+            auto* eff = qobject_cast<QGraphicsOpacityEffect*>(
+                ui->loadingLabel->graphicsEffect());
+            if (!eff) return;
+            QPropertyAnimation* fadeOut=new QPropertyAnimation(eff,"opacity");
+            fadeOut->setDuration(400);
+            fadeOut->setStartValue(1.0);
+            fadeOut->setEndValue(0.0);
+            fadeOut->setEasingCurve(QEasingCurve::InCubic);
+            connect(fadeOut,&QPropertyAnimation::finished,this,[this](){
+                ui->loadingLabel->hide();
+                ui->loadingLabel->setGraphicsEffect(nullptr);
+            });
+            fadeOut->start(QAbstractAnimation::DeleteWhenStopped);
+        });
+    });
+    anim->start(QAbstractAnimation::DeleteWhenStopped);
 }

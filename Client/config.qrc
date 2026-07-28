@@ -10,5 +10,8 @@
         <file>file.png</file>
         <file>shareFile.png</file>
         <file>index.png</file>
+        <file>bg_main.jpg</file>
+        <file>bg_index.jpg</file>
+        <file>style.qss</file>
     </qresource>
 </RCC>

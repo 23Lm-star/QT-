@@ -13,6 +13,8 @@ public:
     explicit SimpleCaptcha(QWidget *parent = nullptr);
 
     QString getCaptchaCode() const { return m_code; }
+    void setCodeLength(int length);
+    bool verify(const QString &input) const;
     void refreshCaptcha();   // 刷新验证码
 
 signals:

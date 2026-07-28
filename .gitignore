@@ -1,2 +1,45 @@
+# Qt/qmake build artifacts
 build-*/
 Client/_github_bundle_repo/
+
+# Qt Creator user settings
+*.pro.user
+*.pro.user.*
+
+# qmake generated files
+Makefile
+Makefile.Debug
+Makefile.Release
+object_script.*.Debug
+object_script.*.Release
+.qmake.stash
+
+# Qt build object files and moc
+debug/
+release/
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+*.o
+*.obj
+*.moc
+
+# Qt resource compiled files
+*.qrc.depends
+
+# IDE / Editor
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Binary executables
+*.exe

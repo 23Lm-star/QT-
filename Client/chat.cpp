@@ -42,9 +42,9 @@ void Chat::on_output_PB_clicked(){
     memcpy(pdu->caData+32,m_strChatName.toStdString().c_str(),32);
     //构造一条消息（消息本体+发送时间）
     Msg* pdu_msg=(Msg*)pdu->caMsg;
-    pdu_msg->totoalLen=Msglen;//消息总长度（+消息本体长度+1）
+    pdu_msg->totalLen=Msglen;//消息总长度（+消息本体长度+1）
     pdu_msg->msgLen=msg.toUtf8().toStdString().size()+1;
-    qDebug()<<"pdu_msg->totoalLen"<<pdu_msg->totoalLen<<" pdu_msg->msgLen"<<pdu_msg->msgLen<<" ";
+    qDebug()<<"pdu_msg->totalLen"<<pdu_msg->totalLen<<" pdu_msg->msgLen"<<pdu_msg->msgLen<<" ";
     memcpy(pdu_msg->Time,QDateTime::currentDateTime().toString().toStdString().c_str(),30);
     memcpy(pdu_msg->msg,msg.toUtf8().toStdString().c_str(),pdu_msg->msgLen);
     qDebug()<<"发送msg"<<pdu_msg->msg<<" time:"<<pdu_msg->Time<<" ";

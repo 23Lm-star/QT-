@@ -4,6 +4,7 @@
 #include "protocol.h"
 
 #include <QString>
+#include <QFile>
 
 class MsgHandler
 {
@@ -29,6 +30,20 @@ public:
     void uploadfileinit();
     void uploadfiledata();
     void flushfile();
+    void downloadfile();
+    void handleCaptcha();
+    void handlMoveFile();
+    void handlUserInformation();
+
+    //流式下载接收状态
+    void handleDownloadRespond();
+    void handleDownloadData();
+    void handleDownloadFinish();
+
+private:
+    QFile* m_recvFile;        //下载接收文件
+    QString m_recvFilePath;   //保存路径
+    QString m_recvFileName;   //文件名
 };
 
 #endif // MSGHANDLER_H

@@ -12,7 +12,7 @@ void UserInformation::setMsg()
 {
     QString LoginName=Client::getinstance().m_LoginName;
     PDU* pdu=mkPDU();
-    pdu->uiType=ENUM_MSG_TYPE_GETUSERINFORMSTION_REQUEST;
+    pdu->uiType=ENUM_MSG_TYPE_GETUSERINFORMATION_REQUEST;
     memcpy(pdu->caData,LoginName.toStdString().c_str(),32);
     Client::getinstance().seedMsg(pdu);
 }

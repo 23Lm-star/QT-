@@ -4,9 +4,55 @@
 #include "ui_file.h"
 #include "uploader.h"
 
+#include <QByteArray>
+#include <QDate>
+#include <QDir>
+#include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QShowEvent>
+#include <QStringList>
+#include <QTimer>
 #include <qinputdialog.h>
 #include <qmessagebox.h>
+#include <cstring>
+
+namespace {
+bool isValidFileName(const QString &name)
+{
+    QString trimmed=name.trimmed();
+    if(trimmed.isEmpty() || trimmed!=name){
+        return false;
+    }
+    if(name=="." || name==".." || name.toUtf8().size()>31){
+        return false;
+    }
+    if(name.endsWith('.') || name.endsWith(' ')){
+        return false;
+    }
+
+    const QString forbidden="<>:\"/\\|?*";
+    for(const QChar &ch:name){
+        if(ch.unicode()<32 || forbidden.contains(ch)){
+            return false;
+        }
+    }
+
+    QString base=name.section('.',0,0).toUpper();
+    static const QStringList reserved={
+        "CON","PRN","AUX","NUL",
+        "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+        "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+    };
+    return !reserved.contains(base);
+}
+
+void copyFixedField(char *dst, int dstSize, const QByteArray &src)
+{
+    memset(dst, 0, dstSize);
+    memcpy(dst, src.constData(), qMin(src.size(), dstSize - 1));
+}
+}
 
 File::File(QWidget *parent) :
     QWidget(parent),
@@ -15,7 +61,6 @@ File::File(QWidget *parent) :
     ui->setupUi(this);
     m_strUserPath=QString("%1/%2").arg(Client::getinstance().m_strRootPath).arg(Client::getinstance().m_LoginName);
     m_strCurPath=m_strUserPath;
-    flushfile();
     ui->currPath_LE->setText(m_strCurPath);
     //创建用户目录和资源目录,若是不存在会创建，存在就不创建了
     QDir dir;
@@ -51,25 +96,68 @@ void File::uploadfile(qint64 resumeOffset)
 }
 
 void File::updateCurrfile(QList<FileInfo *> qFileinfolist){
-    //现将记录的之前的当前目录的 所有文件信息 内存进行释放
+    // 步骤1：释放旧数据内存
     foreach(FileInfo* fileInfos,m_fileInfoList){
         delete fileInfos;
     }
-    //再将所有的内存信息 地址拷贝一份给记录当前目录的列表
+    // 步骤2：接管新数据（File 拥有所有权）
     m_fileInfoList=qFileinfolist;
+    qDebug() << "[File] updateCurrfile: 缓存" << m_fileInfoList.size() << "个文件条目";
+    // 步骤3：数据/UI 分离——仅标记待刷新，由 scheduleUiRefresh 统一调度
+    m_pendingUiRefresh=true;
+    scheduleUiRefresh();
+}
+
+void File::rebuildFileList(){
     ui->file_LW->clear();
-    for(int i=0;i<qFileinfolist.size();i++){
+    for(int i=0;i<m_fileInfoList.size();i++){
         QListWidgetItem*pItem=new QListWidgetItem;
-        if(qFileinfolist[i]->uiType==0){
+        if(m_fileInfoList[i]->uiType==0){
             pItem->setIcon(QIcon(QPixmap(":/dir.png")));
         }
-        else if(qFileinfolist[i]->uiType==1){
+        else if(m_fileInfoList[i]->uiType==1){
             pItem->setIcon(QIcon(QPixmap(":/file.png")));
         }
-        pItem->setText(qFileinfolist[i]->caName);
-        qDebug()<<"pFileInfo->caName:"<<qFileinfolist[i]->caName<<" qFileinfolist[i]->uiType"<<qFileinfolist[i]->uiType<<" ";
+        pItem->setText(m_fileInfoList[i]->caName);
+        qDebug()<<"pFileInfo->caName:"<<m_fileInfoList[i]->caName<<" qFileinfolist[i]->uiType"<<m_fileInfoList[i]->uiType<<" ";
         ui->file_LW->addItem(pItem);
     }
+    m_pendingUiRefresh=false;
+}
+
+void File::scheduleUiRefresh()
+{
+    // 无待处理数据则跳过
+    if (!m_pendingUiRefresh) {
+        return;
+    }
+    // 不可见时不排队，等 showEvent 触发
+    if (!isVisible()) {
+        qDebug() << "[File] scheduleUiRefresh: 页面不可见，延迟到 showEvent";
+        return;
+    }
+    // 已排队则跳过（合并去重）
+    if (m_uiRefreshQueued) {
+        return;
+    }
+    m_uiRefreshQueued = true;
+    qDebug() << "[File] scheduleUiRefresh: 排入一次 UI 刷新";
+    QTimer::singleShot(0, this, [this]() {
+        m_uiRefreshQueued = false;
+        // 回调执行时重新检查可见性与待刷新标志
+        if (isVisible() && m_pendingUiRefresh) {
+            qDebug() << "[File] UI 刷新：开始重建";
+            rebuildFileList();
+            qDebug() << "[File] UI 刷新：完成";
+        }
+    });
+}
+
+void File::showEvent(QShowEvent *event){
+    QWidget::showEvent(event);
+    qDebug() << "[File] showEvent: 页面变为可见，pending=" << m_pendingUiRefresh;
+    // 通过合并排队机制请求重建，不直接操作 QListWidget
+    scheduleUiRefresh();
 }
 
 void File::flushCurrLE()
@@ -85,14 +173,14 @@ void File::errnoMsg(const QString &Msg)
 void File::on_credit_PB_clicked()
 {
      QString strdirName=QInputDialog::getText(this,"新建文件夹","文件夹名");
-     if(strdirName==nullptr||strdirName.size()>32||strdirName.size()<0){
+     if(!isValidFileName(strdirName)){
          QMessageBox::information(this,"提示","文件夹名不合法");
          return;
      }
      uint dirSize=this->m_strCurPath.toUtf8().toStdString().size();
      PDU* pdu=mkPDU(dirSize+1);
      pdu->uiType=ENUM_MSG_TYPE_MKDIR_REQUEST;
-     memcpy(pdu->caData,strdirName.toStdString().c_str(),32);
+     copyFixedField(pdu->caData,32,strdirName.toUtf8());
      memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),dirSize);
      qDebug()<<"pdu->caData:"<<pdu->caData<<"pdu->caMsg"<<pdu->caMsg<<endl;
      Client::getinstance().seedMsg(pdu);
@@ -190,7 +278,7 @@ void File::on_rename_PB_clicked()
     if(strfileName==oldfileName->text()){//如果说当前新文件名和原来文件名相同的话就不需要修改
         return ;
     }
-    if(strfileName.size()<0||strfileName.size()>32){//如果新文件名长度不合理不能修改
+    if(!isValidFileName(strfileName)){//如果新文件名长度不合理不能修改
         QMessageBox::information(this,"提示","新文件名长度不合法");
         return;
     }
@@ -205,8 +293,8 @@ void File::on_rename_PB_clicked()
     //pdu->caMsg里面存入一个当前目录和文件类型
     PDU* pdu=mkPDU(sizeof(fileType)+this->m_strCurPath.toStdString().size()+1);
     pdu->uiType=ENUM_MSG_TYPE_RENAMEFILE_REQUEST;
-    memcpy(pdu->caData,oldfileName->text().toStdString().c_str(),32);//旧文件名
-    memcpy(pdu->caData+32,strfileName.toStdString().c_str(),32);//新文件名
+    copyFixedField(pdu->caData,32,oldfileName->text().toUtf8());//旧文件名
+    copyFixedField(pdu->caData+32,32,strfileName.toUtf8());//新文件名
     memcpy(pdu->caMsg,&fileType,sizeof(fileType));
     memcpy(pdu->caMsg+sizeof (fileType),this->m_strCurPath.toStdString().c_str(),this->m_strCurPath.toStdString().size());
     qDebug()<<"旧文件名"<<pdu->caData<<"新文件名"<<pdu->caData+32<<" 当前路径"<<pdu->caMsg+sizeof (fileType)<<endl;
@@ -233,12 +321,16 @@ void File::on_mkdir_PB_clicked()
     //取出要上传的文件名和文件大小
     int index=m_strUploadPath.lastIndexOf('/');
     QString uploadName=m_strUploadPath.right(m_strUploadPath.size()-index-1);//取出文件名
+    if(!isValidFileName(uploadName)){
+        QMessageBox::information(this,"提示","文件名不合法");
+        return;
+    }
     QFile file(m_strUploadPath);
     qint64 fileSize=file.size();//获取文件大小
     PDU* pdu=mkPDU(m_strCurPath.toUtf8().toStdString().size()+1);
     pdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST;
     uint resumeMagic=UPLOAD_RESUME_MAGIC;
-    memcpy(pdu->caData,uploadName.toUtf8().toStdString().c_str(),32);
+    copyFixedField(pdu->caData,32,uploadName.toUtf8());
     memcpy(pdu->caData+UPLOAD_FILE_SIZE_OFFSET,&fileSize,sizeof(fileSize));
     memcpy(pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
     memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),m_strCurPath.toUtf8().toStdString().size());//当前路径
@@ -248,6 +340,34 @@ void File::on_mkdir_PB_clicked()
 
 void File::on_download_PB_clicked()
 {
+    QListWidgetItem* fileItem=ui->file_LW->currentItem();
+    if(fileItem==nullptr){
+        QMessageBox::information(this,"提示","请选择要下载的文件");
+        return;
+    }
+
+    uint fileType=0;
+    bool found=false;
+    for(int i=0;i<this->m_fileInfoList.size();i++){
+        if(QString::fromUtf8(m_fileInfoList[i]->caName)==fileItem->text()){
+            fileType=m_fileInfoList[i]->uiType;
+            found=true;
+            break;
+        }
+    }
+    if(!found || fileType!=1){
+        QMessageBox::information(this,"提示","只能下载普通文件");
+        return;
+    }
+
+    QString filePath=QString("%1/%2").arg(this->m_strCurPath).arg(fileItem->text());
+    QByteArray filePathBytes=filePath.toUtf8();
+    PDU* pdu=mkPDU(filePathBytes.size()+1);
+    pdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST;
+    QByteArray fileNameBytes=fileItem->text().toUtf8();
+    memcpy(pdu->caData,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
+    memcpy(pdu->caMsg,filePathBytes.constData(),filePathBytes.size());
+    Client::getinstance().seedMsg(pdu);
 
 }
 

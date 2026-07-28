@@ -26,7 +26,9 @@ SOURCES += \
     onlineuser.cpp \
     protocol.cpp \
     sharefile.cpp \
-    uploader.cpp
+    uploader.cpp \
+    simplecaptcha.cpp \
+    userinformation.cpp
 
 HEADERS += \
     chat.h \
@@ -38,7 +40,9 @@ HEADERS += \
     onlineuser.h \
     protocol.h \
     sharefile.h \
-    uploader.h
+    uploader.h \
+    simplecaptcha.h \
+    userinformation.h
 
 FORMS += \
     chat.ui \
@@ -47,7 +51,8 @@ FORMS += \
     friend.ui \
     index.ui \
     onlineuser.ui \
-    sharefile.ui
+    sharefile.ui \
+    userinformation.ui
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin
@@ -55,7 +60,8 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
 RESOURCES += \
-    config.qrc
+    config.qrc \
+    images.qrc
 
 DISTFILES += \
     file.png \

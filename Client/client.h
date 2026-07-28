@@ -6,6 +6,9 @@
 #include <QTcpSocket>
 #include <QTime>
 #include <QtGlobal>
+#include <QPropertyAnimation>
+#include <QTimer>
+#include <QLabel>
 #include "userinformation.h"
 QT_BEGIN_NAMESPACE
 namespace Ui { class Client; }
@@ -36,6 +39,15 @@ public:
     QString generateCaptcha(int length = 6);
     //进行信息处理的函数
     void handlMsg(PDU* &pdu);
+    //登录/注册成功动画
+    void showLoadingAnimation(bool success);
+    void updateCaptchaDisplay(const QString& code);
+    void resetCaptchaButton();
+
+    QTimer* m_captchaCooldownTimer;
+    int m_captchaCooldownSec;
+    void startCaptchaCooldown();
+    void onCaptchaCooldownTick();
 
     ~Client();
 public slots:

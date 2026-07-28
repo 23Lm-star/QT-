@@ -12,12 +12,9 @@ SimpleCaptcha::SimpleCaptcha(QWidget *parent)
     m_label->setAlignment(Qt::AlignCenter);
     m_label->setStyleSheet(
         "QLabel {"
-        "   background-color: #f0f0f0;"
-        "   border: 1px solid #ccc;"
         "   font-family: 'Consolas', monospace;"
         "   font-size: 18px;"
         "   font-weight: bold;"
-        "   color: #333;"
         "}"
     );
     m_label->setFixedSize(120, 40);
@@ -43,6 +40,20 @@ void SimpleCaptcha::refreshCaptcha()
     m_code = generateRandomCode();
     m_label->setText(m_code);
     emit captchaRefreshed();
+}
+
+void SimpleCaptcha::setCodeLength(int length)
+{
+    int clamped = qBound(4, length, 10);
+    if (clamped != m_codeLength) {
+        m_codeLength = clamped;
+        refreshCaptcha();
+    }
+}
+
+bool SimpleCaptcha::verify(const QString &input) const
+{
+    return m_code.compare(input, Qt::CaseInsensitive) == 0;
 }
 
 QString SimpleCaptcha::generateRandomCode()

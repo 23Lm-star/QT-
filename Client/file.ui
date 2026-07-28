@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>615</width>
-    <height>359</height>
+    <width>800</width>
+    <height>467</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -35,21 +35,12 @@
    <item>
     <layout class="QHBoxLayout" name="horizontalLayout">
      <item>
-      <widget class="QListWidget" name="file_LW">
-       <property name="styleSheet">
-        <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(108, 255, 246);</string>
-       </property>
-      </widget>
+      <widget class="QListWidget" name="file_LW"/>
      </item>
      <item>
       <layout class="QVBoxLayout" name="verticalLayout">
        <item>
         <widget class="QPushButton" name="flush_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
          <property name="text">
           <string>刷新文件</string>
          </property>
@@ -70,10 +61,6 @@ background-color: rgb(170, 170, 255);</string>
        </item>
        <item>
         <widget class="QPushButton" name="credit_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
          <property name="text">
           <string>创建文件夹</string>
          </property>
@@ -94,10 +81,6 @@ background-color: rgb(170, 170, 255);</string>
        </item>
        <item>
         <widget class="QPushButton" name="del_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
          <property name="text">
           <string>删除文件</string>
          </property>
@@ -118,10 +101,6 @@ background-color: rgb(170, 170, 255);</string>
        </item>
        <item>
         <widget class="QPushButton" name="rename_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
          <property name="text">
           <string>重命名</string>
          </property>
@@ -142,12 +121,28 @@ background-color: rgb(170, 170, 255);</string>
        </item>
        <item>
         <widget class="QPushButton" name="back_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
          <property name="text">
           <string>返回上一级</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="verticalSpacer_6">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item>
+        <widget class="QPushButton" name="mkdir_PB">
+         <property name="text">
+          <string>上传文件</string>
          </property>
         </widget>
        </item>
@@ -165,13 +160,9 @@ background-color: rgb(170, 170, 255);</string>
         </spacer>
        </item>
        <item>
-        <widget class="QPushButton" name="mkdir_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
+        <widget class="QPushButton" name="download_PB">
          <property name="text">
-          <string>上传文件</string>
+          <string>下载文件</string>
          </property>
         </widget>
        </item>
@@ -190,10 +181,6 @@ background-color: rgb(170, 170, 255);</string>
        </item>
        <item>
         <widget class="QPushButton" name="share_PB">
-         <property name="styleSheet">
-          <string notr="true">background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, stop:0 rgba(0, 0, 0, 255), stop:1 rgba(255, 255, 255, 255));
-background-color: rgb(170, 170, 255);</string>
-         </property>
          <property name="text">
           <string>分享文件</string>
          </property>
@@ -205,6 +192,19 @@ background-color: rgb(170, 170, 255);</string>
    </item>
   </layout>
  </widget>
+ <tabstops>
+  <tabstop>inputPath_PB</tabstop>
+  <tabstop>file_LW</tabstop>
+  <tabstop>flush_PB</tabstop>
+  <tabstop>credit_PB</tabstop>
+  <tabstop>rename_PB</tabstop>
+  <tabstop>mkdir_PB</tabstop>
+  <tabstop>currPath_LE</tabstop>
+  <tabstop>back_PB</tabstop>
+  <tabstop>del_PB</tabstop>
+  <tabstop>download_PB</tabstop>
+  <tabstop>share_PB</tabstop>
+ </tabstops>
  <resources>
   <include location="config.qrc"/>
  </resources>

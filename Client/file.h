@@ -2,6 +2,7 @@
 #define FILE_H
 #include "protocol.h"
 #include <QWidget>
+#include <QShowEvent>
 #include <qlistwidget.h>
 #include "sharefile.h"
 namespace Ui {
@@ -25,6 +26,8 @@ public:
     void flushCurrLE();
     explicit File(QWidget *parent = nullptr);
     ~File();
+protected:
+    void showEvent(QShowEvent *event) override;//页面变为可见时重建待刷新列表
 private slots:
     void errnoMsg(const QString& Msg);
     //创建目录槽函数
@@ -50,6 +53,10 @@ private slots:
 
 private:
     Ui::File *ui;
+    bool m_pendingUiRefresh = false;//标记：存在待刷新的文件列表数据
+    bool m_uiRefreshQueued = false;//防止重复排入 UI 重建回调
+    void rebuildFileList();//集中执行 QListWidget clear() + addItem()
+    void scheduleUiRefresh();//合并排队：最多排入一个 UI 刷新回调
 };
 
 #endif // FILE_H
