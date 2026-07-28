@@ -56,6 +56,8 @@ public slots:
     void connectsort();
     //接受服务器信息调用槽函数
     void recvmsg();
+    //发送注销请求
+    void sendLogoffRequest();
 private slots:
     //注册消息发送槽函数
     void on_register_PB_clicked();

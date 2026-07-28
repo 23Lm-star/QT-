@@ -12,6 +12,7 @@
 #include <QCryptographicHash>
 #include <QGraphicsOpacityEffect>
 #include <QTimer>
+#include <QInputDialog>
 #include <string>
 
 namespace {
@@ -218,6 +219,10 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->handlUserInformation();
         break;
     }
+    case ENUM_MSG_TYPE_LOGOFF_RESPOND:{
+        m_mhptr->handlLogoff();
+        break;
+    }
     default:
         break;
     }
@@ -405,4 +410,31 @@ void Client::showLoadingAnimation(bool success){
         });
     });
     anim->start(QAbstractAnimation::DeleteWhenStopped);
+}
+//发送注销账户请求
+void Client::sendLogoffRequest()
+{
+    //弹出密码确认框
+    bool ok=false;
+    QString pwdInput=QInputDialog::getText(this,"注销确认",
+        "输入密码以确认注销账户：\n（此操作不可逆，将永久删除您的账户、好友关系和所有文件）",
+        QLineEdit::Password,"",&ok);
+    if(!ok||pwdInput.isEmpty()){
+        return;
+    }
+
+    //二次确认
+    int confirm=QMessageBox::warning(this,"最后确认",
+        "确定要永久删除您的账户吗？\n此操作不可撤销！",
+        QMessageBox::Yes|QMessageBox::No,QMessageBox::No);
+    if(confirm!=QMessageBox::Yes){
+        return;
+    }
+
+    QByteArray passwordHash=passwordHashForProtocol(pwdInput);
+    PDU* pdu=mkPDU();
+    pdu->uiType=ENUM_MSG_TYPE_LOGOFF_REQUEST;
+    copyFixedField(pdu->caData,32,m_LoginName.toUtf8());
+    copyExactField(pdu->caData+32,32,passwordHash);
+    seedMsg(pdu);
 }

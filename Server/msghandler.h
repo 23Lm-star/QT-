@@ -43,8 +43,9 @@ public:
     PDU* captcha();//验证码生成
     QString generateCaptchaCode(int length = 6);
     PDU* getuserinformation();//获取用户信息
+    PDU* logoff();//注销账户
 
-    //验证码存储: code → expiryTime（多码共存，纯时间判断，永不过早清除）
+    //验证码存储
     QMap<QString, QDateTime> m_captchas;
     int validateCaptcha(const char* caMsg, uint uiMsgLen); // 0通过,-2错误,-3过期
 

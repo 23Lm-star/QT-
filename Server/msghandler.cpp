@@ -67,6 +67,34 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen)
     return 0;
 }
 
+//处理注销账户请求
+PDU *MsgHandler::logoff()
+{
+    char userName[32]={'\0'};
+    char userPwd[32]={'\0'};
+    memcpy(userName,pdu->caData,32);
+    memcpy(userPwd,pdu->caData+32,32);
+
+    qDebug()<<"logoff request for:"<<QString::fromUtf8(userName);
+
+    bool ret=OperateDB::instance().handleLogoff(userName,userPwd);
+
+    // 如果数据库删除成功，清理用户的文件目录
+    if(ret){
+        QString userDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(QString::fromUtf8(userName));
+        QDir dir(userDir);
+        if(dir.exists()){
+            bool removed=dir.removeRecursively();
+            qDebug()<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
+        }
+    }
+
+    PDU* respdu=mkPDU();
+    respdu->uiType=ENUM_MSG_TYPE_LOGOFF_RESPOND;
+    memcpy(respdu->caData,&ret,sizeof(ret));
+    return respdu;
+}
+
 PDU *MsgHandler::captcha()
 {
     // 清理已过期的旧验证码

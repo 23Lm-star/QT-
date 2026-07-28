@@ -35,6 +35,8 @@ public:
     QStringList getchatMsg(char*seedName,char *revName);
     //获取用户信息
     bool handleGetUserInfo(const char* userName, QString& outName, int& outOnline);
+    //注销/删除用户账户
+    bool handleLogoff(const char* name, const char* pwd);
 private:
     explicit OperateDB(QObject *parent = nullptr);
     OperateDB(const OperateDB&)=delete;

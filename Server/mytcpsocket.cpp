@@ -162,6 +162,10 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->getuserinformation();
         break;
     }
+    case ENUM_MSG_TYPE_LOGOFF_REQUEST:{
+        respdu=m_MsgHandler->logoff();
+        break;
+    }
         default:
             break;
     }

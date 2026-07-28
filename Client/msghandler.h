@@ -34,6 +34,7 @@ public:
     void handleCaptcha();
     void handlMoveFile();
     void handlUserInformation();
+    void handlLogoff();
 
     //流式下载接收状态
     void handleDownloadRespond();

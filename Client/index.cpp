@@ -1,5 +1,6 @@
 #include "index.h"
 #include "ui_index.h"
+#include "client.h"
 #include <QTimer>
 
 Index::Index(QWidget *parent) :
@@ -46,5 +47,5 @@ void Index::on_file_PB_clicked()
 }
 void Index::on_pushButton_clicked()
 {
-
+    Client::getinstance().sendLogoffRequest();
 }

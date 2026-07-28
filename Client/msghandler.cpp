@@ -564,3 +564,22 @@ void MsgHandler::handlUserInformation()
     msg.append(online ? "在线" : "离线");            //12: 使用签名字段显示在线状态
     UserInformation::getinstance().fluMsg(msg);
 }
+
+void MsgHandler::handlLogoff()
+{
+    bool ret=false;
+    memcpy(&ret,pdu->caData,sizeof(ret));
+    qDebug()<<"handlLogoff result:"<<ret;
+    if(ret){
+        QMessageBox::information(&Index::getinstance(),"提示","账户已成功注销，即将返回登录界面。");
+        // 关闭主界面，返回登录界面
+        Index::getinstance().hide();
+        Client::getinstance().show();
+        Client::getinstance().flus();
+        // 断开连接
+        Client::getinstance().sorket.disconnectFromHost();
+    }
+    else {
+        QMessageBox::information(&Index::getinstance(),"提示","注销失败：密码错误或用户不存在。");
+    }
+}

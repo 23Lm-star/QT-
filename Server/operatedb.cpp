@@ -115,9 +115,6 @@ void OperateDB::handleOffLine(const char *strname)
 
     q.prepare("update user_info set online = 0 where name = ?");
     q.addBindValue(QString::fromUtf8(strname));
-    // TODO: implement 注销(user deletion)
-    // if a user deletion feature is added in the future, it must also clean up the friend table
-    // or add ON DELETE CASCADE foreign key constraint. Currently, there's no such feature.
     qDebug()<<"offline update for:"<<QString::fromUtf8(strname);
     q.exec();
 }
@@ -379,6 +376,71 @@ bool OperateDB::handleGetUserInfo(const char *userName, QString &outName, int &o
     }
     outName = q.value(0).toString();
     outOnline = q.value(1).toInt();
+    return true;
+}
+
+bool OperateDB::handleLogoff(const char* name, const char* pwd)
+{
+    if(name==nullptr||pwd==nullptr){
+        return false;
+    }
+
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return false;
+    }
+    QSqlDatabase db = connection.database();
+
+    db.transaction();
+    QSqlQuery q(db);
+
+    // 1. 验证用户名和密码
+    q.prepare("SELECT * FROM user_info WHERE name = ? AND pwd = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(pwd));
+    if(!q.exec() || !q.next()){
+        qDebug()<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    // 2. 删除 message_info 中涉及该用户的记录
+    q.prepare("DELETE FROM message_info WHERE seed_name = ? OR rev_name = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qDebug()<<"logoff: failed to delete messages for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    // 3. 删除 friend 表中涉及该用户的所有记录（双向）
+    q.prepare("DELETE FROM friend WHERE name = ? OR friendName = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qDebug()<<"logoff: failed to delete friend records for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    // 4. 删除 user_info 表中的用户记录
+    q.prepare("DELETE FROM user_info WHERE name = ? AND pwd = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(pwd));
+    if(!q.exec()){
+        qDebug()<<"logoff: failed to delete user_info for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    if(!db.commit()){
+        qDebug()<<"logoff: commit failed for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    qDebug()<<"logoff: successfully deleted user:"<<QString::fromUtf8(name);
     return true;
 }
 
