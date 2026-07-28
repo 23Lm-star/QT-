@@ -164,6 +164,7 @@ Msg (聊天消息体，嵌入 PDU.caMsg)
 | 中文注释乱码 | ✅ 已修复 | BUG-POOL-008，UTF-8 中文注释可读 |
 | 内存池分配说明不足 | ✅ 已修复 | BUG-POOL-003/007，所有权/配对注释已补充 |
 | Client 登录后 pure-virtual 崩溃 | 严重 | BUG-TST-CLIENT-001，重新打开；三轮列表时序修复未通过。R07 要求先取原生栈，优先验证 `Client::showLoadingAnimation()` 中 QWidget 已接管的 `QGraphicsOpacityEffect` 被移除后再次 `deleteLater()` 的所有权风险；禁止继续猜测性修改 Friend/File。 |
+| 缺失注销功能 | ➡️ 新增需求 | REQ-AUTH-001，允许用户安全注销账户。需实现：密码校验、从 `user_info` 和 `friend`、`message_info` 等关联表中彻底删除。 |
 
 ---
 

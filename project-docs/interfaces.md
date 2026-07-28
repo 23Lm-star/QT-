@@ -87,6 +87,8 @@ struct Msg {
 | 41 | `ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND` | S→C | 下载文件响应 |
 | 42 | `ENUM_MSG_TYPE_CAPTCHA_REQUEST` | C→S | 验证码请求 |
 | 43 | `ENUM_MSG_TYPE_CAPTCHA_RESPOND` | S→C | 验证码响应 |
+| 46 | `ENUM_MSG_TYPE_LOGOFF_REQUEST` | C→S | 注销(删除账号)请求 |
+| 47 | `ENUM_MSG_TYPE_LOGOFF_RESPOND` | S→C | 注销(删除账号)响应 |
 | 99999 | `ENUM_MSG_TYPE_MAX` | — | 最大值标记 |
 
 > **✅ 已修复**（2026-07-24）：枚举值冲突已解决，`SHAREFILE_FINISH_RESPOND`=37、`MOVEFILE_REQUEST`=38、`MOVEFILE_RESPOND`=39，拼写也已更正。两端 `handlMsg()` 均已完整处理。
@@ -111,6 +113,8 @@ struct Msg {
 | 重命名文件 | 旧名 | 新名 | — | 当前目录路径 |
 | 下载文件 | 文件名 | — | — | 当前目录路径 |
 | 分享文件 | — | 目标用户名 | — | 文件名 |
+| 注销/删除账号 | `ENUM_MSG_TYPE_LOGOFF_REQUEST` | 用户名（32B）+ 密码（32B） | — | — |
+| | `ENUM_MSG_TYPE_LOGOFF_RESPOND` | 是否成功（4B） | — | — |
 
 ### 1.5 `mkPDU` 接口
 
