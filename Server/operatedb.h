@@ -2,7 +2,6 @@
 #define OPERATEDB_H
 
 #include <QObject>
-#include <QtSql/QSqlDatabase>
 //数据库操作类
 class OperateDB : public QObject
 {
@@ -10,7 +9,6 @@ class OperateDB : public QObject
 public:
     ~OperateDB();
     //管理/维护一个数据库的连接
-    QSqlDatabase m_db;
     void connect();
     static OperateDB& instance();//单例模式
     //执行注册用户操作函数
@@ -35,6 +33,8 @@ public:
     bool seedchatMsg(char*seedName,char *revName,QString msg,QString seedTime);
     //获取聊天信息
     QStringList getchatMsg(char*seedName,char *revName);
+    //获取用户信息
+    bool handleGetUserInfo(const char* userName, QString& outName, int& outOnline);
 private:
     explicit OperateDB(QObject *parent = nullptr);
     OperateDB(const OperateDB&)=delete;

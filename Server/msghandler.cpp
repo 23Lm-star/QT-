@@ -1,10 +1,15 @@
-#include "msghandler.h"
+﻿#include "msghandler.h"
 #include "QDebug"
 #include "operatedb.h"
 #include "mytcpserver.h"
 #include "server.h"
 #include <QByteArray>
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QTime>
+#include <cerrno>
+#include <cstring>
 
 namespace {
 QString fixedString(const char *data, int maxLen)
@@ -20,18 +25,90 @@ QString fixedString(const char *data, int maxLen)
 
 MsgHandler::MsgHandler(){
     pdu=nullptr;
+    static bool seeded=false;
+    if(!seeded){
+        qsrand(QTime::currentTime().msec());
+        seeded=true;
+    }
+}
+
+QString MsgHandler::generateCaptchaCode(int length)
+{
+    const QString chars = "RSTnoprsXYZabcdeJK0QtuvwxyzUVWq123456789LMNPfghijklABCDEFGHm";
+    QString code;
+    for (int i = 0; i < length; ++i) {
+        code.append(chars.at(qrand() % chars.length()));
+    }
+    return code;
+}
+
+int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen)
+{
+    if (uiMsgLen < 4) return -2;
+    QString userInput = QString::fromUtf8(caMsg).trimmed();
+    
+    // 查找验证码（不做预先清理，以便区分"不存在"和"已过期"）
+    auto it = m_captchas.find(userInput);
+    if (it == m_captchas.end()) {
+        qDebug() << "验证码校验失败: 输入 [" << userInput << "] 不在验证码列表中";
+        return -2;
+    }
+    
+    // 检查是否过期
+    QDateTime now = QDateTime::currentDateTime();
+    if (now > it.value()) {
+        qDebug() << "验证码校验失败: 已过期 (过期时间:" << it.value() << "现在:" << now << ")";
+        m_captchas.erase(it);  // 过期后清理
+        return -3;
+    }
+    
+    // 验证码存在且未过期 → 有效
+    qDebug() << "验证码校验成功，剩余有效时间:" << now.secsTo(it.value()) << "秒";
+    return 0;
+}
+
+PDU *MsgHandler::captcha()
+{
+    // 清理已过期的旧验证码
+    QDateTime now = QDateTime::currentDateTime();
+    QList<QString> expiredKeys;
+    for (auto it = m_captchas.begin(); it != m_captchas.end(); ++it) {
+        if (now > it.value()) {
+            expiredKeys.append(it.key());
+        }
+    }
+    for (const QString& key : expiredKeys) {
+        m_captchas.remove(key);
+    }
+    
+    // 生成新验证码（追加，不覆盖旧码）
+    QString code = generateCaptchaCode(6);
+    QDateTime expiry = QDateTime::currentDateTime().addSecs(60);
+    m_captchas.insert(code, expiry);
+    qDebug() << "生成验证码:" << code << "过期时间:" << expiry << "(当前有效验证码数:" << m_captchas.size() << ")";
+    
+    QByteArray codeBytes = code.toUtf8();
+    PDU* respdu = mkPDU(codeBytes.size() + 1);
+    respdu->uiType = ENUM_MSG_TYPE_CAPTCHA_RESPOND;
+    memcpy(respdu->caMsg, codeBytes.constData(), codeBytes.size() + 1);
+    return respdu;
 }
 
 //处理注册请求
 PDU *MsgHandler::rigist()
 {
+    int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen);
+    if (captchaRet != 0) {
+        PDU* respdu = mkPDU();
+        respdu->uiType = ENUM_MSG_TYPE_REGIST_RESPOND;
+        memcpy(respdu->caData, &captchaRet, sizeof(captchaRet));
+        return respdu;
+    }
     //取出用户名和密码
-    char strname[32]={'\0'};
-    char strpwd[32]={'\0'};
-    memcpy(strname,pdu->caData,32);
-    memcpy(strpwd,pdu->caData+32,32);
-    //利用数据库操作对象进行数据库的注册操作,返回注册结果并输出
-    bool ret=OperateDB::instance().handleRegit(strname,strpwd);
+    QString strname=fixedString(pdu->caData,32);
+    QString strpwd=fixedString(pdu->caData+32,32);
+    //利用数据库操作对象进行数据库的注册操作，返回注册结果并输出
+    bool ret=OperateDB::instance().handleRegit(strname.toUtf8().data(),strpwd.toUtf8().data());
     qDebug()<<"regist ret "<<ret<<endl;
     if(ret){
         QDir dir;
@@ -40,23 +117,32 @@ PDU *MsgHandler::rigist()
         qDebug()<<"创建用户目录:"<<"ret1 "<<ret1<<" "<<QString("%1").arg(Server::getinstance().filesPath)<<endl;
         qDebug()<<"创建用户目录:"<<"ret2 "<<ret2<<" "<<QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname)<<endl;
     }
-    //将 注册结果 打包进响应报文返回
+    //将注册结果打包进响应报文返回
     PDU* respdu=mkPDU();
     memcpy(respdu->caData,&ret,sizeof(ret));
-    memcpy(respdu->caData+32,strname,32);
+    QByteArray strnameBytes=strname.toUtf8();
+    memcpy(respdu->caData+32,strnameBytes.constData(),qMin(strnameBytes.size(),31));
     respdu->uiType=ENUM_MSG_TYPE_REGIST_RESPOND;
     return respdu;
 }
-//处理登录请求，同时需要更新socket对象的 客户 用户名
+//处理登录请求，同时需要更新socket对象的客户用户名
 PDU *MsgHandler::login(QString &strname)
 {
+    int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen);
+    if (captchaRet != 0) {
+        PDU* respdu = mkPDU();
+        respdu->uiType = ENUM_MSG_TYPE_LOGIN_RESPOND;
+        memcpy(respdu->caData, &captchaRet, sizeof(captchaRet));
+        return respdu;
+    }
     //取出用户名和密码
-    char username[32]={'\0'};
-    char userpwd[32]={'\0'};
-    memcpy(username,pdu->caData,32);
-    memcpy(userpwd,pdu->caData+32,32);
-    //在数据库中 检查用户名和密码是否一致或者有问题
-    int ret=OperateDB::instance().handleLogin(username,userpwd);
+    QString username=fixedString(pdu->caData,32);
+    QString userpwd=fixedString(pdu->caData+32,32);
+    qDebug()<<"[DIAG-SERVER] login: extracted name="<<username<<" name_hex="<<username.toUtf8().toHex()<<" name_len="<<username.size();
+    qDebug()<<"[DIAG-SERVER] login: pwd_len="<<userpwd.size()<<" pwd_hex="<<userpwd;
+    qDebug()<<"[DIAG-SERVER] caData raw hex:"<<QByteArray(pdu->caData,64).toHex();
+    //在数据库中检查用户名和密码是否一致或有问题
+    int ret=OperateDB::instance().handleLogin(username.toUtf8().data(),userpwd.toUtf8().data());
     qDebug()<<"login ret"<<ret<<endl;
     if(ret==1){//记录已登录的用户名
         strname=username;
@@ -65,7 +151,8 @@ PDU *MsgHandler::login(QString &strname)
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LOGIN_RESPOND;
     memcpy(respdu->caData,&ret,sizeof(ret));
-    memcpy(respdu->caData+32,username,sizeof(username));
+    QByteArray usernameBytes=username.toUtf8();
+    memcpy(respdu->caData+32,usernameBytes.constData(),qMin(usernameBytes.size(),31));
     return respdu;
 }
 //查找用户
@@ -108,7 +195,7 @@ PDU *MsgHandler::addfriend()
     char seedName[32]={'\0'};
     memcpy(userName,pdu->caData,32);
     memcpy(seedName,pdu->caData+32,32);
-    //在数据库中 检查用户名和密码是否一致或者有问题
+    //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleAddFriend(userName,seedName);
     qDebug()<<"addfriend ret"<<ret<<endl;
     PDU* respdu=nullptr;
@@ -123,7 +210,7 @@ PDU *MsgHandler::addfriend()
         pdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_REQUEST;
         memcpy(pdu->caData,userName,32);
         memcpy(pdu->caData+32,seedName,32);
-        MyTcpServer::getinstance().seedAddFriend(seedName,pdu);
+        MyTcpServer::getinstance().sendAddFriendAndRelease(seedName,pdu);
     }
     return respdu;
 }
@@ -134,7 +221,7 @@ PDU *MsgHandler::addfriendFin()
     char seedName[32]={'\0'};
     memcpy(agreeName,pdu->caData,32);
     memcpy(seedName,pdu->caData+32,32);
-    //在数据库中 检查用户名和密码是否一致或者有问题
+    //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleAddFriendFin(seedName,agreeName);
     qDebug()<<" addfriendFin ret"<<ret<<endl;
     PDU* pdu=mkPDU();
@@ -185,7 +272,7 @@ PDU *MsgHandler::chat()
     Msg* pdu_msg=(Msg*)pdu->caMsg;
     memcpy(msg,pdu_msg->msg,pdu_msg->msgLen);
     memcpy(currTime,pdu_msg->Time,30);
-    qDebug()<<"接收到的msg"<<QString(msg)<<" 时间为:"<<QString(currTime)<<endl;
+    qDebug()<<"接收到的msg"<<QString(msg)<<" 时间为"<<QString(currTime)<<endl;
     bool ret= OperateDB::instance().seedchatMsg(seedName,tarName,QString(msg),QString(currTime));
     qDebug()<<"char ret"<<ret<<endl;
     if(ret){
@@ -302,7 +389,7 @@ PDU *MsgHandler::renamefile()
     QString newFilePath(QString::fromUtf8(pdu->caMsg+sizeof(uint))+"/"+QString::fromUtf8(newFileName));
     uint fileType=0;
     memcpy(&fileType,pdu->caMsg,sizeof(fileType));
-    qDebug()<<"文件类型:"<<fileType<<" "<<"旧文件路径"<<oldFilePath<<" "<<"新文件路径"<<newFilePath<<" ";
+    qDebug()<<"文件类型:"<<fileType<<" "<<"旧文件路径:"<<oldFilePath<<" "<<"新文件路径:"<<newFilePath<<" ";
     //进行文件或目录的重命名
     bool ret=1;
     if(fileType==0){//目录
@@ -354,9 +441,103 @@ PDU *MsgHandler::sharefilemove()
     bool ret=QFile::copy(sourcePath,tarPath);
     PDU* respdu=mkPDU();
     memcpy(respdu->caData,&ret,sizeof (ret));
-    respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_FINSH_RESPOND;
+    respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND;
     return respdu;
 
+}
+
+//移动文件（重命名/移动到用户根目录）
+PDU *MsgHandler::movefile(const QString& loginName)
+{
+    char srcFileName[32]={'\0'};
+    memcpy(srcFileName,pdu->caData,32);
+    QString fileName=QString::fromUtf8(srcFileName).trimmed();
+
+    QString srcDir=QString::fromUtf8(pdu->caMsg);
+    QString srcPath=QDir(srcDir).filePath(fileName);
+
+    // 安全路径构造：使用 QDir::filePath() 委托 Qt 处理分隔符
+    QString userRoot=QDir(Server::getinstance().filesPath).filePath(loginName);
+    QString dstPath=QDir(userRoot).filePath(fileName);
+    QString finalDstPath = dstPath;
+
+    //路径合法性校验：源路径必须在用户根目录内
+    QFileInfo srcInfo(srcPath);
+    QFileInfo rootInfo(userRoot);
+    QString canonicalSrc=srcInfo.canonicalFilePath();
+    QString canonicalRoot=rootInfo.canonicalFilePath();
+    QString canonicalRootPrefix=QDir(canonicalRoot).absolutePath();
+    if(!canonicalRootPrefix.endsWith('/')){
+        canonicalRootPrefix.append('/');
+    }
+
+    bool ret=false;
+    if(!canonicalRoot.isEmpty() && !canonicalSrc.isEmpty()
+            && (canonicalSrc==canonicalRoot || canonicalSrc.startsWith(canonicalRootPrefix))
+            && srcInfo.exists()){
+        //确保目标路径也在用户根目录内
+        QFileInfo dstInfo(dstPath);
+        // 确保目标路径的父目录也在用户根目录内
+        QDir dstDir = dstInfo.dir(); // 获取父目录
+        QString canonicalDstDir = dstDir.canonicalPath(); // 父目录必定存在
+        
+        if(!canonicalDstDir.isEmpty() && 
+          (canonicalDstDir == canonicalRoot || canonicalDstDir.startsWith(canonicalRootPrefix))){
+            
+            // 自动重命名处理逻辑
+            finalDstPath = dstPath;
+            if (QFileInfo::exists(finalDstPath)) {
+                QFileInfo checkInfo(finalDstPath);
+                QDir parentDir = checkInfo.dir(); // 获取父目录 QDir 对象
+                QString baseName = checkInfo.completeBaseName();
+                QString suffix = checkInfo.suffix();
+                if (!suffix.isEmpty()) suffix = "." + suffix;
+                
+                int count = 1;
+                const int MAX_RETRIES = 1000;
+                // 使用 QDir::filePath() 构建路径，确保跨平台安全
+                do {
+                    QString numberedName = QString("%1(%2)%3").arg(baseName).arg(count++).arg(suffix);
+                    finalDstPath = parentDir.filePath(numberedName);
+                    if (count > MAX_RETRIES) { ret = false; break; }
+                } while (QFileInfo::exists(finalDstPath));
+                qDebug() << "文件移动重名，自动重命名为:" << finalDstPath;
+            }
+
+            //先尝试 rename；若跨文件系统失败则 copy+remove
+            // 实例化文件对象，失败时获取 errorString() 详细错误
+            QFile srcFile(srcPath);
+            ret = srcFile.rename(finalDstPath);
+            if (!ret) {
+                qDebug() << "rename 失败, errorString:" << srcFile.errorString()
+                         << "src:" << srcPath << "dst:" << finalDstPath;
+                // 降级策略：copy + remove
+                ret = QFile::copy(srcPath, finalDstPath);
+                if (!ret) {
+                    qDebug() << "copy 降级也失败, src:" << srcPath << "dst:" << finalDstPath
+                             << "errno:" << errno << strerror(errno);
+                } else {
+                    if (QFile::remove(srcPath)) {
+                        qDebug() << "copy+remove 降级成功:" << finalDstPath;
+                    } else {
+                        qDebug() << "copy+remove 降级: copy 成功但 remove 失败, src:" << srcPath;
+                        QFile::remove(finalDstPath);  // 清理不完整的目标文件
+                        ret = false;
+                    }
+                }
+            }
+        } else {
+            qDebug() << "movefile 目标路径校验失败: canonicalDstDir=" << canonicalDstDir;
+        }
+    }
+
+    qDebug()<<"movefile src:"<<srcPath<<"dst:"<<finalDstPath<<"ret:"<<ret;
+    PDU* respdu=mkPDU();
+    memcpy(respdu->caData,&ret,sizeof(ret));
+    QByteArray fileNameBytes=fileName.toUtf8();
+    memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
+    respdu->uiType=ENUM_MSG_TYPE_MOVEFILE_RESPOND;
+    return respdu;
 }
 //上传文件初始化
 PDU *MsgHandler::uploadfileinit()
@@ -424,6 +605,44 @@ PDU *MsgHandler::uploadfiledata()
     memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
     return respdu;
 }
+//下载文件（仅做校验，流式分块由 MyTcpSocket 完成）
+PDU *MsgHandler::downloadfile()
+{
+    QString filePath=QString::fromUtf8(pdu->caMsg);
+    QFileInfo fileInfo(filePath);
+    QFileInfo rootInfo(Server::getinstance().filesPath);
+    QString canonicalFilePath=fileInfo.canonicalFilePath();
+    QString canonicalRootPath=rootInfo.canonicalFilePath();
+    QString canonicalRootPrefix=QDir(canonicalRootPath).absolutePath();
+    if(!canonicalRootPrefix.endsWith('/')){
+        canonicalRootPrefix.append('/');
+    }
+    QString fileName=fixedString(pdu->caData,32);
+    bool ret=false;
+    qint64 fileSize=0;
+    m_downloadCanonicalPath.clear();
+
+    if(!canonicalRootPath.isEmpty()
+            && !canonicalFilePath.isEmpty()
+            && (canonicalFilePath==canonicalRootPath || canonicalFilePath.startsWith(canonicalRootPrefix))
+            && fileInfo.isFile()
+            && !fileName.isEmpty()){
+        fileSize=fileInfo.size();
+        ret=true;
+        m_downloadCanonicalPath=canonicalFilePath;
+    }
+
+    //仅返回元数据 PDU（不含文件内容），实际数据由 MyTcpSocket 流式发送
+    PDU* respdu=mkPDU();
+    respdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND;
+    memcpy(respdu->caData,&ret,sizeof(ret));
+    memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
+    QByteArray fileNameBytes=fileName.toUtf8();
+    memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
+    qDebug()<<"downloadfile validate path"<<filePath<<"ret"<<ret<<"size"<<fileSize;
+    return respdu;
+}
+
 //获取聊天信息
 PDU *MsgHandler::chatmsg()
 {
@@ -441,12 +660,35 @@ PDU *MsgHandler::chatmsg()
     respdu->uiType=ENUM_MSG_TYPE_GETCHATMSG_RESPOND;
     for(int i=0,dis=0;i<Msglist.size();i+=2){
         Msg* filei=(Msg*)(respdu->caMsg+dis);
-        filei->totoalLen=sizeof(Msg)+Msglist[i].toUtf8().size()+1;
+        filei->totalLen=sizeof(Msg)+Msglist[i].toUtf8().size()+1;
         filei->msgLen=Msglist[i].toUtf8().size()+1;
         memcpy(filei->Time,Msglist[i+1].toUtf8().toStdString().c_str(),30);
         memcpy(filei->msg,Msglist[i].toUtf8().toStdString().c_str(),filei->msgLen);
         qDebug()<<"filei->msg "<<filei->msg<<" filei->Time"<<filei->Time<<",";
-        dis+=filei->totoalLen;
+        dis+=filei->totalLen;
     }
     return respdu;
 }
+
+//获取用户信息
+PDU *MsgHandler::getuserinformation()
+{
+    char userName[32]={'\0'};
+    memcpy(userName,pdu->caData,32);
+
+    QString outName;
+    int outOnline=0;
+    bool found=OperateDB::instance().handleGetUserInfo(userName,outName,outOnline);
+
+    int resultCode=found ? 0 : -1;
+    PDU* respdu=mkPDU();
+    respdu->uiType=ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND;
+    memcpy(respdu->caData,&resultCode,sizeof(resultCode));
+    memcpy(respdu->caData+sizeof(int),&outOnline,sizeof(outOnline));
+    QByteArray nameBytes=outName.toUtf8();
+    memcpy(respdu->caData+32,nameBytes.constData(),qMin(nameBytes.size(),31));
+    qDebug()<<"getuserinformation userName:"<<userName<<"found:"<<found<<"online:"<<outOnline;
+    return respdu;
+}
+
+

@@ -17,8 +17,15 @@ public:
     quint16 m_usPort;
     //服务器所有用户文件路径
     QString filesPath;
+    //数据库配置
+    QString m_dbHost;
+    quint16 m_dbPort;
+    QString m_dbName;
+    QString m_dbUser;
+    QString m_dbPassword;
     ~Server();
-    void loadconfig();//加载配置文件
+    bool loadconfig();//加载配置文件，成功返回 true
+    bool initialize();//显式初始化：加载配置、监听端口，全部成功返回 true
     static Server& getinstance();
 private:
     Server(QWidget *parent = nullptr);

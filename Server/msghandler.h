@@ -5,6 +5,9 @@
 #include "resumableuploadsession.h"
 
 #include <QString>
+#include <QDateTime>
+#include <QPair>
+#include <QMap>
 
 //用于作为 服务器处理客户端请求 的类
 class MsgHandler
@@ -32,9 +35,21 @@ public:
     PDU* renamefile();//重命名文件
     PDU* sharefile();//分享文件
     PDU* sharefilemove();//分享文件移动
+    PDU* movefile(const QString& loginName);//移动文件
     PDU* uploadfileinit();//上传文件初始化
     PDU* uploadfiledata();//上传文件数据
+    PDU* downloadfile();
     PDU* chatmsg();//获取聊天消息
+    PDU* captcha();//验证码生成
+    QString generateCaptchaCode(int length = 6);
+    PDU* getuserinformation();//获取用户信息
+
+    //验证码存储: code → expiryTime（多码共存，纯时间判断，永不过早清除）
+    QMap<QString, QDateTime> m_captchas;
+    int validateCaptcha(const char* caMsg, uint uiMsgLen); // 0通过,-2错误,-3过期
+
+    //下载文件时存储通过验证的规范路径
+    QString m_downloadCanonicalPath;
 };
 
 #endif // MSGHANDLER_H

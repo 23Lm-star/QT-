@@ -2,9 +2,8 @@
 #include "mytcpsocket.h"
 #include "server.h"
 #include "protocol.h"
-#include "clienttask.h"
+#include "memalloc.h"
 MyTcpServer::MyTcpServer(){
-    m_threadPool.setMaxThreadCount(8);
 }
 //连接新客户端，并且创建新的tcpsocket用来连接新客户端
 void MyTcpServer::incomingConnection(qintptr handle)
@@ -12,13 +11,14 @@ void MyTcpServer::incomingConnection(qintptr handle)
     qDebug()<<"新客户端连接"<<endl;
     MyTcpSocket * m_tcpSocket=new MyTcpSocket;
     m_tcpSocket->setSocketDescriptor(handle);
-    tcpsocketlist.append(m_tcpSocket);
-    for(int i=0;i<tcpsocketlist.size();i++){
-        qDebug()<<tcpsocketlist[i]<<endl;
+    {
+        QMutexLocker locker(&m_tcpsocketlistMutex);
+        tcpsocketlist.append(m_tcpSocket);
+        for(int i=0;i<tcpsocketlist.size();i++){
+            qDebug()<<tcpsocketlist[i]<<endl;
+        }
     }
-    //新建一个客户端连接类对象并且让新建一个线程托管运行
-    ClientTask*task=new ClientTask(m_tcpSocket);
-    m_threadPool.start(task);
+    qDebug()<<"新客户端连接完成"<<endl;
 }
 
 MyTcpServer &MyTcpServer::getinstance()
@@ -29,12 +29,15 @@ MyTcpServer &MyTcpServer::getinstance()
 //移除已经与客户端断连的socket对象
 void MyTcpServer::removeSocket(MyTcpSocket *m)
 {
-    this->tcpsocketlist.removeOne(m);
+    {
+        QMutexLocker locker(&m_tcpsocketlistMutex);
+        this->tcpsocketlist.removeOne(m);
+        for(int i=0;i<tcpsocketlist.size();i++){
+            qDebug()<<tcpsocketlist[i]<<endl;
+        }
+    }
     m->deleteLater();
     m=nullptr;
-    for(int i=0;i<tcpsocketlist.size();i++){
-        qDebug()<<tcpsocketlist[i]<<endl;
-    }
 }
 
 //发送指定的客户端发送添加好友的消息
@@ -43,6 +46,7 @@ void MyTcpServer::seedAddFriend(char *tarname, PDU *pdu)
     if(tarname==nullptr||pdu==nullptr){
         return;
     }
+    QMutexLocker locker(&m_tcpsocketlistMutex);
     for(int i=0;i<tcpsocketlist.size();i++){
         if(strcmp(tcpsocketlist[i]->m_strLoginName.toStdString().c_str(),tarname)==0){
             tcpsocketlist[i]->write((char*)pdu,pdu->uiTotalLen);
@@ -50,11 +54,30 @@ void MyTcpServer::seedAddFriend(char *tarname, PDU *pdu)
         }
     }
 }
+
+//单次拥有型转发：写出后无条件 memfree，调用方不得再访问 PDU
+void MyTcpServer::sendAddFriendAndRelease(char *tarname, PDU *pdu)
+{
+    if(pdu==nullptr){
+        return;
+    }
+    {
+        QMutexLocker locker(&m_tcpsocketlistMutex);
+        for(int i=0;i<tcpsocketlist.size();i++){
+            if(tarname!=nullptr && strcmp(tcpsocketlist[i]->m_strLoginName.toStdString().c_str(),tarname)==0){
+                tcpsocketlist[i]->write((char*)pdu,pdu->uiTotalLen);
+                break;
+            }
+        }
+    }
+    memfree(pdu);
+}
 //给客户端转发pdu消息
 void MyTcpServer::reseed(char *tarname, PDU *pdu){
     if(tarname==nullptr||pdu==nullptr){
         return;
     }
+    QMutexLocker locker(&m_tcpsocketlistMutex);
     for(int i=0;i<tcpsocketlist.size();i++){
         if(strcmp(tcpsocketlist[i]->m_strLoginName.toStdString().c_str(),tarname)==0){
             tcpsocketlist[i]->write((char*)pdu,pdu->uiTotalLen);
