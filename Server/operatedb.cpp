@@ -214,29 +214,6 @@ int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
     db.transaction();
     QSqlQuery q(db);
 
-    /*
-    int usrId = -1;
-    int tarId = -1;
-    
-    q.prepare("SELECT id FROM user_info WHERE name = ?");
-    q.addBindValue(QString::fromUtf8(usrname));
-    if(q.exec() && q.next()) {
-        usrId = q.value(0).toInt();
-    } else {
-        db.rollback();
-        return 0;
-    }
-    
-    q.prepare("SELECT id FROM user_info WHERE name = ?");
-    q.addBindValue(QString::fromUtf8(tarname));
-    if(q.exec() && q.next()) {
-        tarId = q.value(0).toInt();
-    } else {
-        db.rollback();
-        return 0;
-    }
-    */
-
     // 使用两个名字字段存储好友关系
     q.prepare("INSERT INTO friend (name, friendName) VALUES (?, ?)");
     q.addBindValue(QString::fromUtf8(usrname));
@@ -294,29 +271,6 @@ bool OperateDB::handleDeleteFriend(char *userName, char *tarName)
     // 开启事务
     db.transaction();
     QSqlQuery q(db);
-
-    /*
-    int usrId = -1;
-    int tarId = -1;
-    
-    q.prepare("SELECT id FROM user_info WHERE name = ?");
-    q.addBindValue(QString::fromUtf8(userName));
-    if(q.exec() && q.next()) {
-        usrId = q.value(0).toInt();
-    } else {
-        db.rollback();
-        return false;
-    }
-    
-    q.prepare("SELECT id FROM user_info WHERE name = ?");
-    q.addBindValue(QString::fromUtf8(tarName));
-    if(q.exec() && q.next()) {
-        tarId = q.value(0).toInt();
-    } else {
-        db.rollback();
-        return false;
-    }
-    */
 
     // 删除双向好友记录
     q.prepare("DELETE FROM friend WHERE (name = ? AND friendName = ?) OR (name = ? AND friendName = ?)");
