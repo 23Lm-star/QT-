@@ -319,6 +319,7 @@ void MsgHandler::uploadfileinit()
 
 void MsgHandler::uploadfiledata()
 {
+    // 上传数据块响应处理：仅根据服务端状态更新界面或继续上传，移除与文件改名无关的逻辑
     bool ret=true;
     uint resumeMagic=0;
     memcpy(&resumeMagic,pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,sizeof(resumeMagic));
@@ -326,9 +327,10 @@ void MsgHandler::uploadfiledata()
         memcpy(&ret,pdu->caData,sizeof(ret));
     }
     if(!ret){
-        QMessageBox::information(&Index::getinstance(),"提示","上传文件失败");
+        QMessageBox::information(&Index::getinstance(),"提示","上传文件块失败");
         return;
     }
+    // 仅刷新当前文件列表，确保同步状态，不再触发额外的重命名处理
     Index::getinstance().getFile()->flushfile();
 }
 
@@ -491,6 +493,38 @@ void MsgHandler::handleDownloadFinish()
     m_recvFileName.clear();
 }
 
+// 解析分享链接响应：服务端已把文件复制到其【用户目录/分享链接/】，这里提示并刷新列表
+void MsgHandler::handleResolvePublishLink(PDU* pdu)
+{
+    bool ok = false;
+    memcpy(&ok, pdu->caData, sizeof(ok));
+    qDebug() << "[handleResolvePublishLink] 服务端返回 ok=" << ok;
+    if(!ok){
+        QMessageBox::information(&Index::getinstance(), "提示", "分享链接无效或已失效（链接不存在/已撤销/已过期）");
+        return;
+    }
+    // 服务端已把文件复制到其【用户目录/分享链接/】下，这里解析返回的相对路径并提示
+    QString json = QString::fromUtf8(pdu->caMsg);
+    QString savedPath;
+    const QString key = "\"saved_path\":\"";
+    int idx = json.indexOf(key);
+    if(idx >= 0){
+        int start = idx + key.length();
+        int end = json.indexOf('"', start);
+        if(end > start){
+            savedPath = json.mid(start, end - start);
+        }
+    }
+    if(savedPath.isEmpty()){
+        QMessageBox::information(&Index::getinstance(), "提示", "获取分享文件失败：未返回保存路径");
+        return;
+    }
+    QMessageBox::information(&Index::getinstance(), "获取成功",
+                             QString("文件已保存到：%1").arg(savedPath));
+    // 刷新文件列表，使“分享链接”文件夹出现在用户目录中
+    Index::getinstance().getFile()->flushfile();
+}
+
 void MsgHandler::handlfinduser(){
     int ret;
     memcpy(&ret,pdu->caData,sizeof(ret));
@@ -581,5 +615,36 @@ void MsgHandler::handlLogoff()
     }
     else {
         QMessageBox::information(&Index::getinstance(),"提示","注销失败：密码错误或用户不存在。");
+    }
+}
+
+void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
+    bool exists = false;
+    memcpy(&exists, pdu->caData, sizeof(exists));
+    
+    if (!exists) {
+        QMessageBox::information(&Index::getinstance(), "提示", "暂无分享链接");
+        return;
+    }
+    
+    QString link = QString::fromUtf8(pdu->caMsg);
+    // 需要根据当前上下文打开对话框
+    // 假设 Index 有当前选中的文件路径
+    QString filePath = Index::getinstance().getFile()->m_strCurPath + "/" + Index::getinstance().getFile()->m_strShareFileName;
+    ShareLinkDialog *dlg = new ShareLinkDialog(filePath, &Index::getinstance());
+    dlg->setLink(link);
+    dlg->exec();
+    dlg->deleteLater();
+}
+
+void MsgHandler::handleCreatePublishLink(PDU* pdu) {
+    bool ok = false;
+    memcpy(&ok, pdu->caData, sizeof(ok));
+    QString link = QString::fromUtf8(pdu->caMsg);
+    if (ok) {
+        QMessageBox::information(&Index::getinstance(), "提示",
+            QString("生成成功！\n分享链接：%1").arg(link));
+    } else {
+        QMessageBox::information(&Index::getinstance(), "提示", "生成分享链接失败");
     }
 }

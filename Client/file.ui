@@ -107,6 +107,13 @@
         </widget>
        </item>
        <item>
+        <widget class="QPushButton" name="move_PB">
+         <property name="text">
+          <string>移动文件</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <spacer name="verticalSpacer_4">
          <property name="orientation">
           <enum>Qt::Vertical</enum>
@@ -140,7 +147,7 @@
         </spacer>
        </item>
        <item>
-        <widget class="QPushButton" name="mkdir_PB">
+        <widget class="QPushButton" name="upload_PB">
          <property name="text">
           <string>上传文件</string>
          </property>
@@ -186,6 +193,27 @@
          </property>
         </widget>
        </item>
+       <item>
+        <widget class="QPushButton" name="genlink_PB">
+         <property name="text">
+          <string>生成分享链接</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLineEdit" name="sharelink_LE">
+         <property name="placeholderText">
+          <string>粘贴分享链接获取分享文件</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="fetchshare_PB">
+         <property name="text">
+          <string>获取</string>
+         </property>
+        </widget>
+       </item>
       </layout>
      </item>
     </layout>
@@ -198,7 +226,7 @@
   <tabstop>flush_PB</tabstop>
   <tabstop>credit_PB</tabstop>
   <tabstop>rename_PB</tabstop>
-  <tabstop>mkdir_PB</tabstop>
+  <tabstop>upload_PB</tabstop>
   <tabstop>currPath_LE</tabstop>
   <tabstop>back_PB</tabstop>
   <tabstop>del_PB</tabstop>

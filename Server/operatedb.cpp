@@ -17,6 +17,28 @@ OperateDB &OperateDB::instance()
     return s;
 }
 
+OperateDB::OperateDB(QObject *parent) : QObject(parent)
+{
+}
+
+void OperateDB::connect()
+{
+    Server& server = Server::getinstance();
+    DatabaseConnectionPool::instance().init(
+        server.m_dbHost,
+        server.m_dbPort,
+        server.m_dbUser,
+        server.m_dbPassword,
+        server.m_dbName
+    );
+    bool ok = DatabaseConnectionPool::instance().testConnection();
+    if (ok) {
+        qDebug() << "OperateDB::connect - 数据库连接池初始化成功";
+    } else {
+        qCritical() << "OperateDB::connect - 数据库连接池初始化失败: testConnection 返回 false";
+    }
+}
+
 bool OperateDB::handleRegit(char *strname, char *strpwd)
 {
     if(strname==nullptr||strpwd==nullptr){
@@ -46,6 +68,147 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
     q.addBindValue(QString::fromUtf8(strpwd));
     qDebug()<<"insert new user:"<<QString::fromUtf8(strname);
     return q.exec();
+}
+
+bool OperateDB::createShareLink(const QString &hash, const QString &owner, const QString &path, const QDateTime &expire)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        qDebug() << "[createShareLink] 获取数据库连接失败（连接无效）";
+        return false;
+    }
+    QSqlQuery q(connection.database());
+    // 查重：同一 owner + 同一文件若已存在链接，则直接复用，避免重复记录堆积
+    if(!getShareLinkByPath(owner, path).isEmpty()){
+        qDebug() << "[createShareLink] 该文件已存在分享链接，复用已有记录: owner=" << owner << " path=" << path;
+        return true;
+    }
+    q.prepare("INSERT INTO share_link (token_hash, owner_name, relative_path, expire_time) VALUES (?, ?, ?, ?)");
+    q.addBindValue(hash);
+    q.addBindValue(owner);
+    q.addBindValue(path);
+    // 必须显式格式化为 "yyyy-MM-dd HH:mm:ss" 字符串再绑定。
+    // 直接绑定 QDateTime 时，Qt MySQL 驱动会序列化成 ISO 8601 格式（带 'T' 分隔符，如
+    // 2026-07-29T18:00:00），若时间含毫秒/时区，MySQL 可能拒绝或存错。
+    // Qt 5.14 的 QMYSQL 驱动在绑定 QDateTime 时会输出 ISO 格式（带 T / 毫秒），
+    // MySQL 的 DATETIME 在严格模式下会拒绝带 T 的值，导致插入失败。
+    // 这里显式格式化为 MySQL 原生 DATETIME 字符串，避免该问题。
+    q.addBindValue(expire.toString("yyyy-MM-dd HH:mm:ss"));
+    if(!q.exec()){
+        qDebug() << "[createShareLink] 插入分享链接失败:" << q.lastError().text()
+                 << " | hash=" << hash << " owner=" << owner << " path=" << path;
+        return false;
+    }
+    return true;
+}
+
+bool OperateDB::getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("SELECT owner_name, relative_path, expire_time, revoked FROM share_link WHERE token_hash = ?");
+    q.addBindValue(hash);
+    if(q.exec() && q.next()){
+        outInfo.ownerName = q.value(0).toString();
+        outInfo.relativePath = q.value(1).toString();
+        outInfo.expireTime = q.value(2).toDateTime();
+        outInfo.revoked = q.value(3).toInt();
+        return true;
+    }
+    return false;
+}
+
+QString OperateDB::getShareLinkByPath(const QString &owner, const QString &path)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return QString();
+    QSqlQuery q(connection.database());
+    q.prepare("SELECT token_hash FROM share_link WHERE owner_name = ? AND relative_path = ? ORDER BY created_at DESC LIMIT 1");
+    q.addBindValue(owner);
+    q.addBindValue(path);
+    if(q.exec() && q.next()){
+        return q.value(0).toString();
+    }
+    return QString();
+}
+
+// 跨功能联动：删除文件/目录时，清理对应的分享链接记录
+// path 为相对 owner 根目录的路径；若为目录则同时清理其下所有文件（前缀匹配）
+bool OperateDB::deleteShareLinkByPath(const QString &owner, const QString &path)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("DELETE FROM share_link WHERE owner_name = ? AND (relative_path = ? OR relative_path LIKE ?)");
+    q.addBindValue(owner);
+    q.addBindValue(path);
+    q.addBindValue(path + "/%");
+    bool ok = q.exec();
+    if(!ok){
+        qDebug() << "[deleteShareLinkByPath] 失败:" << q.lastError().text()
+                 << " owner=" << owner << " path=" << path;
+    }
+    return ok;
+}
+
+// 跨功能联动：重命名/移动文件时，平移 share_link.relative_path
+// - 精确匹配 oldPath（文件自身）
+// - 前缀匹配 oldPath/（目录下的子文件整体平移）
+bool OperateDB::updateShareLinkPath(const QString &owner, const QString &oldPath, const QString &newPath)
+{
+    if(oldPath == newPath) return true;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlDatabase db = connection.database();
+
+    // 1) 文件自身：relative_path = oldPath → newPath
+    QSqlQuery q1(db);
+    q1.prepare("UPDATE share_link SET relative_path = ? WHERE owner_name = ? AND relative_path = ?");
+    q1.addBindValue(newPath);
+    q1.addBindValue(owner);
+    q1.addBindValue(oldPath);
+    bool ok = q1.exec();
+    if(!ok){
+        qDebug() << "[updateShareLinkPath] 精确更新失败:" << q1.lastError().text()
+                 << " owner=" << owner << " old=" << oldPath << " new=" << newPath;
+    }
+
+    // 2) 目录子文件：oldPath/sub → newPath/sub（仅匹配严格长于 oldPath 的条目）
+    if(!oldPath.isEmpty()){
+        QSqlQuery q2(db);
+        q2.prepare("UPDATE share_link SET relative_path = CONCAT(?, SUBSTRING(relative_path, ?)) "
+                   "WHERE owner_name = ? AND relative_path LIKE ? AND relative_path <> ?");
+        q2.addBindValue(newPath + "/");
+        q2.addBindValue(oldPath.size() + 2);          // 1-based：跳过 "oldPath/" 之后
+        q2.addBindValue(owner);
+        q2.addBindValue(oldPath + "/%");
+        q2.addBindValue(oldPath);
+        if(!q2.exec()){
+            qDebug() << "[updateShareLinkPath] 目录前缀平移失败:" << q2.lastError().text();
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// 跨功能联动：删除好友时，清理两人互发的私聊记录
+bool OperateDB::deleteFriendMessages(const QString &userA, const QString &userB)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("DELETE FROM message_info WHERE (seed_name = ? AND rev_name = ?) OR (seed_name = ? AND rev_name = ?)");
+    q.addBindValue(userA);
+    q.addBindValue(userB);
+    q.addBindValue(userB);
+    q.addBindValue(userA);
+    bool ok = q.exec();
+    if(!ok){
+        qDebug() << "[deleteFriendMessages] 失败:" << q.lastError().text()
+                 << " a=" << userA << " b=" << userB;
+    }
+    return ok;
 }
 
 int OperateDB::handleLogin(char *strname, char *strpwd)
@@ -434,6 +597,22 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
         return false;
     }
 
+    // 3.5 — 删除 share_link 表
+    q.prepare("DELETE FROM share_link WHERE owner_name = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qDebug()<<"logoff: warning - failed to delete share_links (might be empty):"<<QString::fromUtf8(name);
+        // 不回滚，视为成功
+    }
+
+    // 3.6 — 删除 publish_links 表（既有表，补充清理）
+    q.prepare("DELETE FROM publish_links WHERE creator_name = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qDebug()<<"logoff: warning - failed to delete publish_links (might be empty):"<<QString::fromUtf8(name);
+        // 不回滚，视为成功
+    }
+
     if(!db.commit()){
         qDebug()<<"logoff: commit failed for:"<<QString::fromUtf8(name);
         db.rollback();
@@ -444,24 +623,14 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     return true;
 }
 
-void OperateDB::connect()
+bool OperateDB::createPublishLink(const QString &code, const QString &path, const QString &creator)
 {
-    Server& server = Server::getinstance();
-    DatabaseConnectionPool::instance().init(
-        server.m_dbHost,
-        server.m_dbPort,
-        server.m_dbUser,
-        server.m_dbPassword,
-        server.m_dbName
-    );
-    if(DatabaseConnectionPool::instance().testConnection()){
-        qDebug()<<"connect database success"<<endl;
-    }
-    else {
-        qDebug()<<"connect database failed";
-    }
-}
-
-OperateDB::OperateDB(QObject *parent) : QObject(parent)
-{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("INSERT INTO publish_links (short_code, file_path, creator_name) VALUES (?, ?, ?)");
+    q.addBindValue(code);
+    q.addBindValue(path);
+    q.addBindValue(creator);
+    return q.exec();
 }

@@ -1,0 +1,228 @@
+In the Qt C++ project at E:/qt/xiangmu, implement the account deletion (注销/LOGOFF) feature REQ-AUTH-001 across Client and Server.
+
+## File-by-file changes:
+
+### 1. Server/operatedb.h
+Add declaration after handleGetUserInfo:
+```cpp
+    //注销/删除用户账户
+    bool handleLogoff(const char* name, const char* pwd);
+```
+
+### 2. Server/operatedb.cpp
+Replace the TODO comment block (lines 118-120, the "TODO: implement 注销") with a full `handleLogoff` implementation. Keep handleOffLine unchanged.
+
+Add new method after the existing handleGetUserInfo method (before the `connect()` method at line 385):
+
+```cpp
+bool OperateDB::handleLogoff(const char* name, const char* pwd)
+{
+    if(name==nullptr||pwd==nullptr){
+        return false;
+    }
+
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return false;
+    }
+    QSqlDatabase db = connection.database();
+    
+    db.transaction();
+    QSqlQuery q(db);
+
+    // 1. 验证用户名和密码
+    q.prepare("SELECT * FROM user_info WHERE name = ? AND pwd = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(pwd));
+    if(!q.exec() || !q.next()){
+        qDebug()<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    // 2. 删除 message_info 中涉及该用户的记录
+    q.prepare("DELETE FROM message_info WHERE seed_name = ? OR rev_name = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qDebug()<<"logoff: failed to delete messages for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    // 3. 删除 friend 表中涉及该用户的所有记录（双向）
+    q.prepare("DELETE FROM friend WHERE name = ? OR friendName = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qDebug()<<"logoff: failed to delete friend records for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    // 4. 删除 user_info 表中的用户记录
+    q.prepare("DELETE FROM user_info WHERE name = ? AND pwd = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    q.addBindValue(QString::fromUtf8(pwd));
+    if(!q.exec()){
+        qDebug()<<"logoff: failed to delete user_info for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    if(!db.commit()){
+        qDebug()<<"logoff: commit failed for:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+
+    qDebug()<<"logoff: successfully deleted user:"<<QString::fromUtf8(name);
+    return true;
+}
+```
+
+### 3. Server/msghandler.h
+Add after `getuserinformation()`:
+```cpp
+    PDU* logoff();//注销账户
+```
+
+### 4. Server/msghandler.cpp
+Add new method BEFORE the `captcha()` method (around line 70):
+
+```cpp
+//处理注销账户请求
+PDU *MsgHandler::logoff()
+{
+    char userName[32]={'\0'};
+    char userPwd[32]={'\0'};
+    memcpy(userName,pdu->caData,32);
+    memcpy(userPwd,pdu->caData+32,32);
+    
+    qDebug()<<"logoff request for:"<<QString::fromUtf8(userName);
+    
+    bool ret=OperateDB::instance().handleLogoff(userName,userPwd);
+    
+    // 如果数据库删除成功，清理用户的文件目录
+    if(ret){
+        QString userDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(QString::fromUtf8(userName));
+        QDir dir(userDir);
+        if(dir.exists()){
+            bool removed=dir.removeRecursively();
+            qDebug()<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
+        }
+    }
+    
+    PDU* respdu=mkPDU();
+    respdu->uiType=ENUM_MSG_TYPE_LOGOFF_RESPOND;
+    memcpy(respdu->caData,&ret,sizeof(ret));
+    return respdu;
+}
+```
+
+### 5. Server/mytcpsocket.cpp
+In the switch statement, add AFTER the GETUSERINFORMATION_REQUEST case (line 163) and BEFORE the `default:`:
+
+```cpp
+    case ENUM_MSG_TYPE_LOGOFF_REQUEST:{
+        respdu=m_MsgHandler->logoff();
+        break;
+    }
+```
+
+### 6. Client/msghandler.h
+Add after `handlUserInformation()`:
+```cpp
+    void handlLogoff();
+```
+
+### 7. Client/msghandler.cpp
+Add new method at the end of the file (after handlUserInformation, before the closing brace):
+
+```cpp
+void MsgHandler::handlLogoff()
+{
+    bool ret=false;
+    memcpy(&ret,pdu->caData,sizeof(ret));
+    qDebug()<<"handlLogoff result:"<<ret;
+    if(ret){
+        QMessageBox::information(&Index::getinstance(),"提示","账户已成功注销，即将返回登录界面。");
+        // 关闭主界面，返回登录界面
+        Index::getinstance().hide();
+        Client::getinstance().show();
+        Client::getinstance().flus();
+        // 断开连接
+        Client::getinstance().sorket.disconnectFromHost();
+    }
+    else {
+        QMessageBox::information(&Index::getinstance(),"提示","注销失败：密码错误或用户不存在。");
+    }
+}
+```
+
+### 8. Client/client.h
+Add public slot declaration after `on_pushButton_clicked()`:
+```cpp
+    //发送注销请求
+    void sendLogoffRequest();
+```
+
+### 9. Client/client.cpp
+a) In the `handlMsg` switch, add AFTER the GETUSERINFORMATION_RESPOND case (line 219) and BEFORE `default:`:
+```cpp
+    case ENUM_MSG_TYPE_LOGOFF_RESPOND:{
+        m_mhptr->handlLogoff();
+        break;
+    }
+```
+
+b) Add the `sendLogoffRequest` method at the end of client.cpp (before the last closing brace of the class implementation):
+
+```cpp
+void Client::sendLogoffRequest()
+{
+    //弹出密码确认框
+    bool ok=false;
+    QString pwdInput=QInputDialog::getText(this,"注销确认",
+        "输入密码以确认注销账户：\n（此操作不可逆，将永久删除您的账户、好友关系和所有文件）",
+        QLineEdit::Password,"",&ok);
+    if(!ok||pwdInput.isEmpty()){
+        return;
+    }
+    
+    //二次确认
+    int confirm=QMessageBox::warning(this,"最后确认",
+        "确定要永久删除您的账户吗？\n此操作不可撤销！",
+        QMessageBox::Yes|QMessageBox::No,QMessageBox::No);
+    if(confirm!=QMessageBox::Yes){
+        return;
+    }
+    
+    QByteArray passwordHash=passwordHashForProtocol(pwdInput);
+    PDU* pdu=mkPDU();
+    pdu->uiType=ENUM_MSG_TYPE_LOGOFF_REQUEST;
+    copyFixedField(pdu->caData,32,m_LoginName.toUtf8());
+    copyExactField(pdu->caData+32,32,passwordHash);
+    seedMsg(pdu);
+}
+```
+
+c) Add `#include <QInputDialog>` at the top of client.cpp, after the existing includes.
+
+### 10. Client/index.h
+Add a new public method:
+```cpp
+    //注销账号槽函数
+    void onLogoffClicked();
+```
+
+### 11. Client/index.cpp
+Replace the empty `on_pushButton_clicked()` (which is the unused button at index.ui) with:
+```cpp
+void Index::on_pushButton_clicked()
+{
+    Client::getinstance().sendLogoffRequest();
+}
+```
+
+Keep all existing code style, Qt conventions, and file structure unchanged. Only modify what's necessary. Do NOT change anything else.

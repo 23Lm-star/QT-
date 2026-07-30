@@ -2,6 +2,7 @@
 #define CLIENT_H
 #include "msghandler.h"
 #include "protocol.h"
+#include "reconnectdialog.h"
 #include <QWidget>
 #include <QTcpSocket>
 #include <QTime>
@@ -48,6 +49,13 @@ public:
     int m_captchaCooldownSec;
     void startCaptchaCooldown();
     void onCaptchaCooldownTick();
+    void sendHeartbeat();
+    // 心跳开关（调试/模拟僵尸用，true=正常发PING，false=停发模拟假死）
+    static bool s_heartbeatEnabled;
+
+    // 服务端存活检测（复用心跳 PING/PONG）：失联时弹出重连窗口
+    static const qint64 SERVER_ALIVE_TIMEOUT_MS;  // 90s = 3×30s 心跳周期
+    void onServerLost();
 
     ~Client();
 public slots:
@@ -65,9 +73,19 @@ private slots:
     void on_login_PB_clicked();
     //生成随机验证码槽函数
     void on_pushButton_clicked();
+    //socket 断开信号（服务端 abort / 网络中断）
+    void onSocketDisconnected();
+    //重连窗口"重新连接"按钮 → 发起重连
+    void onReconnectRequested();
 
 private:
     Ui::Client *ui;
+    QTimer* m_heartbeatTimer;
+    // 服务端存活检测相关
+    bool m_serverLostShown;     // 重连窗口是否已弹出（去重，避免重复弹）
+    qint64 m_lastPongMs;        // 最后收到 PONG 的时间(ms)
+    bool m_loggedIn;            // 是否已登录（未登录不弹窗，避免登录界面误报）
+    ReconnectDialog* m_reconnectDlg;
     //构造函数设定为私有
     //拷贝构造函数和拷贝赋值函数删除
     Client(QWidget *parent = nullptr);

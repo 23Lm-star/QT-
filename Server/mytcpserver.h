@@ -30,6 +30,11 @@ private:
     //记录所有已经建立连接的 socket对象 链表
     QList<MyTcpSocket*>tcpsocketlist;
     QMutex m_tcpsocketlistMutex;
+
+    //僵尸连接检测：每隔一段时间扫描，静默超过阈值的连接直接 abort 清理
+    qint64 m_zombieTimeoutMs;   // 阈值(ms)，由 zombie_timeout.cfg 读取秒数，默认 90000 (90s)
+    QTimer* m_sweepTimer;
+    void onSweepTimeout();
 };
 
 #endif // MYTCPSERVER_H

@@ -16,6 +16,7 @@ public:
     MsgHandler();
     //记录客户端发送的请求DPU
     PDU* pdu;
+    QString ClientName; 
     //记录要上传的文件对象还有已上传的大小和总大小
     ResumableUploadSession m_uploadSession;
     //各种处理函数，进行各种类型请求的处理
@@ -29,13 +30,14 @@ public:
     PDU* deletefriend();//删除好友
     PDU* chat();//聊天
     PDU* MKDIR();//创建目录
-    PDU* deldir();//删除目录
+    PDU* deldir(const QString& loginName);//删除目录
     PDU* changedir();//跳转目录
     PDU* flushfile();//刷新文件
-    PDU* renamefile();//重命名文件
+    PDU* renamefile(const QString& loginName);//重命名文件
     PDU* sharefile();//分享文件
     PDU* sharefilemove();//分享文件移动
     PDU* movefile(const QString& loginName);//移动文件
+    PDU* listdir(const QString& loginName);//列出子目录（移动文件选择目标用）
     PDU* uploadfileinit();//上传文件初始化
     PDU* uploadfiledata();//上传文件数据
     PDU* downloadfile();
@@ -44,6 +46,11 @@ public:
     QString generateCaptchaCode(int length = 6);
     PDU* getuserinformation();//获取用户信息
     PDU* logoff();//注销账户
+    PDU* createPublishLink(const QString& loginName);//创建外链分享
+    
+    // 新增：安全外链分享（BUG-ARC-PUBLINK-001）
+    PDU* resolvePublishLink(const QString& loginName);
+    PDU* queryFilePublishLink();
 
     //验证码存储
     QMap<QString, QDateTime> m_captchas;

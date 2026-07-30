@@ -16,6 +16,7 @@
 #include <qinputdialog.h>
 #include <qmessagebox.h>
 #include <cstring>
+#include <QDialog>
 
 namespace {
 bool isValidFileName(const QString &name)
@@ -67,6 +68,10 @@ File::File(QWidget *parent) :
     qDebug()<<"创建用户目录:"<<m_strUserPath<<" "<<dir.mkdir(m_strUserPath)<<endl;
     qDebug()<<"创建用户今日目录:"<<m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM"))<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
     m_shareFile=new ShareFile;
+    
+    // 初始化右键菜单
+    ui->file_LW->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(ui->file_LW, &QListWidget::customContextMenuRequested, this, &File::onFileListContextMenu);
 }
 
 File::~File()
@@ -300,6 +305,61 @@ void File::on_rename_PB_clicked()
     qDebug()<<"旧文件名"<<pdu->caData<<"新文件名"<<pdu->caData+32<<" 当前路径"<<pdu->caMsg+sizeof (fileType)<<endl;
     Client::getinstance().seedMsg(pdu);
 }
+void File::on_move_PB_clicked()
+{
+    QListWidgetItem* item = ui->file_LW->currentItem();
+    if(!item){
+        QMessageBox::information(this,"提示","请选择要移动的文件或文件夹");
+        return;
+    }
+    QString srcRel = selectedFileRelativePath(item);
+
+    if(m_moveDlg){
+        delete m_moveDlg;
+        m_moveDlg = nullptr;
+    }
+    m_moveDlg = new FolderSelectDialog(this);
+    connect(m_moveDlg, &FolderSelectDialog::listDirRequested, this, &File::requestListDir);
+    m_moveDlg->browse(""); // 触发首次目录列表加载（连接已建立）
+    if(m_moveDlg->exec() == QDialog::Accepted){
+        QString dstRel = m_moveDlg->selectedRel();
+        // 构造请求：caData=源文件名（短名）；caMsg=srcRel + '\0' + dstRel
+        QByteArray srcRelBytes = srcRel.toUtf8();
+        QByteArray dstRelBytes = dstRel.toUtf8();
+        QByteArray msg;
+        msg.append(srcRelBytes);
+        msg.append('\0');
+        msg.append(dstRelBytes);
+        msg.append('\0');
+
+        PDU* pdu = mkPDU(msg.size());
+        pdu->uiType = ENUM_MSG_TYPE_MOVEFILE_REQUEST;
+        copyFixedField(pdu->caData, 32, item->text().toUtf8());
+        memcpy(pdu->caMsg, msg.constData(), msg.size());
+        Client::getinstance().seedMsg(pdu);
+    }
+    delete m_moveDlg;
+    m_moveDlg = nullptr;
+}
+
+void File::requestListDir(const QString &rel)
+{
+    QByteArray relBytes = rel.toUtf8();
+    QByteArray msg;
+    msg.append(relBytes);
+    msg.append('\0');
+    PDU* pdu = mkPDU(msg.size());
+    pdu->uiType = ENUM_MSG_TYPE_LISTDIR_REQUEST;
+    memcpy(pdu->caMsg, msg.constData(), msg.size());
+    Client::getinstance().seedMsg(pdu);
+}
+
+void File::handleListDirRespond(PDU *pdu)
+{
+    if(m_moveDlg){
+        m_moveDlg->handleListDir(pdu);
+    }
+}
 //手动跳转路径
 void File::on_inputPath_PB_clicked(){
     //目标路径
@@ -312,8 +372,7 @@ void File::on_inputPath_PB_clicked(){
     memcpy(pdu->caMsg,tarPath.toUtf8().toStdString().c_str(),tarPathLen);
     Client::getinstance().seedMsg(pdu);
 }
-
-void File::on_mkdir_PB_clicked()
+void File::on_upload_PB_clicked()
 {
     //获取要上传的文件路径，并记录下来
     m_strUploadPath=QFileDialog::getOpenFileName();
@@ -380,8 +439,118 @@ void File::on_share_PB_clicked()
     m_shareFile->flusfriend();
     m_strShareFileName=listWidgeti->text();
     if(m_shareFile->isHidden()){
+        // 获取选中的文件信息，检查类型
+        uint fileType = 1; // 默认值
+        for(int i=0;i<this->m_fileInfoList.size();i++){
+            if(strcmp(m_fileInfoList[i]->caName,listWidgeti->text().toStdString().c_str())==0){
+                fileType=m_fileInfoList[i]->uiType;
+                break;
+            }
+        }
+        if (fileType == 0) {
+            QMessageBox::information(this, "提示", "目录不可分享");
+            return;
+        }
         m_shareFile->show();
     }
 }
 
 
+
+void File::onFileListContextMenu(const QPoint &pos) {
+    QListWidgetItem *item = ui->file_LW->itemAt(pos);
+    if (!item) return;
+    
+    // 只对普通文件（非目录）显示菜单
+    uint fileType = 1; // 默认普通文件
+    for(int i=0;i<this->m_fileInfoList.size();i++){
+        if(strcmp(m_fileInfoList[i]->caName,item->text().toStdString().c_str())==0){
+            fileType=m_fileInfoList[i]->uiType;
+            break;
+        }
+    }
+    if (fileType == 0) return; // 目录
+    
+    QMenu menu;
+    menu.addAction("获取分享链接", this, &File::onGetShareLink);
+    menu.exec(ui->file_LW->viewport()->mapToGlobal(pos));
+}
+
+QString File::selectedFileRelativePath(QListWidgetItem *item)
+{
+    // 注意：绝不能对成员变量 m_strCurPath 做原地 remove，否则会污染当前路径，
+    // 导致后续 flush/返回上级都发出错误路径（表现为列表刷出 Server 工程目录）。
+    QString prefix = Client::getinstance().m_strRootPath + "/" + Client::getinstance().m_LoginName;
+    QString relCur = m_strCurPath;   // 副本
+    relCur.remove(prefix);
+    QString relativePath = QString("%1/%2").arg(relCur).arg(item->text());
+    if (relativePath.startsWith("/")) relativePath = relativePath.mid(1);
+    // 处理多级重复拼接问题：确保移除后的部分不重复拼接
+    if (relativePath.startsWith(m_strUserPath)) {
+        relativePath = relativePath.mid(m_strUserPath.size());
+        if (relativePath.startsWith("/")) relativePath = relativePath.mid(1);
+    }
+    return relativePath;
+}
+
+void File::onGetShareLink() {
+    QListWidgetItem *item = ui->file_LW->currentItem();
+    if (!item) return;
+    QString relativePath = selectedFileRelativePath(item);
+    PDU* pdu = mkPDU(relativePath.toUtf8().size() + 1);
+    pdu->uiType = ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST;
+    copyFixedField(pdu->caData, 32, Client::getinstance().m_LoginName.toUtf8());
+    memcpy(pdu->caMsg, relativePath.toUtf8().constData(), relativePath.toUtf8().size());
+    Client::getinstance().seedMsg(pdu);
+}
+
+void File::on_genlink_PB_clicked()
+{
+    QListWidgetItem* item = ui->file_LW->currentItem();
+    if (item == nullptr) {
+        QMessageBox::information(this, "提示", "请选择要生成分享链接的文件");
+        return;
+    }
+    // 仅普通文件可生成分享链接，文件夹不允许
+    uint fileType = 1;
+    for (int i = 0; i < this->m_fileInfoList.size(); i++) {
+        if (QString::fromUtf8(m_fileInfoList[i]->caName) == item->text()) {
+            fileType = m_fileInfoList[i]->uiType;
+            break;
+        }
+    }
+    if (fileType == 0) {
+        QMessageBox::information(this, "提示", "文件夹不能生成分享链接");
+        return;
+    }
+    QString relativePath = selectedFileRelativePath(item);
+    PDU* pdu = mkPDU(relativePath.toUtf8().size() + 1);
+    pdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST;
+    memcpy(pdu->caMsg, relativePath.toUtf8().constData(), relativePath.toUtf8().size());
+    Client::getinstance().seedMsg(pdu);
+}
+
+void File::on_fetchshare_PB_clicked()
+{
+    QString text = ui->sharelink_LE->text().trimmed();
+    if (text.isEmpty()) {
+        QMessageBox::information(this, "提示", "请先粘贴分享链接");
+        return;
+    }
+    // 兼容完整链接（cloud-disk://share/<token>）与纯 token 两种输入
+    QString token = text;
+    const QString prefix = "cloud-disk://share/";
+    if (token.startsWith(prefix)) {
+        token = token.mid(prefix.length()).trimmed();
+    }
+    if (token.isEmpty()) {
+        QMessageBox::information(this, "提示", "分享链接格式不正确");
+        return;
+    }
+
+    QByteArray tokenBytes = token.toUtf8();
+    PDU* pdu = mkPDU(tokenBytes.size() + 1);
+    pdu->uiType = ENUM_MSG_TYPE_RESOLVE_PUBLINK_REQUEST;
+    memcpy(pdu->caMsg, tokenBytes.constData(), tokenBytes.size());
+    Client::getinstance().seedMsg(pdu);
+}

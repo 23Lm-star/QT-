@@ -1,7 +1,7 @@
 # 代码地图
 
 > 维护者：项目架构师
-> 最后更新：2026-07-26
+> 最后更新：2026-07-29
 > 本文件是项目的结构化索引，所有 Agent 了解项目结构时先读此文件。
 
 ---
@@ -25,7 +25,9 @@ E:\qt\xiangmu/
 │   ├── friend.h / friend.cpp / .ui      # 好友管理 UI：列表/查找/添加/删除
 │   ├── chat.h / chat.cpp / .ui          # 聊天 UI：消息发送/展示
 │   ├── onlineuser.h / .cpp / .ui        # 在线用户列表 UI
-│   ├── sharefile.h / .cpp / .ui         # 文件分享：选择目标好友 UI
+│   ├── sharefile.h / .cpp / .ui         # 既有好友文件分享：选择目标好友 UI（保护区）
+│   ├── clientheartbeat.{h,cpp}           # ⚠️ 延后：基础心跳已内嵌于 client.cpp（PING/PONG），组件化延后至下迭代
+│   ├── sharelinkdialog.{h,cpp,.ui}       # ⚠️ 待创建：分享链接展示弹窗（R18 fix-spec 任务 C）
 │   ├── uploader.h / uploader.cpp        # 文件上传工作线程（独立 QThread）
 │   ├── userinformation.h / .cpp / .ui   # 用户信息弹窗
 │   ├── simplecaptcha.h / .cpp           # 验证码组件（本地绘制）
@@ -45,10 +47,12 @@ E:\qt\xiangmu/
 │   ├── operatedb.h / .cpp               # 数据库操作集（单例）
 │   ├── databaseconnectionpool.h / .cpp  # 数据库连接池（RAII，按线程隔离）
 │   ├── resumableuploadsession.h / .cpp  # 断点续传会话管理
-│   ├── connect.config                   # 连接配置（IP/端口/文件路径/DB 配置）
+│   ├── sharelinkservice.{h,cpp}          # ⚠️ 待创建：安全 token 生成/哈希/路径校验（R18 fix-spec 任务 B 3.2）
+│   ├── connect.config
 │   ├── config.qrc                       # Qt 资源文件索引
+│   ├── migrate_publish_links.sql         # 分享链接表（⚠️ 需迁移为 share_link，见 BUG-ARC-PUBLINK-001）
 │   │
-│   ├── 自研内存池模块：                  # TCMalloc 风格三级分配器
+│   ├── 自研内存池模块：
 │   │   ├── Common.h                     # 常量、FreeList、SpanList、SizeClass
 │   │   ├── ThreadCache.{h,cpp}          # TLS 无锁线程本地缓存（208 桶）
 │   │   ├── CentralCache.{h,cpp}         # 中心缓存（单例，桶级锁）
@@ -123,6 +127,10 @@ Server 依赖关系：
 | `user_info` | 用户认证 | `id`(PK), `name`, `pwd`, `online` |
 | `friend` | 好友关系（双向） | `user_id`, `friend_id` |
 | `message_info` | 聊天消息 | `seed_name`, `rev_name`, `msg`, `issuccess`, `seed_time` |
+| `share_link`（规划） | 应用内分享链接凭证 | `token_hash`(唯一), `owner_name`, `relative_path`, `expire_time`, `revoked`, `created_at`；仅新增表，不变更既有表 |
+| `publish_links`（当前） | 分享链接（简化版，安全不足） | `short_code`, `file_path`, `creator_name` — ⚠️ 明文存 token、无过期/撤销；待迁移，见 BUG-ARC-PUBLINK-001 |
+
+> 规划依赖：`ClientHeartbeat` 只依赖 `Client::seedMsg()` 与 `Client::handlMsg()` 的窄接入点；`ShareLinkDialog → File` 只经新增 PDU 调用，禁止依赖或修改既有 `ShareFile` 好友分享链路。服务端 `ShareLinkService → OperateDB` 仅使用新增窄接口；解析成功后由 `MyTcpSocket` 复用既有下载流。
 
 ---
 
@@ -132,7 +140,7 @@ Server 依赖关系：
 PDU (76B 固定头 + 柔性数组)
 ├── uiTotalLen: uint  — 报文总长度
 ├── uiMsgLen: uint    — 消息体长度
-├── uiType: uint      — 消息类型枚举（共 43 种）
+├── uiType: uint      — 消息类型枚举（当前已显式分配至 53；规划追加 54~55）
 ├── caData[64]        — 固定参数区（按 uiType 复用）
 └── caMsg[]           — 柔性数组
 
@@ -159,12 +167,13 @@ Msg (聊天消息体，嵌入 PDU.caMsg)
 | 拼写错误 `totalLen` | ✅ 已修复 | BUG-POOL-002，`totoalLen` 零源码残留，文档已同步 |
 | 数据库断线重连 | 一般 | BUG-DB-003，修复中 |
 | 无盐 MD5 密码 | 一般 | BUG-SEC-001，修复中 |
-| 无应用层心跳 | 一般 | BUG-NET-001，修复中 |
-| 服务端启动配置失败弹框 | ✅ 已修复 | BUG-POOL-006，Server 启动生命周期动态验证通过 |
+| 无应用层心跳 | 一般 | BUG-NET-001，已确认，可继续测试，修复延后（基础 PING/PONG 已实现；组件化延后） |
+| 应用内分享链接安全 | **严重** | BUG-ARC-PUBLINK-001：已确认，待修复 → 见 R18 fix-spec（安全加固 + UI） |
+| Client 登录后 pure-virtual 崩溃 | ✅ 已修复 | BUG-TST-CLIENT-001，已关闭 |
 | 中文注释乱码 | ✅ 已修复 | BUG-POOL-008，UTF-8 中文注释可读 |
 | 内存池分配说明不足 | ✅ 已修复 | BUG-POOL-003/007，所有权/配对注释已补充 |
-| Client 登录后 pure-virtual 崩溃 | 严重 | BUG-TST-CLIENT-001，重新打开；三轮列表时序修复未通过。R07 要求先取原生栈，优先验证 `Client::showLoadingAnimation()` 中 QWidget 已接管的 `QGraphicsOpacityEffect` 被移除后再次 `deleteLater()` 的所有权风险；禁止继续猜测性修改 Friend/File。 |
-| 缺失注销功能 | ➡️ 新增需求 | REQ-AUTH-001，允许用户安全注销账户。需实现：密码校验、从 `user_info` 和 `friend`、`message_info` 等关联表中彻底删除。 |
+| 功能基线被错误 Git 回退 | 严重 | BUG-ARC-RECOVERY-001：`git reset HEAD~1` 使 REQ-AUTH-001 及扩展代码不在当前 HEAD；历史提交混入 PDU 释放/好友转发等危险回退，必须定点恢复。 |
+| 安全注销功能被回退 | 严重 | REQ-AUTH-001：历史存在实现但当前基线缺失；需在协议编号稳定后恢复密码校验、事务清理和用户目录清理。 |
 
 ---
 

@@ -6,6 +6,9 @@
 
 #include <QByteArray>
 #include <QFileInfo>
+#include <QTimer>
+#include <QFile>
+#include <QDateTime>
 
 MyTcpSocket::MyTcpSocket()
 {
@@ -18,6 +21,7 @@ MyTcpSocket::MyTcpSocket()
     m_downloadSentSize=0;
     m_downloadActive=false;
     m_invalidPduCount=0;
+    m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
 }
 
 MyTcpSocket::~MyTcpSocket(){
@@ -29,130 +33,109 @@ MyTcpSocket::~MyTcpSocket(){
     delete m_MsgHandler;
 }
 
-// 所有权规则：
-// - 返回非空 PDU → 由 recvmsg() 调用 seedMsg() 发送并释放
-// - 返回 nullptr   → PDU 已由 handlMsg() 内部发送并释放（如下载流），或无需响应
-// 禁止同一 PDU 既返回又通过 sendAndRelease/seedMsg 发送
 PDU *MyTcpSocket::handlMsg(PDU *pdu)
 {
     qDebug()<<"——————开始进行处理————————"<<endl;
     PDU* respdu=nullptr;
-    m_MsgHandler->pdu=pdu;//这里它原来存储的pdu已经被字节数组（缓冲区）释放掉了
-    //根据接收到的来自客户端的消息类型 进行处理
+    m_MsgHandler->pdu=pdu;
+    
     switch(pdu->uiType){
-        //注册用户
         case ENUM_MSG_TYPE_REGIST_REQUEST :{
              respdu=m_MsgHandler->rigist();
              break;
         }
-        //登录用户
          case ENUM_MSG_TYPE_LOGIN_REQUEST :{
             respdu=m_MsgHandler->login(this->m_strLoginName);
             break;
          }
-        //查找用户
     case ENUM_MSG_TYPE_findUser_REQUEST:{
             respdu=m_MsgHandler->finduser();
         break;
     }
-        //获取所有非好友用户
     case ENUM_MSG_TYPE_ONLINEUSER_REQUEST:{
         respdu=m_MsgHandler->onlineuser(this->m_strLoginName);
         break;
     }
-        //添加好友请求
     case ENUM_MSG_TYPE_ADDFRIEND_REQUEST:{
         respdu=m_MsgHandler->addfriend();
         break;
     }
-        //添加好友回应
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:{
         respdu=m_MsgHandler->addfriendFin();
         break;
     }
-        //刷新好友
     case ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST:{
         respdu=m_MsgHandler->flushfriend(this->m_strLoginName);
         break;
     }
-        //删除好友
     case ENUM_MSG_TYPE_DELETEFRIEND_REQUEST:{
         respdu=m_MsgHandler->deletefriend();
         break;
     }
-        //聊天（单条消息）
     case ENUM_MSG_TYPE_CHAT_REQUEST:{
         respdu=m_MsgHandler->chat();
         break;
     }
-        //获取所有未读消息
     case ENUM_MSG_TYPE_GETCHATMSG_REQUEST:{
         respdu=m_MsgHandler->chatmsg();
         break;
     }
-        //创建目录
     case ENUM_MSG_TYPE_MKDIR_REQUEST:{
         respdu=m_MsgHandler->MKDIR();
         break;
     }
-        //跳转目录
     case ENUM_MSG_TYPE_CHANGEDIR_REQUEST:{
         respdu=m_MsgHandler->changedir();
         break;
     }
-        //删除文件
     case ENUM_MSG_TYPE_DELFILE_REQUEST:{
-        respdu=m_MsgHandler->deldir();
+        respdu=m_MsgHandler->deldir(this->m_strLoginName);
         break;
     }
-        //刷新文件
     case ENUM_MSG_TYPE_FLUSHFILE_REQUEST:{
         respdu=m_MsgHandler->flushfile();
         break;
     }
-        //上传文件数据请求
     case ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST:{
         respdu=m_MsgHandler->uploadfiledata();
         break;
     }
-        //上传文件初始化请求
     case ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST:{
         respdu=m_MsgHandler->uploadfileinit();
         break;
     }
-        //重命名文件
     case ENUM_MSG_TYPE_RENAMEFILE_REQUEST:{
-        respdu=m_MsgHandler->renamefile();
+        respdu=m_MsgHandler->renamefile(this->m_strLoginName);
         break;
     }
-        //分享文件请求
     case ENUM_MSG_TYPE_SHAREFILE_REQUEST:{
         respdu=m_MsgHandler->sharefile();
         break;
     }
-        //分享文件同意回应
     case ENUM_MSG_TYPE_SHAREFILE_AGREE_RESPOND:{
         respdu=m_MsgHandler->sharefilemove();
         break;
     }
-        //移动文件请求
     case ENUM_MSG_TYPE_MOVEFILE_REQUEST:{
         respdu=m_MsgHandler->movefile(this->m_strLoginName);
         break;
     }
-    //下载文件请求——流式分块
+    case ENUM_MSG_TYPE_LISTDIR_REQUEST:{
+        respdu=m_MsgHandler->listdir(this->m_strLoginName);
+        break;
+    }
     case ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST:{
-        respdu=m_MsgHandler->downloadfile(); //仅校验，返回元数据
+        respdu=m_MsgHandler->downloadfile();
         if(respdu){
             bool valid=false;
             memcpy(&valid,respdu->caData,sizeof(valid));
-            sendAndRelease(respdu); //先发送并释放元数据响应
+            sendAndRelease(respdu);
             respdu=nullptr;
             if(valid && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
                 startDownloadStream(m_MsgHandler->m_downloadCanonicalPath);
             }
         }
-        return nullptr; //已经通过 sendAndRelease 发送或启动流式发送
+        return nullptr;
     }
     case ENUM_MSG_TYPE_CAPTCHA_REQUEST:{
         respdu=m_MsgHandler->captcha();
@@ -164,6 +147,25 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     }
     case ENUM_MSG_TYPE_LOGOFF_REQUEST:{
         respdu=m_MsgHandler->logoff();
+        break;
+    }
+    case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:{
+        m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
+        qDebug() << "[HEARTBEAT] recv PING from" << m_strLoginName << "-> send PONG";
+        PDU* hRespdu = mkPDU();
+        hRespdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_RESPOND;
+        return hRespdu;
+    }
+    case ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST:{
+        respdu=m_MsgHandler->createPublishLink(this->m_strLoginName);
+        break;
+    }
+    case ENUM_MSG_TYPE_RESOLVE_PUBLINK_REQUEST:{
+        respdu=m_MsgHandler->resolvePublishLink(this->m_strLoginName);
+        break;
+    }
+    case ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST:{
+        respdu=m_MsgHandler->queryFilePublishLink();
         break;
     }
         default:
@@ -262,6 +264,7 @@ void MyTcpSocket::sendNextChunk()
 }
 //接收客户端消息
 void MyTcpSocket::recvmsg(){
+    m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
     QByteArray dpui=this->readAll();
     this->m_dpulist.append(dpui);
     

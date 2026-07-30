@@ -3,8 +3,10 @@
 #include "operatedb.h"
 #include "mytcpserver.h"
 #include "server.h"
+#include "sharelinkservice.h"
+#include "memalloc.h"
 #include <QByteArray>
-#include <QDir>
+
 #include <QFile>
 #include <QFileInfo>
 #include <QTime>
@@ -70,18 +72,19 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen)
 //处理注销账户请求
 PDU *MsgHandler::logoff()
 {
-    char userName[32]={'\0'};
-    char userPwd[32]={'\0'};
-    memcpy(userName,pdu->caData,32);
-    memcpy(userPwd,pdu->caData+32,32);
+    QString userName = fixedString(pdu->caData, 32);
+    QString userPwd  = fixedString(pdu->caData + 32, 32);
 
-    qDebug()<<"logoff request for:"<<QString::fromUtf8(userName);
+    qDebug() << "logoff request for:" << userName;
 
-    bool ret=OperateDB::instance().handleLogoff(userName,userPwd);
+    bool ret = OperateDB::instance().handleLogoff(
+        userName.toUtf8().constData(),
+        userPwd.toUtf8().constData()
+    );
 
     // 如果数据库删除成功，清理用户的文件目录
     if(ret){
-        QString userDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(QString::fromUtf8(userName));
+        QString userDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(userName);
         QDir dir(userDir);
         if(dir.exists()){
             bool removed=dir.removeRecursively();
@@ -257,6 +260,7 @@ PDU *MsgHandler::addfriendFin()
     memcpy(pdu->caData,&ret,sizeof(ret));
     MyTcpServer::getinstance().seedAddFriend(seedName,pdu);
     MyTcpServer::getinstance().seedAddFriend(agreeName,pdu);
+    memfree(pdu);
     return nullptr;
 }
 
@@ -283,6 +287,12 @@ PDU *MsgHandler::deletefriend()
     memcpy(tarName,pdu->caData+32,32);
     bool ret=OperateDB::instance().handleDeleteFriend(strName,tarName);
     qDebug()<<"deletefriend ret"<<ret<<endl;
+
+    // 跨功能联动：好友删除成功后，清理两人互发的私聊记录
+    if(ret){
+        OperateDB::instance().deleteFriendMessages(QString::fromUtf8(strName), QString::fromUtf8(tarName));
+        qDebug() << "[deletefriend] 已联动清理双方私聊记录: " << strName << " - " << tarName;
+    }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_DELETEFRIEND_RESPOND;
     memcpy(pdu->caData,&ret,sizeof(ret));
@@ -326,7 +336,7 @@ PDU *MsgHandler::MKDIR(){
     return respdu;
 }
 //删除目录
-PDU *MsgHandler::deldir()
+PDU *MsgHandler::deldir(const QString& loginName)
 {
     //获取删除文件路径和文件类型
     QString delFilePath(QString::fromUtf8(pdu->caMsg));
@@ -342,6 +352,19 @@ PDU *MsgHandler::deldir()
         QDir dir(delFilePath);
         ans=dir.removeRecursively();//删除目录
     }
+
+    // 跨功能联动：删除成功后，清理该文件（或目录下所有文件）对应的分享链接记录
+    if(ans){
+        // owner 直接使用登录名；relPath 以用户根目录为基准取相对路径，
+        // 避免相对 filesPath 反推时把 filesys 误判为 owner 段
+        QString userRoot = QDir(Server::getinstance().filesPath).absoluteFilePath(loginName);
+        QString relPath = QDir(userRoot).relativeFilePath(QFileInfo(delFilePath).absoluteFilePath());
+        if(!relPath.startsWith("..") && !relPath.startsWith("/") && !relPath.isEmpty()){
+            OperateDB::instance().deleteShareLinkByPath(loginName, relPath);
+            qDebug() << "[deldir] 已联动清理分享链接: owner=" << loginName << " relPath=" << relPath;
+        }
+    }
+
     //返回报文
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_DELFILE_RESPOND;
@@ -405,7 +428,7 @@ PDU *MsgHandler::flushfile()
     return respdu;
 }
 //文件/目录重命名
-PDU *MsgHandler::renamefile()
+PDU *MsgHandler::renamefile(const QString& loginName)
 {
     //拼接旧文件路径和新文件路径
     char oldFileName[32]={'\0'};
@@ -429,6 +452,36 @@ PDU *MsgHandler::renamefile()
         ret=file.rename(oldFilePath,newFilePath);
     }
     qDebug()<<"rename ret"<<ret<<endl;
+
+    // 跨功能联动：重命名成功后，平移该文件的分享链接 relative_path
+    if(ret){
+        // owner 直接使用登录名；relDir 以用户根目录为基准取相对路径，
+        // 避免相对 filesPath 反推时把 filesys 误判为 owner 段
+        QString dirPath = QString::fromUtf8(pdu->caMsg + sizeof(uint)); // 形如 ./filesys/wcy 或 ./filesys/wcy/子目录
+        // relDir：去掉"用户根目录"前缀得到相对路径。
+        // 直接字符串剥离，避免 relativeFilePath 在 CWD 不一致时算出 ".." 开头，
+        // 从而被下方守卫跳过整段联动（即重命名未关联 share_link 的根因）。
+        QString userRootRel = QDir(Server::getinstance().filesPath).filePath(loginName); // 如 ./filesys/wcy
+        QString relDir = dirPath;
+        if (relDir.startsWith(userRootRel)) {
+            relDir = relDir.mid(userRootRel.length());
+            if (relDir.startsWith('/')) relDir = relDir.mid(1);
+        } else {
+            // 兜底：dirPath 非预期格式时退回 relativeFilePath 计算
+            relDir = QDir(QDir(Server::getinstance().filesPath).absoluteFilePath(loginName))
+                         .relativeFilePath(QFileInfo(dirPath).absoluteFilePath());
+        }
+        if(!relDir.startsWith("..") && !relDir.startsWith("/")){
+            QString oldRel = relDir.isEmpty() ? QString::fromUtf8(oldFileName)
+                                             : relDir + "/" + QString::fromUtf8(oldFileName);
+            QString newRel = relDir.isEmpty() ? QString::fromUtf8(newFileName)
+                                             : relDir + "/" + QString::fromUtf8(newFileName);
+            OperateDB::instance().updateShareLinkPath(loginName, oldRel, newRel);
+            qDebug() << "[renamefile] 已联动更新分享链接: owner=" << loginName
+                     << " oldRel=" << oldRel << " newRel=" << newRel;
+        }
+    }
+
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_RENAMEFILE_RESPOND;
     memcpy(respdu->caData,&ret,sizeof(ret));
@@ -454,6 +507,7 @@ PDU *MsgHandler::sharefile()
         qDebug()<<"revName"<<revName<<" ";
         MyTcpServer::getinstance().reseed(revName,resendpdu);
     }
+    memfree(resendpdu);
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_RESPOND;
     return respdu;
@@ -474,19 +528,23 @@ PDU *MsgHandler::sharefilemove()
 
 }
 
-//移动文件（重命名/移动到用户根目录）
+//移动文件（任意目录间移动）
 PDU *MsgHandler::movefile(const QString& loginName)
 {
     char srcFileName[32]={'\0'};
     memcpy(srcFileName,pdu->caData,32);
     QString fileName=QString::fromUtf8(srcFileName).trimmed();
 
-    QString srcDir=QString::fromUtf8(pdu->caMsg);
-    QString srcPath=QDir(srcDir).filePath(fileName);
+    // caMsg 格式：srcRel + '\0' + dstRel（两个以\0结尾的C串，srcRel 含文件名）
+    QByteArray caMsgBytes(pdu->caMsg, pdu->uiMsgLen);
+    int sep = caMsgBytes.indexOf('\0');
+    QString srcRel = QString::fromUtf8(caMsgBytes.left(sep)).trimmed();
+    QString dstRel = QString::fromUtf8(caMsgBytes.mid(sep+1)).trimmed();
 
-    // 安全路径构造：使用 QDir::filePath() 委托 Qt 处理分隔符
     QString userRoot=QDir(Server::getinstance().filesPath).filePath(loginName);
-    QString dstPath=QDir(userRoot).filePath(fileName);
+    QString srcPath=QDir(userRoot).filePath(srcRel);   // srcRel 已含文件名
+    QString dstDir =QDir(userRoot).filePath(dstRel);    // 目标目录
+    QString dstPath=QDir(dstDir).filePath(fileName);
     QString finalDstPath = dstPath;
 
     //路径合法性校验：源路径必须在用户根目录内
@@ -503,63 +561,81 @@ PDU *MsgHandler::movefile(const QString& loginName)
     if(!canonicalRoot.isEmpty() && !canonicalSrc.isEmpty()
             && (canonicalSrc==canonicalRoot || canonicalSrc.startsWith(canonicalRootPrefix))
             && srcInfo.exists()){
-        //确保目标路径也在用户根目录内
-        QFileInfo dstInfo(dstPath);
-        // 确保目标路径的父目录也在用户根目录内
-        QDir dstDir = dstInfo.dir(); // 获取父目录
-        QString canonicalDstDir = dstDir.canonicalPath(); // 父目录必定存在
-        
-        if(!canonicalDstDir.isEmpty() && 
-          (canonicalDstDir == canonicalRoot || canonicalDstDir.startsWith(canonicalRootPrefix))){
-            
-            // 自动重命名处理逻辑
-            finalDstPath = dstPath;
-            if (QFileInfo::exists(finalDstPath)) {
-                QFileInfo checkInfo(finalDstPath);
-                QDir parentDir = checkInfo.dir(); // 获取父目录 QDir 对象
-                QString baseName = checkInfo.completeBaseName();
-                QString suffix = checkInfo.suffix();
-                if (!suffix.isEmpty()) suffix = "." + suffix;
-                
-                int count = 1;
-                const int MAX_RETRIES = 1000;
-                // 使用 QDir::filePath() 构建路径，确保跨平台安全
-                do {
-                    QString numberedName = QString("%1(%2)%3").arg(baseName).arg(count++).arg(suffix);
-                    finalDstPath = parentDir.filePath(numberedName);
-                    if (count > MAX_RETRIES) { ret = false; break; }
-                } while (QFileInfo::exists(finalDstPath));
-                qDebug() << "文件移动重名，自动重命名为:" << finalDstPath;
-            }
+        //确保目标目录也在用户根目录内
+        QFileInfo dstInfo(dstDir);
+        QString canonicalDstDir = dstInfo.canonicalFilePath(); // 目标目录必定存在
 
-            //先尝试 rename；若跨文件系统失败则 copy+remove
-            // 实例化文件对象，失败时获取 errorString() 详细错误
-            QFile srcFile(srcPath);
-            ret = srcFile.rename(finalDstPath);
-            if (!ret) {
-                qDebug() << "rename 失败, errorString:" << srcFile.errorString()
-                         << "src:" << srcPath << "dst:" << finalDstPath;
-                // 降级策略：copy + remove
-                ret = QFile::copy(srcPath, finalDstPath);
+        if(!canonicalDstDir.isEmpty() && dstInfo.isDir() &&
+          (canonicalDstDir == canonicalRoot || canonicalDstDir.startsWith(canonicalRootPrefix))){
+            // 防止把目录移进自身或其子目录
+            if(srcInfo.isDir() && (canonicalDstDir==canonicalSrc || canonicalDstDir.startsWith(canonicalSrc+"/"))){
+                qDebug()<<"movefile 拒绝：不能把目录移进自身或其子目录";
+            }
+            // 原地移动（目标目录就是源所在目录）：无需操作
+            else if(canonicalDstDir == srcInfo.dir().canonicalPath()){
+                ret=true;
+                qDebug()<<"movefile 原地移动，无需操作";
+            }
+            else {
+                // 自动重命名处理逻辑
+                finalDstPath = dstPath;
+                if (QFileInfo::exists(finalDstPath)) {
+                    QFileInfo checkInfo(finalDstPath);
+                    QDir parentDir = checkInfo.dir(); // 获取父目录 QDir 对象
+                    QString baseName = checkInfo.completeBaseName();
+                    QString suffix = checkInfo.suffix();
+                    if (!suffix.isEmpty()) suffix = "." + suffix;
+
+                    int count = 1;
+                    const int MAX_RETRIES = 1000;
+                    // 使用 QDir::filePath() 构建路径，确保跨平台安全
+                    do {
+                        QString numberedName = QString("%1(%2)%3").arg(baseName).arg(count++).arg(suffix);
+                        finalDstPath = parentDir.filePath(numberedName);
+                        if (count > MAX_RETRIES) { ret = false; break; }
+                    } while (QFileInfo::exists(finalDstPath));
+                    qDebug() << "文件移动重名，自动重命名为:" << finalDstPath;
+                }
+
+                //先尝试 rename；若跨文件系统失败则 copy+remove
+                QFile srcFile(srcPath);
+                ret = srcFile.rename(finalDstPath);
                 if (!ret) {
-                    qDebug() << "copy 降级也失败, src:" << srcPath << "dst:" << finalDstPath
-                             << "errno:" << errno << strerror(errno);
-                } else {
-                    if (QFile::remove(srcPath)) {
-                        qDebug() << "copy+remove 降级成功:" << finalDstPath;
+                    qDebug() << "rename 失败, errorString:" << srcFile.errorString()
+                             << "src:" << srcPath << "dst:" << finalDstPath;
+                    // 降级策略：copy + remove
+                    ret = QFile::copy(srcPath, finalDstPath);
+                    if (!ret) {
+                        qDebug() << "copy 降级也失败, src:" << srcPath << "dst:" << finalDstPath
+                                 << "errno:" << errno << strerror(errno);
                     } else {
-                        qDebug() << "copy+remove 降级: copy 成功但 remove 失败, src:" << srcPath;
-                        QFile::remove(finalDstPath);  // 清理不完整的目标文件
-                        ret = false;
+                        if (QFile::remove(srcPath)) {
+                            qDebug() << "copy+remove 降级成功:" << finalDstPath;
+                        } else {
+                            qDebug() << "copy+remove 降级: copy 成功但 remove 失败, src:" << srcPath;
+                            QFile::remove(finalDstPath);  // 清理不完整的目标文件
+                            ret = false;
+                        }
                     }
                 }
             }
         } else {
             qDebug() << "movefile 目标路径校验失败: canonicalDstDir=" << canonicalDstDir;
         }
+    } else {
+        qDebug() << "movefile 源路径校验失败: canonicalSrc=" << canonicalSrc;
     }
 
-    qDebug()<<"movefile src:"<<srcPath<<"dst:"<<finalDstPath<<"ret:"<<ret;
+    qDebug()<<"movefile src:"<<srcPath<<"dst:"<<dstPath<<"ret:"<<ret;
+
+    // 跨功能联动：移动成功后，平移该文件的分享链接 relative_path
+    if(ret){
+        QString newRel = dstRel.isEmpty() ? fileName : (dstRel + "/" + fileName);
+        OperateDB::instance().updateShareLinkPath(loginName, srcRel, newRel);
+        qDebug() << "[movefile] 已联动更新分享链接: owner=" << loginName
+                 << " oldRel=" << srcRel << " newRel=" << newRel;
+    }
+
     PDU* respdu=mkPDU();
     memcpy(respdu->caData,&ret,sizeof(ret));
     QByteArray fileNameBytes=fileName.toUtf8();
@@ -567,6 +643,42 @@ PDU *MsgHandler::movefile(const QString& loginName)
     respdu->uiType=ENUM_MSG_TYPE_MOVEFILE_RESPOND;
     return respdu;
 }
+//列出某相对目录下的子目录（移动文件选择目标用）
+PDU *MsgHandler::listdir(const QString& loginName)
+{
+    QString relPath=QString::fromUtf8(pdu->caMsg).trimmed(); // 相对根目录的浏览路径（空=根）
+    QString userRoot=QDir(Server::getinstance().filesPath).filePath(loginName);
+    QString absDir=QDir(userRoot).filePath(relPath);
+
+    // 越权校验：浏览目录必须在用户根目录内
+    QFileInfo dirInfo(absDir);
+    QString canonicalDir=dirInfo.canonicalFilePath();
+    QString canonicalRoot=QFileInfo(userRoot).canonicalFilePath();
+    QString canonicalRootPrefix=QDir(canonicalRoot).absolutePath();
+    if(!canonicalRootPrefix.endsWith('/')){
+        canonicalRootPrefix.append('/');
+    }
+
+    PDU* respdu=mkPDU();
+    respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
+    if(!canonicalRoot.isEmpty() && !canonicalDir.isEmpty()
+       && (canonicalDir==canonicalRoot || canonicalDir.startsWith(canonicalRootPrefix))
+       && dirInfo.isDir()){
+        QFileInfoList list=QDir(absDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
+        respdu=mkPDU(sizeof(FileInfo)*list.size());
+        respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
+        for(int i=0;i<list.size();i++){
+            FileInfo* p=(FileInfo*)respdu->caMsg+i;
+            memcpy(p->caName,list[i].fileName().toStdString().c_str(),32);
+            p->uiType=0;
+        }
+        qDebug()<<"listdir rel="<<relPath<<" 子目录数="<<list.size();
+    } else {
+        qDebug()<<"listdir 越权或目录不存在: rel="<<relPath;
+    }
+    return respdu;
+}
+
 //上传文件初始化
 PDU *MsgHandler::uploadfileinit()
 {
@@ -719,4 +831,142 @@ PDU *MsgHandler::getuserinformation()
     return respdu;
 }
 
+PDU* MsgHandler::createPublishLink(const QString& loginName) {
+    QString relativePath = fixedString(pdu->caMsg, pdu->uiMsgLen);
+    QString ownerName = loginName;
+    qDebug() << "[createPublishLink] 收到生成请求: owner=" << ownerName << " relativePath=" << relativePath;
 
+    QString token = ShareLinkService::generateToken();
+    QString hash = ShareLinkService::hashToken(token);
+    QDateTime expire = ShareLinkService::defaultExpireTime();
+
+    bool ok = OperateDB::instance().createShareLink(hash, ownerName, relativePath, expire);
+    if(!ok){
+        qDebug() << "[createPublishLink] 写入数据库失败，生成分享链接未完成";
+    }
+
+    PDU* respdu = mkPDU(128);
+    respdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND;
+    memcpy(respdu->caData, &ok, sizeof(ok));
+    if(ok) {
+        QString link = QString("cloud-disk://share/%1").arg(token);
+        QByteArray linkBytes = link.toUtf8();
+        memcpy(respdu->caMsg, linkBytes.constData(), linkBytes.size());
+    }
+    return respdu;
+}
+
+
+
+// 新增：安全外链分享（BUG-ARC-PUBLINK-001）
+PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
+    QString token = fixedString(pdu->caMsg, pdu->uiMsgLen);
+    qDebug() << "[resolvePublishLink] 收到解析请求: token_len=" << token.size()
+             << " token_head=" << token.left(16);
+
+    // 兼容两种输入：
+    //  - 原始 token（22 位 base64url，来自「生成分享链接」弹窗）
+    //  - token_hash 本身（64 位十六进制，来自「获取分享链接」弹窗 / 模拟脚本输出）
+    // 若输入正好是 64 位十六进制，则直接当作 hash 查库；否则先 hash(token) 再查。
+    bool isHex64 = (token.size() == 64);
+    if (isHex64) {
+        for (const QChar &c : token) {
+            if (!c.isDigit() && !((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+                isHex64 = false;
+                break;
+            }
+        }
+    }
+    QString hash = isHex64 ? token : ShareLinkService::hashToken(token);
+    qDebug() << "[resolvePublishLink] hash 来源:" << (isHex64 ? "直接输入(64hex)" : "hashToken(输入)");
+
+    OperateDB::ShareLinkInfo info;
+    PDU* respdu = mkPDU(1024); // 预留 JSON 空间
+    respdu->uiType = ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND;
+
+    bool ok = false;
+    QString savedRelPath; // 形如 "分享链接/2.pdf"，返回给客户端展示
+    if (OperateDB::instance().getShareLinkByHash(hash, info)) {
+        qDebug() << "[resolvePublishLink] 命中记录: owner=" << info.ownerName
+                 << " relativePath=" << info.relativePath
+                 << " revoked=" << info.revoked
+                 << " expireTime=" << info.expireTime.toString("yyyy-MM-dd HH:mm:ss");
+        if (info.revoked) {
+            qDebug() << "[resolvePublishLink] 链接已撤销，拒绝";
+        } else if (QDateTime::currentDateTime() >= info.expireTime) {
+            qDebug() << "[resolvePublishLink] 链接已过期，拒绝";
+        } else {
+            QString ownerRoot = QDir(Server::getinstance().filesPath).filePath(info.ownerName);
+            QString srcPath = QDir(ownerRoot).filePath(info.relativePath);
+            QFileInfo srcFi(srcPath);
+            if (ShareLinkService::validatePath(ownerRoot, info.relativePath)
+                    && srcFi.exists() && srcFi.isFile()) {
+                // 目标目录：服务端【请求者】用户目录下的“分享链接”文件夹
+                QString userRoot = QDir(Server::getinstance().filesPath).filePath(loginName);
+                QString shareDir = QDir(userRoot).filePath("分享链接");
+                QDir().mkpath(shareDir);
+
+                QString baseName = srcFi.completeBaseName();
+                QString suffix = srcFi.suffix();
+                if (!suffix.isEmpty()) suffix = QString(".") + suffix;
+
+                // 同名去重，复用 movefile 的 (1)(2) 规则
+                QString finalDstPath = QDir(shareDir).filePath(srcFi.fileName());
+                if (QFileInfo::exists(finalDstPath)) {
+                    int count = 1;
+                    const int MAX_RETRIES = 1000;
+                    do {
+                        QString numberedName = QString("%1(%2)%3").arg(baseName).arg(count++).arg(suffix);
+                        finalDstPath = QDir(shareDir).filePath(numberedName);
+                        if (count > MAX_RETRIES) { finalDstPath.clear(); break; }
+                    } while (QFileInfo::exists(finalDstPath));
+                }
+
+                if (!finalDstPath.isEmpty()) {
+                    QFile srcFile(srcPath);
+                    if (srcFile.copy(finalDstPath)) {
+                        ok = true;
+                        savedRelPath = "分享链接/" + QFileInfo(finalDstPath).fileName();
+                        qDebug() << "[resolvePublishLink] 已复制分享文件到:" << finalDstPath;
+                    } else {
+                        qDebug() << "[resolvePublishLink] 复制失败:" << srcFile.errorString()
+                                 << " src=" << srcPath << " dst=" << finalDstPath;
+                    }
+                } else {
+                    qDebug() << "[resolvePublishLink] 同名文件过多，放弃复制";
+                }
+            } else {
+                qDebug() << "[resolvePublishLink] 源文件不存在或越权: " << srcPath;
+            }
+        }
+    } else {
+        qDebug() << "[resolvePublishLink] 未找到匹配记录 (hash_head="
+                 << hash.left(16) << "...)";
+    }
+
+    memcpy(respdu->caData, &ok, sizeof(ok));
+    if (ok) {
+        QString json = QString("{\"saved_path\":\"%1\"}").arg(savedRelPath);
+        QByteArray jsonBytes = json.toUtf8();
+        memcpy(respdu->caMsg, jsonBytes.constData(), jsonBytes.size());
+    }
+    return respdu;
+}
+
+PDU* MsgHandler::queryFilePublishLink() {
+    QString relativePath = fixedString(pdu->caMsg, pdu->uiMsgLen);
+    QString ownerName = fixedString(pdu->caData, 32); 
+    
+    QString token = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
+    
+    PDU* respdu = mkPDU(128);
+    respdu->uiType = ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND;
+    bool exists = !token.isEmpty();
+    memcpy(respdu->caData, &exists, sizeof(exists));
+    if (exists) {
+        QString link = QString("cloud-disk://share/%1").arg(token);
+        QByteArray linkBytes = link.toUtf8();
+        memcpy(respdu->caMsg, linkBytes.constData(), linkBytes.size());
+    }
+    return respdu;
+}

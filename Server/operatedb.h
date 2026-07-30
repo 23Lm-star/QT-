@@ -2,6 +2,7 @@
 #define OPERATEDB_H
 
 #include <QObject>
+#include <QDateTime>
 //数据库操作类
 class OperateDB : public QObject
 {
@@ -37,7 +38,27 @@ public:
     bool handleGetUserInfo(const char* userName, QString& outName, int& outOnline);
     //注销/删除用户账户
     bool handleLogoff(const char* name, const char* pwd);
-private:
+    //分享链接操作
+    bool createPublishLink(const QString &code, const QString &path, const QString &creator);
+    QString getFilePathByCode(const QString &code);
+    
+    // 新增：安全外链分享操作（BUG-ARC-PUBLINK-001）
+    bool createShareLink(const QString &hash, const QString &owner, const QString &path, const QDateTime &expire);
+    struct ShareLinkInfo {
+        QString ownerName;
+        QString relativePath;
+        QDateTime expireTime;
+        bool revoked;
+    };
+    bool getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo);
+    QString getShareLinkByPath(const QString &owner, const QString &path);
+
+    // 跨功能联动维护（文件删除/重命名/移动 → 分享链接记录一致性）
+    bool deleteShareLinkByPath(const QString &owner, const QString &path);
+    bool updateShareLinkPath(const QString &owner, const QString &oldPath, const QString &newPath);
+    // 删除好友时清理双方私聊记录
+    bool deleteFriendMessages(const QString &userA, const QString &userB);
+
     explicit OperateDB(QObject *parent = nullptr);
     OperateDB(const OperateDB&)=delete;
     OperateDB& operator=(const OperateDB&)=delete;

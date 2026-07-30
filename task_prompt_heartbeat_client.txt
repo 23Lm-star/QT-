@@ -1,0 +1,23 @@
+# 修改说明：为 Client 端增加心跳定时器，实现定时发送心跳请求并处理响应。
+# 修改文件：Client/client.h, Client/client.cpp
+
+In Client/client.h:
+1. Add private member: QTimer *m_heartbeatTimer;
+2. Add private slot: void sendHeartbeat();
+
+In Client/client.cpp:
+1. In Client constructor:
+   m_heartbeatTimer = new QTimer(this);
+   connect(m_heartbeatTimer, &QTimer::timeout, this, &Client::sendHeartbeat);
+   m_heartbeatTimer->start(30000);
+2. Implement sendHeartbeat():
+   void Client::sendHeartbeat() {
+       PDU* pdu = mkPDU();
+       pdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_REQUEST;
+       seedMsg(pdu);
+   }
+3. In Client::handlMsg():
+   case ENUM_MSG_TYPE_HEARTBEAT_RESPOND: {
+       qDebug() << "[Heartbeat] Received Pong.";
+       break;
+   }

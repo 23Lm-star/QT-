@@ -131,7 +131,29 @@ sizeof(PDU) = 76 字节 (uint=4B 平台)
 
 ---
 
-## 6. 关键依赖关系
+## 6. 低耦合可靠性与应用内链接扩展（ADR-011，规划）
+
+```text
+ClientHeartbeat ──(空 PING/PONG PDU)──> MyTcpSocket
+       │                                      │
+       └── 只经 Client 的 socket 生命周期接入     └── 不访问 DB/业务模块
+
+File ──> ShareLinkDialog ──(创建/解析链接 PDU)──> MsgHandler
+                                                     │
+                                                     v
+                                             ShareLinkService ──> OperateDB（仅 share_link 窄接口）
+                                                     │
+                                                     └── 解析成功复用既有下载流
+```
+
+- `ClientHeartbeat` 是唯一客户端心跳定时器；不依赖或修改 File/Friend/Chat/ShareFile。
+- 分享链接为已登录用户使用的 `cloud-disk://share/<opaque-token>` 访问凭证；不是 HTTP 匿名公网访问。
+- `ShareLinkService` 只依赖文件根目录校验和 `OperateDB` 的新增窄接口；禁止改变既有好友分享、资源所有权和默认访问权限。
+- 详见 `decisions/ADR-011-20260729-低耦合心跳与应用内分享链接.md`。
+
+---
+
+## 7. 关键依赖关系
 
 ```
 Client → protocol.h (共用协议定义)

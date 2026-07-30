@@ -83,15 +83,22 @@ struct Msg {
 | 37 | `ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND` | S→C | 分享文件完成 |
 | 38 | `ENUM_MSG_TYPE_MOVEFILE_REQUEST` | C→S | 移动文件请求 |
 | 39 | `ENUM_MSG_TYPE_MOVEFILE_RESPOND` | S→C | 移动文件回应 |
-| 40 | `ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST` | C→S | 下载文件请求 |
-| 41 | `ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND` | S→C | 下载文件响应 |
-| 42 | `ENUM_MSG_TYPE_CAPTCHA_REQUEST` | C→S | 验证码请求 |
-| 43 | `ENUM_MSG_TYPE_CAPTCHA_RESPOND` | S→C | 验证码响应 |
-| 46 | `ENUM_MSG_TYPE_LOGOFF_REQUEST` | C→S | 注销(删除账号)请求 |
-| 47 | `ENUM_MSG_TYPE_LOGOFF_RESPOND` | S→C | 注销(删除账号)响应 |
+| 43 | `ENUM_MSG_TYPE_DOWNLOADFILE_FINISH` | S→C | 下载完成 |
+| 44 | `ENUM_MSG_TYPE_CAPTCHA_REQUEST` | C→S | 验证码请求 |
+| 45 | `ENUM_MSG_TYPE_CAPTCHA_RESPOND` | S→C | 验证码响应 |
+| 46 | `ENUM_MSG_TYPE_GETUSERINFORMATION_REQUEST` | C→S | 获取用户信息请求 |
+| 47 | `ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND` | S→C | 获取用户信息响应 |
+| 48 | `ENUM_MSG_TYPE_LOGOFF_REQUEST` | C→S | 注销(删除账号)请求 |
+| 49 | `ENUM_MSG_TYPE_LOGOFF_RESPOND` | S→C | 注销(删除账号)响应 |
+| 50 | `ENUM_MSG_TYPE_HEARTBEAT_REQUEST` | C→S | 登录后客户端存活探测 PING；空消息体，不访问业务或数据库 |
+| 51 | `ENUM_MSG_TYPE_HEARTBEAT_RESPOND` | S→C | PONG；空消息体，仅供 ClientHeartbeat 确认 |
+| 52 | `ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST` | C→S | 创建应用内分享链接；路径仅可作为当前登录用户根目录内普通文件的相对路径 |
+| 53 | `ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND` | S→C | 创建结果；成功时 `caMsg` 返回 `cloud-disk://share/<opaque-token>`，不得日志输出 token |
+| 54 | `ENUM_MSG_TYPE_RESOLVE_PUBLINK_REQUEST` | C→S | 解析应用内分享 token；`caMsg` 为完整链接或 token，访问者必须已登录 |
+| 55 | `ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND` | S→C | 解析结果和受限下载元数据；成功后只允许复用既有下载流发送，不改变好友分享协议 |
 | 99999 | `ENUM_MSG_TYPE_MAX` | — | 最大值标记 |
 
-> **✅ 已修复**（2026-07-24）：枚举值冲突已解决，`SHAREFILE_FINISH_RESPOND`=37、`MOVEFILE_REQUEST`=38、`MOVEFILE_RESPOND`=39，拼写也已更正。两端 `handlMsg()` 均已完整处理。
+> **协议兼容基线（2026-07-29）**：下载 `40~43`、验证码 `44~45`、用户信息 `46~47`、注销 `48~49`、心跳 `50~51`、创建链接 `52~53`；本 ADR 规划的解析链接固定为 `54~55`。两端定义和所有分发 case 必须同步，既有 `33~37` 好友分享枚举严禁改动。
 
 ### 1.4 `caData[64]` 字段复用约定
 
@@ -113,6 +120,11 @@ struct Msg {
 | 重命名文件 | 旧名 | 新名 | — | 当前目录路径 |
 | 下载文件 | 文件名 | — | — | 当前目录路径 |
 | 分享文件 | — | 目标用户名 | — | 文件名 |
+| 心跳请求/响应 | — | — | — | 空 |
+| 创建应用内链接 | 文件相对路径（<=31B；或改用 caMsg 以支持长路径） | — | — | 可选过期秒数；首期为空则服务端使用默认过期时间 |
+| 创建应用内链接响应 | 是否成功（4B） | — | — | 成功时返回完整不透明链接；客户端只显示/复制，不写日志 |
+| 解析应用内链接 | — | — | — | 完整链接或 token |
+| 解析应用内链接响应 | 是否成功（4B） | 文件名（32B） | 文件大小（qint64） | 仅允许展示所需元数据；随后走原下载流 |
 | 注销/删除账号 | `ENUM_MSG_TYPE_LOGOFF_REQUEST` | 用户名（32B）+ 密码（32B） | — | — |
 | | `ENUM_MSG_TYPE_LOGOFF_RESPOND` | 是否成功（4B） | — | — |
 

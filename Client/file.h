@@ -5,6 +5,10 @@
 #include <QShowEvent>
 #include <qlistwidget.h>
 #include "sharefile.h"
+#include <QMenu>
+#include "sharelinkdialog.h"
+#include "folderselectdialog.h"
+
 namespace Ui {
 class File;
 }
@@ -24,6 +28,8 @@ public:
     void uploadfile(qint64 resumeOffset=0);//上传文件数据->上传m_strUploadPath文件
     void updateCurrfile(QList<FileInfo*>qFileinfolist);//利用文件信息列表刷新文件信息
     void flushCurrLE();
+    void onGetShareLink();
+    void handleListDirRespond(PDU *pdu);//LISTDIR_RESPOND 转发给目录选择弹窗
     explicit File(QWidget *parent = nullptr);
     ~File();
 protected:
@@ -43,13 +49,28 @@ private slots:
     //重命名文件/目录槽函数
     void on_rename_PB_clicked();
 
+    // 移动文件到目标目录
+    void on_move_PB_clicked();
+    void requestListDir(const QString &rel);
+
     void on_inputPath_PB_clicked();
 
-    void on_mkdir_PB_clicked();
+    // 新增：上传槽函数
+    void on_upload_PB_clicked();
 
     void on_download_PB_clicked();
 
     void on_share_PB_clicked();
+
+    // 新增：生成分享链接
+    void on_genlink_PB_clicked();
+
+    // 新增：通过分享链接获取分享文件
+    void on_fetchshare_PB_clicked();
+
+    // 新增：右键菜单
+    void onFileListContextMenu(const QPoint &pos);
+
 
 private:
     Ui::File *ui;
@@ -57,6 +78,8 @@ private:
     bool m_uiRefreshQueued = false;//防止重复排入 UI 重建回调
     void rebuildFileList();//集中执行 QListWidget clear() + addItem()
     void scheduleUiRefresh();//合并排队：最多排入一个 UI 刷新回调
+    QString selectedFileRelativePath(QListWidgetItem *item);//计算选中文件相对用户根目录的路径
+    FolderSelectDialog* m_moveDlg = nullptr;               // 移动文件时的目标目录选择弹窗
 };
 
 #endif // FILE_H

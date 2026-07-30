@@ -13,6 +13,7 @@
 
 | 报告 | 日期 | 范围 | 结果 |
 |------|------|------|------|
+| `R06-20260729-TST-Heartbeat_ShareLink_Regression.md` | 2026-07-29 | 心跳/分享链接功能静态验证及常规回归 | ✅ 静态通过，逻辑符合验收标准 |
 | `R05-20260726-TST-BUG-TST-CLIENT-001-回归失败.md` | 2026-07-26 | BUG-TST-CLIENT-001 方案 B 增强版 Client 动态回归 | ❌ 回归失败，Friend 组件同模式崩溃，缺陷重新打开 |
 || `R02-20260725-TST-BUG-TST-CLIENT-001-regression.md` | 2026-07-25 | BUG-TST-CLIENT-001 修复后 Client 动态回归 | ❌ 回归失败，缺陷重新打开 |
 | `R01-20260725-TST.md` | 2026-07-25 | POOL-001~008 修复后动态回归测试 | 6/8 静态通过，1/8 动态通过，1 新缺陷阻塞 |
@@ -21,7 +22,9 @@
 
 ## 当前质量状态
 
-**未通过完整质量门禁**。BUG-TST-CLIENT-001 **第二次回归失败**——方案 B 增强版的 File 组件数据/UI 分离正确，但 Friend 组件存在相同模式缺陷（`flushFriend_LW()` 直接操作 QListWidget 导致 vtable 异常）。Client 侧全部动态测试被阻塞。Server 侧 POOL 修复通过验证。
+**心跳功能（BUG-NET-001）**：静态审查通过 ✅，基础 PING/PONG 协议正确。动态验证待用户执行 (`smoke_test.py`)。独立 ClientHeartbeat 组件化延后。
+
+**分享链接功能（BUG-ARC-PUBLINK-001）**：静态审查通过 ✅（协议层通信正确），但安全设计严重偏离 ADR-011 ⚠️。当前为开发原型，不得作为正式功能交付。详情见 `defects/BUG-ARC-PUBLINK-001.md`。
 
 ## 测试执行说明
 

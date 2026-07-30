@@ -22,6 +22,8 @@
 | **Uploader** | `uploader.{h,cpp}` | 文件上传工作线程：`moveToThread` 独立线程，分块(4096B)发送 |
 | **UserInformation** | `userinformation.{h,cpp}`, `userinformation.ui` | 用户信息展示弹出窗口 |
 | **SimpleCaptcha** | `simplecaptcha.{h,cpp}` | 验证码显示组件（本地绘制） |
+| **ClientHeartbeat** | `clientheartbeat.{h,cpp}`（规划） | 唯一客户端心跳调度器：登录后发 PING、接收 PONG、3 次超时上报连接不健康；不依赖业务页面。 |
+| **ShareLinkDialog** | `sharelinkdialog.{h,cpp,.ui}`（规划） | 应用内链接创建/解析对话框；仅经 File 的窄入口调用，不复用或改变好友分享窗口。 |
 | **Protocol** | `protocol.{h,cpp}` | PDU 协议定义 + 构造：`malloc/free` 版本 |
 | **Config** | `connect.config`, `config.qrc` | 连接配置（IP/端口/路径），嵌入 Qt 资源文件 |
 
@@ -58,7 +60,8 @@ Uploader (独立线程)
 | **MyTcpSocket** | `mytcpsocket.{h,cpp}` | 单客户端连接：PDU 粘包/半包处理、消息分发 |
 | **ClientTask** | `clienttask.{h,cpp}` | 线程池任务包装：`QObject + QRunnable` |
 | **MsgHandler** | `msghandler.{h,cpp}` | 请求处理：注册/登录/好友/聊天/文件/验证码 |
-| **OperateDB** | `operatedb.{h,cpp}` | 数据库访问（单例）：全部 SQL 操作集中在此 |
+| **OperateDB** | `operatedb.{h,cpp}` | 数据库访问（单例）：全部 SQL 操作集中在此；仅追加分享链接持久化窄接口 |
+| **ShareLinkService** | `sharelinkservice.{h,cpp}`（规划） | 生成、哈希、解析和校验应用内分享 token；只依赖 OperateDB 窄接口和文件根目录校验，不依赖好友分享链路。 |
 | **DatabaseConnectionPool** | `databaseconnectionpool.{h,cpp}` | 数据库连接池（单例）：RAII 管理，按线程隔离 |
 | **ResumableUploadSession** | `resumableuploadsession.{h,cpp}` | 断点续传会话管理：写入文件、偏移量连续性校验 |
 | **Protocol** | `protocol.{h,cpp}` | PDU 协议定义 + 构造：`memalloc/memfree` 版本 |

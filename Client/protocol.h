@@ -67,6 +67,16 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST = 52,       // 创建外链分享请求
     ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND = 53,       // 创建外链分享响应
 
+    // ===== 分享链接扩展（BUG-ARC-PUBLINK-001） =====
+    ENUM_MSG_TYPE_RESOLVE_PUBLINK_REQUEST = 54,      // 解析分享链接（通过 token）
+    ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND = 55,      // 解析结果
+    ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST = 56,   // 按文件路径查询已有链接
+    ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND = 57,   // 返回已有链接（或空）
+
+    // ===== 移动文件：目录浏览（选择目标目录） =====
+    ENUM_MSG_TYPE_LISTDIR_REQUEST = 58,              // 列出某相对目录下的子目录
+    ENUM_MSG_TYPE_LISTDIR_RESPOND = 59,              // 返回子目录列表（FileInfo 数组，uiType=0）
+
     ENUM_MSG_TYPE_MAX = 99999,
 };
 

@@ -23,6 +23,7 @@ public:
     QByteArray m_dpulist;
     uint m_invalidPduCount; // 丢包计数器
     static const uint MAX_INVALID_PDU_THRESHOLD = 5; // 丢包上限
+    qint64 m_lastActiveMs;  // 最后收到客户端数据的时间(ms)，用于服务端僵尸连接检测
     //接收用户请求的三个过程： (循环)接收--处理--响应
     PDU* handlMsg(PDU* pdu);
     void seedMsg(PDU* respdu);

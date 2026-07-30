@@ -1,0 +1,19 @@
+# 修改说明：实现分享链接功能 (PUBLINK)。
+# 修改文件：Server/operatedb.h, Server/operatedb.cpp, Server/msghandler.h, Server/msghandler.cpp, Server/mytcpsocket.cpp
+
+In Server/operatedb.h:
+1. Add: bool createPublishLink(const QString &code, const QString &path, const QString &creator);
+2. Add: QString getFilePathByCode(const QString &code);
+
+In Server/operatedb.cpp:
+1. Implement createPublishLink: use QSqlQuery to insert into publish_links.
+2. Implement getFilePathByCode: use QSqlQuery to SELECT file_path FROM publish_links WHERE short_code = :code.
+
+In Server/msghandler.h:
+1. Add: PDU* createPublishLink();
+
+In Server/msghandler.cpp:
+1. Implement createPublishLink: extract file path from PDU caData, generate 8-char random short_code, call db.createPublishLink, return PDU with link.
+
+In Server/mytcpsocket.cpp:
+1. Add case ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST: respdu = m_MsgHandler->createPublishLink(); break;

@@ -2,7 +2,6 @@
 #define MSGHANDLER_H
 
 #include "protocol.h"
-
 #include <QString>
 #include <QFile>
 
@@ -35,9 +34,12 @@ public:
     void handlMoveFile();
     void handlUserInformation();
     void handlLogoff();
+    void handleQueryFilePublishLink(PDU* pdu);
+    void handleCreatePublishLink(PDU* pdu);
+    void handleResolvePublishLink(PDU* pdu);
+    void handleDownloadRespond();
 
     //流式下载接收状态
-    void handleDownloadRespond();
     void handleDownloadData();
     void handleDownloadFinish();
 

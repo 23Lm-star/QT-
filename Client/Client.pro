@@ -26,6 +26,9 @@ SOURCES += \
     onlineuser.cpp \
     protocol.cpp \
     sharefile.cpp \
+    sharelinkdialog.cpp \
+    folderselectdialog.cpp \
+    reconnectdialog.cpp \
     uploader.cpp \
     simplecaptcha.cpp \
     userinformation.cpp
@@ -40,6 +43,9 @@ HEADERS += \
     onlineuser.h \
     protocol.h \
     sharefile.h \
+    sharelinkdialog.h \
+    folderselectdialog.h \
+    reconnectdialog.h \
     uploader.h \
     simplecaptcha.h \
     userinformation.h
@@ -52,6 +58,7 @@ FORMS += \
     index.ui \
     onlineuser.ui \
     sharefile.ui \
+    sharelinkdialog.ui \
     userinformation.ui
 
 # Default rules for deployment.
