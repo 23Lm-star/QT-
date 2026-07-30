@@ -31,13 +31,34 @@
 - 同一路径同时只能被一个任务锁持有；冲突时由集成者仲裁。
 - 任务 integrated 或 rejected 后必须释放锁。
 
-## 5. 自动校验脚本（参考实现）
-- 提供 `governance/verify-integration-gate.py`（参考）：输入任务契约 + 仓库路径，自动检查第 3 节全部条件，输出 PASS/FAIL 与越界文件清单。
-- 接入方式（任选其一，逐步落地）：
-  - git `pre-merge` / `pre-receive` 钩子；
-  - CI 流水线；
-  - 集成者手动运行后再合并。
-- 在钩子全量部署前，至少由集成者在每次合并前**手动运行一次**该脚本作为兜底。
+## 5. 自动校验脚本（已落地 ✅）
+- 脚本：`governance/verify-integration-gate.py`（纯只读，只跑 `git diff/rev-parse/log/merge-base`，**绝不修改任何文件、绝不产生提交、绝不切换分支**）。
+- 校验范围：第 3 节全部 7 项门禁（G1 锁登记 / G2 基线 / G3 路径白黑名单 / G4 提交链 / G5 证据等级 / G6 审批 / G7 唯一集成者）。
+- 退出码：`0` = PASS 允许合并；`1` = FAIL 拒绝合并；`2` = 参数/配置错误。
+- 依赖：Python 3 + `PyYAML`（`pip install pyyaml`，脚本在缺失时会给出明确提示，不影响仓库）。
+
+### 集成者用法（合并任一任务分支前手动运行）
+```bash
+python project-docs/governance/verify-integration-gate.py \
+    --contract <本任务的契约.yaml> \
+    --repo E:/qt/xiangmu \
+    --branch <任务分支名(扁平名)>
+# 可选： --json（CI 解析）  --quiet（仅看结论）  --selftest（逻辑自测，不读仓库）
+```
+
+### 实测结果（2026-07-30，冻结工作树未动）
+- 用"仅治理文档"契约校验混合分支 `wip-mixed-pre-refactor` → **FAIL**：76 文件越白名单、8 文件碰受保护区、证据 L1<L3。
+- 用同契约校验基线分支 `add_数据库连接池功能`（零改动）→ **PASS**。
+- 证明：门禁能准确区分越界与合规，且全程只读。
+
+### ⚠️ 接入方式提醒（保护共享主工作树）
+- **不要**在 `E:\qt\xiangmu` 的 `.git/hooks` 里装会自动拦截提交的 `pre-commit`/`pre-merge` 钩子——会干扰你在本项目上的正常开发提交。
+- 当前阶段采用**集成者手动运行兜底**：每次合并任务分支前跑一次上面的命令，PASS 才合并。
+- 若日后要全自动：优先接 **CI 流水线**（在合并 PR 时跑），而非本地钩子；或仅对 `master` 受保护的远端仓库部署 `pre-receive`。
+
+### 分支命名约束（本仓库 Git 环境已知坑）
+- 本仓库 `git branch`/`checkout -b` 对**带 `/` 的嵌套分支名会静默失败**（ref 不落盘，分支变 unborn）。
+- 所有任务分支**一律用扁平名**（如 `task-gov-archive`、`task-r18-publink`），不要用 `task/xxx`。详见 `migration-plan.md` §0.5。
 
 ## 6. 与既有《协作总则》的关系
 - 本门禁是总则第七节“Agent 执行约束”的**强制化补强**，不替代总则；总则中的状态流转、交接规范、缺陷编号等继续有效。
