@@ -9,6 +9,8 @@
 #include "sharelinkdialog.h"
 #include "folderselectdialog.h"
 
+class Uploader;
+
 namespace Ui {
 class File;
 }
@@ -26,6 +28,7 @@ public:
     ShareFile* m_shareFile;
     void flushfile();//刷新当前文件->引导刷新
     void uploadfile(qint64 resumeOffset=0);//上传文件数据->上传m_strUploadPath文件
+    void acknowledgeUploadChunk(bool success, qint64 nextOffset, bool complete);
     void updateCurrfile(QList<FileInfo*>qFileinfolist);//利用文件信息列表刷新文件信息
     void flushCurrLE();
     void onGetShareLink();
@@ -80,6 +83,7 @@ private:
     void scheduleUiRefresh();//合并排队：最多排入一个 UI 刷新回调
     QString selectedFileRelativePath(QListWidgetItem *item);//计算选中文件相对用户根目录的路径
     FolderSelectDialog* m_moveDlg = nullptr;               // 移动文件时的目标目录选择弹窗
+    Uploader* m_uploader = nullptr;
 };
 
 #endif // FILE_H

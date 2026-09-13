@@ -4,6 +4,7 @@
 #include "protocol.h"
 
 #include <QObject>
+#include <QFile>
 
 class Uploader : public QObject
 {
@@ -12,14 +13,24 @@ public:
     QString strUploadPath;
     qint64 m_resumeOffset;
 
-    Uploader(const QString& strUploadPath, qint64 resumeOffset=0);
+    Uploader(const QString& strUploadPath, qint64 resumeOffset=0, QObject* parent=nullptr);
     void start();
 public slots:
-    void uploadFile();
+    void acknowledge(bool success, qint64 nextOffset, bool complete);
 signals:
     void seedMsg(PDU* pdu);
     void errnoMsg(const QString& msg);
-    void finshUpload();
+    void finished(bool success);
+
+private:
+    void sendNextChunk();
+    void finish(bool success);
+
+    QFile m_file;
+    qint64 m_nextOffset;
+    bool m_waitingAck;
+    bool m_active;
+    bool m_finished;
 };
 
 #endif // UPLOADER_H

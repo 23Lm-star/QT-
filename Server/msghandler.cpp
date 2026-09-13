@@ -27,6 +27,7 @@ QString fixedString(const char *data, int maxLen)
 
 MsgHandler::MsgHandler(){
     pdu=nullptr;
+    m_captchaFailCount = 0;
     static bool seeded=false;
     if(!seeded){
         qsrand(QTime::currentTime().msec());
@@ -44,28 +45,56 @@ QString MsgHandler::generateCaptchaCode(int length)
     return code;
 }
 
-int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen)
+int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remainingSec)
 {
-    if (uiMsgLen < 4) return -2;
-    QString userInput = QString::fromUtf8(caMsg).trimmed();
-    
-    // 查找验证码（不做预先清理，以便区分"不存在"和"已过期"）
-    auto it = m_captchas.find(userInput);
-    if (it == m_captchas.end()) {
-        qDebug() << "验证码校验失败: 输入 [" << userInput << "] 不在验证码列表中";
+    remainingSec = 0;
+    QDateTime now = QDateTime::currentDateTime();
+
+    // 若之前锁定且已过期，恢复正常（冷却回到 1 分钟逻辑）
+    if (m_captchaLockUntil.isValid() && now >= m_captchaLockUntil) {
+        m_captchaLockUntil = QDateTime();
+        m_captchaFailCount = 0;
+    }
+
+    // 锁定中：直接拒绝并回传剩余秒数
+    if (m_captchaLockUntil.isValid() && now < m_captchaLockUntil) {
+        remainingSec = now.secsTo(m_captchaLockUntil);
+        qDebug() << "验证码校验失败: 账号已锁定，剩余" << remainingSec << "秒";
+        return -4;
+    }
+
+    if (uiMsgLen < 4) {
+        m_captchaFailCount++;
         return -2;
     }
-    
-    // 检查是否过期
-    QDateTime now = QDateTime::currentDateTime();
-    if (now > it.value()) {
-        qDebug() << "验证码校验失败: 已过期 (过期时间:" << it.value() << "现在:" << now << ")";
-        m_captchas.erase(it);  // 过期后清理
+    QString userInput = QString::fromUtf8(caMsg).trimmed();
+
+    // 无有效码或已过期：不累计失败次数，避免误锁
+    if (m_captchaCode.isEmpty() || now > m_captchaExpiry) {
+        m_captchaCode.clear();
+        qDebug() << "验证码校验失败: 无有效码或已过期";
         return -3;
     }
-    
-    // 验证码存在且未过期 → 有效
-    qDebug() << "验证码校验成功，剩余有效时间:" << now.secsTo(it.value()) << "秒";
+
+    if (userInput != m_captchaCode) {
+        m_captchaFailCount++;
+        // 连续错误达上限 → 触发锁定，冷却升级为锁定时长，作废当前码
+        if (m_captchaFailCount >= CAPTCHA_MAX_FAILS) {
+            m_captchaLockUntil = now.addSecs(CAPTCHA_LOCKOUT_SEC);
+            m_captchaNextAllowed = m_captchaLockUntil;
+            m_captchaCode.clear();
+            remainingSec = CAPTCHA_LOCKOUT_SEC;
+            qDebug() << "验证码连续错误" << m_captchaFailCount << "次，账号锁定" << CAPTCHA_LOCKOUT_SEC << "秒";
+            return -4;
+        }
+        qDebug() << "验证码校验失败: 输入不符";
+        return -2;
+    }
+
+    // 校验成功：一次性使用，作废当前码并重置错误计数
+    m_captchaCode.clear();
+    m_captchaFailCount = 0;
+    qDebug() << "验证码校验成功";
     return 0;
 }
 
@@ -100,39 +129,56 @@ PDU *MsgHandler::logoff()
 
 PDU *MsgHandler::captcha()
 {
-    // 清理已过期的旧验证码
     QDateTime now = QDateTime::currentDateTime();
-    QList<QString> expiredKeys;
-    for (auto it = m_captchas.begin(); it != m_captchas.end(); ++it) {
-        if (now > it.value()) {
-            expiredKeys.append(it.key());
-        }
+    int status = 0;
+    int remaining = 0;
+
+    // 锁定中：禁止获取新码
+    if (m_captchaLockUntil.isValid() && now < m_captchaLockUntil) {
+        status = -6;
+        remaining = now.secsTo(m_captchaLockUntil);
     }
-    for (const QString& key : expiredKeys) {
-        m_captchas.remove(key);
+    // 正常冷却中：拒绝并回传剩余秒数
+    else if (now < m_captchaNextAllowed) {
+        status = -5;
+        remaining = now.secsTo(m_captchaNextAllowed);
     }
-    
-    // 生成新验证码（追加，不覆盖旧码）
-    QString code = generateCaptchaCode(6);
-    QDateTime expiry = QDateTime::currentDateTime().addSecs(60);
-    m_captchas.insert(code, expiry);
-    qDebug() << "生成验证码:" << code << "过期时间:" << expiry << "(当前有效验证码数:" << m_captchas.size() << ")";
-    
-    QByteArray codeBytes = code.toUtf8();
-    PDU* respdu = mkPDU(codeBytes.size() + 1);
+    else {
+        // 覆盖式单码：直接覆盖，旧码自然失效
+        m_captchaCode = generateCaptchaCode(6);
+        m_captchaExpiry = now.addSecs(CAPTCHA_EXPIRE_SEC);
+        m_captchaNextAllowed = now.addSecs(CAPTCHA_COOLDOWN_SEC);
+        remaining = CAPTCHA_COOLDOWN_SEC;   // 成功时回传正常冷却时长
+        status = 0;
+        qDebug() << "生成验证码:" << m_captchaCode << "过期时间:" << m_captchaExpiry;
+    }
+
+    PDU* respdu;
+    if (status == 0) {
+        QByteArray codeBytes = m_captchaCode.toUtf8();
+        respdu = mkPDU(codeBytes.size() + 1);
+        memcpy(respdu->caMsg, codeBytes.constData(), codeBytes.size() + 1);
+    } else {
+        respdu = mkPDU();
+    }
     respdu->uiType = ENUM_MSG_TYPE_CAPTCHA_RESPOND;
-    memcpy(respdu->caMsg, codeBytes.constData(), codeBytes.size() + 1);
+    memcpy(respdu->caData, &status, sizeof(status));
+    memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
     return respdu;
 }
 
 //处理注册请求
 PDU *MsgHandler::rigist()
 {
-    int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen);
+    int remaining = 0;
+    int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen, remaining);
     if (captchaRet != 0) {
         PDU* respdu = mkPDU();
         respdu->uiType = ENUM_MSG_TYPE_REGIST_RESPOND;
         memcpy(respdu->caData, &captchaRet, sizeof(captchaRet));
+        if (captchaRet == -4) {
+            memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
+        }
         return respdu;
     }
     //取出用户名和密码
@@ -159,11 +205,15 @@ PDU *MsgHandler::rigist()
 //处理登录请求，同时需要更新socket对象的客户用户名
 PDU *MsgHandler::login(QString &strname)
 {
-    int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen);
+    int remaining = 0;
+    int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen, remaining);
     if (captchaRet != 0) {
         PDU* respdu = mkPDU();
         respdu->uiType = ENUM_MSG_TYPE_LOGIN_RESPOND;
         memcpy(respdu->caData, &captchaRet, sizeof(captchaRet));
+        if (captchaRet == -4) {
+            memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
+        }
         return respdu;
     }
     //取出用户名和密码
@@ -730,7 +780,7 @@ PDU *MsgHandler::uploadfiledata()
         }
     }
 
-    bool ret=m_uploadSession.append(pdu->caMsg,pdu->uiMsgLen);
+    bool ret=false; // Upload writes are dispatched by MyTcpSocket to UploadWriteTask.
     qDebug()<<"uploadfiledata len"<<pdu->uiMsgLen
             <<"received"<<m_uploadSession.receivedSize()
             <<"total"<<m_uploadSession.totalSize()

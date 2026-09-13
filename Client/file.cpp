@@ -92,12 +92,27 @@ void File::flushfile()
 
 void File::uploadfile(qint64 resumeOffset)
 {
-    Uploader * Uploaderi=new Uploader(m_strUploadPath, resumeOffset);
-    //将上传文件里面的关于UI的语句全部使用信号槽的方式进行调用
-    connect(Uploaderi,&Uploader::seedMsg,&Client::getinstance(),&Client::seedMsg,Qt::QueuedConnection);
-    connect(Uploaderi,&Uploader::errnoMsg,this,&File::errnoMsg,Qt::QueuedConnection);
-    Uploaderi->start();
-    //delete Uploaderi;
+    if(m_uploader){
+        return;
+    }
+    m_uploader=new Uploader(m_strUploadPath,resumeOffset,this);
+    connect(m_uploader,&Uploader::seedMsg,&Client::getinstance(),&Client::seedMsg);
+    connect(m_uploader,&Uploader::errnoMsg,this,&File::errnoMsg);
+    connect(m_uploader,&Uploader::finished,this,[this](bool success){
+        if(success){
+            flushfile();
+        }
+        m_uploader->deleteLater();
+        m_uploader=nullptr;
+    });
+    m_uploader->start();
+}
+
+void File::acknowledgeUploadChunk(bool success, qint64 nextOffset, bool complete)
+{
+    if(m_uploader){
+        m_uploader->acknowledge(success,nextOffset,complete);
+    }
 }
 
 void File::updateCurrfile(QList<FileInfo *> qFileinfolist){

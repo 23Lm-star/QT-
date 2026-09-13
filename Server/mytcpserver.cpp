@@ -38,12 +38,25 @@ void MyTcpServer::incomingConnection(qintptr handle)
     m_tcpSocket->setSocketDescriptor(handle);
     {
         QMutexLocker locker(&m_tcpsocketlistMutex);
+        m_tcpSocket->m_connectionId=++m_nextConnectionId;
         tcpsocketlist.append(m_tcpSocket);
         for(int i=0;i<tcpsocketlist.size();i++){
             qDebug()<<tcpsocketlist[i]<<endl;
         }
     }
     qDebug()<<"新客户端连接完成"<<endl;
+}
+
+void MyTcpServer::handleUploadWriteFinished(quint64 connectionId, qint64 offset,
+                                            qint64 length, bool success)
+{
+    QMutexLocker locker(&m_tcpsocketlistMutex);
+    for(MyTcpSocket* socket : tcpsocketlist){
+        if(socket->m_connectionId == connectionId){
+            socket->handleUploadWriteFinished(offset,length,success);
+            return;
+        }
+    }
 }
 
 MyTcpServer &MyTcpServer::getinstance()

@@ -3,16 +3,19 @@
 #include "protocol.h"
 #include "mytcpserver.h"
 #include "memalloc.h"
+#include "uploadwritetask.h"
 
 #include <QByteArray>
 #include <QFileInfo>
 #include <QTimer>
 #include <QFile>
 #include <QDateTime>
+#include <QThreadPool>
 
 MyTcpSocket::MyTcpSocket()
 {
     connect(this,&MyTcpSocket::readyRead,this,&MyTcpSocket::recvmsg);
+    connect(this,&MyTcpSocket::bytesWritten,this,&MyTcpSocket::onBytesWritten);
     connect(this,&MyTcpSocket::disconnected,this,&MyTcpSocket::clientOffLine);
     m_MsgHandler=new MsgHandler;
     a=0;
@@ -20,6 +23,9 @@ MyTcpSocket::MyTcpSocket()
     m_downloadTotalSize=0;
     m_downloadSentSize=0;
     m_downloadActive=false;
+    m_downloadNextChunkScheduled=false;
+    m_uploadWriteInFlight=false;
+    m_connectionId=0;
     m_invalidPduCount=0;
     m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
 }
@@ -97,8 +103,8 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         break;
     }
     case ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST:{
-        respdu=m_MsgHandler->uploadfiledata();
-        break;
+        handleUploadData(pdu);
+        return nullptr;
     }
     case ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST:{
         respdu=m_MsgHandler->uploadfileinit();
@@ -175,6 +181,50 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
 }
 
 //启动流式下载
+void MyTcpSocket::handleUploadData(PDU* pdu)
+{
+    uint resumeMagic=0;
+    qint64 chunkOffset=0;
+    memcpy(&resumeMagic,pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,sizeof(resumeMagic));
+    memcpy(&chunkOffset,pdu->caData+UPLOAD_CHUNK_OFFSET,sizeof(chunkOffset));
+
+    const qint64 expectedOffset=m_MsgHandler->m_uploadSession.receivedSize();
+    if(resumeMagic != UPLOAD_RESUME_MAGIC || m_uploadWriteInFlight
+            || chunkOffset != expectedOffset || pdu->uiMsgLen == 0
+            || pdu->uiMsgLen > m_MsgHandler->m_uploadSession.totalSize()-expectedOffset
+            || m_MsgHandler->m_uploadSession.stagingFilePath().isEmpty()){
+        sendUploadAck(false,expectedOffset,m_MsgHandler->m_uploadSession.isComplete());
+        return;
+    }
+
+    m_uploadWriteInFlight=true;
+    const QByteArray data(pdu->caMsg,pdu->uiMsgLen);
+    QThreadPool::globalInstance()->start(new UploadWriteTask(
+            m_connectionId,m_MsgHandler->m_uploadSession.stagingFilePath(),chunkOffset,data));
+}
+
+void MyTcpSocket::handleUploadWriteFinished(qint64 offset, qint64 length, bool success)
+{
+    m_uploadWriteInFlight=false;
+    if(success){
+        success=m_MsgHandler->m_uploadSession.acceptWrittenChunk(offset,length);
+    }
+    sendUploadAck(success,m_MsgHandler->m_uploadSession.receivedSize(),
+                  success && m_MsgHandler->m_uploadSession.isComplete());
+}
+
+void MyTcpSocket::sendUploadAck(bool success, qint64 nextOffset, bool complete)
+{
+    PDU* response=mkPDU();
+    const uint resumeMagic=UPLOAD_RESUME_MAGIC;
+    response->uiType=ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND;
+    memcpy(response->caData,&success,sizeof(success));
+    memcpy(response->caData+UPLOAD_ACK_NEXT_OFFSET,&nextOffset,sizeof(nextOffset));
+    memcpy(response->caData+UPLOAD_ACK_COMPLETE_OFFSET,&complete,sizeof(complete));
+    memcpy(response->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
+    seedMsg(response);
+}
+
 void MyTcpSocket::startDownloadStream(const QString& filePath)
 {
     if(m_downloadFile){
@@ -204,15 +254,37 @@ void MyTcpSocket::startDownloadStream(const QString& filePath)
 
     qDebug()<<"开始流式下载:"<<filePath<<"大小:"<<m_downloadTotalSize;
     //用 0ms 延迟的单次定时器启动分块发送（异步，避免阻塞事件循环）
+    scheduleNextDownloadChunk();
+}
+
+void MyTcpSocket::scheduleNextDownloadChunk()
+{
+    if(!m_downloadActive || m_downloadNextChunkScheduled){
+        return;
+    }
+    m_downloadNextChunkScheduled=true;
     QTimer::singleShot(0,this,&MyTcpSocket::sendNextChunk);
+}
+
+void MyTcpSocket::onBytesWritten(qint64)
+{
+    if(m_downloadActive && bytesToWrite()<DOWNLOAD_WRITE_HIGH_WATER){
+        scheduleNextDownloadChunk();
+    }
 }
 
 //发送下一个数据块
 void MyTcpSocket::sendNextChunk()
 {
+    m_downloadNextChunkScheduled=false;
     if(!m_downloadActive || !m_downloadFile || !m_downloadFile->isOpen()){
         qDebug()<<"下载状态无效，停止分块发送";
         m_downloadActive=false;
+        return;
+    }
+
+    if(bytesToWrite()+DOWNLOAD_CHUNK_SIZE+static_cast<qint64>(sizeof(PDU))
+            > DOWNLOAD_WRITE_HIGH_WATER){
         return;
     }
 
@@ -260,7 +332,7 @@ void MyTcpSocket::sendNextChunk()
     seedMsg(dataPdu);
 
     //调度下一个块
-    QTimer::singleShot(0,this,&MyTcpSocket::sendNextChunk);
+    scheduleNextDownloadChunk();
 }
 //接收客户端消息
 void MyTcpSocket::recvmsg(){

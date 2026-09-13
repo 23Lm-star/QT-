@@ -70,8 +70,9 @@ DatabaseConnectionPool &DatabaseConnectionPool::instance()
 }
 
 DatabaseConnectionPool::DatabaseConnectionPool()
-    : m_nextConnectionId(0),
-      m_maxConnectionCountPerThread(8),
+    : m_createdCount(0),
+      m_nextConnectionId(0),
+      m_maxConnectionCount(8),
       m_inited(false),
       m_driverName("QMYSQL"),
       m_port(3306)
@@ -88,7 +89,7 @@ void DatabaseConnectionPool::init(const QString &hostName,
                                   const QString &userName,
                                   const QString &password,
                                   const QString &databaseName,
-                                  int maxConnectionCountPerThread)
+                                  int maxConnectionCount)
 {
     QMutexLocker locker(&m_mutex);
     m_hostName = hostName;
@@ -96,7 +97,7 @@ void DatabaseConnectionPool::init(const QString &hostName,
     m_userName = userName;
     m_password = password;
     m_databaseName = databaseName;
-    m_maxConnectionCountPerThread = qMax(1, maxConnectionCountPerThread);
+    m_maxConnectionCount = qMax(1, maxConnectionCount);
     m_inited = true;
 }
 
@@ -114,10 +115,8 @@ PooledSqlConnection DatabaseConnectionPool::acquire()
         return PooledSqlConnection();
     }
 
-    const Qt::HANDLE threadId = QThread::currentThreadId();
-    ThreadConnections &threadConnections = m_connections[threadId];
-    while (!threadConnections.idleConnectionNames.isEmpty()) {
-        const QString connectionName = threadConnections.idleConnectionNames.dequeue();
+    while (!m_idleConnectionNames.isEmpty()) {
+        const QString connectionName = m_idleConnectionNames.dequeue();
         if (!QSqlDatabase::contains(connectionName)) {
             continue;
         }
@@ -131,27 +130,28 @@ PooledSqlConnection DatabaseConnectionPool::acquire()
         return PooledSqlConnection(connectionName);
     }
 
-    if (threadConnections.createdCount >= m_maxConnectionCountPerThread) {
-        qDebug() << "database connection pool exhausted in current thread";
+    if (m_createdCount >= m_maxConnectionCount) {
+        qDebug() << "database connection pool exhausted";
         return PooledSqlConnection();
     }
 
-    const QString connectionName = createConnectionName(threadId);
+    const QString connectionName = createConnectionName();
     if (!openConnection(connectionName)) {
         return PooledSqlConnection();
     }
 
-    ++threadConnections.createdCount;
-    m_connectionThreads.insert(connectionName, threadId);
+    ++m_createdCount;
+    m_allConnectionNames.insert(connectionName);
     return PooledSqlConnection(connectionName);
 }
 
 void DatabaseConnectionPool::close()
 {
     QMutexLocker locker(&m_mutex);
-    const QStringList connectionNames = m_connectionThreads.keys();
-    m_connections.clear();
-    m_connectionThreads.clear();
+    const QStringList connectionNames = m_allConnectionNames.values();
+    m_idleConnectionNames.clear();
+    m_allConnectionNames.clear();
+    m_createdCount = 0;
 
     for (const QString &connectionName : connectionNames) {
         if (!QSqlDatabase::contains(connectionName)) {
@@ -167,11 +167,9 @@ void DatabaseConnectionPool::close()
     m_inited = false;
 }
 
-QString DatabaseConnectionPool::createConnectionName(Qt::HANDLE threadId)
+QString DatabaseConnectionPool::createConnectionName()
 {
-    return QString("mysql_pool_%1_%2")
-            .arg(reinterpret_cast<quintptr>(threadId))
-            .arg(++m_nextConnectionId);
+    return QString("mysql_pool_%1").arg(++m_nextConnectionId);
 }
 
 bool DatabaseConnectionPool::openConnection(const QString &connectionName)
@@ -196,10 +194,9 @@ bool DatabaseConnectionPool::openConnection(const QString &connectionName)
 void DatabaseConnectionPool::release(const QString &connectionName)
 {
     QMutexLocker locker(&m_mutex);
-    if (!m_connectionThreads.contains(connectionName)) {
+    if (!m_allConnectionNames.contains(connectionName)) {
         return;
     }
 
-    const Qt::HANDLE threadId = m_connectionThreads.value(connectionName);
-    m_connections[threadId].idleConnectionNames.enqueue(connectionName);
+    m_idleConnectionNames.enqueue(connectionName);
 }

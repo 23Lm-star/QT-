@@ -47,7 +47,8 @@ public:
 
     QTimer* m_captchaCooldownTimer;
     int m_captchaCooldownSec;
-    void startCaptchaCooldown();
+    bool m_captchaLocked;   // 账号已锁定（10分钟）：注册/登录/获取验证码均在客户端拦截
+    void startCaptchaCooldown(int sec, bool locked = false);
     void onCaptchaCooldownTick();
     void sendHeartbeat();
     // 心跳开关（调试/模拟僵尸用，true=正常发PING，false=停发模拟假死）
@@ -77,6 +78,8 @@ private slots:
     void onSocketDisconnected();
     //重连窗口"重新连接"按钮 → 发起重连
     void onReconnectRequested();
+    //重连成功后强制回到登录页（服务端重启后需重新鉴权）
+    void forceReLogin();
 
 private:
     Ui::Client *ui;

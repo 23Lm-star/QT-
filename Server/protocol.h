@@ -9,6 +9,8 @@ static const int UPLOAD_FILE_SIZE_OFFSET = 32;
 static const int UPLOAD_RESUME_OFFSET = 32;
 static const int UPLOAD_RESUME_MAGIC_OFFSET = 40;
 static const int UPLOAD_CHUNK_OFFSET = 0;
+static const int UPLOAD_ACK_NEXT_OFFSET = 8;
+static const int UPLOAD_ACK_COMPLETE_OFFSET = 16;
 
 //消息类型的枚举值
 enum ENUM_MSG_TYPE {

@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QMutex>
 #include <QQueue>
+#include <QSet>
 #include <QString>
 #include <QtSql/QSqlDatabase>
 #include <QtSql/QSqlError>
@@ -46,7 +47,7 @@ public:
               const QString &userName,
               const QString &password,
               const QString &databaseName,
-              int maxConnectionCountPerThread = 8);
+              int maxConnectionCount = 8);
     bool testConnection();
     PooledSqlConnection acquire();
     void close();
@@ -54,27 +55,22 @@ public:
 private:
     friend class PooledSqlConnection;
 
-    struct ThreadConnections
-    {
-        QQueue<QString> idleConnectionNames;
-        int createdCount = 0;
-    };
-
     DatabaseConnectionPool();
     ~DatabaseConnectionPool();
 
     DatabaseConnectionPool(const DatabaseConnectionPool &) = delete;
     DatabaseConnectionPool &operator=(const DatabaseConnectionPool &) = delete;
 
-    QString createConnectionName(Qt::HANDLE threadId);
+    QString createConnectionName();
     bool openConnection(const QString &connectionName);
     void release(const QString &connectionName);
 
     QMutex m_mutex;
-    QHash<Qt::HANDLE, ThreadConnections> m_connections;
-    QHash<QString, Qt::HANDLE> m_connectionThreads;
-    int m_nextConnectionId;
-    int m_maxConnectionCountPerThread;
+    QQueue<QString> m_idleConnectionNames;   // 全局共享的空闲连接队列（不再按线程分区）
+    QSet<QString> m_allConnectionNames;      // 所有创建过的连接名，用于统一释放
+    int m_createdCount;                       // 已创建连接数（受全局上限约束）
+    int m_nextConnectionId;                   // 连接名序号
+    int m_maxConnectionCount;                 // 全局最大连接数
     bool m_inited;
 
     QString m_driverName;

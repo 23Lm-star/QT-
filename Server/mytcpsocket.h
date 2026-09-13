@@ -18,6 +18,7 @@ public:
     MsgHandler* m_MsgHandler;
     //登录的用户名
     QString m_strLoginName;
+    quint64 m_connectionId;
     //存储传输的pdu字节流
     int a;
     QByteArray m_dpulist;
@@ -34,7 +35,13 @@ public:
     qint64 m_downloadTotalSize;
     qint64 m_downloadSentSize;
     bool m_downloadActive;
+    bool m_downloadNextChunkScheduled;
+    bool m_uploadWriteInFlight;
+    static constexpr qint64 DOWNLOAD_WRITE_HIGH_WATER = 256 * 1024;
     void startDownloadStream(const QString& filePath);
+    void scheduleNextDownloadChunk();
+    void handleUploadData(PDU* pdu);
+    void sendUploadAck(bool success, qint64 nextOffset, bool complete);
     // 所有权规则：
     // - 返回非空 PDU → 由 recvmsg() 调用 seedMsg() 写入并释放
     // - 返回 nullptr   → PDU 已由 handlMsg() 内部发送并释放（如下载流），或无需响应
@@ -45,7 +52,9 @@ private:
     void sendAndRelease(PDU* pdu);
 private slots:
     void sendNextChunk();
+    void onBytesWritten(qint64 bytes);
 public slots:
+    void handleUploadWriteFinished(qint64 offset, qint64 length, bool success);
     void recvmsg();//接收信息引起的槽函数
     void clientOffLine();//客户端登录下线断开连接的槽函数
 

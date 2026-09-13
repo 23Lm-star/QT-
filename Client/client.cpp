@@ -36,6 +36,15 @@ void copyExactField(char *dst, int dstSize, const QByteArray &src)
     memset(dst, 0, dstSize);
     memcpy(dst, src.constData(), qMin(src.size(), dstSize));
 }
+
+// 把剩余秒数格式化成 MM:SS，用于获取验证码按钮的倒计时显示
+QString formatCooldown(int sec)
+{
+    sec = qMax(0, sec);
+    int m = sec / 60;
+    int s = sec % 60;
+    return QString("%1:%2").arg(m, 2, 10, QChar('0')).arg(s, 2, 10, QChar('0'));
+}
 }
 
 Client::Client(QWidget *parent)
@@ -48,6 +57,7 @@ Client::Client(QWidget *parent)
     loadconfig();
     ui->loadingLabel->hide();
     m_captchaCooldownSec=0;
+    m_captchaLocked=false;
     m_captchaCooldownTimer=new QTimer(this);
     connect(m_captchaCooldownTimer,&QTimer::timeout,this,&Client::onCaptchaCooldownTick);
     
@@ -284,12 +294,31 @@ void Client::seedMsg(PDU *pdu){
 
 void Client::connectsort(){
     qDebug()<<"服务器连接成功"<<endl;
-    if (m_reconnectDlg && m_reconnectDlg->isVisible()) {
+    // 区分"首次连接"与"断线后重连"：重连弹窗可见过说明这是一次重连
+    bool wasReconnect = (m_reconnectDlg && m_reconnectDlg->isVisible());
+    if (wasReconnect) {
         qDebug() << "[HEARTBEAT] 重连成功，关闭重连窗口";
         m_reconnectDlg->accept();   // 触发 closeEvent → 停止 spinner
         m_serverLostShown = false;
         m_lastPongMs = QDateTime::currentMSecsSinceEpoch();
+        forceReLogin();             // 服务端重启后需重新登录，否则新连接无身份
     }
+}
+
+// 服务端重启/连接重建后，本连接的服务端身份已丢失，必须重新登录。
+// 这里直接回到登录界面，要求用户重新输入账号密码；服务端会为新连接重建
+// m_strLoginName，从而修复"重连后 listdir/movefile 退化到 ./filesys 根目录"
+// 以及"未重新鉴权就继续收发文件/聊天"的隐患。
+void Client::forceReLogin() {
+    m_loggedIn = false;
+    // 回到登录界面（Client 在登录成功后曾被 hide，这里重新显示）
+    Index::getinstance().hide();
+    this->show();
+    this->raise();
+    this->activateWindow();
+    flus();                         // 清空账号/密码输入框
+    QMessageBox::information(this, "提示",
+        "与服务器的连接已恢复。\n由于服务端已重启，请重新登录。");
 }
 
 void Client::recvmsg(){
@@ -306,6 +335,10 @@ void Client::recvmsg(){
 }
 
 void Client::on_register_PB_clicked(){
+    if (m_captchaLocked) {
+        QMessageBox::information(this,"提示","账号已锁定，请等待倒计时结束后重试");
+        return;
+    }
     QString strname=ui->name_LE->text();
     QString strpwd=ui->pwd_LE->text();
     if(strname.isEmpty()||strpwd.isEmpty()||strname.toUtf8().size()>31){
@@ -323,6 +356,10 @@ void Client::on_register_PB_clicked(){
 }
 
 void Client::on_login_PB_clicked(){
+    if (m_captchaLocked) {
+        QMessageBox::information(this,"提示","账号已锁定，请等待倒计时结束后重试");
+        return;
+    }
     QString captchaInput=ui->randcode_LE->text();
     if(captchaInput.isEmpty()){
         QMessageBox::information(this,"提示","请输入验证码");
@@ -346,6 +383,10 @@ void Client::on_login_PB_clicked(){
 
 //请求服务端验证码
 void Client::on_pushButton_clicked(){
+    // 客户端拦截：冷却/锁定中直接拒绝发送"获取验证码"请求（按钮本就禁用，这里兜底）
+    if (m_captchaLocked || m_captchaCooldownSec > 0) {
+        return;
+    }
     if(sorket.state()!=QAbstractSocket::ConnectedState){
         QMessageBox::information(this,"提示","未连接服务器，无法获取验证码");
         return;
@@ -363,10 +404,17 @@ void Client::resetCaptchaButton(){
     ui->pushButton->setEnabled(true);
 }
 
-void Client::startCaptchaCooldown(){
-    m_captchaCooldownSec=60;
+void Client::startCaptchaCooldown(int sec, bool locked){
+    if (sec <= 0) sec = locked ? 600 : 60;
+    m_captchaCooldownSec=sec;
+    m_captchaLocked=locked;
     ui->pushButton->setEnabled(false);
-    ui->pushButton->setText(QString("%1s").arg(m_captchaCooldownSec));
+    ui->pushButton->setText(formatCooldown(m_captchaCooldownSec));
+    if (locked) {
+        // 锁定期间：注册/登录按钮也禁用，点击将被客户端直接拦截
+        ui->register_PB->setEnabled(false);
+        ui->login_PB->setEnabled(false);
+    }
     m_captchaCooldownTimer->start(1000);
 }
 
@@ -376,9 +424,15 @@ void Client::onCaptchaCooldownTick(){
         m_captchaCooldownTimer->stop();
         resetCaptchaButton();
         ui->pushButton->setText("获取验证码");
+        if (m_captchaLocked) {
+            // 10 分钟锁定结束：恢复注册/登录，后续冷却回到 1 分钟（由服务端下发时长驱动）
+            m_captchaLocked = false;
+            ui->register_PB->setEnabled(true);
+            ui->login_PB->setEnabled(true);
+        }
         return;
     }
-    ui->pushButton->setText(QString("%1s").arg(m_captchaCooldownSec));
+    ui->pushButton->setText(formatCooldown(m_captchaCooldownSec));
 }
 
 //发送注销账户请求

@@ -1,6 +1,7 @@
 #include "resumableuploadsession.h"
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 
 ResumableUploadSession::ResumableUploadSession()
@@ -21,16 +22,9 @@ ResumableUploadSession::BeginResult ResumableUploadSession::begin(const QString 
 {
     reset();
 
-    BeginResult result;
-    result.ok = false;
-    result.offset = 0;
-    result.complete = false;
-
-    if (dirPath.isEmpty()
-            || fileName.isEmpty()
-            || fileName.contains('/')
-            || fileName.contains('\\')
-            || totalSize < 0) {
+    BeginResult result = {false, 0, false};
+    if (dirPath.isEmpty() || fileName.isEmpty() || fileName.contains('/')
+            || fileName.contains('\\') || totalSize < 0) {
         return result;
     }
 
@@ -39,75 +33,43 @@ ResumableUploadSession::BeginResult ResumableUploadSession::begin(const QString 
         return result;
     }
 
-    const QString filePath = dir.filePath(fileName);
-    QFileInfo fileInfo(filePath);
+    m_filePath = dir.filePath(fileName);
+    QFileInfo fileInfo(m_filePath);
     qint64 offset = 0;
-
     if (resumeEnabled && fileInfo.exists() && fileInfo.isFile()) {
-        const qint64 existsSize = fileInfo.size();
-        if (existsSize > 0 && existsSize < totalSize) {
-            offset = existsSize;
-        } else if (existsSize == totalSize) {
-            m_receivedSize = existsSize;
+        const qint64 existingSize = fileInfo.size();
+        if (existingSize > 0 && existingSize < totalSize) {
+            offset = existingSize;
+        } else if (existingSize == totalSize) {
+            m_receivedSize = existingSize;
             m_totalSize = totalSize;
-            result.ok = true;
-            result.offset = existsSize;
-            result.complete = true;
-            return result;
+            return {true, existingSize, true};
         }
     }
 
-    m_file.setFileName(filePath);
+    QFile file(m_filePath);
     QIODevice::OpenMode mode = QIODevice::WriteOnly;
-    if (resumeEnabled && offset > 0) {
-        mode |= QIODevice::Append;
-    } else {
-        mode |= QIODevice::Truncate;
-    }
-
-    if (!m_file.open(mode)) {
+    mode |= ((resumeEnabled && offset > 0) ? QIODevice::Append : QIODevice::Truncate);
+    if (!file.open(mode)) {
         reset();
         return result;
     }
+    file.close();
 
     m_receivedSize = offset;
     m_totalSize = totalSize;
     result.ok = true;
     result.offset = offset;
     result.complete = isComplete();
-    if (result.complete) {
-        m_file.flush();
-        m_file.close();
-    }
     return result;
 }
 
-bool ResumableUploadSession::append(const char *data, qint64 len)
+bool ResumableUploadSession::acceptWrittenChunk(qint64 offset, qint64 len)
 {
-    if (data == nullptr || len < 0 || !m_file.isOpen()) {
+    if (offset != m_receivedSize || len <= 0 || len > m_totalSize - m_receivedSize) {
         return false;
     }
-
-    if (len == 0) {
-        return true;
-    }
-
-    const qint64 remaining = m_totalSize - m_receivedSize;
-    if (remaining <= 0) {
-        return true;
-    }
-
-    const qint64 writeLen = len > remaining ? remaining : len;
-    const qint64 writeCount = m_file.write(data, writeLen);
-    if (writeCount != writeLen) {
-        return false;
-    }
-
-    m_receivedSize += writeCount;
-    if (isComplete()) {
-        m_file.flush();
-        m_file.close();
-    }
+    m_receivedSize += len;
     return true;
 }
 
@@ -126,13 +88,14 @@ qint64 ResumableUploadSession::totalSize() const
     return m_totalSize;
 }
 
+QString ResumableUploadSession::stagingFilePath() const
+{
+    return m_filePath;
+}
+
 void ResumableUploadSession::reset()
 {
-    if (m_file.isOpen()) {
-        m_file.flush();
-        m_file.close();
-    }
-    m_file.setFileName(QString());
+    m_filePath.clear();
     m_receivedSize = 0;
     m_totalSize = 0;
 }

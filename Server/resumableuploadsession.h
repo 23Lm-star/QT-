@@ -1,7 +1,6 @@
 #ifndef RESUMABLEUPLOADSESSION_H
 #define RESUMABLEUPLOADSESSION_H
 
-#include <QFile>
 #include <QString>
 
 class ResumableUploadSession
@@ -21,14 +20,15 @@ public:
                       const QString &fileName,
                       qint64 totalSize,
                       bool resumeEnabled);
-    bool append(const char *data, qint64 len);
+    bool acceptWrittenChunk(qint64 offset, qint64 len);
     bool isComplete() const;
     qint64 receivedSize() const;
     qint64 totalSize() const;
+    QString stagingFilePath() const;
     void reset();
 
 private:
-    QFile m_file;
+    QString m_filePath;
     qint64 m_receivedSize;
     qint64 m_totalSize;
 };

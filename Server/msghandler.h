@@ -52,9 +52,24 @@ public:
     PDU* resolvePublishLink(const QString& loginName);
     PDU* queryFilePublishLink();
 
-    //验证码存储
-    QMap<QString, QDateTime> m_captchas;
-    int validateCaptcha(const char* caMsg, uint uiMsgLen); // 0通过,-2错误,-3过期
+    // ===== 验证码：单码复用 + 服务端强制冷却 + 连续错误锁定 =====
+    // 参数（与服务端逻辑强一致）
+    static const int CAPTCHA_COOLDOWN_SEC = 60;   // 正常冷却：获取新码后 60s 内禁止再取
+    static const int CAPTCHA_LOCKOUT_SEC = 600;   // 锁定：连续错误达上限后冷静 10 分钟
+    static const int CAPTCHA_MAX_FAILS   = 5;     // 连续错误达到此值触发锁定
+    static const int CAPTCHA_EXPIRE_SEC  = 60;    // 单条验证码有效期（秒）
+
+    // 单码状态（每连接仅保留一个当前有效码，重取即让旧码失效）
+    QString m_captchaCode;
+    QDateTime m_captchaExpiry;
+
+    // 冷却 / 锁定状态
+    QDateTime m_captchaNextAllowed;   // 最早可再次成功获取验证码的时间
+    QDateTime m_captchaLockUntil;     // 锁定结束时间（isValid() 且 now < 此值 => 锁定中）
+    int m_captchaFailCount;           // 连续错误计数
+
+    // 返回：0通过 / -2错误(不存在或不符) / -3过期 / -4已锁定；remainingSec 输出锁定剩余秒数
+    int validateCaptcha(const char* caMsg, uint uiMsgLen, int& remainingSec);
 
     //下载文件时存储通过验证的规范路径
     QString m_downloadCanonicalPath;

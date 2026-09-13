@@ -30,6 +30,15 @@ void MsgHandler::handlrigist(){
         QMessageBox::information(&Client::getinstance(),"提示","验证码已过期，请重新获取");
         return;
     }
+    if(ret==-4){
+        int rem=0;
+        memcpy(&rem,this->pdu->caData+4,sizeof(rem));
+        // 触发客户端 10 分钟锁定：获取验证码按钮进入倒计时，注册/登录被客户端拦截
+        Client::getinstance().startCaptchaCooldown(rem > 0 ? rem : 600, true);
+        QMessageBox::information(&Client::getinstance(),"提示",
+            QString("验证码错误次数过多，账号已锁定，请 %1 分钟后再试").arg(qMax(1,rem/60)));
+        return;
+    }
     if(ret){
         Client::getinstance().showLoadingAnimation(true);
         QString name=QString(rigistName);
@@ -56,6 +65,15 @@ void MsgHandler::handllogin()
     }
     if(ret==-3){
         QMessageBox::information(&Client::getinstance(),"提示","验证码已过期，请重新获取");
+        return;
+    }
+    if(ret==-4){
+        int rem=0;
+        memcpy(&rem,pdu->caData+4,sizeof(rem));
+        // 触发客户端 10 分钟锁定：获取验证码按钮进入倒计时，注册/登录被客户端拦截
+        Client::getinstance().startCaptchaCooldown(rem > 0 ? rem : 600, true);
+        QMessageBox::information(&Client::getinstance(),"提示",
+            QString("验证码错误次数过多，账号已锁定，请 %1 分钟后再试").arg(qMax(1,rem/60)));
         return;
     }
     if(ret==1){
@@ -322,16 +340,15 @@ void MsgHandler::uploadfiledata()
     // 上传数据块响应处理：仅根据服务端状态更新界面或继续上传，移除与文件改名无关的逻辑
     bool ret=true;
     uint resumeMagic=0;
+    qint64 nextOffset=0;
+    bool complete=false;
     memcpy(&resumeMagic,pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,sizeof(resumeMagic));
     if(resumeMagic == UPLOAD_RESUME_MAGIC){
         memcpy(&ret,pdu->caData,sizeof(ret));
+        memcpy(&nextOffset,pdu->caData+UPLOAD_ACK_NEXT_OFFSET,sizeof(nextOffset));
+        memcpy(&complete,pdu->caData+UPLOAD_ACK_COMPLETE_OFFSET,sizeof(complete));
     }
-    if(!ret){
-        QMessageBox::information(&Index::getinstance(),"提示","上传文件块失败");
-        return;
-    }
-    // 仅刷新当前文件列表，确保同步状态，不再触发额外的重命名处理
-    Index::getinstance().getFile()->flushfile();
+    Index::getinstance().getFile()->acknowledgeUploadChunk(ret,nextOffset,complete);
 }
 
 void MsgHandler::flushfile()
@@ -541,11 +558,29 @@ void MsgHandler::handlfinduser(){
 }
 
 void MsgHandler::handleCaptcha(){
-    QByteArray codeBytes(pdu->caMsg,pdu->uiMsgLen);
-    QString code=QString::fromUtf8(codeBytes).trimmed();
-    qDebug()<<"收到服务端验证码:"<<code;
-    Client::getinstance().updateCaptchaDisplay(code);
-    Client::getinstance().startCaptchaCooldown();
+    int status;
+    memcpy(&status, pdu->caData, sizeof(status));
+    int remaining;
+    memcpy(&remaining, pdu->caData + 4, sizeof(remaining));
+
+    if (status == 0) {
+        // 成功：更新显示并启动正常冷却（倒计时由服务端下发秒数驱动）
+        QByteArray codeBytes(pdu->caMsg, pdu->uiMsgLen);
+        QString code = QString::fromUtf8(codeBytes).trimmed();
+        qDebug() << "收到服务端验证码:" << code;
+        Client::getinstance().updateCaptchaDisplay(code);
+        Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
+    } else if (status == -5) {
+        // 冷却中：禁止获取，按服务端剩余秒数倒计时
+        Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
+        QMessageBox::information(&Client::getinstance(), "提示",
+            QString("获取验证码过于频繁，请 %1 秒后再试").arg(remaining));
+    } else if (status == -6) {
+        // 锁定中：获取验证码按钮进入 10 分钟倒计时，并禁用注册/登录（客户端拦截）
+        Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 600, true);
+        QMessageBox::information(&Client::getinstance(), "提示",
+            QString("账号已锁定，请 %1 分钟后再试").arg(qMax(1, remaining / 60)));
+    }
 }
 
 void MsgHandler::handlMoveFile()

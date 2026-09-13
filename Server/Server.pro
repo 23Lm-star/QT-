@@ -26,6 +26,7 @@ SOURCES += \
     resumableuploadsession.cpp \
     server.cpp \
     sharelinkservice.cpp \
+    uploadwritetask.cpp \
     ThreadCache.cpp \
     CentralCache.cpp \
     PageCache.cpp \
@@ -42,6 +43,7 @@ HEADERS += \
     resumableuploadsession.h \
     server.h \
     sharelinkservice.h \
+    uploadwritetask.h \
     Common.h \
     ThreadCache.h \
     CentralCache.h \

@@ -25,11 +25,15 @@ public:
     void sendAddFriendAndRelease(char* tarname, PDU* pdu);
     //信息转发
     void reseed(char*tarname,PDU*pdu);
+public slots:
+    void handleUploadWriteFinished(quint64 connectionId, qint64 offset,
+                                   qint64 length, bool success);
 private:
     MyTcpServer();
     //记录所有已经建立连接的 socket对象 链表
     QList<MyTcpSocket*>tcpsocketlist;
     QMutex m_tcpsocketlistMutex;
+    quint64 m_nextConnectionId = 0;
 
     //僵尸连接检测：每隔一段时间扫描，静默超过阈值的连接直接 abort 清理
     qint64 m_zombieTimeoutMs;   // 阈值(ms)，由 zombie_timeout.cfg 读取秒数，默认 90000 (90s)
