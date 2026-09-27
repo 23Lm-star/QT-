@@ -1,3 +1,4 @@
+/build/
 # Qt/qmake build artifacts
 build-*/
 Client/_github_bundle_repo/
