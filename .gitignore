@@ -10,6 +10,7 @@ Client/_github_bundle_repo/
 Makefile
 Makefile.Debug
 Makefile.Release
+Makefile.*
 object_script.*.Debug
 object_script.*.Release
 .qmake.stash
@@ -43,3 +44,32 @@ Desktop.ini
 
 # Binary executables
 *.exe
+
+# AI and local planning
+/.claude/
+/.planning/
+/.ui_headers_backup_*/
+
+# Local documentation and resume tooling
+/findings.md
+/progress.md
+/task_plan.md
+/update_resume.ps1
+/update_resume_docx.py
+/项目面试文档.md
+/output/
+
+# Local tests and AI task prompts
+/regression_publink_test.py
+/smoke_test.py
+/tier2_publink_simulation.py
+/task_prompt_*.txt
+
+# Redundant vendored material and generated runtime data
+/Server/qtbase/
+/Server/project-docs/
+/Server/filesys/
+
+# Python cache
+__pycache__/
+*.pyc
