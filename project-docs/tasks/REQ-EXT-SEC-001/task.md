@@ -70,3 +70,12 @@
 - 新候选端到端：**47/47 PASS**（原 44 + K2 三例：K2a 未分享给 B 的源伪造同意被拒且无落地 / K2b 正常握手同意落地成功 / K2c 重放同意被拒一次性消费）。证据 `build/evidence/.../eb0ecc1…/`（manifest-sha256 851b6545…）。
 - **F-1（既有，不在本 diff）/I-4（既有 recvmsg DEBUG）** 按治理另立 SMALL 分支，不随本需求。
 - 待办：**增量复审 `c7c4eed..eb0ecc1`**（新会话只读）→ 三事实行 → merge no-ff。原 c7c4eed 审计结论已被修复超越（修复面为 M-1 一处，需再确认未引入新横向读取且握手登记无绕过）。
+
+## B-1 修复轮记录（2026-09-29，owner）
+- 增量复审（eb0ecc1，会话只读）结论 **拒绝（REJECT）**：**B-1 High——M-1 修复可绕过**。绕过链：认证攻击者用 `SHAREFILE` 把**他人文件**"分享给自己"→ sharefile() 登记不校验源归属 → 攻击者再发 `AGREE_RESPOND` 自我同意 → 完成与 M-1 等价的横向复制。K2a 只测"无登记的伪造同意"，未覆盖"自我登记"。原审计处方 `(sharer,receiver,src)` 三角绑定在实现中被简化成 `(receiver,src)` 且登记侧零校验，属修复偏离设计。
+- **修复（新候选 `0efccb9`）**：`sharefile()` 登记/转发前校验源必须落在**分享人本人用户根**（`pathInActorRoot`）——只能分享自己的文件；源不存在或属他人 → 不登记、不转发邀请、拒绝日志带 conn。同意侧沿用 (actor, canonical) 一次性消费。合法分享语义不变（本人文件→他人同意可跨根复制=设计使然）。
+- 新用例 **K2d**：自我登记他人源→自我同意被拒且零复制（协议面验证）。
+- 流水线 @`0efccb9`：build GREEN / test honest-0 / audit PASS。端到端 **48/48 PASS**（干净注册表：服务端重启后跑，登记不跨进程）。证据 `build/evidence/.../0efccb9…/`（manifest-sha256 3407792b…；控制台 grep 密码哈希=0）。
+- 过程教训（记录在案）：握手登记表是进程内存态——端到端脚本必须独占全新服务端进程运行，否则跨轮残存登记/落盘目标会污染断言（本轮 K2 三连 FAIL 即此因，非产品缺陷）。
+- F-1 已另立 SMALL 分支修复并合入 master（`4ae532e`→merge `fad502b`，closeout `628e491`，e2e 5/5）。功能分支合并前需先 `git merge master` 预解 `msghandler.cpp` createPublishLink 相邻区域冲突并重跑三脚本。
+- 待办：**增量复审 `eb0ecc1..0efccb9`**（重点：B-1 关闭 + 源归属校验的绕过面 + 邀请转发被拒时对合法客户端的可见行为）→ 三事实行 → 功能分支 merge master 预解冲突 → merge no-ff。
