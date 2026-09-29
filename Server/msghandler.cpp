@@ -219,9 +219,6 @@ PDU *MsgHandler::login(QString &strname)
     //取出用户名和密码
     QString username=fixedString(pdu->caData,32);
     QString userpwd=fixedString(pdu->caData+32,32);
-    qDebug()<<"[DIAG-SERVER] login: extracted name="<<username<<" name_hex="<<username.toUtf8().toHex()<<" name_len="<<username.size();
-    qDebug()<<"[DIAG-SERVER] login: pwd_len="<<userpwd.size()<<" pwd_hex="<<userpwd;
-    qDebug()<<"[DIAG-SERVER] caData raw hex:"<<QByteArray(pdu->caData,64).toHex();
     //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleLogin(username.toUtf8().data(),userpwd.toUtf8().data());
     qDebug()<<"login ret"<<ret<<endl;

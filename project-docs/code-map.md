@@ -124,7 +124,7 @@ Server 依赖关系：
 
 | 表 | 用途 | 关键字段 |
 |----|------|---------|
-| `user_info` | 用户认证 | `id`(PK), `name`, `pwd`, `online` |
+| `user_info` | 用户认证 | `id`(PK), `name`, `pwd`（服务端加盐哈希）, `online`, `salt`（`''`=迁移前老数据，登录成功自动补盐） |
 | `friend` | 好友关系（双向） | `user_id`, `friend_id` |
 | `message_info` | 聊天消息 | `seed_name`, `rev_name`, `msg`, `issuccess`, `seed_time` |
 | `share_link`（规划） | 应用内分享链接凭证 | `token_hash`(唯一), `owner_name`, `relative_path`, `expire_time`, `revoked`, `created_at`；仅新增表，不变更既有表 |
