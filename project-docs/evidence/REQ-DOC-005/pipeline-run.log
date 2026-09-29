@@ -1,0 +1,17 @@
+REQ-DOC-005 pipeline run @ docs/repo-chrome 1cdaaa1aaf810acca02f6bdceda4e62a4cab99b1 (2026-09-29 16:49)
+
+[build] powershell -File pipeline/build.ps1
+  build OK: Client -> E:\qt\xiangmu\build\build-Client
+  build OK: Server -> E:\qt\xiangmu\build\build-Server
+  build GREEN (1cdaaa1, 20260929-164944)
+
+[test] powershell -File pipeline/test.ps1
+  test: 0 automated tests registered (fill TESTS in pipeline/test.ps1)
+  GUI/manual verification is recorded as human-verified evidence, not BLOCKED.
+  exit 0 (bootstrap-stage honest report; no auto suite exists yet)
+
+[audit] powershell -File pipeline/audit.ps1
+  audit PASS (1cdaaa1)
+  (docs-only HEAD~1..HEAD diff: no frozen-path hit; O-4 false-report not triggered)
+
+A1/A2 判定依据：README「构建」一节命令即 pipeline/build.ps1，本次实测 GREEN。
