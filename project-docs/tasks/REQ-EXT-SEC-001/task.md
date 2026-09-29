@@ -55,3 +55,10 @@
 - 连接身份可区分：已核实成立（socket 对象 + 服务端 `m_connectionId`/`m_strLoginName`），无需协议变更。
 - 权限入口分散：T2 收敛为单一门函数，审计不得接受客户端隐藏按钮作证据——验收只认服务端拒绝日志与哈希绑定流水线报告。
 - 协议编号：本分支零修改两 `protocol.h`；若开发中发现必须新增字段，停止并回 goal 转 LARGE 协议变更。
+
+## 独立测试节点记录（2026-09-29，测试会话=新会话只读）
+- 结论 **PASS**：pipeline 三脚本复跑 GREEN/honest-0/PASS（frozen 零命中，改动面=Server/ 四文件）；`verify.py` 44/44 且输出与 dev 证据逐字节同哈希（可复现）；独立探针未认证 24 类 PDU 全拒、actor 覆盖判别验证、外链全链路落本人根；拒绝日志 54 行无密码/令牌/文件内容。
+- 证据：`build/evidence/codex-req-ext-sec-001-auth-context/c7c4eed…/independent-test-report.md`；handoff `project-docs/handoffs/req-ext-sec-001-test-2026-09-29.txt`（master）。
+- **F-1（既有缺陷，不在本分支 diff 面，不阻塞）**：`createPublishLink` 同 owner+path 去重复用旧 hash 却回新生成未入库 token → 该次链接永不可解析（基线 `8a0bb84` 即存在，测试探针复现）。按治理应另立 SMALL 分支修复，待主人定夺。
+- F-3（Info，既有架构）：登录资料/在线查询为基线语义；`clientOffLine` 与线程池写回对撤销标志无原子保护，窗口极小。
+- 下一步：independent audit（新会话只读）→ integration 三事实行 → merge no-ff。
