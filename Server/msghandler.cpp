@@ -5,12 +5,15 @@
 #include "mytcpserver.h"
 #include "server.h"
 #include "sharelinkservice.h"
+#include "fileobjectstore.h"
 #include "memalloc.h"
 #include <QByteArray>
 
 #include <QFile>
 #include <QFileInfo>
 #include <QTime>
+#include <QVector>
+#include <QSet>
 #include <cerrno>
 #include <cstring>
 
@@ -496,13 +499,27 @@ PDU *MsgHandler::deldir(const QString& loginName)
     if(!pathInActorRoot(delFilePath)){
         qCWarning(lcFs)<<"[deldir] 拒绝越权删除 conn="<<m_connId<<" 路径:"<<delFilePath;
     }
-    else if(delFileType==1){//如果文件类型为普通文件
-        QFile file(delFilePath);
-        ans=file.remove();//删除文件
-    }
-    else if(delFileType==0){//如果文件类型为目录文件
-        QDir dir(delFilePath);
-        ans=dir.removeRecursively();//删除目录
+    else {
+        // REQ-EXT-FILE-001 D5：先按逻辑条目解引用（验收3：减引用，归零→待回收，不物理删对象）；
+        // 无条目则回退物理删除（未迁移存量文件）。
+        const QFileInfo delInfo(delFilePath);
+        const QString delParent = FileObjectStore::normalizeParent(delInfo.absolutePath());
+        const QString delName = delInfo.fileName();
+        const FileObjectStore::EntryInfo e =
+                FileObjectStore::instance().entryByPath(loginName, delParent, delName);
+        if(e.valid()){
+            if(e.isDir){
+                ans = FileObjectStore::instance().releaseSubtree(e.fileId, loginName);
+            } else {
+                ans = FileObjectStore::instance().releaseEntry(e.fileId, loginName);
+            }
+        } else if(delFileType==1){
+            QFile file(delFilePath);
+            ans=file.remove();
+        } else if(delFileType==0){
+            QDir dir(delFilePath);
+            ans=dir.removeRecursively();
+        }
     }
 
     // 跨功能联动：删除成功后，清理该文件（或目录下所有文件）对应的分享链接记录
@@ -577,20 +594,32 @@ PDU *MsgHandler::flushfile()
         respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
         return respdu;
     }
+    // REQ-EXT-FILE-001 D5：逻辑条目为权威；未迁移物理文件按名并入（不与 active 条目重名）。
+    struct Row { QString name; bool isDir; };
+    QVector<Row> rows;
+    QSet<QString> seen;
+    const QString parent = FileObjectStore::normalizeParent(path);
+    const QList<FileObjectStore::EntryInfo> entries =
+            FileObjectStore::instance().listEntries(m_actorName, parent);
+    for(const FileObjectStore::EntryInfo& e : entries){
+        Row r; r.name=e.displayName; r.isDir=e.isDir; rows.append(r); seen.insert(e.displayName);
+    }
     QDir dir(path);
-    QFileInfoList FileInfolist =dir.entryInfoList();
-    PDU* respdu=mkPDU(sizeof(FileInfo)*(FileInfolist.size()-2));
+    if(dir.exists()){
+        const QFileInfoList phys = dir.entryInfoList();
+        for(int i=0;i<phys.size();++i){
+            const QString nm = phys[i].fileName();
+            if(nm=="."||nm==".."||nm==".staging"||nm=="objects") continue;
+            if(seen.contains(nm)) continue;
+            Row r; r.name=nm; r.isDir=phys[i].isDir(); rows.append(r);
+        }
+    }
+    PDU* respdu=mkPDU(sizeof(FileInfo)*rows.size());
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
-    for(int i=2;i<FileInfolist.size();i++){
-        FileInfo* pFileInfo=(FileInfo*)respdu->caMsg+(i-2);
-        memcpy(pFileInfo->caName,FileInfolist[i].fileName().toStdString().c_str(),32);
-        if(FileInfolist[i].isDir()){//若是目录
-            pFileInfo->uiType=0;
-        }
-        else {//若不是目录
-            pFileInfo->uiType=1;
-        }
-        qCDebug(lcFs)<<"caName"<<pFileInfo->caName<<" uiType"<<pFileInfo->uiType<<" ";
+    for(int i=0;i<rows.size();++i){
+        FileInfo* pFileInfo=(FileInfo*)respdu->caMsg+i;
+        memcpy(pFileInfo->caName,rows[i].name.toUtf8().constData(),32);
+        pFileInfo->uiType=rows[i].isDir?0:1;
     }
     return respdu;
 }
@@ -918,12 +947,26 @@ PDU *MsgHandler::uploadfileinit()
     const bool resumeEnabled = (resumeMagic == UPLOAD_RESUME_MAGIC);
     const QString dirPath = QString::fromUtf8(pdu->caMsg);
     const QString fileName = fixedString(strname, 32);
-    // REQ-FS-003①: 校验 dirPath（所在目录，必定存在）；不对最终文件路径做 canonical（新文件尚不存在）。
-    // begin() 内部的 fileName 校验保留，作为纵深防御第二层；不修改会话类接口。
+    // REQ-EXT-FILE-001 T4：内容寻址暂存——写进 .staging 而非最终目录，完成时 commitUpload 转正。
+    // REQ-FS-003①/SEC-001：所在目录须在 actor 本人用户根内；父路径规范化后作逻辑条目键。
     ResumableUploadSession::BeginResult result = {false, 0, false};
-    // REQ-EXT-SEC-001: 上传目标目录收敛为 actor 本人用户根
-    if (pathInActorRoot(dirPath)) {
-        result = m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
+    m_uploadSessionId = -1;
+    const QString parentPath = FileObjectStore::normalizeParent(dirPath);
+    if (pathInActorRoot(dirPath) && !m_actorName.isEmpty()) {
+        result = m_uploadSession.beginStaged(m_actorName, parentPath, fileName, fileSize, resumeEnabled);
+        if (result.ok) {
+            // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
+            m_uploadSessionId = OperateDB::instance().createUploadSession(
+                m_actorName, parentPath, fileName, fileSize,
+                QString(), m_uploadSession.stagingFilePath(), result.offset, 3600);
+            if (m_uploadSessionId < 0) {
+                qCWarning(lcFs) << "uploadfileinit 会话登记失败 conn=" << m_connId;
+            }
+            if (result.complete) {
+                // 0 字节或断点已到尾部：立即落定（仍走服务端复算，验收4）
+                finalizeUploadOnComplete();
+            }
+        }
     } else {
         qCWarning(lcFs) << "uploadfileinit 拒绝越权目录 conn=" << m_connId << ":" << dirPath;
     }
@@ -978,6 +1021,35 @@ PDU *MsgHandler::uploadfiledata()
     memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
     return respdu;
 }
+// REQ-EXT-FILE-001 T4：上传完成→服务端复算转正 + 建逻辑条目 + 引用计数（同事务）。
+// commitUpload 失败即拒绝转正（验收4）；staging 由其转正搬移或丢弃（验收1）。
+void MsgHandler::finalizeUploadOnComplete()
+{
+    const QString owner = m_actorName;
+    const QString parent = m_uploadSession.parentPath();
+    const QString display = m_uploadSession.displayName();
+    const qint64 expected = m_uploadSession.totalSize();
+    const QString staging = m_uploadSession.stagingFilePath();
+    if (owner.isEmpty() || parent.isEmpty() || display.isEmpty() || staging.isEmpty()) {
+        qCWarning(lcFs) << "[finalizeUpload] 会话上下文缺失，拒绝转正 conn=" << m_connId;
+        return;
+    }
+    qCDebug(lcFs) << "[finalizeUpload] verifying conn=" << m_connId << " owner=" << owner << " display=" << display;
+    OperateDB::instance().finishUploadSession(m_uploadSessionId, "verifying");
+    const FileObjectStore::CommitResult r =
+        FileObjectStore::instance().commitUpload(owner, parent, display, expected, staging);
+    if (r.ok) {
+        OperateDB::instance().finishUploadSession(m_uploadSessionId, "done");
+        qCDebug(lcFs) << "[finalizeUpload] 落定 fileId=" << r.fileId << " objId=" << r.objectId
+                      << " dedup=" << r.dedupHit << " 定名=" << r.displayName;
+    } else {
+        OperateDB::instance().finishUploadSession(m_uploadSessionId, "failed");
+        qCWarning(lcFs) << "[finalizeUpload] 拒绝转正 conn=" << m_connId << " 原因=" << r.error;
+    }
+    m_uploadSession.reset();
+    m_uploadSessionId = -1;
+}
+
 //下载文件（仅做校验，流式分块由 MyTcpSocket 完成）
 PDU *MsgHandler::downloadfile()
 {
@@ -992,14 +1064,25 @@ PDU *MsgHandler::downloadfile()
     m_downloadCanonicalPath.clear();
 
     // REQ-EXT-SEC-001: 下载范围收敛为 actor 本人用户根，他人文件不可下载
-    if(pathInActorRoot(filePath)
-            && fileInfo.isFile()
-            && !fileName.isEmpty()){
-        fileSize=fileInfo.size();
-        ret=true;
-        m_downloadCanonicalPath=canonicalFilePath;
-    } else {
-        qCWarning(lcFs)<<"[downloadfile] 拒绝越权下载 conn="<<m_connId<<" 路径:"<<filePath;
+    if(pathInActorRoot(filePath) && !fileName.isEmpty()){
+        // REQ-EXT-FILE-001 D5：优先解析逻辑条目→对象绝对路径；对象缺失回退物理文件（未迁移）。
+        const QString dlParent = FileObjectStore::normalizeParent(fileInfo.absolutePath());
+        const FileObjectStore::EntryInfo e =
+                FileObjectStore::instance().entryByPath(m_actorName, dlParent, fileName);
+        const QString objAbs = (e.valid() && !e.isDir)
+                ? FileObjectStore::instance().objectAbsPath(e.objectId) : QString();
+        if(!objAbs.isEmpty() && QFileInfo(objAbs).isFile()){
+            fileSize = e.sizeBytes > 0 ? e.sizeBytes : QFileInfo(objAbs).size();
+            m_downloadCanonicalPath = objAbs;
+            ret = true;
+        } else if(fileInfo.isFile()){
+            fileSize=fileInfo.size();
+            m_downloadCanonicalPath=canonicalFilePath;
+            ret=true;
+        }
+    }
+    if(!ret){
+        qCWarning(lcFs)<<"[downloadfile] 拒绝越权/不存在下载 conn="<<m_connId<<" 路径:"<<filePath;
     }
 
     //仅返回元数据 PDU（不含文件内容），实际数据由 MyTcpSocket 流式发送

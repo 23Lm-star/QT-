@@ -59,7 +59,7 @@
 4. **T6 迁移**：`migrateLegacyFiles()` 遍历 `filesys/<user>` 未映射文件→建对象+条目+`file_migration_map`（幂等、同名不同内容→`(1)`、失败不删旧，满足 §6 双向映射停止条件核查）。
 5. **T7**：验收 1-5 端到端脚本（仿 SEC-001 48/48 模式，Python 造 PDU + 服务端日志/DB 断言）+ pipeline 三门 + 证据绑定候选哈希；随后 independent test（新会话）、independent audit（新会话只读）、integration 三事实行、merge。
 
-**待 owner 决策 D5（读侧切换前提）**：内容寻址后新上传文件不再有可浏览的 `filesys/<user>/...` 物理文件（唯一物理副本在 `objects/`，客户端零改动靠服务端从 `user_file` 合成 FileInfo 列表）。确认接受"新文件走对象+条目、旧目录仅作未迁移回退与审计映射"？（推荐：是，否则无法同时满足验收1"一个物理对象"与 D4"客户端零改动"——Windows 无 Qt 硬链接 API 可两全。）
+**D5（owner 批准 2026-09-29）**：对象+逻辑条目为权威——新上传唯一物理副本进 `objects/`，客户端界面无改动靠服务端从 `user_file` 合成列表；旧目录仅作未迁移回退与审计映射。每 handler 采用"先查条目、无则回退物理"的兼容模式，可按 handler 分批落地而不回归。
 
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。

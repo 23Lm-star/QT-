@@ -80,6 +80,12 @@ public:
     //下载文件时存储通过验证的规范路径
     QString m_downloadCanonicalPath;
 
+    // ===== REQ-EXT-FILE-001 T3/T4：内容寻址上传落定 =====
+    qint64 m_uploadSessionId = -1;   // 当前暂存会话 upload_session.session_id
+    // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
+    // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。
+    void finalizeUploadOnComplete();
+
     // REQ-FS-003: 统一路径沙箱校验（集中一处，所有路径入口调用）
     // 根与路径分别做 canonical 归一（解析 ../ 与符号链接）后判前缀；
     // 仅当 根存在 且 路径存在 且 canonical(path) 落在 canonical(root) 内（含根本身）时返回 true。
