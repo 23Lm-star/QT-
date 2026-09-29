@@ -1,0 +1,11 @@
+# handoff: REQ-REPO-006
+branch: chore/history-purge
+head: 8b09f8a4e46cea45ef1d99e3b45b8678b06b8c95
+tier: SMALL
+node: goal
+audit: none
+next: owner answers Q1-Q4 in project-docs/tasks/REQ-REPO-006/task.md, then execute REQ-REPO-006 section 7 on a fresh session
+blockers: awaiting owner approval; credentials already live at origin/master HEAD on GitHub (rotate/repo-privacy is a separate decision)
+evidence: project-docs/evidence/REQ-REPO-006/
+owner: claude-code
+date: 2026-09-29
