@@ -30,7 +30,7 @@
 - **T7 收尾**：任务记录+证据归档 `project-docs/evidence/REQ-EXT-SEC-001/`；BRANCH-ORDER 补一行登记（扩展 E 阶段首支）。
 
 ## 允许路径
-`Server/mytcpsocket.{h,cpp}`、`Server/msghandler.{h,cpp}`、`Server/server.cpp`（仅只读引用，预期不改）、`Server/operatedb.cpp`（如需在线态配合，goal 预判不改）、`Client/file.cpp`、`Client/msghandler.cpp`、`Client/client.cpp`（仅 T4 相对路径配合）、`project-docs/tasks/REQ-EXT-SEC-001/`、`project-docs/evidence/REQ-EXT-SEC-001/`、handoff。
+`Server/mytcpsocket.{h,cpp}`、`Server/msghandler.{h,cpp}`、`Server/mytcpserver.{h,cpp}`（修复节点纳入：M-1 握手登记需要连接注册表单例承载共享状态，属阻塞验收的修复提交，同分支同 owner）、`Server/server.cpp`（仅只读引用，预期不改）、`Server/operatedb.cpp`（如需在线态配合，goal 预判不改）、`Client/file.cpp`、`Client/msghandler.cpp`、`Client/client.cpp`（仅 T4 相对路径配合）、`project-docs/tasks/REQ-EXT-SEC-001/`、`project-docs/evidence/REQ-EXT-SEC-001/`、handoff。
 **禁止**：两 `protocol.h`（frozen，改结构/枚举编号即违规）、`Server/filesys/` 运行数据入库、新外部依赖、顺手加群组逻辑。
 
 ## 待主人批准的决策（approval card）
@@ -62,3 +62,11 @@
 - **F-1（既有缺陷，不在本分支 diff 面，不阻塞）**：`createPublishLink` 同 owner+path 去重复用旧 hash 却回新生成未入库 token → 该次链接永不可解析（基线 `8a0bb84` 即存在，测试探针复现）。按治理应另立 SMALL 分支修复，待主人定夺。
 - F-3（Info，既有架构）：登录资料/在线查询为基线语义；`clientOffLine` 与线程池写回对撤销标志无原子保护，窗口极小。
 - 下一步：independent audit（新会话只读）→ integration 三事实行 → merge no-ff。
+
+## 审计 + 修复节点记录（2026-09-29）
+- 独立审计（c7c4eed）：**PASS（允许合并）**，无 High 阻塞；报告 `build/evidence/.../c7c4eed…/audit-report.md`。A1/A3/A4/A5 PASS；A2 带星标 PASS*，例外即下述 M-1。改动面仅 Server/ 四文件+文档，两 protocol.h、Client/ 零命中。
+- **M-1 修复（本分支，新候选 `eb0ecc1`）**：`sharefilemove` 源路径原仅默认沙箱根（基线遗留，分支注释明示维持）——已认证接收者伪造 `AGREE_RESPOND` 可把沙箱内任意他人已存在文件拷进本人目录=横向读取，违背需求 §2"路径字段不作授权依据"、A2。**根因**：分享是无状态转发，接收者同意时无从校验"该源是否被分享给自己"。**修复**：`sharefile()` 以服务端 canonical 对每位接收者登记握手授权（新增 `MyTcpServer::{add,has,consume}PendingShare`，30min TTL/上限1024/一次性消费）；`sharefilemove()` 仅放行有登记的 (actor, canonical源)，复制改以服务端 canonical 执行（顺带闭合该入口 verify-then-act）。未授权/重放/无登记源一律拒绝。**允许路径同步纳入 `mytcpserver.{h,cpp}`**（阻塞验收的修复提交，同分支同 owner）。
+- 新候选流水线：build GREEN / test honest-0 / **audit PASS（@eb0ecc1）**。
+- 新候选端到端：**47/47 PASS**（原 44 + K2 三例：K2a 未分享给 B 的源伪造同意被拒且无落地 / K2b 正常握手同意落地成功 / K2c 重放同意被拒一次性消费）。证据 `build/evidence/.../eb0ecc1…/`（manifest-sha256 851b6545…）。
+- **F-1（既有，不在本 diff）/I-4（既有 recvmsg DEBUG）** 按治理另立 SMALL 分支，不随本需求。
+- 待办：**增量复审 `c7c4eed..eb0ecc1`**（新会话只读）→ 三事实行 → merge no-ff。原 c7c4eed 审计结论已被修复超越（修复面为 M-1 一处，需再确认未引入新横向读取且握手登记无绕过）。
