@@ -105,3 +105,11 @@ commit-map（61 条，旧→新哈希）归档：`project-docs/evidence/REQ-REPO
 
 ### 停止点
 **未推送。任何 push / force-push 待主人单独批准**（本地历史已与 GitHub 旧历史分叉，推送必然需要 --force）。
+
+### 远端分支清理（2026-09-29 主人批准"远端分支全部删除，不推送"）
+- 已删：`origin/master`（其 HEAD 原含密码 config）、`origin/backup-runnable-2026-07-30`
+- `add_数据库连接池功能` 远端已不存在
+- **未删：`main`**（GitHub 默认分支，push 删除被拒 `refusing to delete the current branch`）
+  ——tip = 6599683 初始提交，其 connect.config 为 host/port/path 无密码，凭据面已全清；
+  残留仅 project-master 测试包。彻底清空需在 GitHub 网页端改默认分支或删仓库（主人决定）
+- 本地新历史未推送，远端现存 `main` 与本地无交集引用
