@@ -8,7 +8,8 @@ CREATE TABLE user_info (
     id INT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(32) UNIQUE NOT NULL,
     pwd VARCHAR(32) NOT NULL,
-    online INT DEFAULT 0
+    online INT DEFAULT 0,
+    salt VARCHAR(32) NOT NULL DEFAULT ''
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE friend (
@@ -18,7 +19,8 @@ CREATE TABLE friend (
     UNIQUE KEY (name, friendName)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 插入测试用户（注意：pwd 字段存储的是 MD5(password) 的 32 字符 hex 串，不是明文！）
+-- 插入测试用户（注意：pwd 字段存储的是服务端加盐后的 32 字符 hex 串，不是明文！）
+-- salt='' 表示迁移前老数据，按裸 MD5 比对；下方种子数据 salt 为空，登录成功后会自动补盐升级
 -- 123456 的 MD5 哈希 = e10adc3949ba59abbe56e057f20f883e
 INSERT INTO user_info (name, pwd, online) VALUES ('tester', 'e10adc3949ba59abbe56e057f20f883e', 1);
 INSERT INTO user_info (name, pwd, online) VALUES ('friend1', 'e10adc3949ba59abbe56e057f20f883e', 1);

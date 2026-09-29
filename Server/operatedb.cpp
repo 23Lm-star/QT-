@@ -3,9 +3,34 @@
 #include "server.h"
 
 #include <QDebug>
+#include <QCryptographicHash>
+#include <QRandomGenerator>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlError>
+
+namespace {
+// 生成 32 位 hex 随机盐（熵源为 OS 级密码学安全随机数）
+QString generatePasswordSalt()
+{
+    quint64 entropy[2];
+    entropy[0] = QRandomGenerator::system()->generate64();
+    entropy[1] = QRandomGenerator::system()->generate64();
+    return QString::fromLatin1(
+        QCryptographicHash::hash(QByteArray(reinterpret_cast<const char *>(entropy), sizeof(entropy)),
+                                 QCryptographicHash::Sha256).toHex().left(32));
+}
+
+// salt 为空表示迁移前的老数据：保持裸哈希原值比对（登录成功后由调用方补盐升级）
+QString applyPasswordSalt(const QString &clientHash, const QString &salt)
+{
+    if (salt.isEmpty()) {
+        return clientHash;
+    }
+    return QString::fromLatin1(
+        QCryptographicHash::hash((clientHash + salt).toUtf8(), QCryptographicHash::Md5).toHex());
+}
+}
 
 OperateDB::~OperateDB()
 {
@@ -63,9 +88,11 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
         return false;
     }
 
-    q.prepare("insert into user_info(name,pwd) values(?,?)");
+    const QString salt = generatePasswordSalt();
+    q.prepare("insert into user_info(name,pwd,salt) values(?,?,?)");
     q.addBindValue(QString::fromUtf8(strname));
-    q.addBindValue(QString::fromUtf8(strpwd));
+    q.addBindValue(applyPasswordSalt(QString::fromUtf8(strpwd), salt));
+    q.addBindValue(salt);
     qDebug()<<"insert new user:"<<QString::fromUtf8(strname);
     return q.exec();
 }
@@ -225,24 +252,12 @@ int OperateDB::handleLogin(char *strname, char *strpwd)
     QSqlQuery q(db);
 
     QString nameParam = QString::fromUtf8(strname);
-    QString pwdParam = QString::fromUtf8(strpwd);
-    qDebug()<<"[DIAG-DB] handleLogin: name="<<nameParam<<" name_hex="<<nameParam.toUtf8().toHex()<<" name_len="<<nameParam.size();
-    qDebug()<<"[DIAG-DB] handleLogin: pwd_hex="<<pwdParam<<" pwd_len="<<pwdParam.size();
-    
-    // 先查用户是否存在（只看 name）
-    QSqlQuery check(db);
-    check.prepare("SELECT pwd, HEX(pwd), CHAR_LENGTH(pwd) FROM user_info WHERE name = ?");
-    check.addBindValue(nameParam);
-    if(check.exec() && check.next()){
-        qDebug()<<"[DIAG-DB] DB中该用户存在! pwd="<<check.value(0).toString()<<" HEX="<<check.value(1).toString()<<" LEN="<<check.value(2).toInt();
-    } else {
-        qDebug()<<"[DIAG-DB] 用户 ["<<nameParam<<"] 根本不存在于数据库中!";
-    }
-    
-    q.prepare("select * from user_info where name = ? and pwd = ?");
+    const QString clientHash = QString::fromUtf8(strpwd);
+
+    // 按用户名取存储哈希与盐（salt 为空 = 迁移前老数据）
+    q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
     q.addBindValue(nameParam);
-    q.addBindValue(pwdParam);
-    qDebug()<<"login select for:"<<QString::fromUtf8(strname);
+    qDebug()<<"login select for:"<<nameParam;
     if(!q.exec()){
         qDebug()<<"login select failed:"<<q.lastError().text();
         return 0;
@@ -251,11 +266,32 @@ int OperateDB::handleLogin(char *strname, char *strpwd)
         qDebug()<<"user name or password not found";
         return -1;
     }
+    const QString storedPwd = q.value(0).toString();
+    const QString salt = q.value(1).toString();
+    QString effectiveHash = applyPasswordSalt(clientHash, salt);
+    if(effectiveHash != storedPwd){
+        qDebug()<<"user name or password not found";
+        return -1;
+    }
+
+    // 老用户登录成功 → 自动补盐升级（条件更新，不覆盖并发下已写入的新盐）
+    if(salt.isEmpty()){
+        QSqlQuery upgrade(db);
+        const QString newSalt = generatePasswordSalt();
+        const QString newHash = applyPasswordSalt(clientHash, newSalt);
+        upgrade.prepare("UPDATE user_info SET pwd = ?, salt = ? WHERE name = ? AND salt = ''");
+        upgrade.addBindValue(newHash);
+        upgrade.addBindValue(newSalt);
+        upgrade.addBindValue(nameParam);
+        if(upgrade.exec() && upgrade.numRowsAffected() > 0){
+            effectiveHash = newHash;
+        }
+    }
 
     q.prepare("update user_info set online = 1 where name = ? and pwd = ?");
-    q.addBindValue(QString::fromUtf8(strname));
-    q.addBindValue(QString::fromUtf8(strpwd));
-    qDebug()<<"login update online for:"<<QString::fromUtf8(strname);
+    q.addBindValue(nameParam);
+    q.addBindValue(effectiveHash);
+    qDebug()<<"login update online for:"<<nameParam;
     if (!q.exec()) {
         qCritical() << "UPDATE online status failed:" << q.lastError();
         return 0;
@@ -557,11 +593,16 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     db.transaction();
     QSqlQuery q(db);
 
-    // 1. 验证用户名和密码
-    q.prepare("SELECT * FROM user_info WHERE name = ? AND pwd = ?");
+    // 1. 按用户名取哈希与盐后校验密码（salt 为空 = 迁移前老数据，按裸哈希比对）
+    q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
     q.addBindValue(QString::fromUtf8(name));
-    q.addBindValue(QString::fromUtf8(pwd));
     if(!q.exec() || !q.next()){
+        qDebug()<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
+        db.rollback();
+        return false;
+    }
+    const QString effectiveHash = applyPasswordSalt(QString::fromUtf8(pwd), q.value(1).toString());
+    if(effectiveHash != q.value(0).toString()){
         qDebug()<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
@@ -590,7 +631,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     // 4. 删除 user_info 表中的用户记录
     q.prepare("DELETE FROM user_info WHERE name = ? AND pwd = ?");
     q.addBindValue(QString::fromUtf8(name));
-    q.addBindValue(QString::fromUtf8(pwd));
+    q.addBindValue(effectiveHash);
     if(!q.exec()){
         qDebug()<<"logoff: failed to delete user_info for:"<<QString::fromUtf8(name);
         db.rollback();
