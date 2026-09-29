@@ -1,7 +1,7 @@
 # 代码地图
 
 > 维护者：项目架构师
-> 最后更新：2026-07-29
+> 最后更新：2026-09-29
 > 本文件是项目的结构化索引，所有 Agent 了解项目结构时先读此文件。
 
 ---
@@ -16,7 +16,8 @@ E:\qt\xiangmu/
 │
 ├── Client/                              # 客户端（Qt 5 Widgets GUI）
 │   ├── Client.pro                       # qmake 构建文件（core gui network）
-│   ├── main.cpp                         # 入口
+│   ├── main.cpp                         # 入口（设默认日志过滤规则）
+│   ├── logging.h / logging.cpp          # 日志分类：lcCli(xmu.cli)，安静默认+QT_LOGGING_RULES 开关（REQ-LOG-007）
 │   ├── protocol.h / protocol.cpp        # PDU 协议定义 + malloc/free 构造
 │   ├── client.h / client.cpp / .ui      # 主窗口：登录/注册、TCP 连接、PDU 收发
 │   ├── msghandler.{h,cpp}              # 响应分发：按 uiType 路由到各模块处理
@@ -37,7 +38,8 @@ E:\qt\xiangmu/
 │
 ├── Server/                              # 服务端（Qt Console）
 │   ├── Server.pro                       # qmake 构建文件（core gui network sql）
-│   ├── main.cpp                         # 入口
+│   ├── main.cpp                         # 入口（设默认日志过滤规则）
+│   ├── logging.h / logging.cpp          # 日志分类：lcNet/lcDb/lcFs/lcAuth/lcApp(xmu.*)，安静默认+QT_LOGGING_RULES 开关（REQ-LOG-007）
 │   ├── protocol.h / protocol.cpp        # PDU 协议定义 + memalloc/memfree 构造
 │   ├── server.h / server.cpp            # 服务端入口窗口：加载配置、启动监听
 │   ├── mytcpserver.h / .cpp             # TCP 监听器（单例），管理连接列表

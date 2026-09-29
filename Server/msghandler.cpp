@@ -1,4 +1,5 @@
-﻿#include "msghandler.h"
+﻿#include "logging.h"
+#include "msghandler.h"
 #include "QDebug"
 #include "operatedb.h"
 #include "mytcpserver.h"
@@ -59,7 +60,7 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
     // 锁定中：直接拒绝并回传剩余秒数
     if (m_captchaLockUntil.isValid() && now < m_captchaLockUntil) {
         remainingSec = now.secsTo(m_captchaLockUntil);
-        qDebug() << "验证码校验失败: 账号已锁定，剩余" << remainingSec << "秒";
+        qCDebug(lcAuth) << "验证码校验失败: 账号已锁定，剩余" << remainingSec << "秒";
         return -4;
     }
 
@@ -72,7 +73,7 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
     // 无有效码或已过期：不累计失败次数，避免误锁
     if (m_captchaCode.isEmpty() || now > m_captchaExpiry) {
         m_captchaCode.clear();
-        qDebug() << "验证码校验失败: 无有效码或已过期";
+        qCDebug(lcAuth) << "验证码校验失败: 无有效码或已过期";
         return -3;
     }
 
@@ -84,17 +85,17 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
             m_captchaNextAllowed = m_captchaLockUntil;
             m_captchaCode.clear();
             remainingSec = CAPTCHA_LOCKOUT_SEC;
-            qDebug() << "验证码连续错误" << m_captchaFailCount << "次，账号锁定" << CAPTCHA_LOCKOUT_SEC << "秒";
+            qCWarning(lcAuth) << "验证码连续错误" << m_captchaFailCount << "次，账号锁定" << CAPTCHA_LOCKOUT_SEC << "秒";
             return -4;
         }
-        qDebug() << "验证码校验失败: 输入不符";
+        qCDebug(lcAuth) << "验证码校验失败: 输入不符";
         return -2;
     }
 
     // 校验成功：一次性使用，作废当前码并重置错误计数
     m_captchaCode.clear();
     m_captchaFailCount = 0;
-    qDebug() << "验证码校验成功";
+    qCDebug(lcAuth) << "验证码校验成功";
     return 0;
 }
 
@@ -104,7 +105,7 @@ PDU *MsgHandler::logoff()
     QString userName = fixedString(pdu->caData, 32);
     QString userPwd  = fixedString(pdu->caData + 32, 32);
 
-    qDebug() << "logoff request for:" << userName;
+    qCDebug(lcAuth) << "logoff request for:" << userName;
 
     bool ret = OperateDB::instance().handleLogoff(
         userName.toUtf8().constData(),
@@ -117,7 +118,7 @@ PDU *MsgHandler::logoff()
         QDir dir(userDir);
         if(dir.exists()){
             bool removed=dir.removeRecursively();
-            qDebug()<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
+            qCDebug(lcAuth)<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
         }
     }
 
@@ -150,7 +151,7 @@ PDU *MsgHandler::captcha()
         m_captchaNextAllowed = now.addSecs(CAPTCHA_COOLDOWN_SEC);
         remaining = CAPTCHA_COOLDOWN_SEC;   // 成功时回传正常冷却时长
         status = 0;
-        qDebug() << "生成验证码:" << m_captchaCode << "过期时间:" << m_captchaExpiry;
+        qCDebug(lcAuth) << "生成验证码:" << m_captchaCode << "过期时间:" << m_captchaExpiry;
     }
 
     PDU* respdu;
@@ -186,13 +187,13 @@ PDU *MsgHandler::rigist()
     QString strpwd=fixedString(pdu->caData+32,32);
     //利用数据库操作对象进行数据库的注册操作，返回注册结果并输出
     bool ret=OperateDB::instance().handleRegit(strname.toUtf8().data(),strpwd.toUtf8().data());
-    qDebug()<<"regist ret "<<ret<<endl;
+    qCDebug(lcAuth)<<"regist ret "<<ret<<endl;
     if(ret){
         QDir dir;
         bool ret1=dir.mkdir(QString("%1").arg(Server::getinstance().filesPath));
         bool ret2=dir.mkdir(QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname));
-        qDebug()<<"创建用户目录:"<<"ret1 "<<ret1<<" "<<QString("%1").arg(Server::getinstance().filesPath)<<endl;
-        qDebug()<<"创建用户目录:"<<"ret2 "<<ret2<<" "<<QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname)<<endl;
+        qCDebug(lcAuth)<<"创建用户目录:"<<"ret1 "<<ret1<<" "<<QString("%1").arg(Server::getinstance().filesPath)<<endl;
+        qCDebug(lcAuth)<<"创建用户目录:"<<"ret2 "<<ret2<<" "<<QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname)<<endl;
     }
     //将注册结果打包进响应报文返回
     PDU* respdu=mkPDU();
@@ -221,7 +222,7 @@ PDU *MsgHandler::login(QString &strname)
     QString userpwd=fixedString(pdu->caData+32,32);
     //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleLogin(username.toUtf8().data(),userpwd.toUtf8().data());
-    qDebug()<<"login ret"<<ret<<endl;
+    qCDebug(lcAuth)<<"login ret"<<ret<<endl;
     if(ret==1){//记录已登录的用户名
         strname=username;
     }
@@ -240,7 +241,7 @@ PDU *MsgHandler::finduser(){
     memcpy(userName,pdu->caData,32);
     //在数据库中查找所需要查找的用户，并返回其状态
     int ret=OperateDB::instance().handleFindUser(userName);
-    qDebug()<<"findUser ret"<<ret<<endl;
+    qCDebug(lcNet)<<"findUser ret"<<ret<<endl;
     //将查找用户的状态打包进响应报文中并返回
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_findUser_RESPOND;
@@ -253,10 +254,10 @@ PDU *MsgHandler::onlineuser(const QString &myname)
     //在数据库中查找所有在线用户
     QStringList userNames=OperateDB::instance().handleOnlineUsers(myname);
     //打印查找信息
-    qDebug()<<"所有在线用户个数"<<userNames.size()<<" ";
+    qCDebug(lcNet)<<"所有在线用户个数"<<userNames.size()<<" ";
     for(int i=0;i<userNames.size();i++){
-        qDebug()<<userNames[i]<<" ";
-    } qDebug()<<endl;
+        qCDebug(lcNet)<<userNames[i]<<" ";
+    } qCDebug(lcNet)<<endl;
     //将查找的在线用户的信息打包进响应报文中并返回
     PDU* respdu=mkPDU(userNames.size()*32);
     respdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_RESPOND;
@@ -275,7 +276,7 @@ PDU *MsgHandler::addfriend()
     memcpy(seedName,pdu->caData+32,32);
     //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleAddFriend(userName,seedName);
-    qDebug()<<"addfriend ret"<<ret<<endl;
+    qCDebug(lcNet)<<"addfriend ret"<<ret<<endl;
     PDU* respdu=nullptr;
     //将若是添加的好友不在线打包进响应报文并返回
     if(ret!=1){
@@ -301,7 +302,7 @@ PDU *MsgHandler::addfriendFin()
     memcpy(seedName,pdu->caData+32,32);
     //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleAddFriendFin(seedName,agreeName);
-    qDebug()<<" addfriendFin ret"<<ret<<endl;
+    qCDebug(lcNet)<<" addfriendFin ret"<<ret<<endl;
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_RESPOND;
     memcpy(pdu->caData,&ret,sizeof(ret));
@@ -314,10 +315,10 @@ PDU *MsgHandler::addfriendFin()
 PDU *MsgHandler::flushfriend(const QString &username)
 {
     QStringList ret=OperateDB::instance().handleFlushFriend(username);
-    qDebug()<<"ret.size()="<<ret.size();
+    qCDebug(lcNet)<<"ret.size()="<<ret.size();
     for(int i=0;i<ret.size();i++){
-        qDebug()<<ret[i]<<" ";
-    }qDebug()<<endl;
+        qCDebug(lcNet)<<ret[i]<<" ";
+    }qCDebug(lcNet)<<endl;
     PDU* respdu=mkPDU(ret.size()*32);
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND;
     for(int i=0;i<ret.size();i++){
@@ -333,12 +334,12 @@ PDU *MsgHandler::deletefriend()
     memcpy(strName,pdu->caData,32);
     memcpy(tarName,pdu->caData+32,32);
     bool ret=OperateDB::instance().handleDeleteFriend(strName,tarName);
-    qDebug()<<"deletefriend ret"<<ret<<endl;
+    qCDebug(lcNet)<<"deletefriend ret"<<ret<<endl;
 
     // 跨功能联动：好友删除成功后，清理两人互发的私聊记录
     if(ret){
         OperateDB::instance().deleteFriendMessages(QString::fromUtf8(strName), QString::fromUtf8(tarName));
-        qDebug() << "[deletefriend] 已联动清理双方私聊记录: " << strName << " - " << tarName;
+        qCDebug(lcNet) << "[deletefriend] 已联动清理双方私聊记录: " << strName << " - " << tarName;
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_DELETEFRIEND_RESPOND;
@@ -357,9 +358,9 @@ PDU *MsgHandler::chat()
     Msg* pdu_msg=(Msg*)pdu->caMsg;
     memcpy(msg,pdu_msg->msg,pdu_msg->msgLen);
     memcpy(currTime,pdu_msg->Time,30);
-    qDebug()<<"接收到的msg"<<QString(msg)<<" 时间为"<<QString(currTime)<<endl;
+    qCDebug(lcNet)<<"接收到的msg"<<QString(msg)<<" 时间为"<<QString(currTime)<<endl;
     bool ret= OperateDB::instance().seedchatMsg(seedName,tarName,QString(msg),QString(currTime));
-    qDebug()<<"char ret"<<ret<<endl;
+    qCDebug(lcNet)<<"char ret"<<ret<<endl;
     if(ret){
         MyTcpServer::getinstance().reseed(tarName,pdu);//转发给接收人
     }
@@ -402,10 +403,10 @@ PDU *MsgHandler::MKDIR(){
         ret1=dir.mkdir(QString("%1").arg(path));
         ret2=dir.mkdir(QString("%1/%2").arg(path).arg(dirName));
     } else {
-        qWarning()<<"[MKDIR] 拒绝越权建目录:"<<path<<dirName;
+        qCWarning(lcFs)<<"[MKDIR] 拒绝越权建目录:"<<path<<dirName;
     }
-    qDebug()<<"mkdir" <<QString("%1").arg(path)<<"ret1"<<ret1<<" ";
-    qDebug()<<"mkdir" <<QString("%1/%2").arg(path).arg(fileName)<<"ret2"<<ret2<<" ";
+    qCDebug(lcFs)<<"mkdir" <<QString("%1").arg(path)<<"ret1"<<ret1<<" ";
+    qCDebug(lcFs)<<"mkdir" <<QString("%1/%2").arg(path).arg(fileName)<<"ret2"<<ret2<<" ";
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_MKDIR_RESPOND;
     memcpy(respdu->caData,&ret2,sizeof(ret2));
@@ -418,11 +419,11 @@ PDU *MsgHandler::deldir(const QString& loginName)
     QString delFilePath(QString::fromUtf8(pdu->caMsg));
     uint delFileType=0;
     memcpy(&delFileType,pdu->caData,sizeof(uint));
-    qDebug()<<"删除文件:"<<delFilePath<<"文件类型"<<delFileType<<endl;
+    qCDebug(lcFs)<<"删除文件:"<<delFilePath<<"文件类型"<<delFileType<<endl;
     bool ans=0;//记录删除结果，默认删除失败
     // REQ-FS-003②: 先校验后删除，顺序不可颠倒（removeRecursively 不可逆）
     if(!isPathInSandbox(delFilePath)){
-        qWarning()<<"[deldir] 拒绝越权删除:"<<delFilePath;
+        qCWarning(lcFs)<<"[deldir] 拒绝越权删除:"<<delFilePath;
     }
     else if(delFileType==1){//如果文件类型为普通文件
         QFile file(delFilePath);
@@ -441,7 +442,7 @@ PDU *MsgHandler::deldir(const QString& loginName)
         QString relPath = QDir(userRoot).relativeFilePath(QFileInfo(delFilePath).absoluteFilePath());
         if(!relPath.startsWith("..") && !relPath.startsWith("/") && !relPath.isEmpty()){
             OperateDB::instance().deleteShareLinkByPath(loginName, relPath);
-            qDebug() << "[deldir] 已联动清理分享链接: owner=" << loginName << " relPath=" << relPath;
+            qCDebug(lcFs) << "[deldir] 已联动清理分享链接: owner=" << loginName << " relPath=" << relPath;
         }
     }
 
@@ -454,17 +455,17 @@ PDU *MsgHandler::deldir(const QString& loginName)
 //切换目录
 PDU *MsgHandler::changedir(){
     QString tarPath=QString(pdu->caMsg).toUtf8();
-    qDebug()<<"tarPath"<<tarPath<<" ";
+    qCDebug(lcFs)<<"tarPath"<<tarPath<<" ";
     QFileInfo FileInfoi(tarPath.toStdString().c_str());
-    qDebug()<<tarPath.toStdString().c_str()<<" ";
+    qCDebug(lcFs)<<tarPath.toStdString().c_str()<<" ";
     PDU* respdu=nullptr;
     bool isExist=FileInfoi.exists();
     // REQ-FS-003⑤: 沙箱外路径按"不存在"处理，不回显任意路径的存在性与名称
     if(isExist && !isPathInSandbox(tarPath)){
         isExist=false;
-        qWarning()<<"[changedir] 拒绝越权路径探测:"<<tarPath;
+        qCWarning(lcFs)<<"[changedir] 拒绝越权路径探测:"<<tarPath;
     }
-    qDebug()<<" isExist "<<isExist<<" ";
+    qCDebug(lcFs)<<" isExist "<<isExist<<" ";
     //如果文件存在
     if(isExist){
         if(FileInfoi.isDir()){//如果是目录
@@ -472,7 +473,7 @@ PDU *MsgHandler::changedir(){
             int PathLen=tarPath.toStdString().size();
             respdu=mkPDU(PathLen+1);//创建pdu，长度为目标目录长度+1
             memcpy(respdu->caMsg,tarPath.toStdString().c_str(),PathLen);
-            qDebug()<<" isdir "<<"tarPath"<<tarPath<<endl;
+            qCDebug(lcFs)<<" isdir "<<"tarPath"<<tarPath<<endl;
         }
         else if(FileInfoi.isFile()){//如果是文件
             int index=tarPath.lastIndexOf('/');
@@ -481,7 +482,7 @@ PDU *MsgHandler::changedir(){
             int PathLen=tarPath.toStdString().size();
             respdu=mkPDU(PathLen+1);//创建pdu，长度为目标目录长度+1
             memcpy(respdu->caMsg,tarPath.toStdString().c_str(),PathLen);
-            qDebug()<<" isFile "<<"tarPath"<<tarPath<<endl;
+            qCDebug(lcFs)<<" isFile "<<"tarPath"<<tarPath<<endl;
         }
     }
     //如果文件不存在
@@ -498,7 +499,7 @@ PDU *MsgHandler::flushfile()
     QString path(QString::fromUtf8(pdu->caMsg));
     // REQ-FS-003⑤: 沙箱外目录一律不回显条目
     if(!isPathInSandbox(path)){
-        qWarning()<<"[flushfile] 拒绝越权列目录:"<<path;
+        qCWarning(lcFs)<<"[flushfile] 拒绝越权列目录:"<<path;
         PDU* respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
         return respdu;
@@ -516,7 +517,7 @@ PDU *MsgHandler::flushfile()
         else {//若不是目录
             pFileInfo->uiType=1;
         }
-        qDebug()<<"caName"<<pFileInfo->caName<<" uiType"<<pFileInfo->uiType<<" ";
+        qCDebug(lcFs)<<"caName"<<pFileInfo->caName<<" uiType"<<pFileInfo->uiType<<" ";
     }
     return respdu;
 }
@@ -528,7 +529,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     char newFileName[32]={'\0'};
     memcpy(oldFileName,pdu->caData,32);
     memcpy(newFileName,pdu->caData+32,32);
-    qDebug()<<"旧文件名:"<<oldFileName<<" "<<"新文件名:"<<newFileName<<" ";
+    qCDebug(lcFs)<<"旧文件名:"<<oldFileName<<" "<<"新文件名:"<<newFileName<<" ";
     // 旧名/新名共用同一所在目录 dirPath（现状布局），校验目录一处即可；
     // 不校验 newFilePath：新文件尚不存在，canonical 为空会误拒所有正常重命名
     QString dirPath(QString::fromUtf8(pdu->caMsg+sizeof(uint)));
@@ -539,19 +540,19 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     QString newFilePath(dirPath+"/"+newName);
     uint fileType=0;
     memcpy(&fileType,pdu->caMsg,sizeof(fileType));
-    qDebug()<<"文件类型:"<<fileType<<" "<<"旧文件路径:"<<oldFilePath<<" "<<"新文件路径:"<<newFilePath<<" ";
+    qCDebug(lcFs)<<"文件类型:"<<fileType<<" "<<"旧文件路径:"<<oldFilePath<<" "<<"新文件路径:"<<newFilePath<<" ";
     //进行文件或目录的重命名
     bool ret=1;
     // REQ-FS-003③: 先校验后重命名；未知 fileType 维持原状（ret=1 不执行改名）
     if(!isPathInSandbox(dirPath)){
         ret=0;
-        qWarning()<<"[renamefile] 拒绝越权重命名目录:"<<dirPath;
+        qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名目录:"<<dirPath;
     }
     else if(oldName.contains('/') || oldName.contains('\\')
             || newName.contains('/') || newName.contains('\\')){
         // F-1: 名称段含分隔符时 dirPath 校验可被 "dirPath/../x" 拼接绕过，一律拒绝
         ret=0;
-        qWarning()<<"[renamefile] 拒绝越权重命名名称段:"<<oldName<<newName;
+        qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名名称段:"<<oldName<<newName;
     }
     else if(fileType==0){//目录
         QDir dir;
@@ -561,7 +562,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         QFile file;
         ret=file.rename(oldFilePath,newFilePath);
     }
-    qDebug()<<"rename ret"<<ret<<endl;
+    qCDebug(lcFs)<<"rename ret"<<ret<<endl;
 
     // 跨功能联动：重命名成功后，平移该文件的分享链接 relative_path
     if(ret){
@@ -587,7 +588,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
             QString newRel = relDir.isEmpty() ? newName
                                              : relDir + "/" + newName;
             OperateDB::instance().updateShareLinkPath(loginName, oldRel, newRel);
-            qDebug() << "[renamefile] 已联动更新分享链接: owner=" << loginName
+            qCDebug(lcFs) << "[renamefile] 已联动更新分享链接: owner=" << loginName
                      << " oldRel=" << oldRel << " newRel=" << newRel;
         }
     }
@@ -605,16 +606,16 @@ PDU *MsgHandler::sharefile()
     memcpy(seedName,pdu->caData,32);
     int revUserCnt=0;
     memcpy(&revUserCnt,pdu->caData+32,sizeof (revUserCnt));
-    qDebug()<<"seedName "<<seedName<<" revUserCnt "<<revUserCnt<<" ";
+    qCDebug(lcFs)<<"seedName "<<seedName<<" revUserCnt "<<revUserCnt<<" ";
     PDU* resendpdu=mkPDU(pdu->uiMsgLen-revUserCnt*32);
     resendpdu->uiType=ENUM_MSG_TYPE_SHAREFILE_AGREE_REQUEST;
     memcpy(resendpdu->caData,seedName,32);
     memcpy(resendpdu->caMsg,pdu->caMsg+32*revUserCnt,resendpdu->uiMsgLen);
-    qDebug()<<"resendpdu->caMsg"<<resendpdu->caMsg<<endl;
+    qCDebug(lcFs)<<"resendpdu->caMsg"<<resendpdu->caMsg<<endl;
     for(int i=0;i<revUserCnt;i++){
         char revName[32]={'\0'};
         memcpy(revName,pdu->caMsg+32*i,32);
-        qDebug()<<"revName"<<revName<<" ";
+        qCDebug(lcFs)<<"revName"<<revName<<" ";
         MyTcpServer::getinstance().reseed(revName,resendpdu);
     }
     memfree(resendpdu);
@@ -632,15 +633,15 @@ PDU *MsgHandler::sharefilemove()
     // 目标接收者目录段同样客户端可控（../ 可逃逸），拼接方式维持原状
     QString recvDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(recvName);
     QString tarPath=QString("%1/%2/%3").arg(Server::getinstance().filesPath).arg(pdu->caData).arg(fileName);
-    qDebug()<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
+    qCDebug(lcFs)<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
     // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含反斜杠（Windows 下 "\.." 逃逸）
     bool ret=false;
     if(!isPathInSandbox(sourcePath)){
-        qWarning()<<"[sharefilemove] 拒绝越权源路径:"<<sourcePath;
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权源路径:"<<sourcePath;
     } else if(!isPathInSandbox(recvDir)){
-        qWarning()<<"[sharefilemove] 拒绝越权目标目录:"<<recvDir;
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权目标目录:"<<recvDir;
     } else if(fileName.contains('\\')){
-        qWarning()<<"[sharefilemove] 拒绝含路径分隔符的目标名:"<<fileName;
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝含路径分隔符的目标名:"<<fileName;
     } else {
         ret=QFile::copy(sourcePath,tarPath);
     }
@@ -684,12 +685,12 @@ PDU *MsgHandler::movefile(const QString& loginName)
         if(dstInfo.isDir() && isPathInSandbox(dstDir, userRoot)){
             // 防止把目录移进自身或其子目录
             if(srcInfo.isDir() && (canonicalDstDir==canonicalSrc || canonicalDstDir.startsWith(canonicalSrc+"/"))){
-                qDebug()<<"movefile 拒绝：不能把目录移进自身或其子目录";
+                qCWarning(lcFs)<<"movefile 拒绝：不能把目录移进自身或其子目录";
             }
             // 原地移动（目标目录就是源所在目录）：无需操作
             else if(canonicalDstDir == srcInfo.dir().canonicalPath()){
                 ret=true;
-                qDebug()<<"movefile 原地移动，无需操作";
+                qCDebug(lcFs)<<"movefile 原地移动，无需操作";
             }
             else {
                 // 自动重命名处理逻辑
@@ -709,25 +710,25 @@ PDU *MsgHandler::movefile(const QString& loginName)
                         finalDstPath = parentDir.filePath(numberedName);
                         if (count > MAX_RETRIES) { ret = false; break; }
                     } while (QFileInfo::exists(finalDstPath));
-                    qDebug() << "文件移动重名，自动重命名为:" << finalDstPath;
+                    qCDebug(lcFs) << "文件移动重名，自动重命名为:" << finalDstPath;
                 }
 
                 //先尝试 rename；若跨文件系统失败则 copy+remove
                 QFile srcFile(srcPath);
                 ret = srcFile.rename(finalDstPath);
                 if (!ret) {
-                    qDebug() << "rename 失败, errorString:" << srcFile.errorString()
+                    qCWarning(lcFs) << "rename 失败, errorString:" << srcFile.errorString()
                              << "src:" << srcPath << "dst:" << finalDstPath;
                     // 降级策略：copy + remove
                     ret = QFile::copy(srcPath, finalDstPath);
                     if (!ret) {
-                        qDebug() << "copy 降级也失败, src:" << srcPath << "dst:" << finalDstPath
+                        qCWarning(lcFs) << "copy 降级也失败, src:" << srcPath << "dst:" << finalDstPath
                                  << "errno:" << errno << strerror(errno);
                     } else {
                         if (QFile::remove(srcPath)) {
-                            qDebug() << "copy+remove 降级成功:" << finalDstPath;
+                            qCDebug(lcFs) << "copy+remove 降级成功:" << finalDstPath;
                         } else {
-                            qDebug() << "copy+remove 降级: copy 成功但 remove 失败, src:" << srcPath;
+                            qCWarning(lcFs) << "copy+remove 降级: copy 成功但 remove 失败, src:" << srcPath;
                             QFile::remove(finalDstPath);  // 清理不完整的目标文件
                             ret = false;
                         }
@@ -735,19 +736,19 @@ PDU *MsgHandler::movefile(const QString& loginName)
                 }
             }
         } else {
-            qDebug() << "movefile 目标路径校验失败: canonicalDstDir=" << canonicalDstDir;
+            qCWarning(lcFs) << "movefile 目标路径校验失败: canonicalDstDir=" << canonicalDstDir;
         }
     } else {
-        qDebug() << "movefile 源路径校验失败: canonicalSrc=" << canonicalSrc;
+        qCWarning(lcFs) << "movefile 源路径校验失败: canonicalSrc=" << canonicalSrc;
     }
 
-    qDebug()<<"movefile src:"<<srcPath<<"dst:"<<dstPath<<"ret:"<<ret;
+    qCDebug(lcFs)<<"movefile src:"<<srcPath<<"dst:"<<dstPath<<"ret:"<<ret;
 
     // 跨功能联动：移动成功后，平移该文件的分享链接 relative_path
     if(ret){
         QString newRel = dstRel.isEmpty() ? fileName : (dstRel + "/" + fileName);
         OperateDB::instance().updateShareLinkPath(loginName, srcRel, newRel);
-        qDebug() << "[movefile] 已联动更新分享链接: owner=" << loginName
+        qCDebug(lcFs) << "[movefile] 已联动更新分享链接: owner=" << loginName
                  << " oldRel=" << srcRel << " newRel=" << newRel;
     }
 
@@ -780,9 +781,9 @@ PDU *MsgHandler::listdir(const QString& loginName)
             memcpy(p->caName,list[i].fileName().toStdString().c_str(),32);
             p->uiType=0;
         }
-        qDebug()<<"listdir rel="<<relPath<<" 子目录数="<<list.size();
+        qCDebug(lcFs)<<"listdir rel="<<relPath<<" 子目录数="<<list.size();
     } else {
-        qDebug()<<"listdir 越权或目录不存在: rel="<<relPath;
+        qCWarning(lcFs)<<"listdir 越权或目录不存在: rel="<<relPath;
     }
     return respdu;
 }
@@ -806,12 +807,12 @@ PDU *MsgHandler::uploadfileinit()
     if (isPathInSandbox(dirPath)) {
         result = m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
     } else {
-        qWarning() << "uploadfileinit 拒绝越权目录:" << dirPath;
+        qCWarning(lcFs) << "uploadfileinit 拒绝越权目录:" << dirPath;
     }
 
     bool ret=result.ok;
     qint64 resumeOffset=result.offset;
-    qDebug()<<"uploadfileinit file"<<fileName
+    qCDebug(lcFs)<<"uploadfileinit file"<<fileName
             <<"size"<<fileSize
             <<"resume"<<resumeEnabled
             <<"offset"<<resumeOffset
@@ -845,7 +846,7 @@ PDU *MsgHandler::uploadfiledata()
     }
 
     bool ret=false; // Upload writes are dispatched by MyTcpSocket to UploadWriteTask.
-    qDebug()<<"uploadfiledata len"<<pdu->uiMsgLen
+    qCDebug(lcFs)<<"uploadfiledata len"<<pdu->uiMsgLen
             <<"received"<<m_uploadSession.receivedSize()
             <<"total"<<m_uploadSession.totalSize()
             <<"ret"<<ret<<endl;
@@ -887,7 +888,7 @@ PDU *MsgHandler::downloadfile()
     memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
     QByteArray fileNameBytes=fileName.toUtf8();
     memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
-    qDebug()<<"downloadfile validate path"<<filePath<<"ret"<<ret<<"size"<<fileSize;
+    qCDebug(lcFs)<<"downloadfile validate path"<<filePath<<"ret"<<ret<<"size"<<fileSize;
     return respdu;
 }
 
@@ -899,7 +900,7 @@ PDU *MsgHandler::chatmsg()
     memcpy(revName,pdu->caData,32);
     memcpy(seedName,pdu->caData+32,32);
     QStringList Msglist= OperateDB::instance().getchatMsg(seedName,revName);
-    qDebug()<<"chatmsg msglist.size"<<Msglist.size()<<" ";
+    qCDebug(lcNet)<<"chatmsg msglist.size"<<Msglist.size()<<" ";
     int Msgtotallen=0;
     for(int i=0;i<Msglist.size();i+=2){
         Msgtotallen+=Msglist[i].toUtf8().size()+1+sizeof(Msg);
@@ -912,7 +913,7 @@ PDU *MsgHandler::chatmsg()
         filei->msgLen=Msglist[i].toUtf8().size()+1;
         memcpy(filei->Time,Msglist[i+1].toUtf8().toStdString().c_str(),30);
         memcpy(filei->msg,Msglist[i].toUtf8().toStdString().c_str(),filei->msgLen);
-        qDebug()<<"filei->msg "<<filei->msg<<" filei->Time"<<filei->Time<<",";
+        qCDebug(lcNet)<<"filei->msg "<<filei->msg<<" filei->Time"<<filei->Time<<",";
         dis+=filei->totalLen;
     }
     return respdu;
@@ -935,14 +936,14 @@ PDU *MsgHandler::getuserinformation()
     memcpy(respdu->caData+sizeof(int),&outOnline,sizeof(outOnline));
     QByteArray nameBytes=outName.toUtf8();
     memcpy(respdu->caData+32,nameBytes.constData(),qMin(nameBytes.size(),31));
-    qDebug()<<"getuserinformation userName:"<<userName<<"found:"<<found<<"online:"<<outOnline;
+    qCDebug(lcNet)<<"getuserinformation userName:"<<userName<<"found:"<<found<<"online:"<<outOnline;
     return respdu;
 }
 
 PDU* MsgHandler::createPublishLink(const QString& loginName) {
     QString relativePath = fixedString(pdu->caMsg, pdu->uiMsgLen);
     QString ownerName = loginName;
-    qDebug() << "[createPublishLink] 收到生成请求: owner=" << ownerName << " relativePath=" << relativePath;
+    qCDebug(lcFs) << "[createPublishLink] 收到生成请求: owner=" << ownerName << " relativePath=" << relativePath;
 
     QString token = ShareLinkService::generateToken();
     QString hash = ShareLinkService::hashToken(token);
@@ -950,7 +951,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
 
     bool ok = OperateDB::instance().createShareLink(hash, ownerName, relativePath, expire);
     if(!ok){
-        qDebug() << "[createPublishLink] 写入数据库失败，生成分享链接未完成";
+        qCWarning(lcFs) << "[createPublishLink] 写入数据库失败，生成分享链接未完成";
     }
 
     PDU* respdu = mkPDU(128);
@@ -969,7 +970,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
 // 新增：安全外链分享（BUG-ARC-PUBLINK-001）
 PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
     QString token = fixedString(pdu->caMsg, pdu->uiMsgLen);
-    qDebug() << "[resolvePublishLink] 收到解析请求: token_len=" << token.size()
+    qCDebug(lcFs) << "[resolvePublishLink] 收到解析请求: token_len=" << token.size()
              << " token_head=" << token.left(16);
 
     // 兼容两种输入：
@@ -986,7 +987,7 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
         }
     }
     QString hash = isHex64 ? token : ShareLinkService::hashToken(token);
-    qDebug() << "[resolvePublishLink] hash 来源:" << (isHex64 ? "直接输入(64hex)" : "hashToken(输入)");
+    qCDebug(lcFs) << "[resolvePublishLink] hash 来源:" << (isHex64 ? "直接输入(64hex)" : "hashToken(输入)");
 
     OperateDB::ShareLinkInfo info;
     PDU* respdu = mkPDU(1024); // 预留 JSON 空间
@@ -995,14 +996,14 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
     bool ok = false;
     QString savedRelPath; // 形如 "分享链接/2.pdf"，返回给客户端展示
     if (OperateDB::instance().getShareLinkByHash(hash, info)) {
-        qDebug() << "[resolvePublishLink] 命中记录: owner=" << info.ownerName
+        qCDebug(lcFs) << "[resolvePublishLink] 命中记录: owner=" << info.ownerName
                  << " relativePath=" << info.relativePath
                  << " revoked=" << info.revoked
                  << " expireTime=" << info.expireTime.toString("yyyy-MM-dd HH:mm:ss");
         if (info.revoked) {
-            qDebug() << "[resolvePublishLink] 链接已撤销，拒绝";
+            qCWarning(lcFs) << "[resolvePublishLink] 链接已撤销，拒绝";
         } else if (QDateTime::currentDateTime() >= info.expireTime) {
-            qDebug() << "[resolvePublishLink] 链接已过期，拒绝";
+            qCWarning(lcFs) << "[resolvePublishLink] 链接已过期，拒绝";
         } else {
             QString ownerRoot = QDir(Server::getinstance().filesPath).filePath(info.ownerName);
             QString srcPath = QDir(ownerRoot).filePath(info.relativePath);
@@ -1035,20 +1036,20 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                     if (srcFile.copy(finalDstPath)) {
                         ok = true;
                         savedRelPath = "分享链接/" + QFileInfo(finalDstPath).fileName();
-                        qDebug() << "[resolvePublishLink] 已复制分享文件到:" << finalDstPath;
+                        qCDebug(lcFs) << "[resolvePublishLink] 已复制分享文件到:" << finalDstPath;
                     } else {
-                        qDebug() << "[resolvePublishLink] 复制失败:" << srcFile.errorString()
+                        qCWarning(lcFs) << "[resolvePublishLink] 复制失败:" << srcFile.errorString()
                                  << " src=" << srcPath << " dst=" << finalDstPath;
                     }
                 } else {
-                    qDebug() << "[resolvePublishLink] 同名文件过多，放弃复制";
+                    qCWarning(lcFs) << "[resolvePublishLink] 同名文件过多，放弃复制";
                 }
             } else {
-                qDebug() << "[resolvePublishLink] 源文件不存在或越权: " << srcPath;
+                qCWarning(lcFs) << "[resolvePublishLink] 源文件不存在或越权: " << srcPath;
             }
         }
     } else {
-        qDebug() << "[resolvePublishLink] 未找到匹配记录 (hash_head="
+        qCDebug(lcFs) << "[resolvePublishLink] 未找到匹配记录 (hash_head="
                  << hash.left(16) << "...)";
     }
 

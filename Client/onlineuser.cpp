@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "onlineuser.h"
 #include "ui_onlineuser.h"
 
@@ -35,7 +36,7 @@ void OnlineUser::on_listWidget_itemDoubleClicked(QListWidgetItem *item)
     memcpy(pdu->caData,myName.toStdString().c_str(),32);
     memcpy(pdu->caData+32,seedName.toStdString().c_str()+cnt+1,32);
     //显示发送数据包内容
-    qDebug()<<"添加好友请求 已发送:"<<endl
+    qCDebug(lcCli)<<"添加好友请求 已发送:"<<endl
             <<"pdu->uiTotalLen"<<pdu->uiTotalLen<<endl
             <<"pdu->uiMsgLen"<<pdu->uiMsgLen<<endl
             <<"pdu->uiType"<<pdu->uiType<<endl

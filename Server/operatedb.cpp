@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "operatedb.h"
 #include "databaseconnectionpool.h"
 #include "server.h"
@@ -58,9 +59,9 @@ void OperateDB::connect()
     );
     bool ok = DatabaseConnectionPool::instance().testConnection();
     if (ok) {
-        qDebug() << "OperateDB::connect - 数据库连接池初始化成功";
+        qCDebug(lcDb) << "OperateDB::connect - 数据库连接池初始化成功";
     } else {
-        qCritical() << "OperateDB::connect - 数据库连接池初始化失败: testConnection 返回 false";
+        qCCritical(lcDb) << "OperateDB::connect - 数据库连接池初始化失败: testConnection 返回 false";
     }
 }
 
@@ -79,9 +80,9 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
 
     q.prepare("select * from user_info where name = ?");
     q.addBindValue(QString::fromUtf8(strname));
-    qDebug()<<"query user exist for:"<<QString::fromUtf8(strname);
+    qCDebug(lcDb)<<"query user exist for:"<<QString::fromUtf8(strname);
     if(!q.exec()){
-        qDebug()<<"query user exist failed:"<<q.lastError().text();
+        qCWarning(lcDb)<<"query user exist failed:"<<q.lastError().text();
         return false;
     }
     if(q.next()){
@@ -93,7 +94,7 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
     q.addBindValue(QString::fromUtf8(strname));
     q.addBindValue(applyPasswordSalt(QString::fromUtf8(strpwd), salt));
     q.addBindValue(salt);
-    qDebug()<<"insert new user:"<<QString::fromUtf8(strname);
+    qCDebug(lcDb)<<"insert new user:"<<QString::fromUtf8(strname);
     return q.exec();
 }
 
@@ -101,13 +102,13 @@ bool OperateDB::createShareLink(const QString &hash, const QString &owner, const
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()){
-        qDebug() << "[createShareLink] 获取数据库连接失败（连接无效）";
+        qCWarning(lcDb) << "[createShareLink] 获取数据库连接失败（连接无效）";
         return false;
     }
     QSqlQuery q(connection.database());
     // 查重：同一 owner + 同一文件若已存在链接，则直接复用，避免重复记录堆积
     if(!getShareLinkByPath(owner, path).isEmpty()){
-        qDebug() << "[createShareLink] 该文件已存在分享链接，复用已有记录: owner=" << owner << " path=" << path;
+        qCDebug(lcDb) << "[createShareLink] 该文件已存在分享链接，复用已有记录: owner=" << owner << " path=" << path;
         return true;
     }
     q.prepare("INSERT INTO share_link (token_hash, owner_name, relative_path, expire_time) VALUES (?, ?, ?, ?)");
@@ -122,7 +123,7 @@ bool OperateDB::createShareLink(const QString &hash, const QString &owner, const
     // 这里显式格式化为 MySQL 原生 DATETIME 字符串，避免该问题。
     q.addBindValue(expire.toString("yyyy-MM-dd HH:mm:ss"));
     if(!q.exec()){
-        qDebug() << "[createShareLink] 插入分享链接失败:" << q.lastError().text()
+        qCWarning(lcDb) << "[createShareLink] 插入分享链接失败:" << q.lastError().text()
                  << " | hash=" << hash << " owner=" << owner << " path=" << path;
         return false;
     }
@@ -173,7 +174,7 @@ bool OperateDB::deleteShareLinkByPath(const QString &owner, const QString &path)
     q.addBindValue(path + "/%");
     bool ok = q.exec();
     if(!ok){
-        qDebug() << "[deleteShareLinkByPath] 失败:" << q.lastError().text()
+        qCWarning(lcDb) << "[deleteShareLinkByPath] 失败:" << q.lastError().text()
                  << " owner=" << owner << " path=" << path;
     }
     return ok;
@@ -197,7 +198,7 @@ bool OperateDB::updateShareLinkPath(const QString &owner, const QString &oldPath
     q1.addBindValue(oldPath);
     bool ok = q1.exec();
     if(!ok){
-        qDebug() << "[updateShareLinkPath] 精确更新失败:" << q1.lastError().text()
+        qCWarning(lcDb) << "[updateShareLinkPath] 精确更新失败:" << q1.lastError().text()
                  << " owner=" << owner << " old=" << oldPath << " new=" << newPath;
     }
 
@@ -212,7 +213,7 @@ bool OperateDB::updateShareLinkPath(const QString &owner, const QString &oldPath
         q2.addBindValue(oldPath + "/%");
         q2.addBindValue(oldPath);
         if(!q2.exec()){
-            qDebug() << "[updateShareLinkPath] 目录前缀平移失败:" << q2.lastError().text();
+            qCWarning(lcDb) << "[updateShareLinkPath] 目录前缀平移失败:" << q2.lastError().text();
             ok = false;
         }
     }
@@ -232,7 +233,7 @@ bool OperateDB::deleteFriendMessages(const QString &userA, const QString &userB)
     q.addBindValue(userA);
     bool ok = q.exec();
     if(!ok){
-        qDebug() << "[deleteFriendMessages] 失败:" << q.lastError().text()
+        qCWarning(lcDb) << "[deleteFriendMessages] 失败:" << q.lastError().text()
                  << " a=" << userA << " b=" << userB;
     }
     return ok;
@@ -257,20 +258,20 @@ int OperateDB::handleLogin(char *strname, char *strpwd)
     // 按用户名取存储哈希与盐（salt 为空 = 迁移前老数据）
     q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
     q.addBindValue(nameParam);
-    qDebug()<<"login select for:"<<nameParam;
+    qCDebug(lcDb)<<"login select for:"<<nameParam;
     if(!q.exec()){
-        qDebug()<<"login select failed:"<<q.lastError().text();
+        qCWarning(lcDb)<<"login select failed:"<<q.lastError().text();
         return 0;
     }
     if(!q.next()){
-        qDebug()<<"user name or password not found";
+        qCWarning(lcDb)<<"user name or password not found";
         return -1;
     }
     const QString storedPwd = q.value(0).toString();
     const QString salt = q.value(1).toString();
     QString effectiveHash = applyPasswordSalt(clientHash, salt);
     if(effectiveHash != storedPwd){
-        qDebug()<<"user name or password not found";
+        qCWarning(lcDb)<<"user name or password not found";
         return -1;
     }
 
@@ -291,9 +292,9 @@ int OperateDB::handleLogin(char *strname, char *strpwd)
     q.prepare("update user_info set online = 1 where name = ? and pwd = ?");
     q.addBindValue(nameParam);
     q.addBindValue(effectiveHash);
-    qDebug()<<"login update online for:"<<nameParam;
+    qCDebug(lcDb)<<"login update online for:"<<nameParam;
     if (!q.exec()) {
-        qCritical() << "UPDATE online status failed:" << q.lastError();
+        qCCritical(lcDb) << "UPDATE online status failed:" << q.lastError();
         return 0;
     }
     return 1;
@@ -314,7 +315,7 @@ void OperateDB::handleOffLine(const char *strname)
 
     q.prepare("update user_info set online = 0 where name = ?");
     q.addBindValue(QString::fromUtf8(strname));
-    qDebug()<<"offline update for:"<<QString::fromUtf8(strname);
+    qCDebug(lcDb)<<"offline update for:"<<QString::fromUtf8(strname);
     q.exec();
 }
 
@@ -333,7 +334,7 @@ int OperateDB::handleFindUser(const char *userName)
 
     q.prepare("select * from user_info where name = ?");
     q.addBindValue(QString::fromUtf8(userName));
-    qDebug()<<"find user:"<<QString::fromUtf8(userName);
+    qCDebug(lcDb)<<"find user:"<<QString::fromUtf8(userName);
     q.exec();
     if(q.next()){
         return q.value(3).toInt();
@@ -361,7 +362,7 @@ QStringList OperateDB::handleOnlineUsers(const QString &strname)
     q.addBindValue(strname);
     q.addBindValue(strname);
     q.addBindValue(strname);
-    qDebug()<<"online users query for:"<<strname;
+    qCDebug(lcDb)<<"online users query for:"<<strname;
     q.exec();
 
     QStringList ret;
@@ -424,7 +425,7 @@ int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
         return 0;
     }
     
-    qDebug()<<"AddFriendFin:"<<QString::fromUtf8(usrname)<<"<->"<<QString::fromUtf8(tarname);
+    qCDebug(lcDb)<<"AddFriendFin:"<<QString::fromUtf8(usrname)<<"<->"<<QString::fromUtf8(tarname);
     return 1;
 }
 
@@ -484,7 +485,7 @@ bool OperateDB::handleDeleteFriend(char *userName, char *tarName)
         return false;
     }
     
-    qDebug()<<"deletefriend:"<<QString::fromUtf8(userName)<<"-"<<QString::fromUtf8(tarName);
+    qCDebug(lcDb)<<"deletefriend:"<<QString::fromUtf8(userName)<<"-"<<QString::fromUtf8(tarName);
     return true;
 }
 
@@ -506,7 +507,7 @@ bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString 
     bool ans=1;
     ans&=q.exec();
     ans&=q.next();
-    qDebug()<<"select online ans:"<<ans<<" for:"<<QString::fromUtf8(revName);
+    qCDebug(lcDb)<<"select online ans:"<<ans<<" for:"<<QString::fromUtf8(revName);
 
     q.prepare(R"(insert into message_info(seed_name,rev_name,msg,issuccess,seed_time)
         values(?,?,?,?,?))");
@@ -516,7 +517,7 @@ bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString 
     q.addBindValue(ans ? 1 : 0);
     q.addBindValue(seedTime);
     bool execRet=q.exec();
-    qDebug()<<"chat msg insert:"<<execRet;
+    qCDebug(lcDb)<<"chat msg insert:"<<execRet;
     return ans;
 }
 
@@ -537,7 +538,7 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName)
     q.prepare("select msg,seed_time from message_info where seed_name = ? and rev_name = ? and issuccess = 0");
     q.addBindValue(QString::fromUtf8(seedName));
     q.addBindValue(QString::fromUtf8(revName));
-    qDebug()<<"getchatMsg for:"<<QString::fromUtf8(seedName)<<"->"<<QString::fromUtf8(revName);
+    qCDebug(lcDb)<<"getchatMsg for:"<<QString::fromUtf8(seedName)<<"->"<<QString::fromUtf8(revName);
     if(!q.exec()){
         return ret;
     }
@@ -551,7 +552,7 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName)
     q.prepare("update message_info set issuccess = 1 where seed_name = ? and rev_name = ?");
     q.addBindValue(QString::fromUtf8(seedName));
     q.addBindValue(QString::fromUtf8(revName));
-    qDebug()<<"update msg issuccess=1 ret:"<<q.exec();
+    qCDebug(lcDb)<<"update msg issuccess=1 ret:"<<q.exec();
     return ret;
 }
 
@@ -597,13 +598,13 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec() || !q.next()){
-        qDebug()<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
+        qCWarning(lcDb)<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
     }
     const QString effectiveHash = applyPasswordSalt(QString::fromUtf8(pwd), q.value(1).toString());
     if(effectiveHash != q.value(0).toString()){
-        qDebug()<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
+        qCWarning(lcDb)<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
     }
@@ -613,7 +614,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.addBindValue(QString::fromUtf8(name));
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec()){
-        qDebug()<<"logoff: failed to delete messages for:"<<QString::fromUtf8(name);
+        qCWarning(lcDb)<<"logoff: failed to delete messages for:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
     }
@@ -623,7 +624,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.addBindValue(QString::fromUtf8(name));
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec()){
-        qDebug()<<"logoff: failed to delete friend records for:"<<QString::fromUtf8(name);
+        qCWarning(lcDb)<<"logoff: failed to delete friend records for:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
     }
@@ -633,7 +634,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.addBindValue(QString::fromUtf8(name));
     q.addBindValue(effectiveHash);
     if(!q.exec()){
-        qDebug()<<"logoff: failed to delete user_info for:"<<QString::fromUtf8(name);
+        qCWarning(lcDb)<<"logoff: failed to delete user_info for:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
     }
@@ -642,7 +643,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.prepare("DELETE FROM share_link WHERE owner_name = ?");
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec()){
-        qDebug()<<"logoff: warning - failed to delete share_links (might be empty):"<<QString::fromUtf8(name);
+        qCDebug(lcDb)<<"logoff: warning - failed to delete share_links (might be empty):"<<QString::fromUtf8(name);
         // 不回滚，视为成功
     }
 
@@ -650,17 +651,17 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.prepare("DELETE FROM publish_links WHERE creator_name = ?");
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec()){
-        qDebug()<<"logoff: warning - failed to delete publish_links (might be empty):"<<QString::fromUtf8(name);
+        qCDebug(lcDb)<<"logoff: warning - failed to delete publish_links (might be empty):"<<QString::fromUtf8(name);
         // 不回滚，视为成功
     }
 
     if(!db.commit()){
-        qDebug()<<"logoff: commit failed for:"<<QString::fromUtf8(name);
+        qCWarning(lcDb)<<"logoff: commit failed for:"<<QString::fromUtf8(name);
         db.rollback();
         return false;
     }
 
-    qDebug()<<"logoff: successfully deleted user:"<<QString::fromUtf8(name);
+    qCDebug(lcDb)<<"logoff: successfully deleted user:"<<QString::fromUtf8(name);
     return true;
 }
 

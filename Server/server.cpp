@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "server.h"
 #include <QFile>
 #include <QDebug>
@@ -17,7 +18,7 @@ bool Server::loadconfig()
 {
     QFile file(":/connect.config");
     if(!file.open(QIODevice::ReadOnly)){
-        qCritical() << "connect.config: 打开配置文件失败";
+        qCCritical(lcApp) << "connect.config: 打开配置文件失败";
         return false;
     }
     QString s=QString(file.readAll());
@@ -34,11 +35,11 @@ bool Server::loadconfig()
         m_dbUser = lst[6];
         m_dbPassword = lst[7];
     } else {
-        qCritical() << "connect.config: expected 8 lines, got" << lst.size();
+        qCCritical(lcApp) << "connect.config: expected 8 lines, got" << lst.size();
         file.close();
         return false;
     }
-    qDebug()<<"loadconfig m_strlp"<<m_strlp<<"m_usPort"<<m_usPort<<"filesPath"<<filesPath<<endl;
+    qCDebug(lcApp)<<"loadconfig m_strlp"<<m_strlp<<"m_usPort"<<m_usPort<<"filesPath"<<filesPath<<endl;
     file.close();
     return true;
 }
@@ -47,22 +48,22 @@ bool Server::initialize()
 {
     // 第一步：加载配置文件
     if(!loadconfig()){
-        qCritical() << "Server::initialize - loadconfig failed";
+        qCCritical(lcApp) << "Server::initialize - loadconfig failed";
         return false;
     }
     // 第二步：检查配置完整性
     if(m_strlp.isEmpty() || m_usPort == 0 || filesPath.isEmpty() ||
        m_dbHost.isEmpty() || m_dbPort == 0 || m_dbName.isEmpty() ||
        m_dbUser.isEmpty() || m_dbPassword.isEmpty()){
-        qCritical() << "Server::initialize - 配置不完整，请检查 connect.config";
+        qCCritical(lcApp) << "Server::initialize - 配置不完整，请检查 connect.config";
         return false;
     }
     // 第三步：监听端口
     if(!MyTcpServer::getinstance().listen(QHostAddress(m_strlp), m_usPort)){
-        qCritical() << "Server::initialize - listen failed:" << MyTcpServer::getinstance().errorString();
+        qCCritical(lcApp) << "Server::initialize - listen failed:" << MyTcpServer::getinstance().errorString();
         return false;
     }
-    qDebug() << "Server::initialize - 服务端启动成功，监听" << m_strlp << ":" << m_usPort;
+    qCDebug(lcApp) << "Server::initialize - 服务端启动成功，监听" << m_strlp << ":" << m_usPort;
     return true;
 }
 

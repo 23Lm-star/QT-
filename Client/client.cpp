@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "client.h"
 #include "ui_client.h"
 #include "process.h"
@@ -131,11 +132,11 @@ void Client::sendHeartbeat() {
     }
     // 决策：编译开关关闭 或 文件内容=1 → 不发
     const bool willSend = s_heartbeatEnabled && !zombie;
-    qDebug() << "[HEARTBEAT] 读取" << flagFile << "值=" << rawVal
+    qCDebug(lcCli) << "[HEARTBEAT] 读取" << flagFile << "值=" << rawVal
              << "| 编译开关=" << s_heartbeatEnabled
              << "| 决策=" << (willSend ? "发PING" : "不发PING");
     if (!willSend) {
-        qDebug() << "[HEARTBEAT] PING 跳过（模拟假死）";
+        qCDebug(lcCli) << "[HEARTBEAT] PING 跳过（模拟假死）";
         return;
     }
     // 复用心跳检测服务端存活：距上次收到 PONG 已超过阈值，判定服务端失联
@@ -146,7 +147,7 @@ void Client::sendHeartbeat() {
 
     PDU* pdu = mkPDU();
     pdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_REQUEST;
-    qDebug() << "[HEARTBEAT] send PING";
+    qCDebug(lcCli) << "[HEARTBEAT] send PING";
     seedMsg(pdu);
 }
 
@@ -156,7 +157,7 @@ void Client::handlMsg(PDU *&pdu)
     switch(pdu->uiType){
     case ENUM_MSG_TYPE_HEARTBEAT_RESPOND: {
         m_lastPongMs = QDateTime::currentMSecsSinceEpoch();
-        qDebug() << "[HEARTBEAT] recv PONG";
+        qCDebug(lcCli) << "[HEARTBEAT] recv PONG";
         break;
     }
     case ENUM_MSG_TYPE_REGIST_RESPOND:{
@@ -293,11 +294,11 @@ void Client::seedMsg(PDU *pdu){
 }
 
 void Client::connectsort(){
-    qDebug()<<"服务器连接成功"<<endl;
+    qCDebug(lcCli)<<"服务器连接成功"<<endl;
     // 区分"首次连接"与"断线后重连"：重连弹窗可见过说明这是一次重连
     bool wasReconnect = (m_reconnectDlg && m_reconnectDlg->isVisible());
     if (wasReconnect) {
-        qDebug() << "[HEARTBEAT] 重连成功，关闭重连窗口";
+        qCDebug(lcCli) << "[HEARTBEAT] 重连成功，关闭重连窗口";
         m_reconnectDlg->accept();   // 触发 closeEvent → 停止 spinner
         m_serverLostShown = false;
         m_lastPongMs = QDateTime::currentMSecsSinceEpoch();
@@ -469,14 +470,14 @@ void Client::showLoadingAnimation(bool success){}
 void Client::onServerLost() {
     if (m_serverLostShown) return;
     m_serverLostShown = true;
-    qDebug() << "[HEARTBEAT] 服务端失联，弹出重连窗口";
+    qCDebug(lcCli) << "[HEARTBEAT] 服务端失联，弹出重连窗口";
     m_reconnectDlg->show();
     m_reconnectDlg->raise();
     m_reconnectDlg->activateWindow();
 }
 
 void Client::onSocketDisconnected() {
-    qDebug() << "[HEARTBEAT] socket disconnected 信号";
+    qCDebug(lcCli) << "[HEARTBEAT] socket disconnected 信号";
     // 已登录才弹窗（未登录在登录界面，连接失败不应弹重连窗口）
     if (m_loggedIn && !m_serverLostShown) {
         onServerLost();
@@ -484,7 +485,7 @@ void Client::onSocketDisconnected() {
 }
 
 void Client::onReconnectRequested() {
-    qDebug() << "[HEARTBEAT] 用户点击重新连接，发起 connectToHost";
+    qCDebug(lcCli) << "[HEARTBEAT] 用户点击重新连接，发起 connectToHost";
     if (sorket.state() == QAbstractSocket::ConnectedState) {
         sorket.disconnectFromHost();
     }

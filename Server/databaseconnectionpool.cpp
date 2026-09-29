@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "databaseconnectionpool.h"
 
 #include <QDebug>
@@ -111,7 +112,7 @@ PooledSqlConnection DatabaseConnectionPool::acquire()
 {
     QMutexLocker locker(&m_mutex);
     if (!m_inited) {
-        qDebug() << "database connection pool is not initialized";
+        qCDebug(lcDb) << "database connection pool is not initialized";
         return PooledSqlConnection();
     }
 
@@ -123,7 +124,7 @@ PooledSqlConnection DatabaseConnectionPool::acquire()
 
         QSqlDatabase db = QSqlDatabase::database(connectionName);
         if (!db.isOpen() && !db.open()) {
-            qDebug() << "reopen mysql connection failed" << db.lastError().text();
+            qCWarning(lcDb) << "reopen mysql connection failed" << db.lastError().text();
             continue;
         }
 
@@ -131,7 +132,7 @@ PooledSqlConnection DatabaseConnectionPool::acquire()
     }
 
     if (m_createdCount >= m_maxConnectionCount) {
-        qDebug() << "database connection pool exhausted";
+        qCDebug(lcDb) << "database connection pool exhausted";
         return PooledSqlConnection();
     }
 
@@ -185,7 +186,7 @@ bool DatabaseConnectionPool::openConnection(const QString &connectionName)
         return true;
     }
 
-    qDebug() << "open mysql connection failed" << db.lastError().text();
+    qCWarning(lcDb) << "open mysql connection failed" << db.lastError().text();
     db = QSqlDatabase();
     QSqlDatabase::removeDatabase(connectionName);
     return false;

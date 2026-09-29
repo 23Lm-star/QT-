@@ -20,6 +20,7 @@ SOURCES += \
     file.cpp \
     friend.cpp \
     index.cpp \
+    logging.cpp \
     main.cpp \
     client.cpp \
     msghandler.cpp \
@@ -36,6 +37,7 @@ SOURCES += \
 HEADERS += \
     chat.h \
     client.h \
+    logging.h \
     file.h \
     friend.h \
     index.h \

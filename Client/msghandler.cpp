@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "client.h"
 #include "msghandler.h"
 #include <QString>
@@ -18,10 +19,10 @@ MsgHandler::MsgHandler()
 void MsgHandler::handlrigist(){
     int ret;
     memcpy(&ret,this->pdu->caData,sizeof(ret));
-    qDebug()<<"rigist ret"<<ret<<endl;
+    qCDebug(lcCli)<<"rigist ret"<<ret<<endl;
     char rigistName[32]={'\0'};
     memcpy(rigistName,this->pdu->caData+32,32);
-    qDebug()<<QString(rigistName)<<endl;
+    qCDebug(lcCli)<<QString(rigistName)<<endl;
     if(ret==-2){
         QMessageBox::information(&Client::getinstance(),"提示","验证码错误，请重新输入");
         return;
@@ -83,7 +84,7 @@ void MsgHandler::handllogin()
         QString loginName=QString(lName);
         QTimer::singleShot(1500,[loginName](){
             Client::getinstance().m_LoginName=loginName;
-            qDebug()<<"登录账号成功，用户名为:"<<loginName;
+            qCDebug(lcCli)<<"登录账号成功，用户名为:"<<loginName;
             Index::getinstance().show();
             Client::getinstance().hide();
             // 主界面完全构造并显示后，在事件循环下一轮触发初始刷新（仅好友列表）
@@ -126,7 +127,7 @@ void MsgHandler::handlAddFriend()
 {
     int ret=0;
     memcpy(&ret,pdu->caData,sizeof (ret));
-    qDebug()<<"AddFriend ans ret"<<ret<<endl;
+    qCDebug(lcCli)<<"AddFriend ans ret"<<ret<<endl;
     if(ret==1){
         Index::getinstance().getFriend()->flushfriend();
     }
@@ -208,7 +209,7 @@ void MsgHandler::getcharmsg()
             memcpy(currTime,respdu_Msg->Time,30);
             Msglist.append(QString(msg));
             Msglist.append(QString(currTime));
-            qDebug()<<"getmsg msg:"<<QString(msg)<<" currTime:"<<QString(currTime)<<"  ";
+            qCDebug(lcCli)<<"getmsg msg:"<<QString(msg)<<" currTime:"<<QString(currTime)<<"  ";
             dis+=respdu_Msg->totalLen;
         }
         // 更新界面
@@ -219,7 +220,7 @@ void MsgHandler::mkdir()
 {
     bool ret=1;
     memcpy(&ret,pdu->caData,sizeof (ret));
-    qDebug()<<"mkdir ret"<<ret<<endl;
+    qCDebug(lcCli)<<"mkdir ret"<<ret<<endl;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","创建文件夹成功");
         Index::getinstance().getFile()->flushfile();
@@ -233,7 +234,7 @@ void MsgHandler::deldir()
 {
     bool ret=0;
     memcpy(&ret,pdu->caData,sizeof(ret));
-    qDebug()<<"删除文件结果"<<ret<<endl;
+    qCDebug(lcCli)<<"删除文件结果"<<ret<<endl;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","删除文件夹成功");
         PDU* pdu=mkPDU(Index::getinstance().getFile()->m_strCurPath.size()+1);
@@ -264,7 +265,7 @@ void MsgHandler::renamedir()
 {
     bool ret=0;
     memcpy(&ret,pdu->caData,sizeof (ret));
-    qDebug()<<"rename ret"<<ret<<endl;
+    qCDebug(lcCli)<<"rename ret"<<ret<<endl;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","文件重命名成功");
         PDU* pdu=mkPDU(Index::getinstance().getFile()->m_strCurPath.toUtf8().toStdString().size()+1);
@@ -284,9 +285,9 @@ void MsgHandler::sharefileagree()
     QString filePath=pdu->caMsg;
     int index=filePath.lastIndexOf('/');
     QString fileName=filePath.right(filePath.size()-index-1);
-    qDebug()<<"接收到seedName:"<<seedName<<"的文件fileName "<<fileName<<" ";
+    qCDebug(lcCli)<<"接收到seedName:"<<seedName<<"的文件fileName "<<fileName<<" ";
     int ret=QMessageBox::question(&Index::getinstance(),"分享文件请求",QString("你是否同意接受%1的文件%2").arg(seedName).arg(fileName));
-    qDebug()<<" ret="<<ret<<endl;
+    qCDebug(lcCli)<<" ret="<<ret<<endl;
     if(ret!=QMessageBox::Yes){
         return ;
     }
@@ -301,7 +302,7 @@ void MsgHandler::sharefilefinsh()
 {
     bool ret=0;
     memcpy(&ret,pdu->caData,sizeof (ret));
-    qDebug()<<"sharefilefinsh ret"<<ret<<endl;
+    qCDebug(lcCli)<<"sharefilefinsh ret"<<ret<<endl;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","接收分享文件成功");
         Index::getinstance().getFile()->flushfile();//刷新一下文件
@@ -321,7 +322,7 @@ void MsgHandler::uploadfileinit()
     if(resumeMagic == UPLOAD_RESUME_MAGIC){
         memcpy(&resumeOffset,pdu->caData+UPLOAD_RESUME_OFFSET,sizeof(resumeOffset));
     }
-    qDebug()<<"uploadfileinit ret"<<ret<<" resumeOffset"<<resumeOffset<<endl;
+    qCDebug(lcCli)<<"uploadfileinit ret"<<ret<<" resumeOffset"<<resumeOffset<<endl;
     if(ret){
         QFile localFile(Index::getinstance().getFile()->m_strUploadPath);
         if(resumeMagic == UPLOAD_RESUME_MAGIC && localFile.exists() && resumeOffset >= localFile.size()){
@@ -359,7 +360,7 @@ void MsgHandler::flushfile()
         FileInfo* newFileInfo=new FileInfo;
         memcpy(newFileInfo,pdu->caMsg+i*sizeof (FileInfo),sizeof(FileInfo));
         qFileinfolist.append(newFileInfo);
-        qDebug()<<"newFileInfo->caName"<<newFileInfo->caName<<" newFileInfo->uiType"<<newFileInfo->uiType<<" ";
+        qCDebug(lcCli)<<"newFileInfo->caName"<<newFileInfo->caName<<" newFileInfo->uiType"<<newFileInfo->uiType<<" ";
     }
     Index::getinstance().getFile()->updateCurrfile(qFileinfolist);
 }
@@ -471,18 +472,18 @@ void MsgHandler::handleDownloadRespond()
         return;
     }
     m_recvFilePath=savePath;
-    qDebug()<<"下载准备就绪:"<<savePath<<"预期大小:"<<fileSize;
+    qCDebug(lcCli)<<"下载准备就绪:"<<savePath<<"预期大小:"<<fileSize;
 }
 
 void MsgHandler::handleDownloadData()
 {
     if(!m_recvFile || !m_recvFile->isOpen()){
-        qDebug()<<"下载数据块到达但文件未打开";
+        qCDebug(lcCli)<<"下载数据块到达但文件未打开";
         return;
     }
     qint64 written=m_recvFile->write(pdu->caMsg,pdu->uiMsgLen);
     if(written != (qint64)pdu->uiMsgLen){
-        qDebug()<<"写入下载数据块失败";
+        qCWarning(lcCli)<<"写入下载数据块失败";
     }
 }
 
@@ -515,7 +516,7 @@ void MsgHandler::handleResolvePublishLink(PDU* pdu)
 {
     bool ok = false;
     memcpy(&ok, pdu->caData, sizeof(ok));
-    qDebug() << "[handleResolvePublishLink] 服务端返回 ok=" << ok;
+    qCDebug(lcCli) << "[handleResolvePublishLink] 服务端返回 ok=" << ok;
     if(!ok){
         QMessageBox::information(&Index::getinstance(), "提示", "分享链接无效或已失效（链接不存在/已撤销/已过期）");
         return;
@@ -545,7 +546,7 @@ void MsgHandler::handleResolvePublishLink(PDU* pdu)
 void MsgHandler::handlfinduser(){
     int ret;
     memcpy(&ret,pdu->caData,sizeof(ret));
-    qDebug()<<"client finduser ret"<<ret<<endl;
+    qCDebug(lcCli)<<"client finduser ret"<<ret<<endl;
     if(ret==2){
         QMessageBox::information(&Client::getinstance(),"提示","该用户不存在");
     }
@@ -567,7 +568,7 @@ void MsgHandler::handleCaptcha(){
         // 成功：更新显示并启动正常冷却（倒计时由服务端下发秒数驱动）
         QByteArray codeBytes(pdu->caMsg, pdu->uiMsgLen);
         QString code = QString::fromUtf8(codeBytes).trimmed();
-        qDebug() << "收到服务端验证码:" << code;
+        qCDebug(lcCli) << "收到服务端验证码:" << code;
         Client::getinstance().updateCaptchaDisplay(code);
         Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
     } else if (status == -5) {
@@ -589,7 +590,7 @@ void MsgHandler::handlMoveFile()
     memcpy(&ret,pdu->caData,sizeof(ret));
     char fileName[32]={'\0'};
     memcpy(fileName,pdu->caData+32,32);
-    qDebug()<<"movefile ret:"<<ret<<" fileName:"<<QString::fromUtf8(fileName);
+    qCDebug(lcCli)<<"movefile ret:"<<ret<<" fileName:"<<QString::fromUtf8(fileName);
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示",QString("文件%1移动成功").arg(QString::fromUtf8(fileName)));
         Index::getinstance().getFile()->flushfile();
@@ -609,7 +610,7 @@ void MsgHandler::handlUserInformation()
     char userName[32]={'\0'};
     memcpy(userName,pdu->caData+32,32);
 
-    qDebug()<<"handlUserInformation result:"<<resultCode<<"online:"<<online<<"name:"<<QString::fromUtf8(userName);
+    qCDebug(lcCli)<<"handlUserInformation result:"<<resultCode<<"online:"<<online<<"name:"<<QString::fromUtf8(userName);
 
     if(resultCode!=0){
         QMessageBox::information(&Index::getinstance(),"提示","用户信息获取失败");
@@ -638,7 +639,7 @@ void MsgHandler::handlLogoff()
 {
     bool ret=false;
     memcpy(&ret,pdu->caData,sizeof(ret));
-    qDebug()<<"handlLogoff result:"<<ret;
+    qCDebug(lcCli)<<"handlLogoff result:"<<ret;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","账户已成功注销，即将返回登录界面。");
         // 关闭主界面，返回登录界面

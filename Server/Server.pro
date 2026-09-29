@@ -17,6 +17,7 @@ DEFINES += QT_DEPRECATED_WARNINGS
 
 SOURCES += \
     databaseconnectionpool.cpp \
+    logging.cpp \
     main.cpp \
     msghandler.cpp \
     mytcpserver.cpp \
@@ -35,6 +36,7 @@ SOURCES += \
 
 HEADERS += \
     databaseconnectionpool.h \
+    logging.h \
     msghandler.h \
     mytcpserver.h \
     mytcpsocket.h \
