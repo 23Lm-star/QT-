@@ -71,6 +71,11 @@ Desktop.ini
 /Server/project-docs/
 /Server/filesys/
 
+# Local credentials -- never track. Use connect.config.template as the reference.
+/Server/connect.config
+/Server/connect.config.bak-*
+/Client/connect.config.local
+
 # Python cache
 __pycache__/
 *.pyc
