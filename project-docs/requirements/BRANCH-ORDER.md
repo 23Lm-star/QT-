@@ -16,7 +16,7 @@
 | **B 卫生** | 4 | REQ-DOC-005 | `docs/repo-chrome` | SMALL | 无（但建议在 004 之后） |
 | **B 卫生** | 5 | REQ-REPO-006 | `chore/history-purge` | SMALL ⚠️不可逆 | 必须在 004 之后 |
 | **——** | — | **🚦 推送门（第一次 push 到 GitHub）** | — | — | 阶段 A+B 全绿后 |
-| **C 质量** | 6 | REQ-LOG-007 | `refactor/logging-levels` | MEDIUM | **必须在 AUTH-002 之后**（改同一批行） |
+| **C 质量** | 6 | REQ-LOG-007 | `refactor/logging-levels` | MEDIUM | **必须在 AUTH-002 之后**（改同一批行）✅ 已完成（merge 01ccf89，2026-09-29） |
 | **C 质量** | 7 | REQ-TEST-008A | `test/upload-session` | MEDIUM | 建议在 FS-003 之后 |
 | **C 质量** | 8 | REQ-TEST-008B | `chore/register-tests-in-pipeline` | SMALL | **必须在 8A 之后** |
 | **C 质量** | 9 | REQ-CI-009 | `chore/ci-static-check` | SMALL | 必须在 AUTH-002、LOG-007 之后（否则规则会报已修的缺陷） |
@@ -102,7 +102,7 @@
        ↓
    🚦🚦🚦  推送到 GitHub（需主人批准）  🚦🚦🚦
        ↓
-⑥ refactor/logging-levels                 MEDIUM   (必须先于 ⑨)
+⑥ refactor/logging-levels                 MEDIUM ✅ 已完成（merge 01ccf89，2026-09-29；必须先于 ⑨）
        ↓
 ⑦ test/upload-session                     MEDIUM
        ↓
@@ -208,7 +208,7 @@
 | `REQ-REPO-004-repo-sanitize.md` | 267 | SMALL ✅ |
 | `REQ-DOC-005-repo-chrome.md` | 286 | SMALL |
 | `REQ-REPO-006-history-purge.md` | 277 | SMALL ⚠️ |
-| `REQ-LOG-007-logging-levels.md` | 327 | MEDIUM |
+| `REQ-LOG-007-logging-levels.md` | 327 | MEDIUM ✅ |
 | `REQ-TEST-008A-upload-session-tests.md` | 606 | MEDIUM |
 | `REQ-TEST-008B-register-tests-in-pipeline.md` | 331 | SMALL |
 | `REQ-CI-009-ci-static-check.md` | 398 | SMALL |

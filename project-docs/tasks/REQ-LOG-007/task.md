@@ -66,4 +66,4 @@ goal（本节点）→ 主人批准 → dev（先 Server 后 Client，逐文件�
 - 计数 213→213、旧形式残留 0、客户端路径残留 0（grep 实证）。
 
 ## 状态
-**完成：三门 GREEN/GREEN/PASS @b039569，§7 六项 PASS，待合并。**
+**已完成：三门 GREEN/GREEN/PASS，§7 六项 PASS，no-ff 合入 master @01ccf89，合并结果三门再次全绿 @01ccf89。证据归档 project-docs/evidence/REQ-LOG-007/。未 push（待主人指令）。**
