@@ -7,24 +7,28 @@
 | **任务等级** | **MEDIUM** |
 | **基线 commit** | `b5d7bb3`（编写时 master HEAD） |
 | **流程版本** | Development OS v1.7 |
-| **状态** | 待执行 |
+| **状态** | 执行中 —— **范围已修订**（2026-09-29 主人批准：漏盘入口全部纳入本需求；isPathInSandbox 增加可选根参数。决策日志见 `project-docs/tasks/REQ-FS-003/task.md`） |
 
 ---
 
 ## 一、背景（为什么要做）
 
-服务端共 **6 处**接收客户端传来的路径，其中 **5 处**做了规范路径校验，**唯独上传入口没做**。缺的这一个恰好是最危险的（可写入任意路径）。
+服务端共 **10 处**接收客户端传来的路径（2026-09-29 修订：原文盘点 6 处，漏了 4 处），其中 **3 处**做了规范路径校验，**7 处缺失**。
 
-### 已核实：6 个路径入口的校验现状
+### 已核实：10 个路径入口的校验现状（行号按基线 `b5d7bb3` 复核）
 
 | # | 函数 | 位置 | 是否校验 | 校验证明 |
 |---|---|---|---|---|
-| 1 | `downloadfile()` | `msghandler.cpp:799` | ✅ 有 | `canonicalFilePath` + `startsWith(canonicalRootPrefix)`（804-806 行） |
-| 2 | `movefile()` | `msghandler.cpp:582` | ✅ 有 | `canonicalSrc` / `canonicalDstDir` 双校验（603-619 行） |
-| 3 | `listdir()` | `msghandler.cpp:697` | ✅ 有 | `canonicalDir` + `startsWith`（705-715 行） |
-| 4 | `deldir()` | `msghandler.cpp:389` | ⚠️ **半有** | 只做了**相对路径反推**（411-412 行），用于清理分享链接；**删除动作本身无校验** |
+| 1 | `downloadfile()` | `msghandler.cpp:799` | ✅ 有 | `canonicalFilePath` + `startsWith(canonicalRootPrefix)`（803-817 行），**根=整个 filesPath** |
+| 2 | `movefile()` | `msghandler.cpp:582` | ✅ 有 | `canonicalSrc` / `canonicalDstDir` 双校验（600-619 行），**根=用户目录 filesPath/loginName** |
+| 3 | `listdir()` | `msghandler.cpp:697` | ✅ 有 | `canonicalDir` + `startsWith`（703-716 行），**根=用户目录** |
+| 4 | `deldir()` | `msghandler.cpp:389` | ⚠️ **半有** | 只做了**相对路径反推**（410-412 行），用于清理分享链接；**删除动作本身无校验** |
 | 5 | `renamefile()` | `msghandler.cpp:481` | ⚠️ **半有** | 同 deldir，靠 `relDir.startsWith("..")` 反推 |
 | 6 | **`uploadfileinit()`** | **`msghandler.cpp:733`** | ❌ **无** | 直接 `QString::fromUtf8(pdu->caMsg)` → 传给 `begin()` |
+| 7 | **`MKDIR()`** | **`msghandler.cpp:372`** | ❌ **无** | 客户端 path 直接 `dir.mkdir()`（379-380 行），可在任意位置建目录。**原文误记为"已有校验"，2026-09-29 修订纳入本需求** |
+| 8 | **`flushfile()`** | `msghandler.cpp:461` | ❌ **无** | 客户端 path 直接 `entryInfoList()`（463-464 行），可**列任意目录**（信息泄露）。修订纳入 |
+| 9 | **`changedir()`** | `msghandler.cpp:425` | ❌ **无** | 客户端 path 探测存在性并回显（431-450 行），可**探测任意路径**。修订纳入 |
+| 10 | **`sharefilemove()`** | `msghandler.cpp:566` | ❌ **无** | `sourcePath` 全客户端可控（568 行），`QFile::copy` 可把服务器可读的**任意文件**（含 `connect.config`）复制进自己目录再下载 —— **读取逃逸链**。另：目标路径由 `pdu->caData`（接收者名，客户端可控）拼接，`../` 可使目标也逃逸。修订纳入 |
 
 ### 缺陷 1（P0-2）：上传路径穿越
 
@@ -97,6 +101,9 @@ if(ans){ /* 反推 relPath，清理分享链接 */ }                            
 | A7 | 重命名沙箱内文件**正常** | 正常重命名，成功 |
 | A8 | 所有路径校验逻辑**集中在一处**，不复制粘贴 | 代码审查：只有一个 `isPathInSandbox()` 实现 |
 | A9 | 三项 pipeline 全绿 | `build.ps1` GREEN、`test.ps1` GREEN、`audit.ps1` PASS |
+| A10 | MKDIR 沙箱外建目录**被拒绝**；沙箱内建目录正常 | 构造越权 mkdir，返回 false 且目录未创建（2026-09-29 修订新增） |
+| A11 | flushfile/changedir 对沙箱外路径**不回显任何真实信息**（返回空/不存在）；沙箱内正常 | 构造越权请求，确认无目录名/存在性泄露（修订新增） |
+| A12 | sharefilemove 源在沙箱外或目标目录经 `caData` 逃逸时**被拒绝**，不产生任何复制文件；沙箱内正常共享不受影响 | 以沙箱外临时文件为源发起复制，返回 false 且目标位置无新文件（修订新增） |
 
 ---
 
@@ -109,20 +116,23 @@ if(ans){ /* 反推 relPath，清理分享链接 */ }                            
 放到 `Server/msghandler.h`（类内静态成员），实现放 `msghandler.cpp`：
 
 ```cpp
-// msghandler.h（public 段）
-// 判断 path 是否位于 filesPath 沙箱内（含沙箱根本身）。
-// 规则：先做 canonical 归一（解析 ../ 与符号链接），再判断前缀。
-// 返回 true 仅当：path 存在 且 canonical(path) 落在 canonical(filesPath) 之内。
-static bool isPathInSandbox(const QString &path);
+// msghandler.h（public 段，2026-09-29 修订：增加可选根参数）
+// 判断 path 是否位于指定沙箱根内（含根本身）。
+// 规则：根与 path 分别做 canonical 归一（解析 ../ 与符号链接），再判断前缀。
+// 返回 true 仅当：根存在 且 path 存在 且 canonical(path) 落在 canonical(root) 之内。
+// root 为空 → 默认 Server::getinstance().filesPath。
+static bool isPathInSandbox(const QString &path, const QString &root = QString());
 ```
 
 ```cpp
 // msghandler.cpp
-bool MsgHandler::isPathInSandbox(const QString &path)
+bool MsgHandler::isPathInSandbox(const QString &path, const QString &root)
 {
     if (path.isEmpty()) return false;
 
-    QFileInfo rootInfo(Server::getinstance().filesPath);
+    const QString rootRaw = root.isEmpty() ? Server::getinstance().filesPath : root;
+    // 实测 connect.config 第 3 行为相对路径 "./filesys" → 必须先绝对化归一（§9 已坐实为必选项）
+    QFileInfo rootInfo(QDir(rootRaw).absolutePath());
     const QString canonicalRoot = rootInfo.canonicalFilePath();
     if (canonicalRoot.isEmpty()) return false;      // 沙箱根不存在 → 一律拒绝
 
@@ -137,11 +147,13 @@ bool MsgHandler::isPathInSandbox(const QString &path)
 }
 ```
 
+> **根参数用途**：`movefile`/`listdir` 替换现有校验时传入用户目录根（`QDir(filesPath).filePath(loginName)`），**保持现有用户级隔离不放松**；其余入口用默认根（整个 filesPath）。
+
 > **注意 canonical 的一个特性**：`canonicalFilePath()` 对**不存在**的路径返回空字符串。所以：
 > - 对**删除/重命名**（目标必须已存在）→ 直接用 `isPathInSandbox(target)` 即可，天然拒绝不存在路径。
 > - 对**上传**（目标目录必须已存在，但文件可能尚不存在）→ 应校验 **`dirPath`（目录，必定存在）**，也就是 `isPathInSandbox(dirPath)`。**不要对最终文件路径做 canonical**，因为新文件还不存在会返回空。
 
-### 3.2 四处改动
+### 3.2 改动块（2026-09-29 修订后共 ①–⑤ 五块，覆盖全部 10 个路径入口）
 
 **① `uploadfileinit()`（`msghandler.cpp:733`）—— 在 `begin()` 之前拦一道**
 
@@ -186,24 +198,42 @@ PDU *MsgHandler::deldir(const QString& loginName)
 
 > ⚠️ **顺序不能颠倒。** 校验必须在 `file.remove()` / `removeRecursively()` **之前**。`removeRecursively()` 是不可逆删除，删完再校验等于没校验。
 
-**③ `renamefile()`（`msghandler.cpp:481`）—— 同样前置校验**
+**③ `renamefile()`（`msghandler.cpp:481`）—— 同样前置校验（2026-09-29 修订：只校验所在目录）**
 
-`renamefile` 里有两处路径：源路径 `dirPath`（来自 `pdu->caMsg`）与目标目录。**两个都要校验**（否则可以重命名到沙箱外）：
+现状代码里旧名/新名共用**同一个目录** `dirPath`（`pdu->caMsg+sizeof(uint)`，489-490 行），因此只需**校验 `dirPath` 一处**。
+
+> ⚠️ **陷阱**：不要校验 `newFilePath`（新文件路径）。目标文件在 rename 前不存在，`canonicalFilePath()` 返回空 → 直接校验它会把**所有正常重命名误拒**（A7 必挂）。
 
 ```cpp
-if (!isPathInSandbox(srcPath) || !isPathInSandbox(dstDir)) {
-    qWarning() << "[renamefile] 拒绝越权重命名:" << srcPath << "->" << dstDir;
-    // 直接返回 false 的 respdu，不做任何 rename
+const QString dirPath = QString::fromUtf8(pdu->caMsg + sizeof(uint));
+if (!isPathInSandbox(dirPath)) {
+    qWarning() << "[renamefile] 拒绝越权重命名目录:" << dirPath;
+    // 直接返回 ret=false 的 respdu，不做任何 rename
 } else {
-    // 原来的 rename 逻辑
+    // 原来的 rename 逻辑（含事后的分享链接联动，保持不变）
 }
 ```
 
-**④ `movefile()` / `listdir()` / `downloadfile()` / `MKDIR()` —— 用新函数替换现有重复逻辑**
+**④ `movefile()` / `listdir()` / `downloadfile()` —— 用新函数替换现有重复逻辑（2026-09-29 修订）**
 
-这 4 处已有校验，**功能上不要改行为**，只把重复的 canoical 代码替换成 `isPathInSandbox()` 调用，减少重复。**如果替换过程中发现行为有差异（比如原来允许某个边界情况），以原行为为准，不要收紧也不要放松** —— 那属于另一件事。
+> 更正原文事实错误：**MKDIR 并非"已有校验"**，它从未被校验过，已移入 ⑤ 做新增拦截。本步只覆盖三处真正有校验的入口。
 
-> 如果替换风险感觉较大，**可以只做 ①②③，第 ④ 步留给后续需求**。最小必要改动是 ①②③。**优先保证不引入回归。**
+三处现有校验的**根不同**：`movefile`/`listdir` 的根是**用户目录**（`filesPath/loginName`），`downloadfile` 的根是**整个 filesPath**。替换时必须把原根通过 `isPathInSandbox(path, root)` 的根参数传入，**严格保持现有隔离级别，不收紧也不放松**。**功能上不要改行为**：只替换重复的 canonical 样板代码；**如果替换过程中发现行为有差异（比如原来允许某个边界情况），以原行为为准** —— 那属于另一件事。
+
+> 如果替换风险感觉较大，**可以只做 ①②③⑤，第 ④ 步留给后续需求**。最小必要安全改动是 ①②③⑤。**优先保证不引入回归。**
+
+**⑤ `MKDIR()` / `flushfile()` / `changedir()` / `sharefilemove()` —— 新增拦截（2026-09-29 修订，漏盘入口纳入）**
+
+四处均为原本零校验的入口，统一用 `isPathInSandbox()`（默认根 filesPath）**前置拦截**：
+
+| 函数 | 校验对象 | 拒绝时行为 |
+|---|---|---|
+| `MKDIR` | `path`（待建目录的所在路径） | 不调用 `mkdir`，`ret1/ret2=false` 返回 |
+| `flushfile` | `pdu->caMsg` 目录 | 返回空条目 `respdu`，不列任何目录项 |
+| `changedir` | `tarPath` | 按 `isExist=false` 路径返回，不回显任意路径信息 |
+| `sharefilemove` | `sourcePath` **与** 目标目录 `filesPath/<caData段>` 都要校验（caData 客户端可控，`../` 可使目标逃逸） | `ret=false`，不调用 `copy` |
+
+> 这四处是对**原本无任何校验**的入口新增拦截：正常客户端流程中路径本就落在沙箱内，行为不变（对应禁止事项 #8"不弱化合法功能"）。
 
 ### 3.3 明确不做的事
 
@@ -211,6 +241,7 @@ if (!isPathInSandbox(srcPath) || !isPathInSandbox(dstDir)) {
 - **不改客户端**。客户端照常发路径。
 - **不引入"用户归属目录"新概念**。本需求只保证「不逃出 `filesPath`」，**不**做「A 用户不能删 B 用户文件」的细粒度隔离——那是更大的设计（需要给每个用户建沙箱子目录并在所有入口校验），**另开需求**。
   > 本次的 `loginName` 参数仍然只用于分享链接联动，不参与授权判定。
+  > （2026-09-29 修订注：`movefile`/`listdir` **现有**的用户目录根属于维持原状，不是本次新引入的概念；新增拦截一律用默认根 filesPath。）
 
 ---
 
@@ -218,7 +249,7 @@ if (!isPathInSandbox(srcPath) || !isPathInSandbox(dstDir)) {
 
 ```
 Server/msghandler.h               ← 新增 isPathInSandbox 声明
-Server/msghandler.cpp             ← 新增实现 + 四处调用点
+Server/msghandler.cpp             ← 新增实现 + 调用点（修订后覆盖 deldir/renamefile/uploadfileinit/MKDIR/flushfile/changedir/sharefilemove 新增拦截 + movefile/listdir/downloadfile 替换）
 project-docs/tasks/REQ-FS-003/task.md
 project-docs/evidence/REQ-FS-003/
 ```
@@ -293,6 +324,9 @@ pipeline 证明不了「越权被拦住」。必须**人工构造越权请求**�
 | 删除逃逸 | `delFilePath` 填沙箱外一个**测试用**文件 | 返回 false，**该文件依然存在** |
 | 删除正常 | 删自己沙箱内的测试文件 | 成功删除 |
 | 重命名逃逸 | 源路径填沙箱外测试文件 | 返回 false，**文件名未变** |
+| mkdir 逃逸（修订新增） | `MKDIR` 的 path 填沙箱外路径（如 `build/` 下临时目录） | 返回 false，目录未创建 |
+| 列目录逃逸（修订新增） | `flushfile` 的 path 填沙箱外目录 | 不回显任何目录项 |
+| 共享读取逃逸（修订新增） | `sharefilemove` 源填沙箱外测试文件 | 返回 false，目标目录**无新文件** |
 
 > ⚠️ **越权测试用的"目标文件"必须是自己新建的临时文件**（建议放 `build/` 下），**绝不能拿系统文件或项目源码做实验**。测完记得清理。
 > ⚠️ 测试前**先备份**任何会被碰到的真实文件。
@@ -350,7 +384,7 @@ python "C:/Users/王晨扬/.codex/skills/development-os-v1-7/scripts/validate-ha
 
 | 情况 | 怎么办 |
 |---|---|
-| `filesPath` 配的是相对路径（`./filesys`），canonical 后可能对不上 | **先确认 `Server::getinstance().filesPath` 被解析成绝对路径**（`QDir(...).absolutePath()`）。若没有，在 `isPathInSandbox` 内做 `QDir(root).absolutePath()` |
+| `filesPath` 配的是相对路径（`./filesys`），canonical 后可能对不上 | **2026-09-29 已实测坐实**：`connect.config` 第 3 行就是 `./filesys`。`isPathInSandbox` 内对根做 `QDir(root).absolutePath()` 归一**已是定型方案的必选项**（见 §3.1 实现） |
 | 替换已有校验时发现行为变了 | **回退到原逻辑**，只做 ①②③ 三处新增。不要为了"统一"引入回归 |
 | 想顺便做用户级隔离 | **不做**。另开需求 |
 | `uploadfileinit` 里 `dirPath` 是空串 | `isPathInSandbox("")` 返回 false → 拒绝，符合预期 |
@@ -364,9 +398,9 @@ python "C:/Users/王晨扬/.codex/skills/development-os-v1-7/scripts/validate-ha
 
 1. 最终 commit 哈希（分支 + 合并）
 2. 三项 pipeline 实际输出（GREEN / GREEN / PASS）
-3. §7 六个场景的实际结果（**尤其"越权被拒且目标完好"这三条**）
+3. §7 九个场景的实际结果（**尤其"越权被拒且目标完好"的各条**）
 4. `isPathInSandbox` 最终实现的代码片段
-5. 第 ④ 步（替换已有校验）做了没有；若做了，说明行为是否有差异
+5. 第 ④ 步（替换已有校验，movefile/listdir 传用户根）做了没有；若做了，说明行为是否有差异；第 ⑤ 步四处新增拦截全部落地情况
 6. handoff 校验脚本输出
 7. 任何偏差或未预期情况
 
