@@ -2,21 +2,21 @@
 
 ## 档位
 - **LARGE**（goal 节点定档）：触碰消息协议（两 `protocol.h` 为 frozen_paths，追加 PDU 枚举即命中，须主人协议变更批准）、新建数据库表与事务级并发（群内序号原子分配、幂等提交）、在线广播架构（有界异步队列替代现有同步转发）；跨会话大特性（依赖 SEC-001、GROUP-001 先后落地）。需求文档自声明 LARGE。
-- 流程版本：Development OS v1.7。分支：`codex/req-ext-group-002-group-messaging`，基线 master@`628e491`（本 goal 节点切出，仅承载文档）。
+- 流程版本：Development OS v1.7。分支：`codex/req-ext-group-002-group-messaging`，切出基线 master@`628e491`（goal 节点，仅承载文档）；会话中 SEC-001 并入 master@`7fc47c1`，本分支按规则 `git merge` 同步（头 `6096e32`），actor 门与加盐登录已在树内。
 - 节点计划：goal（本会话：归纳+切分支，不动生产源码）→ 等待主人批准 + 依赖合并 → design（计划文档随分支，含 PDU 编号分配表）→ development → independent test（新会话只读）→ repair → independent audit（新会话、不同代理、只读）→ integration（三事实行）→ merge no-ff。
 
 ## 依赖核查（2026-09-29 goal 节点实测）
 | 依赖 | 状态 | 影响 |
 |---|---|---|
-| REQ-EXT-SEC-001 身份与授权上下文 | ⏳ **进行中未合并**：分支 `codex/req-ext-sec-001-auth-context`，独立测试 PASS（`c7c4eed`，44/44）、审计修复 M-1/B-1 已落（`eb0ecc1` 47/47 → `0efccb9` 48/48），尚差最终审计处置与合并 | 群入口的"校验会话"直接复用其 actor 门；master 基线**尚无登录门**，本分支不得先于它实现业务入口 |
+| REQ-EXT-SEC-001 身份与授权上下文 | ✅ **已合并 master@`7fc47c1`**（本 goal 会话期间完成；no-ff，审计链 `c7c4eed` PASS → M-1 `eb0ecc1` → B-1 `0efccb9` ACCEPT，pipeline GREEN/honest-0/PASS，48/48 e2e） | 群入口"校验会话"可直接复用其 actor 门（`isPublicRequestType`/`authRejectPdu`，mytcpsocket.cpp:53）与新表无关，前提已解除 |
 | REQ-EXT-GROUP-001 群生命周期与成员关系 | ❌ **未开始**（无分支、无 `group_info/group_member/group_invitation` 表） | 本需求以"已验证的群成员关系"为唯一事实源；成员校验、禁言、`last_read_seq` 载体都不存在，开发硬前置 |
 | AUTH-002 / FS-003 / LOG-007 等基线 | ✅ 已合并 master | 登录加盐、路径沙箱、日志分类可直接复用 |
 
-**结论：本分支今天只到 goal 节点为止。开发节点启动条件 = SEC-001 与 GROUP-001 相继合并 master 后，本分支 `git merge master` 同步，且获得主人批准。**
+**结论：本分支今天只到 goal 节点为止。开发节点启动条件 = GROUP-001 合并 master 后（SEC-001 已就绪），本分支 `git merge master` 同步，且获得主人批准。**
 
-## 现状盘点（代码事实，master@628e491）
+## 现状盘点（代码事实，并入 SEC-001 后的基线 master@7fc47c1）
 - **协议**：两 `protocol.h` 枚举已显式分配至 **59**（LISTDIR_RESPOND），`ENUM_MSG_TYPE_MAX=99999`；PDU = 76B 定头（uiTotalLen/uiMsgLen/uiType/caData[64]/caMsg 柔性数组）；`Msg{totalLen,msgLen,Time[30],msg[]}` 嵌于 caMsg；caData 两个 32B 槽=（自己,对方）。Server 侧已有入站上限 `MAX_INBOUND_PDU_SIZE=16KB`、`MAX_PENDING_INBOUND_BYTES=256KB`——**入站有界，出站转发无界队列**。
-- **一对一发送**（`Server/msghandler.cpp chat()` :413）：发送人取自客户端 PDU（master 基线未覆盖，SEC-001 分支已改为 actor 强制覆盖）；`char msg[120]` 定长拷贝、无内容长度校验；`OperateDB::seedchatMsg`(:492) 查收件人 online → 插入 `message_info`（issuccess=在线已投/0=离线待补）→ 在线则 `MyTcpServer::reseed` 同步转发。
+- **一对一发送**（`Server/msghandler.cpp chat()` :413）：发送人已由服务端 actor 强制覆盖（SEC-001，随 `7fc47c1` 在树内）；`char msg[120]` 定长拷贝、无内容长度校验的存量面仍在——群入口必须自带长度校验，不回改一对一；`OperateDB::seedchatMsg`(:492) 查收件人 online → 插入 `message_info`（issuccess=在线已投/0=离线待补）→ 在线则 `MyTcpServer::reseed` 同步转发。
 - **在线投递**（`Server/mytcpserver.cpp reseed()` :115）：持 `m_tcpsocketlistMutex` 遍历连接列表，按登录名匹配**首个**连接直接 `write()`——单目标、同步、在全局锁下写 socket；慢连接阻塞面正是需求 §4.3 要消除的。群广播需要 fan-out 变体且有界队列。
 - **离线补偿现状**（`getchatMsg` :524 + `chatmsg()` :1017）：按 `issuccess=0` 一次取全量并**整批置 1**——无序号、无分页、无成员级游标，"拉取即全部已读"。群消息**不得**复用此模型，必须按需求新建 seq 游标 + 分页 + 未读计数。
 - **事务能力**：`OperateDB` 已有 `db.transaction()` 先例 3 处（`operatedb.cpp` :411/:469/:594 附近，好友添加/删除等），QMYSQL + DatabaseConnectionPool（RAII、线程隔离）上事务已被证明可用——T1 的"事务内原子分配序号"有现实基线。
@@ -37,7 +37,7 @@
 **禁止**：改既有枚举编号/删字段（协议兼容硬约束）；改 `message_info` 一对一语义；顺手实现富媒体/撤回/编辑/转发/群文件/多设备投递状态（需求 §6 排除）；新外部依赖；`Server/filesys/` 入库；在 SEC-001/GROUP-001 未合并前动生产源码。
 
 ## 待主人批准的决策（approval card，业务语言）
-- **D1 开发启动时机**：推荐 = SEC-001 走完审计并入 master、GROUP-001 完成并入 master 后，再开本分支 development（依赖顺序，需求自声明）。替代 = 提前并行开发——不推荐，将把未验证的身份门与成员表假设写进代码，独立测试必 BLOCKED。
+- **D1 开发启动时机**：SEC-001 已并入 master（本会话期间），剩余硬前置 = **GROUP-001 完成并入 master** + 主人批准。推荐按此顺序开 development。替代 = 提前并行开发——不推荐，成员表/禁言/游标载体都不存在，独立测试必 BLOCKED。
 - **D2 协议编号分配**：推荐 = design 节点出一张覆盖 GROUP-001+GROUP-002 的 PDU 编号分配表（60 起连续段，只追加），主人一次性批准，两分支按表施工，避免 frozen 文件二次改动。
 - **D3 序号原子分配实现**：推荐 = MySQL `LAST_INSERT_ID(seq+1)` 技巧（单语句免显式行锁，实现简单）；替代 = `SELECT ... FOR UPDATE` 事务内加一（可移植性好、多一次往返）。以并发对打测试证据裁决。
 - **D4 广播队列粒度**：推荐 = 每连接一个有界发送队列（慢成员只拖累自己）；替代 = 全局单队列（实现省，但一人卡顿全员延迟，违背 §4.3）。
