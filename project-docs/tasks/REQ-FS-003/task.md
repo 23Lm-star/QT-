@@ -4,7 +4,7 @@
 - **tier 依据**: 触碰生产源码（`Server/msghandler.h/.cpp`）但不触碰 `frozen_paths`（两个 `protocol.h`）、不改对外协议、单分支单主题可回滚；基线 `b5d7bb3`，分支 `fix/path-traversal-and-ownership`
 - **owner_agent**: claude-code
 - **date**: 2026-09-29
-- **状态**: 独立审计 FAIL（F-1）→ owner 修复会话完成 @`a518e35` + 重盖章 28/28，**待独立复审会话**（复审通过并经主人通知后才合并 master）
+- **状态**: 独立审计 FAIL（F-1）→ owner 修复 @`a518e35` → **独立复审 PASS（无阻塞项，O-5 记录在案）**，主人通知合并 → 合并 master 节点执行中
 
 ## 需求（业务语言）
 
