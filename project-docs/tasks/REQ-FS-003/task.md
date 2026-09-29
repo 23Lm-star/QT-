@@ -48,3 +48,4 @@
 | 2026-09-29 | **§七 人工越权验证 = 端到端 TCP 实测**：本机无 MySQL 服务，但经核实分发层无登录门且全部拒绝路径不触 DB，Server.exe 直接起监听 127.0.0.1:5000，Python harness 构造真实 PDU | 优于 R19 报告的 Tier-2/3 回退：25/25 PASS（10 处入口越权全拒 + 合法功能全正常 + 续传 offset 正确 + victim 文件内容完好），`manual-verify.log` + 服务端 10 条拒绝日志 `server-reject-lines.log` |
 | 2026-09-29 | 测试材料纪律：victim 等临时文件只建在 `build/reqfs003_out/`；沙箱工作目录测后移入 `build/reqfs003/trash_*`，未用 rm/del 手工删（禁止事项 #11） | changedir "C:/Windows" 仅作探测断言（isExist=false），无写入动作 |
 | 2026-09-29 | 工具链注记：Server.exe 为 GUI 子系统，日志需 `QT_FORCE_STDERR_LOGGING=1` 才进管道且输出 GBK 编码；v1.7 脚本需 `py -3.13`（PATH 上的 Anaconda Python 3.6.5 语法不兼容） | 建议后续写入 manifest notes（非本需求范围，未动） |
+| 2026-09-29 | **独立审计会话判定 FAIL，禁止合并**：F-1（High）`renamefile` 名称段（`oldFileName/newFileName`，caData 64 字节）无校验直接拼接，`../` 可绕过 dirPath 校验改名沙箱外文件，A6 被绕；其余 A1–A5/A7–A12 通过，范围合规通过 | 报告 `project-docs/evidence/REQ-FS-003/audit-report.md`（含残余观察 O-1–O-4）；需 owner 新会话修复（校验拼接后 `oldFilePath` 或名称段分隔符检查，同 MKDIR 模式）并重审 |
