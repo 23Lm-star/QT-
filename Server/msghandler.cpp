@@ -945,20 +945,32 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
     QString ownerName = loginName;
     qCDebug(lcFs) << "[createPublishLink] 收到生成请求: owner=" << ownerName << " relativePath=" << relativePath;
 
-    QString token = ShareLinkService::generateToken();
-    QString hash = ShareLinkService::hashToken(token);
     QDateTime expire = ShareLinkService::defaultExpireTime();
 
-    bool ok = OperateDB::instance().createShareLink(hash, ownerName, relativePath, expire);
-    if(!ok){
-        qCWarning(lcFs) << "[createPublishLink] 写入数据库失败，生成分享链接未完成";
+    // F-1 修复：同一 owner+path 已有链接时，原实现仍返回"新生成但未入库"的 token，
+    // 该链接永远无法解析（库里只有旧记录的 hash）。原始 token 不可反推，但
+    // resolvePublishLink 支持 64 位十六进制 hash 直接查库，故去重复用时返回已存 hash 形式链接。
+    QString linkValue;
+    bool ok = false;
+    const QString existingHash = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
+    if(!existingHash.isEmpty()){
+        linkValue = existingHash;
+        ok = true;
+        qCDebug(lcFs) << "[createPublishLink] 复用已有链接，返回 hash 形式链接（可直接解析）owner=" << ownerName;
+    } else {
+        const QString token = ShareLinkService::generateToken();
+        ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName, relativePath, expire);
+        linkValue = token;
+        if(!ok){
+            qCWarning(lcFs) << "[createPublishLink] 写入数据库失败，生成分享链接未完成";
+        }
     }
 
     PDU* respdu = mkPDU(128);
     respdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND;
     memcpy(respdu->caData, &ok, sizeof(ok));
     if(ok) {
-        QString link = QString("cloud-disk://share/%1").arg(token);
+        QString link = QString("cloud-disk://share/%1").arg(linkValue);
         QByteArray linkBytes = link.toUtf8();
         memcpy(respdu->caMsg, linkBytes.constData(), linkBytes.size());
     }
