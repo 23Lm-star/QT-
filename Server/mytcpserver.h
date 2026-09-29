@@ -25,6 +25,11 @@ public:
     void sendAddFriendAndRelease(char* tarname, PDU* pdu);
     //信息转发
     void reseed(char*tarname,PDU*pdu);
+    // REQ-EXT-SEC-001 M-1: 分享握手登记表——分享人发出邀请时登记 (接收者, 服务端 canonical 源路径)，
+    // 接收者同意移动时仅放行有登记的条目并在成功后消费。仅事件循环主线程（socket 处理器）访问，无需加锁。
+    void addPendingShare(const QString& receiver, const QString& canonicalSource);
+    bool hasPendingShare(const QString& receiver, const QString& canonicalSource) const;
+    void consumePendingShare(const QString& receiver, const QString& canonicalSource);
 public slots:
     void handleUploadWriteFinished(quint64 connectionId, qint64 offset,
                                    qint64 length, bool success);
@@ -39,6 +44,11 @@ private:
     qint64 m_zombieTimeoutMs;   // 阈值(ms)，由 zombie_timeout.cfg 读取秒数，默认 90000 (90s)
     QTimer* m_sweepTimer;
     void onSweepTimeout();
+
+    struct PendingShare { QString receiver; QString canonicalSource; qint64 addedMs; };
+    QList<PendingShare> m_pendingShares;    // 30 分钟过期、上限 1024，添加时惰性清理
+    static const qint64 PENDING_SHARE_TTL_MS = 30*60*1000;
+    static const int PENDING_SHARE_MAX = 1024;
 };
 
 #endif // MYTCPSERVER_H
