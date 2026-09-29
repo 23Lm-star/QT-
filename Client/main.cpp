@@ -10,9 +10,9 @@ int main(int argc, char *argv[])
 {
     QApplication a(argc, argv);
 
-    // 默认安静（与 Server 同策略，D2）：排查时设 QT_LOGGING_RULES="xmu.cli.debug=true"
-    if (qEnvironmentVariableIsEmpty("QT_LOGGING_RULES"))
-        QLoggingCategory::setFilterRules(QStringLiteral("xmu.*.debug=false"));
+    // 默认安静（与 Server 同策略）：排查时设 QT_LOGGING_RULES="xmu.cli.debug=true"
+    // Qt 5.14 实测环境变量优先于程序化规则，无需守卫。
+    QLoggingCategory::setFilterRules(QStringLiteral("xmu.*.debug=false"));
 
     // 加载全局 QSS 炫酷主题
     QFile qssFile(":/style.qss");
