@@ -13,7 +13,7 @@
 | **A 安全** | 1 | REQ-AUTH-002 | `fix/auth-security-baseline` | MEDIUM | 无 |
 | **A 安全** | 2 | REQ-FS-003 | `fix/path-traversal-and-ownership` | MEDIUM | 无 |
 | **B 卫生** | 3 | REQ-REPO-004 | `chore/repo-sanitize` | SMALL | 无 |
-| **B 卫生** | 4 | REQ-DOC-005 | `docs/repo-chrome` | SMALL | 无（但建议在 004 之后） |
+| **B 卫生** | 4 | REQ-DOC-005 | `docs/repo-chrome` | SMALL | 无（但建议在 004 之后）✅ 已完成（merge 08265d5 + closeout 69f2d66，2026-09-29） |
 | **B 卫生** | 5 | REQ-REPO-006 | `chore/history-purge` | SMALL ⚠️不可逆 | 必须在 004 之后 |
 | **——** | — | **🚦 推送门（第一次 push 到 GitHub）** | — | — | 阶段 A+B 全绿后 |
 | **C 质量** | 6 | REQ-LOG-007 | `refactor/logging-levels` | MEDIUM | **必须在 AUTH-002 之后**（改同一批行）✅ 已完成（merge 01ccf89，2026-09-29） |
@@ -27,6 +27,8 @@
 > ✅ **2026-09-29 当日完成**：`fix/auth-security-baseline` → master no-ff @`2fe0a48`；pipeline build GREEN / test 0 注册项 / audit PASS；A1–A5 人工验证 11 项 PASS（见 `project-docs/evidence/REQ-AUTH-002/`）。**A6 记为部分满足**：7 处 DIAG 已清零，但 `Server/mytcpsocket.cpp:390-396` 传输层报文转储仍打印 `caData`（含密码哈希）/`caMsg`，经主人决策移交 **REQ-LOG-007**（⑥ 的范围应包含此点；该文件不在 ① 的允许清单内）。
 >
 > ✅ **2026-09-29 当日完成（REQ-REPO-004）**：`chore/repo-sanitize` → master no-ff @`2304f23`；三门 GREEN/GREEN/PASS（分支 a7be845 与合并后 2304f23 各跑一轮）。A1–A7 全过。**合并事件**：merge 应用 rename 时删盘 `Client/connect.config`，步骤 1 备份按 §九 预案秒级恢复——同型需求（rm --cached + 同内容 template）合并后必须确认/恢复本地实文件（见 `project-docs/evidence/REQ-REPO-004/post-merge-verify.log`）。
+>
+> ✅ **2026-09-29 当日完成（REQ-DOC-005）**：`docs/repo-chrome` → master no-ff @`08265d5`（README+LICENSE(MIT，主人选定)+task.md+证据；三门在合并结果上实测 GREEN/honest-0/PASS）。**.gitattributes 主人批准不加**（core.autocrlf=true，行尾归一另开需求）。closeout（handoff+post-merge 补记）因并行会话抢占工作区误落 `refactor/logging-levels`@`ab99e6b`，随 ⑥ 合并 `01ccf89` 先进 master，本会话再以空 diff 合并 `69f2d66` 补全分支拓扑；handoff 校验 `OK (10 lines)`（注意：validate-handoff.py 需 `py -3.13`，默认 python 3.6.5 会 TypeError）。遗留分支处置建议与零删除/零推送记录见 `project-docs/evidence/REQ-DOC-005/`。
 
 ---
 
@@ -96,7 +98,7 @@
        ↓
 ③ chore/repo-sanitize                     SMALL
        ↓
-④ docs/repo-chrome                        SMALL
+④ docs/repo-chrome                        SMALL ✅ 已完成（merge 08265d5，closeout 69f2d66，2026-09-29）
        ↓
 ⑤ chore/history-purge                     SMALL ⚠️ 需主人批准确认 Q1/Q2/Q3
        ↓
