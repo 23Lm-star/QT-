@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "client.h"
 #include "file.h"
 #include "index.h"
@@ -65,8 +66,8 @@ File::File(QWidget *parent) :
     ui->currPath_LE->setText(m_strCurPath);
     //创建用户目录和资源目录,若是不存在会创建，存在就不创建了
     QDir dir;
-    qDebug()<<"创建用户目录:"<<m_strUserPath<<" "<<dir.mkdir(m_strUserPath)<<endl;
-    qDebug()<<"创建用户今日目录:"<<m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM"))<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
+    qCDebug(lcCli)<<"创建用户目录:"<<m_strUserPath.section('/', -1)<<" "<<dir.mkdir(m_strUserPath)<<endl;
+    qCDebug(lcCli)<<"创建用户今日目录:"<<QDate::currentDate().toString("yyyy-MM")<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
     m_shareFile=new ShareFile;
     
     // 初始化右键菜单
@@ -122,7 +123,7 @@ void File::updateCurrfile(QList<FileInfo *> qFileinfolist){
     }
     // 步骤2：接管新数据（File 拥有所有权）
     m_fileInfoList=qFileinfolist;
-    qDebug() << "[File] updateCurrfile: 缓存" << m_fileInfoList.size() << "个文件条目";
+    qCDebug(lcCli) << "[File] updateCurrfile: 缓存" << m_fileInfoList.size() << "个文件条目";
     // 步骤3：数据/UI 分离——仅标记待刷新，由 scheduleUiRefresh 统一调度
     m_pendingUiRefresh=true;
     scheduleUiRefresh();
@@ -139,7 +140,7 @@ void File::rebuildFileList(){
             pItem->setIcon(QIcon(QPixmap(":/file.png")));
         }
         pItem->setText(m_fileInfoList[i]->caName);
-        qDebug()<<"pFileInfo->caName:"<<m_fileInfoList[i]->caName<<" qFileinfolist[i]->uiType"<<m_fileInfoList[i]->uiType<<" ";
+        qCDebug(lcCli)<<"pFileInfo->caName:"<<m_fileInfoList[i]->caName<<" qFileinfolist[i]->uiType"<<m_fileInfoList[i]->uiType<<" ";
         ui->file_LW->addItem(pItem);
     }
     m_pendingUiRefresh=false;
@@ -153,7 +154,7 @@ void File::scheduleUiRefresh()
     }
     // 不可见时不排队，等 showEvent 触发
     if (!isVisible()) {
-        qDebug() << "[File] scheduleUiRefresh: 页面不可见，延迟到 showEvent";
+        qCDebug(lcCli) << "[File] scheduleUiRefresh: 页面不可见，延迟到 showEvent";
         return;
     }
     // 已排队则跳过（合并去重）
@@ -161,21 +162,21 @@ void File::scheduleUiRefresh()
         return;
     }
     m_uiRefreshQueued = true;
-    qDebug() << "[File] scheduleUiRefresh: 排入一次 UI 刷新";
+    qCDebug(lcCli) << "[File] scheduleUiRefresh: 排入一次 UI 刷新";
     QTimer::singleShot(0, this, [this]() {
         m_uiRefreshQueued = false;
         // 回调执行时重新检查可见性与待刷新标志
         if (isVisible() && m_pendingUiRefresh) {
-            qDebug() << "[File] UI 刷新：开始重建";
+            qCDebug(lcCli) << "[File] UI 刷新：开始重建";
             rebuildFileList();
-            qDebug() << "[File] UI 刷新：完成";
+            qCDebug(lcCli) << "[File] UI 刷新：完成";
         }
     });
 }
 
 void File::showEvent(QShowEvent *event){
     QWidget::showEvent(event);
-    qDebug() << "[File] showEvent: 页面变为可见，pending=" << m_pendingUiRefresh;
+    qCDebug(lcCli) << "[File] showEvent: 页面变为可见，pending=" << m_pendingUiRefresh;
     // 通过合并排队机制请求重建，不直接操作 QListWidget
     scheduleUiRefresh();
 }
@@ -202,7 +203,7 @@ void File::on_credit_PB_clicked()
      pdu->uiType=ENUM_MSG_TYPE_MKDIR_REQUEST;
      copyFixedField(pdu->caData,32,strdirName.toUtf8());
      memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),dirSize);
-     qDebug()<<"pdu->caData:"<<pdu->caData<<"pdu->caMsg"<<pdu->caMsg<<endl;
+     qCDebug(lcCli)<<"pdu->caData:"<<pdu->caData<<"pdu->caMsg"<<"<path suppressed>"<<endl;
      Client::getinstance().seedMsg(pdu);
 }
 
@@ -218,14 +219,14 @@ void File::on_del_PB_clicked()
          return ;
      }
      int del_ret= QMessageBox::question(this,"提示",QString("你确定要删除文件%1吗").arg(fileName->text()));
-     qDebug()<<"确认删除文件结果："<<del_ret<<endl;
+     qCDebug(lcCli)<<"确认删除文件结果："<<del_ret<<endl;
      if(del_ret==QMessageBox::No){
-         qDebug()<<"取消删除文件"<<endl;
+         qCDebug(lcCli)<<"取消删除文件"<<endl;
          return;
      }
      QString PathName(QString(this->m_strCurPath+"/"+fileName->text()));
      uint fileType=0;
-     qDebug()<<"uitype:"<<fileType<<"pdu->caMsg"<<PathName<<endl;
+     qCDebug(lcCli)<<"uitype:"<<fileType<<"pdu->caMsg"<<"<path suppressed>"<<endl;
      for(int i=0;i<this->m_fileInfoList.size();i++){
          if(strcmp(m_fileInfoList[i]->caName,fileName->text().toStdString().c_str())==0){
              memcpy(&fileType,&m_fileInfoList[i]->uiType,sizeof(m_fileInfoList[i]->uiType));
@@ -236,7 +237,7 @@ void File::on_del_PB_clicked()
      pdu->uiType=ENUM_MSG_TYPE_DELFILE_REQUEST;
      memcpy(pdu->caData,&fileType,sizeof(fileType));
      memcpy(pdu->caMsg,PathName.toStdString().c_str(),PathName.toStdString().size());
-     qDebug()<<"uitype:"<<fileType<<"pdu->caMsg"<<pdu->caMsg<<endl;
+     qCDebug(lcCli)<<"uitype:"<<fileType<<"pdu->caMsg"<<"<path suppressed>"<<endl;
      Client::getinstance().seedMsg(pdu);
 }
 //进入当前文件/目录
@@ -317,7 +318,7 @@ void File::on_rename_PB_clicked()
     copyFixedField(pdu->caData+32,32,strfileName.toUtf8());//新文件名
     memcpy(pdu->caMsg,&fileType,sizeof(fileType));
     memcpy(pdu->caMsg+sizeof (fileType),this->m_strCurPath.toStdString().c_str(),this->m_strCurPath.toStdString().size());
-    qDebug()<<"旧文件名"<<pdu->caData<<"新文件名"<<pdu->caData+32<<" 当前路径"<<pdu->caMsg+sizeof (fileType)<<endl;
+    qCDebug(lcCli)<<"旧文件名"<<pdu->caData<<"新文件名"<<pdu->caData+32<<" 当前路径"<<"<path suppressed>"<<endl;
     Client::getinstance().seedMsg(pdu);
 }
 void File::on_move_PB_clicked()
@@ -391,7 +392,7 @@ void File::on_upload_PB_clicked()
 {
     //获取要上传的文件路径，并记录下来
     m_strUploadPath=QFileDialog::getOpenFileName();
-    qDebug()<<"上传文件源路径"<<m_strUploadPath<<endl;
+    qCDebug(lcCli)<<"上传文件源路径"<<m_strUploadPath.section('/', -1)<<endl;
     //取出要上传的文件名和文件大小
     int index=m_strUploadPath.lastIndexOf('/');
     QString uploadName=m_strUploadPath.right(m_strUploadPath.size()-index-1);//取出文件名
@@ -408,7 +409,7 @@ void File::on_upload_PB_clicked()
     memcpy(pdu->caData+UPLOAD_FILE_SIZE_OFFSET,&fileSize,sizeof(fileSize));
     memcpy(pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
     memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),m_strCurPath.toUtf8().toStdString().size());//当前路径
-    qDebug()<<"文件名"<<pdu->caData<<"文件大小"<<fileSize<<" 上传路径"<<pdu->caMsg<<endl;
+    qCDebug(lcCli)<<"文件名"<<pdu->caData<<"文件大小"<<fileSize<<" 上传路径"<<"<path suppressed>"<<endl;
     Client::getinstance().seedMsg(pdu);
 }
 

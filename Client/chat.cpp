@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "chat.h"
 #include "client.h"
 #include "protocol.h"
@@ -44,10 +45,10 @@ void Chat::on_output_PB_clicked(){
     Msg* pdu_msg=(Msg*)pdu->caMsg;
     pdu_msg->totalLen=Msglen;//消息总长度（+消息本体长度+1）
     pdu_msg->msgLen=msg.toUtf8().toStdString().size()+1;
-    qDebug()<<"pdu_msg->totalLen"<<pdu_msg->totalLen<<" pdu_msg->msgLen"<<pdu_msg->msgLen<<" ";
+    qCDebug(lcCli)<<"pdu_msg->totalLen"<<pdu_msg->totalLen<<" pdu_msg->msgLen"<<pdu_msg->msgLen<<" ";
     memcpy(pdu_msg->Time,QDateTime::currentDateTime().toString().toStdString().c_str(),30);
     memcpy(pdu_msg->msg,msg.toUtf8().toStdString().c_str(),pdu_msg->msgLen);
-    qDebug()<<"发送msg"<<pdu_msg->msg<<" time:"<<pdu_msg->Time<<" ";
-    qDebug()<<"报文长度为:"<<pdu->uiTotalLen<<" msgLen:"<<pdu->uiMsgLen<<endl;
+    qCDebug(lcCli)<<"发送msg"<<pdu_msg->msg<<" time:"<<pdu_msg->Time<<" ";
+    qCDebug(lcCli)<<"报文长度为:"<<pdu->uiTotalLen<<" msgLen:"<<pdu->uiMsgLen<<endl;
     Client::getinstance().seedMsg(pdu);
 }

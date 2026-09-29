@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "mytcpserver.h"
 #include "mytcpsocket.h"
 #include "server.h"
@@ -18,12 +19,12 @@ MyTcpServer::MyTcpServer(){
         cf.close();
         if (ok && secs > 0) {
             m_zombieTimeoutMs = secs * 1000;
-            qDebug() << "[ZOMBIE] 阈值配置:" << secs << "s (" << m_zombieTimeoutMs << "ms)";
+            qCDebug(lcNet) << "[ZOMBIE] 阈值配置:" << secs << "s (" << m_zombieTimeoutMs << "ms)";
         } else {
-            qDebug() << "[ZOMBIE] 阈值配置无效，使用默认 90s";
+            qCDebug(lcNet) << "[ZOMBIE] 阈值配置无效，使用默认 90s";
         }
     } else {
-        qDebug() << "[ZOMBIE] 未找到 zombie_timeout.cfg，使用默认阈值 90s";
+        qCDebug(lcNet) << "[ZOMBIE] 未找到 zombie_timeout.cfg，使用默认阈值 90s";
     }
 
     m_sweepTimer = new QTimer(this);
@@ -33,7 +34,7 @@ MyTcpServer::MyTcpServer(){
 //连接新客户端，并且创建新的tcpsocket用来连接新客户端
 void MyTcpServer::incomingConnection(qintptr handle)
 {
-    qDebug()<<"新客户端连接"<<endl;
+    qCDebug(lcNet)<<"新客户端连接"<<endl;
     MyTcpSocket * m_tcpSocket=new MyTcpSocket;
     m_tcpSocket->setSocketDescriptor(handle);
     {
@@ -41,10 +42,10 @@ void MyTcpServer::incomingConnection(qintptr handle)
         m_tcpSocket->m_connectionId=++m_nextConnectionId;
         tcpsocketlist.append(m_tcpSocket);
         for(int i=0;i<tcpsocketlist.size();i++){
-            qDebug()<<tcpsocketlist[i]<<endl;
+            qCDebug(lcNet)<<tcpsocketlist[i]<<endl;
         }
     }
-    qDebug()<<"新客户端连接完成"<<endl;
+    qCDebug(lcNet)<<"新客户端连接完成"<<endl;
 }
 
 void MyTcpServer::handleUploadWriteFinished(quint64 connectionId, qint64 offset,
@@ -71,7 +72,7 @@ void MyTcpServer::removeSocket(MyTcpSocket *m)
         QMutexLocker locker(&m_tcpsocketlistMutex);
         this->tcpsocketlist.removeOne(m);
         for(int i=0;i<tcpsocketlist.size();i++){
-            qDebug()<<tcpsocketlist[i]<<endl;
+            qCDebug(lcNet)<<tcpsocketlist[i]<<endl;
         }
     }
     m->deleteLater();
@@ -138,7 +139,7 @@ void MyTcpServer::onSweepTimeout(){
     }
     // 退出锁后再 abort：避免 abort()→disconnected→clientOffLine→removeSocket 重入同一把锁导致死锁
     for (MyTcpSocket* s : stale) {
-        qDebug() << "僵尸连接清理:" << s->m_strLoginName
+        qCDebug(lcNet) << "僵尸连接清理:" << s->m_strLoginName
                  << "静默" << (now - s->m_lastActiveMs) << "ms";
         s->abort();   // 立即关闭 → 触发 disconnected → clientOffLine() 走既有清理
     }

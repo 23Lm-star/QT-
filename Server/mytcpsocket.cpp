@@ -1,3 +1,4 @@
+#include "logging.h"
 #include "mytcpsocket.h"
 #include "operatedb.h"
 #include "protocol.h"
@@ -41,7 +42,7 @@ MyTcpSocket::~MyTcpSocket(){
 
 PDU *MyTcpSocket::handlMsg(PDU *pdu)
 {
-    qDebug()<<"——————开始进行处理————————"<<endl;
+    qCDebug(lcNet)<<"——————开始进行处理————————"<<endl;
     PDU* respdu=nullptr;
     m_MsgHandler->pdu=pdu;
     
@@ -157,7 +158,7 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     }
     case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:{
         m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
-        qDebug() << "[HEARTBEAT] recv PING from" << m_strLoginName << "-> send PONG";
+        qCDebug(lcNet) << "[HEARTBEAT] recv PING from" << m_strLoginName << "-> send PONG";
         PDU* hRespdu = mkPDU();
         hRespdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_RESPOND;
         return hRespdu;
@@ -235,7 +236,7 @@ void MyTcpSocket::startDownloadStream(const QString& filePath)
 
     m_downloadFile=new QFile(filePath);
     if(!m_downloadFile->open(QIODevice::ReadOnly)){
-        qDebug()<<"下载文件打开失败:"<<filePath;
+        qCWarning(lcNet)<<"下载文件打开失败:"<<filePath;
         delete m_downloadFile;
         m_downloadFile=nullptr;
 
@@ -252,7 +253,7 @@ void MyTcpSocket::startDownloadStream(const QString& filePath)
     m_downloadSentSize=0;
     m_downloadActive=true;
 
-    qDebug()<<"开始流式下载:"<<filePath<<"大小:"<<m_downloadTotalSize;
+    qCDebug(lcNet)<<"开始流式下载:"<<filePath<<"大小:"<<m_downloadTotalSize;
     //用 0ms 延迟的单次定时器启动分块发送（异步，避免阻塞事件循环）
     scheduleNextDownloadChunk();
 }
@@ -278,7 +279,7 @@ void MyTcpSocket::sendNextChunk()
 {
     m_downloadNextChunkScheduled=false;
     if(!m_downloadActive || !m_downloadFile || !m_downloadFile->isOpen()){
-        qDebug()<<"下载状态无效，停止分块发送";
+        qCDebug(lcNet)<<"下载状态无效，停止分块发送";
         m_downloadActive=false;
         return;
     }
@@ -297,7 +298,7 @@ void MyTcpSocket::sendNextChunk()
         memcpy(finishPdu->caData,&success,sizeof(success));
         seedMsg(finishPdu);
 
-        qDebug()<<"下载完成，总发送:"<<m_downloadSentSize<<"字节";
+        qCDebug(lcNet)<<"下载完成，总发送:"<<m_downloadSentSize<<"字节";
         m_downloadFile->close();
         delete m_downloadFile;
         m_downloadFile=nullptr;
@@ -308,7 +309,7 @@ void MyTcpSocket::sendNextChunk()
     int chunkSize=qMin((qint64)DOWNLOAD_CHUNK_SIZE,remaining);
     QByteArray chunk=m_downloadFile->read(chunkSize);
     if(chunk.isEmpty()){
-        qDebug()<<"读取文件块失败";
+        qCWarning(lcNet)<<"读取文件块失败";
         m_downloadFile->close();
         delete m_downloadFile;
         m_downloadFile=nullptr;
@@ -342,7 +343,7 @@ void MyTcpSocket::recvmsg(){
     
     // 安全校验：未处理缓存超过 256 KB，防止耗尽内存攻击
     if (m_dpulist.size() > MAX_PENDING_INBOUND_BYTES) {
-        qWarning() << "Security: Inbound buffer exceeded 256KB from" 
+        qCWarning(lcNet) << "Security: Inbound buffer exceeded 256KB from" 
                    << this->peerAddress() << "- size:" << m_dpulist.size();
         m_dpulist.clear();
         this->disconnectFromHost();
@@ -365,14 +366,14 @@ void MyTcpSocket::recvmsg(){
             
             if (!valid) {
                 m_invalidPduCount++;
-                qWarning() << "Security: Invalid PDU from" << this->peerAddress()
+                qCWarning(lcNet) << "Security: Invalid PDU from" << this->peerAddress()
                            << "Count:" << m_invalidPduCount << "/" << MAX_INVALID_PDU_THRESHOLD
                            << "uiTotalLen:" << pduTotalLen
                            << "uiMsgLen:" << pdu->uiMsgLen
                            << "uiType:" << pdu->uiType;
                 
                 if (m_invalidPduCount >= MAX_INVALID_PDU_THRESHOLD) {
-                    qCritical() << "Security: Dropped packets exceeded threshold. Kicking client:" << this->peerAddress();
+                    qCCritical(lcNet) << "Security: Dropped packets exceeded threshold. Kicking client:" << this->peerAddress();
                     m_dpulist.clear();
                     this->disconnectFromHost();
                     return;
@@ -387,7 +388,7 @@ void MyTcpSocket::recvmsg(){
             m_invalidPduCount = 0;
 
             if(m_dpulist.size()>=(int)pduTotalLen){
-                qDebug()<<"请求信息已接收成功:"<<" "
+                qCDebug(lcNet)<<"请求信息已接收成功:"<<" "
                         <<"pdu->uiTotalLen"<<pdu->uiTotalLen<<" "
                         <<"pdu->uiMsgLen"<<pdu->uiMsgLen<<" "
                         <<"pdu->uiType"<<pdu->uiType<<"  "
@@ -412,7 +413,7 @@ void MyTcpSocket::clientOffLine(){
     m_downloadActive=false;
     OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
     MyTcpServer::getinstance().removeSocket(this);
-    qDebug()<<"用户"<<m_strLoginName<<"已经退出登录"<<endl;
+    qCDebug(lcNet)<<"用户"<<m_strLoginName<<"已经退出登录"<<endl;
 }
 //发送 PDU 到客户端并释放其内存（所有权转移到此方法）
 //pdu 为 nullptr 时安全空操作
@@ -431,7 +432,7 @@ void MyTcpSocket::seedMsg(PDU *respdu){
         return;
     }
     this->write((char*)respdu,respdu->uiTotalLen);
-    qDebug()<<"响应信息 已发送:"<<" "
+    qCDebug(lcNet)<<"响应信息 已发送:"<<" "
             <<"respdu->uiTotalLen"<<respdu->uiTotalLen<<" "
             <<"respdu->uiMsgLen"<<respdu->uiMsgLen<<" "
             <<"respdu->uiType"<<respdu->uiType<<" "

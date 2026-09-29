@@ -43,5 +43,18 @@
 ## 流程
 goal（本节点）→ 主人批准 → dev（先 Server 后 Client，逐文件改级别；先建分类文件+登记 .pro）→ build/test/audit → §7 人工验证 → 提交 → 等主人批准合并 → no-ff 合 master → handoff。**全程不 push。**
 
+## 批准记录
+- 2026-09-29：主人批准 D1–D6 全案开始开发；**D5 裁决 = 仅降级 debug、默认不输出、语句与文本保留**（不涂哈希）。
+
+## 开发执行记录
+- 分类标识符（D1）：`lcNet/lcDb/lcFs/lcAuth/lcApp` + 客户端 `lcCli`；显示名 `xmu.net` 等不变。
+- 过滤规则（D2/D6）：两个 main.cpp 均在 `QApplication` 构造后、`QT_LOGGING_RULES` 为空时 `setFilterRules("xmu.*.debug=false")`。
+- msghandler.cpp 函数级归属（38–236 auth / 237–369 net / 370–894 fs / 895–941 net / 942–1080 fs）：`sharefile*` 与 publish-link 三函数归 **fs**（文件分享），`getuserinformation`/`chatmsg` 归 net。
+- Server 端路径（deldir 等打服务器存储路径）：**保留文本**——服务端日志面向运维自身数据，默认已静默（A6 仅约束客户端）。
+- 客户端去路径 8 处（D4）：file.cpp :69/:70/:206/:229/:240/:321/:395/:412（绝对路径 → 文件名或 `<path suppressed>`；语句全部保留）。:240 为实测补漏（文档未列）。
+- **A4 错误升级（开发中补充判定）**：语义为"操作真失败"的原 qDebug 升为 `qCWarning(同类)`，共 34 处——operatedb 16（SQL 失败 + 登录/logoff 凭据不符；:646/:654 两条自带 "might be empty" 保持 debug）、连接池 2（MySQL 打开失败）、msghandler fs 13（move/rename/copy/listdir/分享链接 拒绝与失败）、auth 1（:88 验证码连错锁定，:63/:76/:91 单次输入错误保持 debug 防刷屏）、mytcpsocket 2（下载打开/读块失败）、Client msghandler 1（下载写块失败）。升级后 `qCDebug 157 / qCWarning 47 / qCCritical 9`＝**213，A7 持平**；旧形式残留 0。按类：fs 56、cli 60、db 40、net 37、auth 12、app 8。
+- 踩坑记录：`Server/msghandler.cpp` 带 UTF-8 BOM，行首插 include 会把 BOM 挤到第 2 行导致 `stray '\357'` 编译错，已字节级修复（BOM 回文件首）。
+- 文档旧表偏差已在上方重基线表记录（warn 实为 13、crit 实为 9，源于 FS-003 新增拒绝日志）。
+
 ## 状态
-**待开发前总结批准，未动任何生产源码。**
+**开发完成（分级+分类文件+main 守卫+客户端去路径），三门与 §7 人工验证进行中。**
