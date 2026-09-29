@@ -73,6 +73,12 @@ public:
 
     //下载文件时存储通过验证的规范路径
     QString m_downloadCanonicalPath;
+
+    // REQ-FS-003: 统一路径沙箱校验（集中一处，所有路径入口调用）
+    // 根与路径分别做 canonical 归一（解析 ../ 与符号链接）后判前缀；
+    // 仅当 根存在 且 路径存在 且 canonical(path) 落在 canonical(root) 内（含根本身）时返回 true。
+    // root 为空默认整个 filesPath；movefile/listdir 传入用户目录根以保持用户级隔离。
+    static bool isPathInSandbox(const QString &path, const QString &root = QString());
 };
 
 #endif // MSGHANDLER_H

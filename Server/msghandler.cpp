@@ -369,15 +369,44 @@ PDU *MsgHandler::chat()
     return nullptr;
 }
 //创建目录
+// REQ-FS-003: 统一路径沙箱校验实现（唯一实现，所有入口复用）
+bool MsgHandler::isPathInSandbox(const QString &path, const QString &root)
+{
+    if (path.isEmpty()) return false;
+
+    const QString rootRaw = root.isEmpty() ? Server::getinstance().filesPath : root;
+    // connect.config 实测 filesPath 为相对路径 "./filesys"，先绝对化归一再 canonical
+    QFileInfo rootInfo(QDir(rootRaw).absolutePath());
+    const QString canonicalRoot = rootInfo.canonicalFilePath();
+    if (canonicalRoot.isEmpty()) return false;      // 沙箱根不存在 → 一律拒绝
+
+    QFileInfo targetInfo(path);
+    const QString canonicalTarget = targetInfo.canonicalFilePath();
+    if (canonicalTarget.isEmpty()) return false;    // 路径不存在（含非法路径）→ 拒绝
+
+    QString prefix = canonicalRoot;
+    if (!prefix.endsWith('/')) prefix.append('/');
+
+    return canonicalTarget == canonicalRoot || canonicalTarget.startsWith(prefix);
+}
+
 PDU *MsgHandler::MKDIR(){
     //获取目录名和路径
     char fileName[32]={'\0'};
     QString path(QString::fromUtf8(pdu->caMsg));
     memcpy(fileName,pdu->caData,32);
     //构建QDir对象，创建目录，分两步
-    QDir dir;
-    bool ret1=dir.mkdir(QString("%1").arg(path));
-    bool ret2=dir.mkdir(QString("%1/%2").arg(path).arg(fileName));
+    bool ret1=false;
+    bool ret2=false;
+    const QString dirName = fixedString(fileName, 32);
+    // REQ-FS-003⑤: path 为待建目录的所在父目录（须存在且在沙箱内）；新目录名不得含路径分隔符
+    if(isPathInSandbox(path) && !dirName.contains('/') && !dirName.contains('\\')){
+        QDir dir;
+        ret1=dir.mkdir(QString("%1").arg(path));
+        ret2=dir.mkdir(QString("%1/%2").arg(path).arg(dirName));
+    } else {
+        qWarning()<<"[MKDIR] 拒绝越权建目录:"<<path<<dirName;
+    }
     qDebug()<<"mkdir" <<QString("%1").arg(path)<<"ret1"<<ret1<<" ";
     qDebug()<<"mkdir" <<QString("%1/%2").arg(path).arg(fileName)<<"ret2"<<ret2<<" ";
     PDU* respdu=mkPDU();
@@ -394,7 +423,11 @@ PDU *MsgHandler::deldir(const QString& loginName)
     memcpy(&delFileType,pdu->caData,sizeof(uint));
     qDebug()<<"删除文件:"<<delFilePath<<"文件类型"<<delFileType<<endl;
     bool ans=0;//记录删除结果，默认删除失败
-    if(delFileType==1){//如果文件类型为普通文件
+    // REQ-FS-003②: 先校验后删除，顺序不可颠倒（removeRecursively 不可逆）
+    if(!isPathInSandbox(delFilePath)){
+        qWarning()<<"[deldir] 拒绝越权删除:"<<delFilePath;
+    }
+    else if(delFileType==1){//如果文件类型为普通文件
         QFile file(delFilePath);
         ans=file.remove();//删除文件
     }
@@ -429,6 +462,11 @@ PDU *MsgHandler::changedir(){
     qDebug()<<tarPath.toStdString().c_str()<<" ";
     PDU* respdu=nullptr;
     bool isExist=FileInfoi.exists();
+    // REQ-FS-003⑤: 沙箱外路径按"不存在"处理，不回显任意路径的存在性与名称
+    if(isExist && !isPathInSandbox(tarPath)){
+        isExist=false;
+        qWarning()<<"[changedir] 拒绝越权路径探测:"<<tarPath;
+    }
     qDebug()<<" isExist "<<isExist<<" ";
     //如果文件存在
     if(isExist){
@@ -460,7 +498,15 @@ PDU *MsgHandler::changedir(){
 //刷新目录
 PDU *MsgHandler::flushfile()
 {
-    QDir dir(QString::fromUtf8(pdu->caMsg));
+    QString path(QString::fromUtf8(pdu->caMsg));
+    // REQ-FS-003⑤: 沙箱外目录一律不回显条目
+    if(!isPathInSandbox(path)){
+        qWarning()<<"[flushfile] 拒绝越权列目录:"<<path;
+        PDU* respdu=mkPDU();
+        respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
+        return respdu;
+    }
+    QDir dir(path);
     QFileInfoList FileInfolist =dir.entryInfoList();
     PDU* respdu=mkPDU(sizeof(FileInfo)*(FileInfolist.size()-2));
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
@@ -486,14 +532,31 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     memcpy(oldFileName,pdu->caData,32);
     memcpy(newFileName,pdu->caData+32,32);
     qDebug()<<"旧文件名:"<<oldFileName<<" "<<"新文件名:"<<newFileName<<" ";
-    QString oldFilePath(QString::fromUtf8(pdu->caMsg+sizeof(uint))+"/"+QString::fromUtf8(oldFileName));
-    QString newFilePath(QString::fromUtf8(pdu->caMsg+sizeof(uint))+"/"+QString::fromUtf8(newFileName));
+    // 旧名/新名共用同一所在目录 dirPath（现状布局），校验目录一处即可；
+    // 不校验 newFilePath：新文件尚不存在，canonical 为空会误拒所有正常重命名
+    QString dirPath(QString::fromUtf8(pdu->caMsg+sizeof(uint)));
+    // F-1 修复：名称段同 MKDIR 模式拒绝 '/'、'\\'，堵 "dirPath/../x" 拼接逃逸
+    const QString oldName = fixedString(oldFileName, 32);
+    const QString newName = fixedString(newFileName, 32);
+    QString oldFilePath(dirPath+"/"+oldName);
+    QString newFilePath(dirPath+"/"+newName);
     uint fileType=0;
     memcpy(&fileType,pdu->caMsg,sizeof(fileType));
     qDebug()<<"文件类型:"<<fileType<<" "<<"旧文件路径:"<<oldFilePath<<" "<<"新文件路径:"<<newFilePath<<" ";
     //进行文件或目录的重命名
     bool ret=1;
-    if(fileType==0){//目录
+    // REQ-FS-003③: 先校验后重命名；未知 fileType 维持原状（ret=1 不执行改名）
+    if(!isPathInSandbox(dirPath)){
+        ret=0;
+        qWarning()<<"[renamefile] 拒绝越权重命名目录:"<<dirPath;
+    }
+    else if(oldName.contains('/') || oldName.contains('\\')
+            || newName.contains('/') || newName.contains('\\')){
+        // F-1: 名称段含分隔符时 dirPath 校验可被 "dirPath/../x" 拼接绕过，一律拒绝
+        ret=0;
+        qWarning()<<"[renamefile] 拒绝越权重命名名称段:"<<oldName<<newName;
+    }
+    else if(fileType==0){//目录
         QDir dir;
         ret=dir.rename(oldFilePath,newFilePath);
     }
@@ -507,7 +570,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     if(ret){
         // owner 直接使用登录名；relDir 以用户根目录为基准取相对路径，
         // 避免相对 filesPath 反推时把 filesys 误判为 owner 段
-        QString dirPath = QString::fromUtf8(pdu->caMsg + sizeof(uint)); // 形如 ./filesys/wcy 或 ./filesys/wcy/子目录
+        // dirPath 已在重命名前取得（校验对象即此目录）
         // relDir：去掉"用户根目录"前缀得到相对路径。
         // 直接字符串剥离，避免 relativeFilePath 在 CWD 不一致时算出 ".." 开头，
         // 从而被下方守卫跳过整段联动（即重命名未关联 share_link 的根因）。
@@ -522,10 +585,10 @@ PDU *MsgHandler::renamefile(const QString& loginName)
                          .relativeFilePath(QFileInfo(dirPath).absoluteFilePath());
         }
         if(!relDir.startsWith("..") && !relDir.startsWith("/")){
-            QString oldRel = relDir.isEmpty() ? QString::fromUtf8(oldFileName)
-                                             : relDir + "/" + QString::fromUtf8(oldFileName);
-            QString newRel = relDir.isEmpty() ? QString::fromUtf8(newFileName)
-                                             : relDir + "/" + QString::fromUtf8(newFileName);
+            QString oldRel = relDir.isEmpty() ? oldName
+                                             : relDir + "/" + oldName;
+            QString newRel = relDir.isEmpty() ? newName
+                                             : relDir + "/" + newName;
             OperateDB::instance().updateShareLinkPath(loginName, oldRel, newRel);
             qDebug() << "[renamefile] 已联动更新分享链接: owner=" << loginName
                      << " oldRel=" << oldRel << " newRel=" << newRel;
@@ -565,12 +628,25 @@ PDU *MsgHandler::sharefile()
 //分享文件（移动）
 PDU *MsgHandler::sharefilemove()
 {
-    QString sourcePath=pdu->caMsg;
+    QString sourcePath=QString::fromUtf8(pdu->caMsg);
     int indexi=sourcePath.lastIndexOf('/');
     QString fileName=sourcePath.right(sourcePath.size()-indexi-1);
+    QString recvName=QString::fromUtf8(pdu->caData);
+    // 目标接收者目录段同样客户端可控（../ 可逃逸），拼接方式维持原状
+    QString recvDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(recvName);
     QString tarPath=QString("%1/%2/%3").arg(Server::getinstance().filesPath).arg(pdu->caData).arg(fileName);
     qDebug()<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
-    bool ret=QFile::copy(sourcePath,tarPath);
+    // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含反斜杠（Windows 下 "\.." 逃逸）
+    bool ret=false;
+    if(!isPathInSandbox(sourcePath)){
+        qWarning()<<"[sharefilemove] 拒绝越权源路径:"<<sourcePath;
+    } else if(!isPathInSandbox(recvDir)){
+        qWarning()<<"[sharefilemove] 拒绝越权目标目录:"<<recvDir;
+    } else if(fileName.contains('\\')){
+        qWarning()<<"[sharefilemove] 拒绝含路径分隔符的目标名:"<<fileName;
+    } else {
+        ret=QFile::copy(sourcePath,tarPath);
+    }
     PDU* respdu=mkPDU();
     memcpy(respdu->caData,&ret,sizeof (ret));
     respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND;
@@ -598,25 +674,17 @@ PDU *MsgHandler::movefile(const QString& loginName)
     QString finalDstPath = dstPath;
 
     //路径合法性校验：源路径必须在用户根目录内
+    // REQ-FS-003④: 统一走 isPathInSandbox，根传用户目录（原校验根即 userRoot，隔离级别不变；
+    // canonicalSrc/canonicalDstDir 仍保留，供下方"移入自身子目录"与原地移动判断使用）
     QFileInfo srcInfo(srcPath);
-    QFileInfo rootInfo(userRoot);
     QString canonicalSrc=srcInfo.canonicalFilePath();
-    QString canonicalRoot=rootInfo.canonicalFilePath();
-    QString canonicalRootPrefix=QDir(canonicalRoot).absolutePath();
-    if(!canonicalRootPrefix.endsWith('/')){
-        canonicalRootPrefix.append('/');
-    }
+    QFileInfo dstInfo(dstDir);
+    QString canonicalDstDir = dstInfo.canonicalFilePath(); // 目标目录必定存在
 
     bool ret=false;
-    if(!canonicalRoot.isEmpty() && !canonicalSrc.isEmpty()
-            && (canonicalSrc==canonicalRoot || canonicalSrc.startsWith(canonicalRootPrefix))
-            && srcInfo.exists()){
+    if(isPathInSandbox(srcPath, userRoot) && srcInfo.exists()){
         //确保目标目录也在用户根目录内
-        QFileInfo dstInfo(dstDir);
-        QString canonicalDstDir = dstInfo.canonicalFilePath(); // 目标目录必定存在
-
-        if(!canonicalDstDir.isEmpty() && dstInfo.isDir() &&
-          (canonicalDstDir == canonicalRoot || canonicalDstDir.startsWith(canonicalRootPrefix))){
+        if(dstInfo.isDir() && isPathInSandbox(dstDir, userRoot)){
             // 防止把目录移进自身或其子目录
             if(srcInfo.isDir() && (canonicalDstDir==canonicalSrc || canonicalDstDir.startsWith(canonicalSrc+"/"))){
                 qDebug()<<"movefile 拒绝：不能把目录移进自身或其子目录";
@@ -701,19 +769,12 @@ PDU *MsgHandler::listdir(const QString& loginName)
     QString absDir=QDir(userRoot).filePath(relPath);
 
     // 越权校验：浏览目录必须在用户根目录内
+    // REQ-FS-003④: 统一走 isPathInSandbox，根传用户目录（原校验根即 userRoot，隔离级别不变）
     QFileInfo dirInfo(absDir);
-    QString canonicalDir=dirInfo.canonicalFilePath();
-    QString canonicalRoot=QFileInfo(userRoot).canonicalFilePath();
-    QString canonicalRootPrefix=QDir(canonicalRoot).absolutePath();
-    if(!canonicalRootPrefix.endsWith('/')){
-        canonicalRootPrefix.append('/');
-    }
 
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
-    if(!canonicalRoot.isEmpty() && !canonicalDir.isEmpty()
-       && (canonicalDir==canonicalRoot || canonicalDir.startsWith(canonicalRootPrefix))
-       && dirInfo.isDir()){
+    if(isPathInSandbox(absDir, userRoot) && dirInfo.isDir()){
         QFileInfoList list=QDir(absDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
         respdu=mkPDU(sizeof(FileInfo)*list.size());
         respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
@@ -742,8 +803,14 @@ PDU *MsgHandler::uploadfileinit()
     const bool resumeEnabled = (resumeMagic == UPLOAD_RESUME_MAGIC);
     const QString dirPath = QString::fromUtf8(pdu->caMsg);
     const QString fileName = fixedString(strname, 32);
-    ResumableUploadSession::BeginResult result =
-            m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
+    // REQ-FS-003①: 校验 dirPath（所在目录，必定存在）；不对最终文件路径做 canonical（新文件尚不存在）。
+    // begin() 内部的 fileName 校验保留，作为纵深防御第二层；不修改会话类接口。
+    ResumableUploadSession::BeginResult result = {false, 0, false};
+    if (isPathInSandbox(dirPath)) {
+        result = m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
+    } else {
+        qWarning() << "uploadfileinit 拒绝越权目录:" << dirPath;
+    }
 
     bool ret=result.ok;
     qint64 resumeOffset=result.offset;
@@ -800,21 +867,15 @@ PDU *MsgHandler::downloadfile()
 {
     QString filePath=QString::fromUtf8(pdu->caMsg);
     QFileInfo fileInfo(filePath);
-    QFileInfo rootInfo(Server::getinstance().filesPath);
+    // REQ-FS-003④: 统一走 isPathInSandbox（原校验根即整个 filesPath，与默认根一致；
+    // canonicalFilePath 仍保留，供 MyTcpSocket 流式下载使用）
     QString canonicalFilePath=fileInfo.canonicalFilePath();
-    QString canonicalRootPath=rootInfo.canonicalFilePath();
-    QString canonicalRootPrefix=QDir(canonicalRootPath).absolutePath();
-    if(!canonicalRootPrefix.endsWith('/')){
-        canonicalRootPrefix.append('/');
-    }
     QString fileName=fixedString(pdu->caData,32);
     bool ret=false;
     qint64 fileSize=0;
     m_downloadCanonicalPath.clear();
 
-    if(!canonicalRootPath.isEmpty()
-            && !canonicalFilePath.isEmpty()
-            && (canonicalFilePath==canonicalRootPath || canonicalFilePath.startsWith(canonicalRootPrefix))
+    if(isPathInSandbox(filePath)
             && fileInfo.isFile()
             && !fileName.isEmpty()){
         fileSize=fileInfo.size();
