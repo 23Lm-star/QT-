@@ -692,10 +692,24 @@ PDU *MsgHandler::sharefile()
     memcpy(resendpdu->caData,seedName,32);
     memcpy(resendpdu->caMsg,pdu->caMsg+32*revUserCnt,resendpdu->uiMsgLen);
     qCDebug(lcFs)<<"resendpdu->caMsg"<<resendpdu->caMsg<<endl;
+    // REQ-EXT-SEC-001 M-1：分享源以服务端 canonical 登记为对每位接收者的握手授权；
+    // 接收者同意移动时仅放行有登记的源，伪造 AGREE_RESPOND 拿不到未分享给自己的文件
+    int sharePathLen = int(pdu->uiMsgLen) - 32*revUserCnt;
+    if(sharePathLen < 0){
+        sharePathLen = 0;
+    }
+    const QByteArray sharePathBytes(pdu->caMsg+32*revUserCnt, sharePathLen);
+    const QString shareCanonicalSrc = QFileInfo(QString::fromUtf8(sharePathBytes).trimmed()).canonicalFilePath();
+    if(shareCanonicalSrc.isEmpty()){
+        qCWarning(lcFs)<<"[sharefile] 分享源不存在，握手未登记 conn="<<m_connId;
+    }
     for(int i=0;i<revUserCnt;i++){
         char revName[32]={'\0'};
         memcpy(revName,pdu->caMsg+32*i,32);
         qCDebug(lcFs)<<"revName"<<revName<<" ";
+        if(!shareCanonicalSrc.isEmpty()){
+            MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(), shareCanonicalSrc);
+        }
         MyTcpServer::getinstance().reseed(revName,resendpdu);
     }
     memfree(resendpdu);
@@ -707,7 +721,7 @@ PDU *MsgHandler::sharefile()
 PDU *MsgHandler::sharefilemove()
 {
     // REQ-EXT-SEC-001：接收者目录以连接级 actor 生成（PDU caData 用户字段仅作请求数据）；
-    // 源路径为他人在分享握手中标题的文件，维持沙箱校验即可
+    // 源路径必须持有分享人对本接收者的握手登记（M-1 修复），未授权的任意沙箱源被拒绝
     QString sourcePath=QString::fromUtf8(pdu->caMsg);
     int indexi=sourcePath.lastIndexOf('/');
     QString fileName=sourcePath.right(sourcePath.size()-indexi-1);
@@ -728,6 +742,7 @@ PDU *MsgHandler::sharefilemove()
     QString tarPath=QString("%1/%2").arg(recvDir).arg(fileName);
     qCDebug(lcFs)<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
     // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含路径分隔符（Windows 下 "\.." 逃逸）
+    const QString canonicalSrc=QFileInfo(sourcePath).canonicalFilePath();
     bool ret=false;
     if(!isPathInSandbox(sourcePath)){
         qCWarning(lcFs)<<"[sharefilemove] 拒绝越权源路径 conn="<<m_connId<<":"<<sourcePath;
@@ -735,8 +750,15 @@ PDU *MsgHandler::sharefilemove()
         qCWarning(lcFs)<<"[sharefilemove] 拒绝越权目标目录 conn="<<m_connId<<":"<<recvDir;
     } else if(fileName.contains('\\') || fileName.contains('/')){
         qCWarning(lcFs)<<"[sharefilemove] 拒绝含路径分隔符的目标名 conn="<<m_connId;
+    } else if(canonicalSrc.isEmpty()
+              || !MyTcpServer::getinstance().hasPendingShare(recvName, canonicalSrc)){
+        // REQ-EXT-SEC-001 M-1: 无握手登记的源一律拒绝；复制执行改用服务端 canonical
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝：源无分享握手登记 conn="<<m_connId<<":"<<sourcePath;
     } else {
-        ret=QFile::copy(sourcePath,tarPath);
+        ret=QFile::copy(canonicalSrc,tarPath);
+        if(ret){
+            MyTcpServer::getinstance().consumePendingShare(recvName, canonicalSrc);
+        }
     }
     PDU* respdu=mkPDU();
     memcpy(respdu->caData,&ret,sizeof (ret));

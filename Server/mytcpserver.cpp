@@ -125,6 +125,44 @@ void MyTcpServer::reseed(char *tarname, PDU *pdu){
     }
 }
 
+// REQ-EXT-SEC-001 M-1：分享握手登记（仅主线程访问）
+void MyTcpServer::addPendingShare(const QString& receiver, const QString& canonicalSource)
+{
+    if(receiver.isEmpty() || canonicalSource.isEmpty()){
+        return;
+    }
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    for(int i=m_pendingShares.size()-1;i>=0;--i){
+        if(now - m_pendingShares[i].addedMs > PENDING_SHARE_TTL_MS){
+            m_pendingShares.removeAt(i);
+        }
+    }
+    while(m_pendingShares.size() >= PENDING_SHARE_MAX){
+        m_pendingShares.removeFirst();
+    }
+    m_pendingShares.append(PendingShare{receiver, canonicalSource, now});
+}
+
+bool MyTcpServer::hasPendingShare(const QString& receiver, const QString& canonicalSource) const
+{
+    for(const PendingShare& ps : m_pendingShares){
+        if(ps.receiver==receiver && ps.canonicalSource==canonicalSource){
+            return true;
+        }
+    }
+    return false;
+}
+
+void MyTcpServer::consumePendingShare(const QString& receiver, const QString& canonicalSource)
+{
+    for(int i=0;i<m_pendingShares.size();++i){
+        if(m_pendingShares[i].receiver==receiver && m_pendingShares[i].canonicalSource==canonicalSource){
+            m_pendingShares.removeAt(i);
+            return;
+        }
+    }
+}
+
 //僵尸连接扫描：静默超过 m_zombieTimeoutMs 的连接直接 abort，触发既有下线清理
 void MyTcpServer::onSweepTimeout(){
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
