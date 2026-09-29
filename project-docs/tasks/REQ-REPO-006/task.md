@@ -69,6 +69,39 @@
 - Q3 = **A**：git-filter-repo（pip 安装）
 - Q4 = 仓库**私有**且密码**仅本地使用** → 按本需求流程执行；force-push 仍另行批准，本需求不含任何推送
 
-## 七、执行记录
+## 七、执行记录（2026-09-29）
 
-（执行中回填：备份路径与 rev-list 验证、filter-repo 输出、前后对照、pipeline 三项、commit-map）
+### 备份与前置
+- 镜像备份：`E:/qt/xiangmu-backup-20260929-165513.git`，`git rev-list --all --count`：备份 60 = 原仓库 60 ✓
+- 本地凭据双保险副本：`E:/qt/config-backup-20260929-165513/`（Server-connect.config md5 与源一致）
+- 工具：`git-filter-repo 2.47.0`（pip 安装于 workbuddy 环境）
+
+### filter-repo 输出（单条重写，O1）
+```
+git-filter-repo --path Server/connect.config --path project-master/ --invert-paths --force
+NOTICE: Removing 'origin' remote (was https://github.com:443/23Lm-star/QT-.git)
+Parsed 1 → 34 → 60 commits; New history written in 0.76s; Completely finished after 3.25s
+```
+commit-map（61 条，旧→新哈希）归档：`project-docs/evidence/REQ-REPO-006/commit-map.txt`
+
+### 前后对照
+| 项 | 重写前 | 重写后 |
+|---|---|---|
+| `.git` 体积 | 51 MB | **19 MB** |
+| rev-list --all --count | 60 | 60（无 commit 因清空变冗余） |
+| 最大 blob | 视频共享系统自动化测试.zip 23.9 MB | Client/mag.png 2.9 MB |
+
+### 验证（§4.6，含 C4 修正）
+- `git log --all -- Server/connect.config` → 0 行 ✓；`git log --all -S"123456" -- Server/connect.config` → 0 ✓
+- `git log --all -- project-master/` → 0 路径 ✓
+- 本地 `Server/connect.config`（65B）与 `Client/connect.config`（28B）均在磁盘 ✓
+- remote 已按记录加回 `https://github.com/23Lm-star/QT-.git`（规范化原 `:443` 写法，同一地址）
+
+### pipeline
+- build.ps1 → **GREEN**（f93529f）
+- test.ps1 → 0 automated tests registered（项目既有状态，人工证据另记），非阻塞
+- audit.ps1 → **PASS**（f93529f）
+- gc：`reflog expire --expire=now --all` + `gc --prune=now --aggressive` 已执行；备份保留（禁删）
+
+### 停止点
+**未推送。任何 push / force-push 待主人单独批准**（本地历史已与 GitHub 旧历史分叉，推送必然需要 --force）。
