@@ -19,6 +19,9 @@ public:
     //登录的用户名
     QString m_strLoginName;
     quint64 m_connectionId;
+    // REQ-EXT-SEC-001：连接认证状态（仅服务端登录成功/注销/断线时写入，客户端不可覆盖）
+    bool m_actorAuthenticated = false;
+    quint64 m_actorSessionVersion = 0;
     //存储传输的pdu字节流
     int a;
     QByteArray m_dpulist;
@@ -42,6 +45,9 @@ public:
     void scheduleNextDownloadChunk();
     void handleUploadData(PDU* pdu);
     void sendUploadAck(bool success, qint64 nextOffset, bool complete);
+    // REQ-EXT-SEC-001：统一入口门——公开类型白名单 + 未认证拒绝响应
+    static bool isPublicRequestType(uint uiType);
+    PDU* authRejectPdu(uint uiType);
     // 所有权规则：
     // - 返回非空 PDU → 由 recvmsg() 调用 seedMsg() 写入并释放
     // - 返回 nullptr   → PDU 已由 handlMsg() 内部发送并释放（如下载流），或无需响应

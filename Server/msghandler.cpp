@@ -24,6 +24,13 @@ QString fixedString(const char *data, int maxLen)
     }
     return QString::fromUtf8(bytes);
 }
+// REQ-EXT-SEC-001：将服务端派生的身份写入 32 字节定长字段（覆盖客户端提交的"自己"字段）
+void copySelfField(char *dst, const QString &name)
+{
+    memset(dst, 0, 32);
+    const QByteArray bytes = name.toUtf8();
+    memcpy(dst, bytes.constData(), qMin(bytes.size(), 31));
+}
 }
 
 MsgHandler::MsgHandler(){
@@ -100,32 +107,67 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
 }
 
 //处理注销账户请求
-PDU *MsgHandler::logoff()
+// REQ-EXT-SEC-001：授权依据为连接级身份（m_actorName），PDU 用户字段只作请求数据；
+// 删除目录同样以服务端派生的 actor 生成，密码仅作为对本人账号的二次确认。
+PDU *MsgHandler::logoff(bool &revoked)
 {
-    QString userName = fixedString(pdu->caData, 32);
+    revoked=false;
+    const QString actor=m_actorName;
+    if(actor.isEmpty()){
+        qCWarning(lcAuth)<<"[logoff] 拒绝：连接无认证上下文 conn="<<m_connId;
+        PDU* respdu=mkPDU();
+        respdu->uiType=ENUM_MSG_TYPE_LOGOFF_RESPOND;
+        bool ret=false;
+        memcpy(respdu->caData,&ret,sizeof(ret));
+        return respdu;
+    }
+
+    QString claimedName = fixedString(pdu->caData, 32);
     QString userPwd  = fixedString(pdu->caData + 32, 32);
 
-    qCDebug(lcAuth) << "logoff request for:" << userName;
+    if(claimedName!=actor){
+        qCWarning(lcAuth)<<"[logoff] PDU 用户名字段与连接身份不符，按连接身份受理 conn="<<m_connId;
+    }
+    qCDebug(lcAuth) << "logoff request for:" << actor;
 
     bool ret = OperateDB::instance().handleLogoff(
-        userName.toUtf8().constData(),
+        actor.toUtf8().constData(),
         userPwd.toUtf8().constData()
     );
 
-    // 如果数据库删除成功，清理用户的文件目录
+    // 如果数据库删除成功，清理用户的文件目录（目录名 = 服务端 actor，非客户端字段）
     if(ret){
-        QString userDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(userName);
+        QString userDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(actor);
         QDir dir(userDir);
         if(dir.exists()){
             bool removed=dir.removeRecursively();
             qCDebug(lcAuth)<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
         }
+        revoked=true;
     }
 
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LOGOFF_RESPOND;
     memcpy(respdu->caData,&ret,sizeof(ret));
     return respdu;
+}
+
+// ===== REQ-EXT-SEC-001：actor 用户根与规范路径校验 =====
+QString MsgHandler::actorUserRoot() const
+{
+    if(m_actorName.isEmpty()){
+        return QString();
+    }
+    return QDir(Server::getinstance().filesPath).absoluteFilePath(m_actorName);
+}
+
+bool MsgHandler::pathInActorRoot(const QString &path) const
+{
+    const QString root=actorUserRoot();
+    if(root.isEmpty()){
+        return false;
+    }
+    return isPathInSandbox(path, root);
 }
 
 PDU *MsgHandler::captcha()
@@ -204,8 +246,10 @@ PDU *MsgHandler::rigist()
     return respdu;
 }
 //处理登录请求，同时需要更新socket对象的客户用户名
-PDU *MsgHandler::login(QString &strname)
+// REQ-EXT-SEC-001：authOk 仅在服务端凭据校验通过时为 true，由连接层据此绑定 actor_context
+PDU *MsgHandler::login(QString &strname, bool &authOk)
 {
+    authOk = false;
     int remaining = 0;
     int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen, remaining);
     if (captchaRet != 0) {
@@ -225,6 +269,7 @@ PDU *MsgHandler::login(QString &strname)
     qCDebug(lcAuth)<<"login ret"<<ret<<endl;
     if(ret==1){//记录已登录的用户名
         strname=username;
+        authOk=true;
     }
     //将登录结果打包进响应报文并返回
     PDU* respdu=mkPDU();
@@ -270,6 +315,12 @@ PDU *MsgHandler::onlineuser(const QString &myname)
 PDU *MsgHandler::addfriend()
 {
     //取出添加人和目标人
+    // REQ-EXT-SEC-001：添加人（自己）以连接级 actor 覆盖
+    const QString claimedSelf = fixedString(pdu->caData, 32);
+    if(claimedSelf != m_actorName){
+        qCWarning(lcNet)<<"[addfriend] 添加人字段与连接身份不符，按连接身份改写 conn="<<m_connId;
+    }
+    copySelfField(pdu->caData, m_actorName);
     char userName[32]={'\0'};
     char seedName[32]={'\0'};
     memcpy(userName,pdu->caData,32);
@@ -296,6 +347,12 @@ PDU *MsgHandler::addfriend()
 
 PDU *MsgHandler::addfriendFin()
 {
+    // REQ-EXT-SEC-001：同意人（自己）以连接级 actor 覆盖
+    const QString claimedSelf = fixedString(pdu->caData, 32);
+    if(claimedSelf != m_actorName){
+        qCWarning(lcNet)<<"[addfriendFin] 同意人字段与连接身份不符，按连接身份改写 conn="<<m_connId;
+    }
+    copySelfField(pdu->caData, m_actorName);
     char agreeName[32]={'\0'};
     char seedName[32]={'\0'};
     memcpy(agreeName,pdu->caData,32);
@@ -329,6 +386,12 @@ PDU *MsgHandler::flushfriend(const QString &username)
 
 PDU *MsgHandler::deletefriend()
 {
+    // REQ-EXT-SEC-001：删除发起人（自己）在 caData+32，以连接级 actor 覆盖
+    const QString claimedSelf = fixedString(pdu->caData + 32, 32);
+    if(claimedSelf != m_actorName){
+        qCWarning(lcNet)<<"[deletefriend] 发起人字段与连接身份不符，按连接身份改写 conn="<<m_connId;
+    }
+    copySelfField(pdu->caData + 32, m_actorName);
     char strName[32]={'\0'};
     char tarName[32]={'\0'};
     memcpy(strName,pdu->caData,32);
@@ -349,6 +412,12 @@ PDU *MsgHandler::deletefriend()
 
 PDU *MsgHandler::chat()
 {
+    // REQ-EXT-SEC-001：发送人字段以连接级 actor 强制覆盖（入库与转发报文同步改写），客户端提交只作请求数据
+    const QString claimedSender = fixedString(pdu->caData, 32);
+    if(claimedSender != m_actorName){
+        qCWarning(lcNet)<<"[chat] 发送人字段与连接身份不符，按连接身份改写 conn="<<m_connId<<" claimed="<<claimedSender;
+    }
+    copySelfField(pdu->caData, m_actorName);
     char seedName[32]={'\0'};//发送人
     char tarName[32]={'\0'};//接收人
     memcpy(seedName,pdu->caData,32);
@@ -398,12 +467,13 @@ PDU *MsgHandler::MKDIR(){
     bool ret2=false;
     const QString dirName = fixedString(fileName, 32);
     // REQ-FS-003⑤: path 为待建目录的所在父目录（须存在且在沙箱内）；新目录名不得含路径分隔符
-    if(isPathInSandbox(path) && !dirName.contains('/') && !dirName.contains('\\')){
+    // REQ-EXT-SEC-001: 收敛为 actor 本人用户根（filesPath/<actor>），跨用户目录一律拒绝
+    if(pathInActorRoot(path) && !dirName.contains('/') && !dirName.contains('\\')){
         QDir dir;
         ret1=dir.mkdir(QString("%1").arg(path));
         ret2=dir.mkdir(QString("%1/%2").arg(path).arg(dirName));
     } else {
-        qCWarning(lcFs)<<"[MKDIR] 拒绝越权建目录:"<<path<<dirName;
+        qCWarning(lcFs)<<"[MKDIR] 拒绝越权建目录 conn="<<m_connId<<" 路径:"<<path<<" 名:"<<dirName;
     }
     qCDebug(lcFs)<<"mkdir" <<QString("%1").arg(path)<<"ret1"<<ret1<<" ";
     qCDebug(lcFs)<<"mkdir" <<QString("%1/%2").arg(path).arg(fileName)<<"ret2"<<ret2<<" ";
@@ -422,8 +492,9 @@ PDU *MsgHandler::deldir(const QString& loginName)
     qCDebug(lcFs)<<"删除文件:"<<delFilePath<<"文件类型"<<delFileType<<endl;
     bool ans=0;//记录删除结果，默认删除失败
     // REQ-FS-003②: 先校验后删除，顺序不可颠倒（removeRecursively 不可逆）
-    if(!isPathInSandbox(delFilePath)){
-        qCWarning(lcFs)<<"[deldir] 拒绝越权删除:"<<delFilePath;
+    // REQ-EXT-SEC-001: 只能删除 actor 本人用户根内的路径（loginName 参数即连接级身份）
+    if(!pathInActorRoot(delFilePath)){
+        qCWarning(lcFs)<<"[deldir] 拒绝越权删除 conn="<<m_connId<<" 路径:"<<delFilePath;
     }
     else if(delFileType==1){//如果文件类型为普通文件
         QFile file(delFilePath);
@@ -461,9 +532,10 @@ PDU *MsgHandler::changedir(){
     PDU* respdu=nullptr;
     bool isExist=FileInfoi.exists();
     // REQ-FS-003⑤: 沙箱外路径按"不存在"处理，不回显任意路径的存在性与名称
-    if(isExist && !isPathInSandbox(tarPath)){
+    // REQ-EXT-SEC-001: 探测范围收敛为 actor 本人用户根，他人目录按"不存在"处理
+    if(isExist && !pathInActorRoot(tarPath)){
         isExist=false;
-        qCWarning(lcFs)<<"[changedir] 拒绝越权路径探测:"<<tarPath;
+        qCWarning(lcFs)<<"[changedir] 拒绝越权路径探测 conn="<<m_connId<<":"<<tarPath;
     }
     qCDebug(lcFs)<<" isExist "<<isExist<<" ";
     //如果文件存在
@@ -498,8 +570,9 @@ PDU *MsgHandler::flushfile()
 {
     QString path(QString::fromUtf8(pdu->caMsg));
     // REQ-FS-003⑤: 沙箱外目录一律不回显条目
-    if(!isPathInSandbox(path)){
-        qCWarning(lcFs)<<"[flushfile] 拒绝越权列目录:"<<path;
+    // REQ-EXT-SEC-001: 列目录范围收敛为 actor 本人用户根
+    if(!pathInActorRoot(path)){
+        qCWarning(lcFs)<<"[flushfile] 拒绝越权列目录 conn="<<m_connId<<":"<<path;
         PDU* respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
         return respdu;
@@ -544,15 +617,16 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     //进行文件或目录的重命名
     bool ret=1;
     // REQ-FS-003③: 先校验后重命名；未知 fileType 维持原状（ret=1 不执行改名）
-    if(!isPathInSandbox(dirPath)){
+    // REQ-EXT-SEC-001: 目录收敛为 actor 本人用户根（loginName 参数即连接级身份）
+    if(!pathInActorRoot(dirPath)){
         ret=0;
-        qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名目录:"<<dirPath;
+        qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名目录 conn="<<m_connId<<":"<<dirPath;
     }
     else if(oldName.contains('/') || oldName.contains('\\')
             || newName.contains('/') || newName.contains('\\')){
         // F-1: 名称段含分隔符时 dirPath 校验可被 "dirPath/../x" 拼接绕过，一律拒绝
         ret=0;
-        qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名名称段:"<<oldName<<newName;
+        qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名名称段 conn="<<m_connId;
     }
     else if(fileType==0){//目录
         QDir dir;
@@ -602,6 +676,12 @@ PDU *MsgHandler::renamefile(const QString& loginName)
 PDU *MsgHandler::sharefile()
 {
     //发送用户名
+    // REQ-EXT-SEC-001：分享人（自己）以连接级 actor 覆盖，转发给他人的署名即服务端身份
+    const QString claimedSharer = fixedString(pdu->caData, 32);
+    if(claimedSharer != m_actorName){
+        qCWarning(lcFs)<<"[sharefile] 分享人字段与连接身份不符，按连接身份改写 conn="<<m_connId;
+    }
+    copySelfField(pdu->caData, m_actorName);
     char seedName[32]={'\0'};
     memcpy(seedName,pdu->caData,32);
     int revUserCnt=0;
@@ -626,22 +706,35 @@ PDU *MsgHandler::sharefile()
 //分享文件（移动）
 PDU *MsgHandler::sharefilemove()
 {
+    // REQ-EXT-SEC-001：接收者目录以连接级 actor 生成（PDU caData 用户字段仅作请求数据）；
+    // 源路径为他人在分享握手中标题的文件，维持沙箱校验即可
     QString sourcePath=QString::fromUtf8(pdu->caMsg);
     int indexi=sourcePath.lastIndexOf('/');
     QString fileName=sourcePath.right(sourcePath.size()-indexi-1);
-    QString recvName=QString::fromUtf8(pdu->caData);
-    // 目标接收者目录段同样客户端可控（../ 可逃逸），拼接方式维持原状
+    QString recvName=m_actorName;
+    if(recvName.isEmpty()){
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝：连接无认证上下文 conn="<<m_connId;
+        PDU* respdu=mkPDU();
+        bool fail=false;
+        memcpy(respdu->caData,&fail,sizeof(fail));
+        respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND;
+        return respdu;
+    }
+    const QString claimedRecv=QString::fromUtf8(pdu->caData);
+    if(claimedRecv!=recvName){
+        qCWarning(lcFs)<<"[sharefilemove] 接收者字段与连接身份不符，按连接身份生成目标 conn="<<m_connId;
+    }
     QString recvDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(recvName);
-    QString tarPath=QString("%1/%2/%3").arg(Server::getinstance().filesPath).arg(pdu->caData).arg(fileName);
+    QString tarPath=QString("%1/%2/%3").arg(recvDir).arg(fileName);
     qCDebug(lcFs)<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
-    // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含反斜杠（Windows 下 "\.." 逃逸）
+    // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含路径分隔符（Windows 下 "\.." 逃逸）
     bool ret=false;
     if(!isPathInSandbox(sourcePath)){
-        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权源路径:"<<sourcePath;
-    } else if(!isPathInSandbox(recvDir)){
-        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权目标目录:"<<recvDir;
-    } else if(fileName.contains('\\')){
-        qCWarning(lcFs)<<"[sharefilemove] 拒绝含路径分隔符的目标名:"<<fileName;
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权源路径 conn="<<m_connId<<":"<<sourcePath;
+    } else if(!pathInActorRoot(recvDir)){
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权目标目录 conn="<<m_connId<<":"<<recvDir;
+    } else if(fileName.contains('\\') || fileName.contains('/')){
+        qCWarning(lcFs)<<"[sharefilemove] 拒绝含路径分隔符的目标名 conn="<<m_connId;
     } else {
         ret=QFile::copy(sourcePath,tarPath);
     }
@@ -804,10 +897,11 @@ PDU *MsgHandler::uploadfileinit()
     // REQ-FS-003①: 校验 dirPath（所在目录，必定存在）；不对最终文件路径做 canonical（新文件尚不存在）。
     // begin() 内部的 fileName 校验保留，作为纵深防御第二层；不修改会话类接口。
     ResumableUploadSession::BeginResult result = {false, 0, false};
-    if (isPathInSandbox(dirPath)) {
+    // REQ-EXT-SEC-001: 上传目标目录收敛为 actor 本人用户根
+    if (pathInActorRoot(dirPath)) {
         result = m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
     } else {
-        qCWarning(lcFs) << "uploadfileinit 拒绝越权目录:" << dirPath;
+        qCWarning(lcFs) << "uploadfileinit 拒绝越权目录 conn=" << m_connId << ":" << dirPath;
     }
 
     bool ret=result.ok;
@@ -873,12 +967,15 @@ PDU *MsgHandler::downloadfile()
     qint64 fileSize=0;
     m_downloadCanonicalPath.clear();
 
-    if(isPathInSandbox(filePath)
+    // REQ-EXT-SEC-001: 下载范围收敛为 actor 本人用户根，他人文件不可下载
+    if(pathInActorRoot(filePath)
             && fileInfo.isFile()
             && !fileName.isEmpty()){
         fileSize=fileInfo.size();
         ret=true;
         m_downloadCanonicalPath=canonicalFilePath;
+    } else {
+        qCWarning(lcFs)<<"[downloadfile] 拒绝越权下载 conn="<<m_connId<<" 路径:"<<filePath;
     }
 
     //仅返回元数据 PDU（不含文件内容），实际数据由 MyTcpSocket 流式发送
@@ -895,6 +992,12 @@ PDU *MsgHandler::downloadfile()
 //获取聊天信息
 PDU *MsgHandler::chatmsg()
 {
+    // REQ-EXT-SEC-001：查询者（自己）在 caData 首段，以连接级 actor 覆盖，防止读取他人聊天历史
+    const QString claimedSelf = fixedString(pdu->caData, 32);
+    if(claimedSelf != m_actorName){
+        qCWarning(lcNet)<<"[chatmsg] 查询者字段与连接身份不符，按连接身份改写 conn="<<m_connId;
+    }
+    copySelfField(pdu->caData, m_actorName);
     char seedName[32]={'\0'};
     char revName[32]={'\0'};
     memcpy(revName,pdu->caData,32);
@@ -1063,8 +1166,12 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
 }
 
 PDU* MsgHandler::queryFilePublishLink() {
+    // REQ-EXT-SEC-001：owner 以连接级 actor 生成，PDU 用户字段仅作请求数据
     QString relativePath = fixedString(pdu->caMsg, pdu->uiMsgLen);
-    QString ownerName = fixedString(pdu->caData, 32); 
+    QString ownerName = m_actorName;
+    if(fixedString(pdu->caData, 32) != ownerName){
+        qCWarning(lcFs)<<"[queryFilePublishLink] owner 字段与连接身份不符，按连接身份查询 conn="<<m_connId;
+    }
     
     QString token = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
     

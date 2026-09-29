@@ -21,7 +21,7 @@ public:
     ResumableUploadSession m_uploadSession;
     //各种处理函数，进行各种类型请求的处理
     PDU* rigist();//注册
-    PDU* login(QString& strname);//登录
+    PDU* login(QString& strname, bool& authOk);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context）
     PDU* finduser();//查找用户
     PDU *onlineuser(const QString & myname);//在线用户
     PDU* addfriend();//添加用户
@@ -45,7 +45,13 @@ public:
     PDU* captcha();//验证码生成
     QString generateCaptchaCode(int length = 6);
     PDU* getuserinformation();//获取用户信息
-    PDU* logoff();//注销账户
+    PDU* logoff(bool& revoked);//注销账户（REQ-EXT-SEC-001：授权依据为连接级身份，revoked 供会话撤销）
+
+    // ===== REQ-EXT-SEC-001：连接级 actor_context（仅服务端登录成功时写入，客户端 PDU 字段不作为授权依据） =====
+    QString m_actorName;   // 服务端派生的操作者用户名
+    quint64 m_connId = 0;  // 连接关联标识（拒绝审计用）
+    QString actorUserRoot() const;                     // 服务端生成的规范用户根：filesPath/<actor>
+    bool pathInActorRoot(const QString& path) const;   // 路径必须落在 actor 本人用户根内
     PDU* createPublishLink(const QString& loginName);//创建外链分享
     
     // 新增：安全外链分享（BUG-ARC-PUBLINK-001）
