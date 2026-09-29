@@ -19,6 +19,11 @@ int main(int argc, char *argv[])
     }
     // 仅成功后初始化数据库连接池
     OperateDB::instance().connect();
+    // REQ-EXT-FILE-001 T1/D1：schema 版本检查 fail-fast——库不可达或未执行迁移则拒绝启动
+    if (!OperateDB::instance().checkSchemaVersion()) {
+        qCCritical(lcApp) << "DB schema not ready (see lcDb critical log). Exiting.";
+        return 1;
+    }
     s.show();
     return a.exec();
 }

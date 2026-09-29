@@ -12,6 +12,10 @@ public:
     //管理/维护一个数据库的连接
     void connect();
     static OperateDB& instance();//单例模式
+    //REQ-EXT-FILE-001 T1: 文件资产 schema 版本（D1 启动 fail-fast，不静默建表）
+    static const int kFileAssetSchemaVersion = 2026092901;
+    //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
+    bool checkSchemaVersion();
     //执行注册用户操作函数
     bool handleRegit(char* strname,char*strpwd);
     //登录用户

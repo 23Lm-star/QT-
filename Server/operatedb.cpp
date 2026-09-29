@@ -65,6 +65,36 @@ void OperateDB::connect()
     }
 }
 
+// REQ-EXT-FILE-001 T1：启动 schema 版本检查（D1 fail-fast：库不可达/表缺失/版本低一律拒绝启动，
+// 不静默建表、不自动执行迁移——迁移只由 migrate_ext_file_001.sql 人工受控执行）。
+bool OperateDB::checkSchemaVersion()
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) {
+        qCCritical(lcDb) << "[checkSchemaVersion] 数据库不可达：请先检查 connect.config 与 MySQL 服务";
+        return false;
+    }
+    QSqlQuery q(connection.database());
+    if (!q.exec("SELECT MAX(version) FROM schema_version")) {
+        qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
+                         << q.lastError().text()
+                         << "— 请先执行 Server/migrate_ext_file_001.sql";
+        return false;
+    }
+    int version = 0;
+    if (q.next() && !q.value(0).isNull()) {
+        version = q.value(0).toInt();
+    }
+    const int required = kFileAssetSchemaVersion;
+    if (version < required) {
+        qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
+                         << "— 请先执行 Server/migrate_ext_file_001.sql";
+        return false;
+    }
+    qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
+    return true;
+}
+
 bool OperateDB::handleRegit(char *strname, char *strpwd)
 {
     if(strname==nullptr||strpwd==nullptr){

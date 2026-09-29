@@ -40,6 +40,12 @@
 `Server/fileobjectstore.{h,cpp}`、`Server/operatedb.{h,cpp}`、`Server/resumableuploadsession.{h,cpp}`、`Server/uploadwritetask.{h,cpp}`、`Server/msghandler.{h,cpp}`、`Server/mytcpsocket.{h,cpp}`（会话持久化配合）、`Server/server.{h,cpp}`（启动版本检查）、`Server/Server.pro`、`Server/migrate_ext_file_001.sql`、`Client/*`（仅回归必需的最小配合，预期零改动）、`project-docs/tasks|evidence/REQ-EXT-FILE-001/`。
 **禁止**：两 `protocol.h`（frozen）、`Server/filesys/` 入库、新外部依赖、顺手实现秒传 PDU/群文件/乱序并发上传、物理删除用户旧文件。
 
+## 运行环境事实（T1 实测，独立测试会话需照此准备）
+- 本机 MySQL 5.7：**Antelope+COMPACT，索引键 767B 上限**，`character_set_server=utf8` → 新表统一 utf8+缩窄索引列（已落 DDL）。
+- QMYSQL 驱动不在 Qt 发行版：需 `release/sqldrivers/qsqlmysql.dll` + exe 同目录 `libmysql.dll`（从主工作树 `build/build-Server/release/` 复制，非入库物）。
+- Server.exe 运行目录必须为 `Server/`（`filesPath=./filesys` 为相对路径）；GUI 子系统，stdout 不可重定向捕获，断言走端口/日志文件/DB。
+- 迁移实测幂等：重放 `migrate_ext_file_001.sql` 零报错；fail-fast 实测：版本低→进程秒退、不监听 5000。
+
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
 2. 32 字节展示名 + `(1)` 后缀溢出 → 后缀插入时截基名保留扩展名，规则写进 T3 测试。

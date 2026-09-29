@@ -4,7 +4,7 @@
 
 物理字节只存一份（`file_object`，内容寻址），用户看到的每个文件是一条逻辑条目（`user_file`，归属+目录+展示名→对象）；上传经持久化会话（`upload_session`）临时写、服务端复算后原子转正；删除=解引用，引用归零标待回收；旧路径经 `file_migration_map` 双向可审计映射。客户端协议与 UI 零改动（D4）。
 
-## 2. 表结构（T1，全部 utf8mb4/InnoDB）
+## 2. 表结构（T1，utf8/InnoDB——实测本机 MySQL 5.7 Antelope+COMPACT，索引键上限 767B，列宽已适配；见 `migrate_ext_file_001.sql` 头注）
 
 ```sql
 -- schema_version：单行版本表，启动检查依据（D1）
@@ -24,23 +24,23 @@ CREATE TABLE IF NOT EXISTS file_object (
 
 CREATE TABLE IF NOT EXISTS user_file (
   file_id      BIGINT AUTO_INCREMENT PRIMARY KEY,
-  owner_name   VARCHAR(64) NOT NULL,           -- 服务端 actor，客户端字段不参与（T5）
-  parent_path  VARCHAR(255) NOT NULL,          -- 规范逻辑路径，用户根内，'/' 结尾
-  display_name VARCHAR(128) NOT NULL,
+  owner_name   VARCHAR(32) NOT NULL,           -- 服务端 actor，客户端字段不参与（T5）
+  parent_path  VARCHAR(150) NOT NULL,          -- 规范逻辑路径，用户根内，'/' 结尾
+  display_name VARCHAR(70) NOT NULL,
   is_dir       TINYINT NOT NULL DEFAULT 0,     -- 目录=条目，object_id NULL
   object_id    BIGINT NULL,
   status       ENUM('active','deleted') NOT NULL DEFAULT 'active',
   created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  UNIQUE KEY uk_loc (owner_name, parent_path, display_name, is_dir),
+  UNIQUE KEY uk_loc (owner_name, parent_path, display_name),   -- 目录与文件同一命名空间（同磁盘现状）
   KEY idx_owner (owner_name, parent_path, status),
   CONSTRAINT fk_uf_obj FOREIGN KEY (object_id) REFERENCES file_object(object_id));
 
 CREATE TABLE IF NOT EXISTS upload_session (
   session_id     BIGINT AUTO_INCREMENT PRIMARY KEY,
-  owner_name     VARCHAR(64) NOT NULL,
-  parent_path    VARCHAR(255) NOT NULL,
-  display_name   VARCHAR(128) NOT NULL,
+  owner_name     VARCHAR(32) NOT NULL,
+  parent_path    VARCHAR(150) NOT NULL,
+  display_name   VARCHAR(70) NOT NULL,
   expected_size  BIGINT NOT NULL,
   client_sha256  CHAR(64) NULL,                -- 仅预检元数据，不作授权/转正依据
   staging_path   VARCHAR(255) NOT NULL,        -- filesys/tmp/{session_id}
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS upload_session (
   KEY idx_owner_status (owner_name, status));
 
 CREATE TABLE IF NOT EXISTS file_migration_map (
-  old_path    VARCHAR(255) NOT NULL PRIMARY KEY, -- 旧物理相对路径 filesys/<user>/...
+  old_path    VARCHAR(191) NOT NULL PRIMARY KEY, -- 旧物理相对路径 filesys/<user>/...
   file_id     BIGINT NULL,
   object_id   BIGINT NULL,
   status      ENUM('mapped','skipped_name_conflict','failed') NOT NULL,
