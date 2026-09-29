@@ -4,7 +4,7 @@
 - **tier 依据**: 触碰生产源码（`Server/msghandler.h/.cpp`）但不触碰 `frozen_paths`（两个 `protocol.h`）、不改对外协议、单分支单主题可回滚；基线 `b5d7bb3`，分支 `fix/path-traversal-and-ownership`
 - **owner_agent**: claude-code
 - **date**: 2026-09-29
-- **状态**: 独立审计 FAIL（F-1）→ owner 修复 @`a518e35` → **独立复审 PASS（无阻塞项，O-5 记录在案）**，主人通知合并 → 合并 master 节点执行中
+- **状态**: **已完成并合并 master** @`f937c90`（no-ff，合并结果 build GREEN / test 0 注册项 / audit PASS）；审计 FAIL→修复→复审 PASS 全流程闭环；O-5 及 O-1–O-4 残余观察记录在案
 
 ## 需求（业务语言）
 
@@ -53,3 +53,5 @@
 | 2026-09-29 | **根因定性：需求 §3.2③"校验 dirPath 一处即可"为规格盲区**（默认名称为裸文件名），已同步修订需求文档（§二 A6 扩名称段、§3.2③ 二次修订、§七 增至 10 场景） | 实现忠实于旧规格；冲突时同步修正文档 |
 | 2026-09-29 | **重盖章 @`a518e35`**：端到端 harness 扩 S6b/S6c/S6d（旧名 `../`、新名 `../`、新名 `\`）= **28/28 PASS**；build GREEN / test 0 注册项 / audit PASS；服务端拒绝日志含 3 条"拒绝越权重命名名称段"，victim 完好 | 证据 `project-docs/evidence/REQ-FS-003/repair/`；handoff `req-fs-003-repair-2026-09-29.txt` |
 | 2026-09-29 | **待独立复审会话（auditor ≠ developer）确认 A6 后由主人通知合并**；复审前合并禁令维持（强制门） | 本会话未合并 master |
+| 2026-09-29 | **独立复审会话（只读 worktree @a518e35）判定 PASS**：F-1 关闭、A6 达标、范围合规、证据链核验无伪造；新增观察 O-5（Low，`.`/`..` 纯名依赖系统调用兜底，与 MKDIR 同模式，不阻塞） | 报告 `project-docs/evidence/REQ-FS-003/reaudit-report.md` |
+| 2026-09-29 | **主人指令合并（"继续"）**：三事实线齐（复审 PASS / frozen-path 空 / pipeline GREEN）后 `fix/path-traversal-and-ownership` no-ff 合入 master @`f937c90`；合并结果 build GREEN / test 0 注册项 / audit PASS | push origin 未做，待主人指令；REQ-FS-003 关闭 |
