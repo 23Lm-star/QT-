@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QDateTime>
 #include <QThreadPool>
+#include <cstring>
 
 MyTcpSocket::MyTcpSocket()
 {
@@ -45,14 +46,39 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     qCDebug(lcNet)<<"——————开始进行处理————————"<<endl;
     PDU* respdu=nullptr;
     m_MsgHandler->pdu=pdu;
-    
+
+    // ===== REQ-EXT-SEC-001 T2: 统一入口门 =====
+    // 白名单（注册/登录/验证码/心跳）之外的一切业务请求，必须携带连接级认证上下文；
+    // 拒绝原因与连接关联标识入日志（不含密码/令牌/文件内容），并回失败响应。
+    if(!isPublicRequestType(pdu->uiType) && !m_actorAuthenticated){
+        qCWarning(lcAuth)<<"[AUTHGATE] 拒绝：未认证连接发送业务请求 conn="<<m_connectionId
+                         <<" type="<<pdu->uiType<<" session="<<m_actorSessionVersion;
+        if(pdu->uiType==ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST){
+            sendUploadAck(false,m_MsgHandler->m_uploadSession.receivedSize(),false);
+            return nullptr;
+        }
+        return authRejectPdu(pdu->uiType);
+    }
+    // 处理器统一使用服务端派生的 actor（登录时绑定，注销/断线撤销）
+    m_MsgHandler->m_actorName=this->m_strLoginName;
+    m_MsgHandler->m_connId=this->m_connectionId;
+
     switch(pdu->uiType){
         case ENUM_MSG_TYPE_REGIST_REQUEST :{
              respdu=m_MsgHandler->rigist();
              break;
         }
          case ENUM_MSG_TYPE_LOGIN_REQUEST :{
-            respdu=m_MsgHandler->login(this->m_strLoginName);
+            bool authOk=false;
+            respdu=m_MsgHandler->login(this->m_strLoginName,authOk);
+            if(authOk){
+                // REQ-EXT-SEC-001 T1：登录成功，绑定连接级 actor_context
+                m_actorAuthenticated=true;
+                ++m_actorSessionVersion;
+                m_MsgHandler->m_actorName=this->m_strLoginName;
+                qCDebug(lcAuth)<<"[AUTH] 登录成功并绑定连接身份 conn="<<m_connectionId
+                                <<" session="<<m_actorSessionVersion;
+            }
             break;
          }
     case ENUM_MSG_TYPE_findUser_REQUEST:{
@@ -153,7 +179,17 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         break;
     }
     case ENUM_MSG_TYPE_LOGOFF_REQUEST:{
-        respdu=m_MsgHandler->logoff();
+        bool revoked=false;
+        respdu=m_MsgHandler->logoff(revoked);
+        if(revoked){
+            // REQ-EXT-SEC-001 T1：注销成功，撤销业务访问（连接保留，D2），后续请求被入口门拒绝
+            m_actorAuthenticated=false;
+            ++m_actorSessionVersion;
+            m_strLoginName.clear();
+            m_MsgHandler->m_actorName.clear();
+            qCWarning(lcAuth)<<"[AUTH] 注销撤销业务访问（连接保留）conn="<<m_connectionId
+                              <<" session="<<m_actorSessionVersion;
+        }
         break;
     }
     case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:{
@@ -412,8 +448,92 @@ void MyTcpSocket::clientOffLine(){
     }
     m_downloadActive=false;
     OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
+    // REQ-EXT-SEC-001 T1：断线即撤销连接级 actor_context
+    m_actorAuthenticated=false;
+    ++m_actorSessionVersion;
+    m_MsgHandler->m_actorName.clear();
+    m_strLoginName.clear();
     MyTcpServer::getinstance().removeSocket(this);
-    qCDebug(lcNet)<<"用户"<<m_strLoginName<<"已经退出登录"<<endl;
+    qCDebug(lcNet)<<"用户已经退出登录，业务访问已撤销 conn="<<m_connectionId<<endl;
+}
+
+// REQ-EXT-SEC-001：白名单——注册/登录/验证码/心跳可在未认证状态使用
+bool MyTcpSocket::isPublicRequestType(uint uiType)
+{
+    switch(uiType){
+    case ENUM_MSG_TYPE_REGIST_REQUEST:
+    case ENUM_MSG_TYPE_LOGIN_REQUEST:
+    case ENUM_MSG_TYPE_CAPTCHA_REQUEST:
+    case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// REQ-EXT-SEC-001：未认证拒绝时按请求类型回对应失败响应（caData 清零即 false/空列表/异常码）
+PDU* MyTcpSocket::authRejectPdu(uint uiType)
+{
+    auto reject=[&](uint respType){
+        PDU* r=mkPDU();
+        r->uiType=respType;
+        memset(r->caData,0,sizeof(r->caData));
+        return r;
+    };
+    switch(uiType){
+    case ENUM_MSG_TYPE_findUser_REQUEST:{
+        PDU* r=reject(ENUM_MSG_TYPE_findUser_RESPOND); int ret=-1; memcpy(r->caData,&ret,sizeof(ret)); return r;
+    }
+    case ENUM_MSG_TYPE_ONLINEUSER_REQUEST:
+        return reject(ENUM_MSG_TYPE_ONLINEUSER_RESPOND);
+    case ENUM_MSG_TYPE_ADDFRIEND_REQUEST:{
+        PDU* r=reject(ENUM_MSG_TYPE_ADDFRIEND_RESPOND); int ret=-1; memcpy(r->caData,&ret,sizeof(ret)); return r;
+    }
+    case ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST:
+        return reject(ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND);
+    case ENUM_MSG_TYPE_DELETEFRIEND_REQUEST:
+        return reject(ENUM_MSG_TYPE_DELETEFRIEND_RESPOND);
+    case ENUM_MSG_TYPE_GETCHATMSG_REQUEST:
+        return reject(ENUM_MSG_TYPE_GETCHATMSG_RESPOND);
+    case ENUM_MSG_TYPE_MKDIR_REQUEST:
+        return reject(ENUM_MSG_TYPE_MKDIR_RESPOND);
+    case ENUM_MSG_TYPE_CHANGEDIR_REQUEST:
+        return reject(ENUM_MSG_TYPE_CHANGEDIR_RESPOND);
+    case ENUM_MSG_TYPE_DELFILE_REQUEST:
+        return reject(ENUM_MSG_TYPE_DELFILE_RESPOND);
+    case ENUM_MSG_TYPE_FLUSHFILE_REQUEST:
+        return reject(ENUM_MSG_TYPE_FLUSHFILE_RESPOND);
+    case ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST:
+        return reject(ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND);
+    case ENUM_MSG_TYPE_RENAMEFILE_REQUEST:
+        return reject(ENUM_MSG_TYPE_RENAMEFILE_RESPOND);
+    case ENUM_MSG_TYPE_SHAREFILE_REQUEST:
+        return reject(ENUM_MSG_TYPE_SHAREFILE_RESPOND);
+    case ENUM_MSG_TYPE_SHAREFILE_AGREE_RESPOND:
+        return reject(ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND);
+    case ENUM_MSG_TYPE_MOVEFILE_REQUEST:
+        return reject(ENUM_MSG_TYPE_MOVEFILE_RESPOND);
+    case ENUM_MSG_TYPE_LISTDIR_REQUEST:
+        return reject(ENUM_MSG_TYPE_LISTDIR_RESPOND);
+    case ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST:
+        return reject(ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND);
+    case ENUM_MSG_TYPE_GETUSERINFORMATION_REQUEST:{
+        PDU* r=reject(ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND); int ret=-1; memcpy(r->caData,&ret,sizeof(ret)); return r;
+    }
+    case ENUM_MSG_TYPE_LOGOFF_REQUEST:
+        return reject(ENUM_MSG_TYPE_LOGOFF_RESPOND);
+    case ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST:
+        return reject(ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND);
+    case ENUM_MSG_TYPE_RESOLVE_PUBLINK_REQUEST:
+        return reject(ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND);
+    case ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST:
+        return reject(ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND);
+    case ENUM_MSG_TYPE_CHAT_REQUEST:
+    case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
+        return nullptr; // 无响应语义的投递型请求，拒绝仅落审计日志
+    default:
+        return nullptr;
+    }
 }
 //发送 PDU 到客户端并释放其内存（所有权转移到此方法）
 //pdu 为 nullptr 时安全空操作
