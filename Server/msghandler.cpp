@@ -699,17 +699,19 @@ PDU *MsgHandler::sharefile()
         sharePathLen = 0;
     }
     const QByteArray sharePathBytes(pdu->caMsg+32*revUserCnt, sharePathLen);
-    const QString shareCanonicalSrc = QFileInfo(QString::fromUtf8(sharePathBytes).trimmed()).canonicalFilePath();
-    if(shareCanonicalSrc.isEmpty()){
-        qCWarning(lcFs)<<"[sharefile] 分享源不存在，握手未登记 conn="<<m_connId;
+    const QString shareSrcRaw = QString::fromUtf8(sharePathBytes).trimmed();
+    const QString shareCanonicalSrc = QFileInfo(shareSrcRaw).canonicalFilePath();
+    // B-1 修复（增量复审）：分享源必须落在分享人本人用户根内——只能分享自己的文件；
+    // 源不存在或属他人时不登记握手也不转发邀请，杜绝"自我登记+自我同意"复制他人文件
+    const bool sourceOwned = !shareCanonicalSrc.isEmpty() && pathInActorRoot(shareSrcRaw);
+    if(!sourceOwned){
+        qCWarning(lcFs)<<"[sharefile] 拒绝：分享源不属于分享人，不登记不转发 conn="<<m_connId<<" 源:"<<shareSrcRaw;
     }
-    for(int i=0;i<revUserCnt;i++){
+    for(int i=0;i<revUserCnt && sourceOwned;i++){
         char revName[32]={'\0'};
         memcpy(revName,pdu->caMsg+32*i,32);
         qCDebug(lcFs)<<"revName"<<revName<<" ";
-        if(!shareCanonicalSrc.isEmpty()){
-            MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(), shareCanonicalSrc);
-        }
+        MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(), shareCanonicalSrc);
         MyTcpServer::getinstance().reseed(revName,resendpdu);
     }
     memfree(resendpdu);
