@@ -1,0 +1,373 @@
+# REQ-FS-003　上传路径校验 + 文件操作越权
+
+| 项目 | 值 |
+|---|---|
+| **需求编号** | REQ-FS-003 |
+| **分支名** | `fix/path-traversal-and-ownership` |
+| **任务等级** | **MEDIUM** |
+| **基线 commit** | `b5d7bb3`（编写时 master HEAD） |
+| **流程版本** | Development OS v1.7 |
+| **状态** | 待执行 |
+
+---
+
+## 一、背景（为什么要做）
+
+服务端共 **6 处**接收客户端传来的路径，其中 **5 处**做了规范路径校验，**唯独上传入口没做**。缺的这一个恰好是最危险的（可写入任意路径）。
+
+### 已核实：6 个路径入口的校验现状
+
+| # | 函数 | 位置 | 是否校验 | 校验证明 |
+|---|---|---|---|---|
+| 1 | `downloadfile()` | `msghandler.cpp:799` | ✅ 有 | `canonicalFilePath` + `startsWith(canonicalRootPrefix)`（804-806 行） |
+| 2 | `movefile()` | `msghandler.cpp:582` | ✅ 有 | `canonicalSrc` / `canonicalDstDir` 双校验（603-619 行） |
+| 3 | `listdir()` | `msghandler.cpp:697` | ✅ 有 | `canonicalDir` + `startsWith`（705-715 行） |
+| 4 | `deldir()` | `msghandler.cpp:389` | ⚠️ **半有** | 只做了**相对路径反推**（411-412 行），用于清理分享链接；**删除动作本身无校验** |
+| 5 | `renamefile()` | `msghandler.cpp:481` | ⚠️ **半有** | 同 deldir，靠 `relDir.startsWith("..")` 反推 |
+| 6 | **`uploadfileinit()`** | **`msghandler.cpp:733`** | ❌ **无** | 直接 `QString::fromUtf8(pdu->caMsg)` → 传给 `begin()` |
+
+### 缺陷 1（P0-2）：上传路径穿越
+
+`Server/msghandler.cpp:733`：
+
+```cpp
+const QString dirPath = QString::fromUtf8(pdu->caMsg);      // ← 客户端完全可控，零校验
+const QString fileName = fixedString(strname, 32);
+ResumableUploadSession::BeginResult result =
+        m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
+```
+
+进入 `Server/resumableuploadsession.cpp:18`：
+
+```cpp
+BeginResult ResumableUploadSession::begin(const QString &dirPath, ...)
+{
+    reset();
+    BeginResult result = {false, 0, false};
+    if (dirPath.isEmpty() || fileName.isEmpty() || fileName.contains('/')
+            || fileName.contains('\\') || totalSize < 0) {
+        return result;                                      // ← fileName 校验了，dirPath 没校验
+    }
+    QDir dir(dirPath);
+    if (!dir.exists()) { return result; }                   // ← 只查"目录存在"，不管"在不在沙箱里"
+    m_filePath = dir.filePath(fileName);                    // ← 落在任意已存在目录
+    ...
+}
+```
+
+**只有 `fileName` 被校验（不允许含 `/` `\`），`dirPath` 完全放行。** 后果：
+
+- `dirPath = C:/Windows/Temp` → 可在系统目录下建文件
+- `dirPath = E:/qt/xiangmu/Server` → 可覆盖服务端源码（下次编译即被执行）
+- 配合 `resumeEnabled`（客户端可控 magic）→ 可 **Append** 到已存在文件尾部，篡改已有文件内容
+
+`fileName` 被限制为 32 字节且无路径分隔符，所以不能靠文件名穿越；**但目录穿越这条路完全敞开**。
+
+### 缺陷 2（P1）：删除/重命名的动作本身无归属校验
+
+`deldir()`（389 行）与 `renamefile()`（481 行）**先执行文件操作，再反推相对路径**：
+
+```cpp
+// deldir 现状顺序
+if(delFileType==1){ QFile file(delFilePath); ans=file.remove(); }       // ← 先删
+else if(delFileType==0){ QDir dir(delFilePath); ans=dir.removeRecursively(); }
+if(ans){ /* 反推 relPath，清理分享链接 */ }                              // ← 后反推
+```
+
+`delFilePath` 来自 `pdu->caMsg`，客户端可控。**没有 `canonicalFilePath` 校验**，因此：
+
+- 可删 `filesPath` 之外的任意文件/目录（`QDir::removeRecursively()` 递归删目录）
+- 可重命名 `filesPath` 之外的任意文件
+- `loginName` 参数只被用于**事后**清理分享链接，没有参与**授权判定**
+
+对比 `downloadfile` / `movefile` / `listdir` 都做了 `canonicalFilePath` + 前缀校验，**这三个函数的写法就是本需求的正面范例，照抄即可**。
+
+---
+
+## 二、目标（验收标准）
+
+| # | 验收标准 | 怎么验证 |
+|---|---|---|
+| A1 | 上传目录若不在用户沙箱内，服务端**拒绝**（`ok=false`），不创建任何文件 | 构造 `dirPath=../../` 的上传请求，返回 `ret=false`；确认无文件落地 |
+| A2 | 上传目录为合法沙箱内路径时，功能**完全正常** | 正常上传一个文件，成功且内容正确 |
+| A3 | 断电续传（resume）功能不受影响 | 中断后重传，从正确 offset 续传 |
+| A4 | 删除不在沙箱内的文件/目录**被拒绝**，且**不执行删除动作** | 构造越权删除请求，返回 `false`，目标文件**依然存在** |
+| A5 | 删除自己沙箱内的文件/目录**正常** | 正常删除，成功 |
+| A6 | 重命名越权路径**被拒绝**，目标文件**依然存在** | 构造越权重命名，返回 `false`，原文件未被改名 |
+| A7 | 重命名沙箱内文件**正常** | 正常重命名，成功 |
+| A8 | 所有路径校验逻辑**集中在一处**，不复制粘贴 | 代码审查：只有一个 `isPathInSandbox()` 实现 |
+| A9 | 三项 pipeline 全绿 | `build.ps1` GREEN、`test.ps1` GREEN、`audit.ps1` PASS |
+
+---
+
+## 三、技术方案（已定型，不要自行改动思路）
+
+### 3.1 核心原则：一个校验函数，四处调用
+
+**不要**在 4 个函数里各写一遍 `canonicalFilePath` 逻辑（重复代码 = 未来改一处漏三处）。抽一个**静态辅助函数**：
+
+放到 `Server/msghandler.h`（类内静态成员），实现放 `msghandler.cpp`：
+
+```cpp
+// msghandler.h（public 段）
+// 判断 path 是否位于 filesPath 沙箱内（含沙箱根本身）。
+// 规则：先做 canonical 归一（解析 ../ 与符号链接），再判断前缀。
+// 返回 true 仅当：path 存在 且 canonical(path) 落在 canonical(filesPath) 之内。
+static bool isPathInSandbox(const QString &path);
+```
+
+```cpp
+// msghandler.cpp
+bool MsgHandler::isPathInSandbox(const QString &path)
+{
+    if (path.isEmpty()) return false;
+
+    QFileInfo rootInfo(Server::getinstance().filesPath);
+    const QString canonicalRoot = rootInfo.canonicalFilePath();
+    if (canonicalRoot.isEmpty()) return false;      // 沙箱根不存在 → 一律拒绝
+
+    QFileInfo targetInfo(path);
+    const QString canonicalTarget = targetInfo.canonicalFilePath();
+    if (canonicalTarget.isEmpty()) return false;    // 路径不存在（含非法路径）→ 拒绝
+
+    QString prefix = canonicalRoot;
+    if (!prefix.endsWith('/')) prefix.append('/');
+
+    return canonicalTarget == canonicalRoot || canonicalTarget.startsWith(prefix);
+}
+```
+
+> **注意 canonical 的一个特性**：`canonicalFilePath()` 对**不存在**的路径返回空字符串。所以：
+> - 对**删除/重命名**（目标必须已存在）→ 直接用 `isPathInSandbox(target)` 即可，天然拒绝不存在路径。
+> - 对**上传**（目标目录必须已存在，但文件可能尚不存在）→ 应校验 **`dirPath`（目录，必定存在）**，也就是 `isPathInSandbox(dirPath)`。**不要对最终文件路径做 canonical**，因为新文件还不存在会返回空。
+
+### 3.2 四处改动
+
+**① `uploadfileinit()`（`msghandler.cpp:733`）—— 在 `begin()` 之前拦一道**
+
+```cpp
+const QString dirPath = QString::fromUtf8(pdu->caMsg);
+const QString fileName = fixedString(strname, 32);
+
+ResumableUploadSession::BeginResult result = {false, 0, false};
+if (isPathInSandbox(dirPath)) {                       // ← 新增校验
+    result = m_uploadSession.begin(dirPath, fileName, fileSize, resumeEnabled);
+} else {
+    qWarning() << "uploadfileinit 拒绝越权目录:" << dirPath;
+}
+```
+
+> **不要改 `ResumableUploadSession::begin()` 的签名或逻辑。** 校验放在调用方（`MsgHandler`），因为只有 `MsgHandler` 能拿到 `Server::getinstance().filesPath`（沙箱根）。`ResumableUploadSession` 是个纯文件会话类，保持它不依赖全局单例。
+> **`begin()` 内部现有的 `fileName` 校验保留**，那是纵深防御的第二层，不要删。
+
+**② `deldir()`（`msghandler.cpp:389`）—— 把校验提到删除动作之前**
+
+现状顺序是「先删后反推」，必须改成「**先校验，后删除**」：
+
+```cpp
+PDU *MsgHandler::deldir(const QString& loginName)
+{
+    QString delFilePath(QString::fromUtf8(pdu->caMsg));
+    uint delFileType=0;
+    memcpy(&delFileType,pdu->caData,sizeof(uint));
+
+    bool ans = false;
+    if (!isPathInSandbox(delFilePath)) {                         // ← 新增：越权直接拒绝
+        qWarning() << "[deldir] 拒绝越权删除:" << delFilePath;
+    } else if (delFileType==1) {
+        QFile file(delFilePath);  ans=file.remove();
+    } else if (delFileType==0) {
+        QDir dir(delFilePath);    ans=dir.removeRecursively();
+    }
+    // 下面的分享链接联动清理逻辑保持不变（现在只有 ans==true 才可能走到）
+    ...
+}
+```
+
+> ⚠️ **顺序不能颠倒。** 校验必须在 `file.remove()` / `removeRecursively()` **之前**。`removeRecursively()` 是不可逆删除，删完再校验等于没校验。
+
+**③ `renamefile()`（`msghandler.cpp:481`）—— 同样前置校验**
+
+`renamefile` 里有两处路径：源路径 `dirPath`（来自 `pdu->caMsg`）与目标目录。**两个都要校验**（否则可以重命名到沙箱外）：
+
+```cpp
+if (!isPathInSandbox(srcPath) || !isPathInSandbox(dstDir)) {
+    qWarning() << "[renamefile] 拒绝越权重命名:" << srcPath << "->" << dstDir;
+    // 直接返回 false 的 respdu，不做任何 rename
+} else {
+    // 原来的 rename 逻辑
+}
+```
+
+**④ `movefile()` / `listdir()` / `downloadfile()` / `MKDIR()` —— 用新函数替换现有重复逻辑**
+
+这 4 处已有校验，**功能上不要改行为**，只把重复的 canoical 代码替换成 `isPathInSandbox()` 调用，减少重复。**如果替换过程中发现行为有差异（比如原来允许某个边界情况），以原行为为准，不要收紧也不要放松** —— 那属于另一件事。
+
+> 如果替换风险感觉较大，**可以只做 ①②③，第 ④ 步留给后续需求**。最小必要改动是 ①②③。**优先保证不引入回归。**
+
+### 3.3 明确不做的事
+
+- **不改协议**。路径仍然通过 `pdu->caMsg` 传递，不加签名字段。
+- **不改客户端**。客户端照常发路径。
+- **不引入"用户归属目录"新概念**。本需求只保证「不逃出 `filesPath`」，**不**做「A 用户不能删 B 用户文件」的细粒度隔离——那是更大的设计（需要给每个用户建沙箱子目录并在所有入口校验），**另开需求**。
+  > 本次的 `loginName` 参数仍然只用于分享链接联动，不参与授权判定。
+
+---
+
+## 四、允许改动的文件（allowed paths）
+
+```
+Server/msghandler.h               ← 新增 isPathInSandbox 声明
+Server/msghandler.cpp             ← 新增实现 + 四处调用点
+project-docs/tasks/REQ-FS-003/task.md
+project-docs/evidence/REQ-FS-003/
+```
+
+**`Server/resumableuploadsession.cpp` 与 `.h` 不在允许清单内**（保持原样，除非执行中发现必须改 → 停下报告）。
+
+---
+
+## 五、禁止事项（⚠️ 违反即停止并上报）
+
+| # | 禁止 | 原因 |
+|---|---|---|
+| 1 | **禁止修改 `Server/protocol.h` / `Client/protocol.h`** | frozen_path 冻结路径，触发 LARGE |
+| 2 | **禁止修改 `Server/resumableuploadsession.*` 的接口** | 校验放调用方，会话类保持纯文件逻辑 |
+| 3 | **禁止把校验放在删除动作之后** | 顺序颠倒 = 校验无效 |
+| 4 | **禁止只校验 `fileName` 不校验 `dirPath`** | 本次缺陷的核心就是 dirPath 漏校验 |
+| 5 | **禁止顺手改其他缺陷** | 日志分级、密码加盐各自有独立分支 |
+| 6 | **禁止引入"用户级目录隔离"** | 超出范围，见 §3.3 |
+| 7 | **禁止大规模格式化** | 不做全文缩进/行尾/include 重排 |
+| 8 | **禁止弱化任何合法功能** | 正常上传、下载、删除、重命名、续传必须全部照旧可用 |
+| 9 | **禁止自行决定档位升降** | 需升 LARGE → 停下报告 |
+| 10 | **禁止 `git push`** | 不可逆操作，等主人批准 |
+| 11 | **禁止用 `rm`/`del` 手工删除测试文件** | 测试产生的越权文件走回收站或放在 `build/` 内清理 |
+
+---
+
+## 六、执行流程（Development OS v1.7）
+
+```bash
+# ① 会话开场
+powershell -File pipeline/state.ps1
+#    branch: master   suspended git state: none  ← 否则停下
+
+# ② 切分支
+git switch master
+git switch -c fix/path-traversal-and-ownership
+
+# ③ 写代码（只改 §4 文件）
+
+# ④ 跑门（顺序：先 test 后 audit）
+powershell -File pipeline/build.ps1
+powershell -File pipeline/test.ps1
+powershell -File pipeline/audit.ps1
+
+# ⑤ 人工验证（§7 的越权场景 pipeline 测不出）
+
+# ⑥ 提交
+git add Server/msghandler.h Server/msghandler.cpp
+git commit -m "fix(security): enforce sandbox path validation on upload/delete/rename"
+
+# ⑦ 合并回 master
+git switch master
+git merge --no-ff fix/path-traversal-and-ownership -m "merge: REQ-FS-003 path traversal + ownership (MEDIUM)"
+git branch -d fix/path-traversal-and-ownership
+
+# ⑧ 停下等主人批准推送
+```
+
+---
+
+## 七、需要的验证证据
+
+pipeline 证明不了「越权被拦住」。必须**人工构造越权请求**并记录结果。
+
+### 必须做的越权测试
+
+| 场景 | 构造方式 | 期望 |
+|---|---|---|
+| 上传逃逸 | `dirPath` 填 `C:/Windows/Temp`（或 `../../`） | 服务端日志出现「拒绝越权目录」，无文件写入 |
+| 上传正常 | `dirPath` 填用户真实沙箱目录 | 上传成功，文件内容一致 |
+| 续传 | 上传中断后重传 | offset 正确，续传成功 |
+| 删除逃逸 | `delFilePath` 填沙箱外一个**测试用**文件 | 返回 false，**该文件依然存在** |
+| 删除正常 | 删自己沙箱内的测试文件 | 成功删除 |
+| 重命名逃逸 | 源路径填沙箱外测试文件 | 返回 false，**文件名未变** |
+
+> ⚠️ **越权测试用的"目标文件"必须是自己新建的临时文件**（建议放 `build/` 下），**绝不能拿系统文件或项目源码做实验**。测完记得清理。
+> ⚠️ 测试前**先备份**任何会被碰到的真实文件。
+
+### 证据目录
+
+```
+build/evidence/fix-path-traversal-and-ownership/<commit-hash>/
+    pipeline-run.log
+    manual-verify.log     # 上面 6 个场景的实际输出
+    manifest.txt
+```
+
+```bash
+python "C:/Users/王晨扬/.codex/skills/development-os-v1-7/scripts/record-evidence.py" \
+  --evidence-dir build/evidence/fix-path-traversal-and-ownership/<hash> \
+  --repo E:/qt/xiangmu \
+  --label "REQ-FS-003: sandbox path validation enforced on 4 entries" \
+  Server/msghandler.cpp Server/msghandler.h
+```
+
+---
+
+## 八、任务记录与 handoff（必须产出）
+
+### 8.1 `project-docs/tasks/REQ-FS-003/task.md`
+
+含：档位 + 依据、验收标准、allowed paths、决策日志（append-only，尤其记录「哪些函数用了新函数替换、哪些没动」）。
+
+### 8.2 handoff
+
+路径 `project-docs/handoffs/fix-path-traversal-and-ownership-<日期>.txt`，**严格 10 行**：
+
+```text
+# handoff: REQ-FS-003
+branch: master
+head: <合并后 commit 完整哈希>
+tier: MEDIUM
+node: merged
+audit: none
+next: powershell -File pipeline/state.ps1
+blockers: none
+evidence: project-docs/evidence/REQ-FS-003/
+owner: claude-code
+date: <YYYY-MM-DD>
+```
+
+```bash
+python "C:/Users/王晨扬/.codex/skills/development-os-v1-7/scripts/validate-handoff.py" <handoff 路径>
+```
+
+---
+
+## 九、遇到的边界情况怎么办
+
+| 情况 | 怎么办 |
+|---|---|
+| `filesPath` 配的是相对路径（`./filesys`），canonical 后可能对不上 | **先确认 `Server::getinstance().filesPath` 被解析成绝对路径**（`QDir(...).absolutePath()`）。若没有，在 `isPathInSandbox` 内做 `QDir(root).absolutePath()` |
+| 替换已有校验时发现行为变了 | **回退到原逻辑**，只做 ①②③ 三处新增。不要为了"统一"引入回归 |
+| 想顺便做用户级隔离 | **不做**。另开需求 |
+| `uploadfileinit` 里 `dirPath` 是空串 | `isPathInSandbox("")` 返回 false → 拒绝，符合预期 |
+| 客户端上传时带的路径是相对路径 | 需要确认客户端实际发的是绝对路径。**先实测**，如果是相对路径，先弄清基准目录再决定方案，**不要想当然** |
+| 测试中误删了真实文件 | 立即停止，报告，从备份恢复。记录到决策日志 |
+| pipeline 报 `FROZEN-PATH HIT` | 立即停止报告 |
+
+---
+
+## 十、完成后请回报这些
+
+1. 最终 commit 哈希（分支 + 合并）
+2. 三项 pipeline 实际输出（GREEN / GREEN / PASS）
+3. §7 六个场景的实际结果（**尤其"越权被拒且目标完好"这三条**）
+4. `isPathInSandbox` 最终实现的代码片段
+5. 第 ④ 步（替换已有校验）做了没有；若做了，说明行为是否有差异
+6. handoff 校验脚本输出
+7. 任何偏差或未预期情况
+
+**不要自行推送。**
