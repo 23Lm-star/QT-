@@ -11,4 +11,5 @@ files:
 gates: build GREEN (1cdaaa1) / test honest-0-registered / audit PASS (1cdaaa1)
        post-merge audit: see pipeline-run.log addendum
 decisions: LICENSE=MIT (owner); .gitattributes deferred (autocrlf=true); no branch deleted; no push
-status: merged into master --no-ff (hash in handoff docs/repo-chrome-2026-09-29.txt)
+status: merged into master --no-ff @ 08265d5aeb9b460a4a466316483e9fd31b915932; handoff
+        project-docs/handoffs/docs-repo-chrome-2026-09-29.txt; no push (owner approval pending)
