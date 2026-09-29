@@ -725,7 +725,7 @@ PDU *MsgHandler::sharefilemove()
         qCWarning(lcFs)<<"[sharefilemove] 接收者字段与连接身份不符，按连接身份生成目标 conn="<<m_connId;
     }
     QString recvDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(recvName);
-    QString tarPath=QString("%1/%2/%3").arg(recvDir).arg(fileName);
+    QString tarPath=QString("%1/%2").arg(recvDir).arg(fileName);
     qCDebug(lcFs)<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
     // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含路径分隔符（Windows 下 "\.." 逃逸）
     bool ret=false;
