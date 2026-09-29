@@ -46,6 +46,21 @@
 - Server.exe 运行目录必须为 `Server/`（`filesPath=./filesys` 为相对路径）；GUI 子系统，stdout 不可重定向捕获，断言走端口/日志文件/DB。
 - 迁移实测幂等：重放 `migrate_ext_file_001.sql` 零报错；fail-fast 实测：版本低→进程秒退、不监听 5000。
 
+## 开发进度（2026-09-29 development 节点，进行中）
+- **T1 ✅**（`8dba0f9`）：4 表 + `schema_version`@2026092901（utf8/InnoDB，适配 MySQL5.7 Antelope 767B 键上限）+ 幂等重放实测 + `checkSchemaVersion()` 启动 fail-fast。冒烟：达标监听 5000 / 降级秒退不监听。回滚脚本就位。
+- **T2 ✅**（`cd17507`）：`FileObjectStore` 内容寻址核心——`hashStaging`（流式 SHA-256）+ `commitUpload`（对象 find-or-create / 条目建或复活 / 引用计数，同一事务；新对象 staging 原子 rename 到 `objects/{sha2}/{id}`，命中既有对象丢弃 staging）。`releaseEntry/releaseSubtree`（归零→`pending_reclaim`，绝不物理删）。DB 级事务模拟实测验收 1/2/3。Server.build GREEN。
+- **T4 🟡 groundwork（本次，additive/未接热路径，零回归）**：`ResumableUploadSession::beginStaged`（staging=`.staging/<sha1(owner|parent|display|size)>.part`，确定性路径支持断点续传）+ `OperateDB::{createUploadSession,updateUploadOffset,finishUploadSession}`（upload_session 表 CRUD）。均未被 handler 调用，现网行为不变。Server.build GREEN。
+
+## 剩余开发（下一个 development 节点，必须原子落地）
+读/写权威切换（T3+T5）+ 迁移（T6）+ e2e（T7）互相依赖，不能分批否则回归：
+1. **写侧切换**：`uploadfileinit`→`beginStaged`+`createUploadSession`；`handleUploadWriteFinished` 完成时→`MsgHandler::finalizeUpload()`=`commitUpload`+`finishUploadSession`。
+2. **读侧切换（与写侧同批）**：`flushfile`/`listdir`→`FileObjectStore::listEntries`（DB 优先，某 parent 零条目且物理目录存在→回退 QDir，兼容未迁移用户）；`downloadfile`→`entryByPath`→`objectAbsPath`（对象缺失回退 canonical 物理）。
+3. **其余 handler**：`deldir`→`releaseEntry/Subtree`（无条目回退物理删）；`MKDIR`→建目录条目（+物理 mkdir）；`renamefile`/`movefile`→`relocateEntry`（无条目回退物理 rename）；`sharefilemove`→源条目 `refObject`+接收者新条目（+物理 copy 回退）。
+4. **T6 迁移**：`migrateLegacyFiles()` 遍历 `filesys/<user>` 未映射文件→建对象+条目+`file_migration_map`（幂等、同名不同内容→`(1)`、失败不删旧，满足 §6 双向映射停止条件核查）。
+5. **T7**：验收 1-5 端到端脚本（仿 SEC-001 48/48 模式，Python 造 PDU + 服务端日志/DB 断言）+ pipeline 三门 + 证据绑定候选哈希；随后 independent test（新会话）、independent audit（新会话只读）、integration 三事实行、merge。
+
+**待 owner 决策 D5（读侧切换前提）**：内容寻址后新上传文件不再有可浏览的 `filesys/<user>/...` 物理文件（唯一物理副本在 `objects/`，客户端零改动靠服务端从 `user_file` 合成 FileInfo 列表）。确认接受"新文件走对象+条目、旧目录仅作未迁移回退与审计映射"？（推荐：是，否则无法同时满足验收1"一个物理对象"与 D4"客户端零改动"——Windows 无 Qt 硬链接 API 可两全。）
+
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
 2. 32 字节展示名 + `(1)` 后缀溢出 → 后缀插入时截基名保留扩展名，规则写进 T3 测试。

@@ -63,6 +63,16 @@ public:
     // 删除好友时清理双方私聊记录
     bool deleteFriendMessages(const QString &userA, const QString &userB);
 
+    // ===== REQ-EXT-FILE-001 T4：上传会话持久化（upload_session 表） =====
+    // 登记暂存会话；返回 session_id（<0 失败）。ttlSec<=0 时默认 3600。
+    qint64 createUploadSession(const QString &owner, const QString &parentPath,
+                               const QString &displayName, qint64 expectedSize,
+                               const QString &clientSha256, const QString &stagingPath,
+                               qint64 confirmedOffset, int ttlSec);
+    bool updateUploadOffset(qint64 sessionId, qint64 confirmedOffset);
+    // 完成/失败：写 status（done|failed|expired|verifying）
+    bool finishUploadSession(qint64 sessionId, const QString &status);
+
     explicit OperateDB(QObject *parent = nullptr);
     OperateDB(const OperateDB&)=delete;
     OperateDB& operator=(const OperateDB&)=delete;

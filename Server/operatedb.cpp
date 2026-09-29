@@ -95,6 +95,60 @@ bool OperateDB::checkSchemaVersion()
     return true;
 }
 
+// ===== REQ-EXT-FILE-001 T4：upload_session 持久化（staging 归属/offset/过期）=====
+qint64 OperateDB::createUploadSession(const QString &owner, const QString &parentPath,
+                                      const QString &displayName, qint64 expectedSize,
+                                      const QString &clientSha256, const QString &stagingPath,
+                                      qint64 confirmedOffset, int ttlSec)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return -1;
+    QSqlQuery q(connection.database());
+    q.prepare("INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,"
+              "client_sha256,staging_path,confirmed_offset,status,expires_at) "
+              "VALUES (?,?,?,?,?,?,?,'uploading',?)");
+    q.addBindValue(owner);
+    q.addBindValue(parentPath);
+    q.addBindValue(displayName);
+    q.addBindValue(expectedSize);
+    q.addBindValue(clientSha256.isEmpty() ? QVariant() : QVariant(clientSha256));
+    q.addBindValue(stagingPath);
+    q.addBindValue(confirmedOffset);
+    q.addBindValue(QDateTime::currentDateTime().addSecs(ttlSec > 0 ? ttlSec : 3600)
+                       .toString("yyyy-MM-dd HH:mm:ss"));
+    if(!q.exec()){
+        qCWarning(lcDb) << "[createUploadSession] 失败:" << q.lastError().text();
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+bool OperateDB::updateUploadOffset(qint64 sessionId, qint64 confirmedOffset)
+{
+    if(sessionId < 0) return false;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE upload_session SET confirmed_offset=? WHERE session_id=? AND status='uploading'");
+    q.addBindValue(confirmedOffset);
+    q.addBindValue(sessionId);
+    return q.exec();
+}
+
+bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status)
+{
+    if(sessionId < 0) return false;
+    if(status != "done" && status != "failed" && status != "expired" && status != "verifying")
+        return false;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE upload_session SET status=? WHERE session_id=?");
+    q.addBindValue(status);
+    q.addBindValue(sessionId);
+    return q.exec();
+}
+
 bool OperateDB::handleRegit(char *strname, char *strpwd)
 {
     if(strname==nullptr||strpwd==nullptr){
