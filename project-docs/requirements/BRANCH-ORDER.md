@@ -23,6 +23,8 @@
 | **D 架构** | 10 | REQ-CFG-010 | `feat/config-externalization` | MEDIUM | 必须在 REPO-004 之后 |
 
 > ⚠️ **2026-09-29 更正**：① REQ-AUTH-002 此前被误标为"已完成 (a621309 + a9d06a7)"——这两个提交实为 `fix-db-credentials-out-of-index`（取消跟踪 `Server/connect.config`）的产物；加盐与清日志在 master 上并不存在，实际状态为**待执行**（分支 `fix/auth-security-baseline` 于 2026-09-29 从 master `24967df` 切出）。
+>
+> ✅ **2026-09-29 当日完成**：`fix/auth-security-baseline` → master no-ff @`2fe0a48`；pipeline build GREEN / test 0 注册项 / audit PASS；A1–A5 人工验证 11 项 PASS（见 `project-docs/evidence/REQ-AUTH-002/`）。**A6 记为部分满足**：7 处 DIAG 已清零，但 `Server/mytcpsocket.cpp:390-396` 传输层报文转储仍打印 `caData`（含密码哈希）/`caMsg`，经主人决策移交 **REQ-LOG-007**（⑥ 的范围应包含此点；该文件不在 ① 的允许清单内）。
 
 ---
 
@@ -86,7 +88,7 @@
 ## 三、执行序列图（可直接照抄）
 
 ```
-① fix/auth-security-baseline              MEDIUM（2026-09-29 更正：待执行）
+① fix/auth-security-baseline              MEDIUM ✅ 已完成（merge 2fe0a48，2026-09-29）
        ↓
 ② fix/path-traversal-and-ownership        MEDIUM
        ↓
@@ -182,7 +184,7 @@
 **最低限度**（只为"能安全地推上去"）：
 
 ```
-① AUTH-002  →  待执行
+① AUTH-002  →  ✅ 已完成（merge 2fe0a48）
 ② FS-003    →  必须（路径穿越是 P0）
 ③ REPO-004  →  必须（配置进库）
 ⑤ REPO-006  →  必须（历史里有密码）
@@ -199,7 +201,7 @@
 
 | 文件 | 行数 | 等级 |
 |---|---|---|
-| `REQ-AUTH-002-password-salt.md` | 316 | MEDIUM |
+| `REQ-AUTH-002-password-salt.md` | 316 | MEDIUM ✅ |
 | `REQ-FS-003-path-traversal-and-ownership.md` | 373 | MEDIUM |
 | `REQ-REPO-004-repo-sanitize.md` | 267 | SMALL |
 | `REQ-DOC-005-repo-chrome.md` | 286 | SMALL |
