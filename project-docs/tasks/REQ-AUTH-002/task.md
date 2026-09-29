@@ -4,7 +4,7 @@
 - **tier 依据**: 触碰生产源码（`Server/operatedb.cpp`、`Server/msghandler.cpp`）但不触碰 `frozen_paths`（两个 `protocol.h`）、不改对外协议、不引入新外部依赖、不新建功能；单分支单主题可回滚；需求含 A1–A7 验收标准
 - **owner_agent**: claude-code
 - **date**: 2026-09-29
-- **状态**: **GOAL 完成（需求分析 + 分支创建 + 开发前归纳），等待主人批准后进入 dev**
+- **状态**: **DEV 完成 + 端到端人工验证完成（A1–A5 全过）；pipeline 复核中；待合并 master（不 push）**
 
 ## 需求（业务语言）
 
@@ -51,3 +51,8 @@
 | 2026-09-29 | 档位定为 MEDIUM | 判据见上；不触 frozen_paths、不改协议、无外部依赖 |
 | 2026-09-29 | 分支 `fix/auth-security-baseline` 从 master `24967df` 切出 | 需求文档本身已在 master 跟踪（73d85d8 入库），分支首个提交为本任务记录 |
 | 2026-09-29 | 环境核实：本机 MySQL 5.7 运行中（`mydb`@localhost:3306），`mysql.exe` 可用 | A1–A5 人工验证可行；`pipeline/test.ps1` 为 0 注册测试，运行时行为必须靠人工/端到端验证（沿用 FS-003 的 Python TCP harness 先例） |
+| 2026-09-29 | dev 完成：`operatedb.cpp` 加盐三入口 + 7 处 DIAG 删除；提交 `64804fe`（含 3 项已批准补充文档） | 盐 = 32 位 hex，熵源 `QRandomGenerator::system()`；注册存 `MD5(clientHash+salt)`；登录先按 name 取 `pwd,salt`（salt='' 按裸哈希比对），比对成功后条件升级 `UPDATE ... WHERE name=? AND salt=''` 且仅当 `numRowsAffected()>0` 才采用新值（防并发升级互相覆盖）；`online=1` 绑定"升级后的有效哈希"（落实 goal 期预警）；注销两处比对同法 |
+| 2026-09-29 | 数据漂移处置（经主人指示） | live `mydb` 中 `tester/friend1/friend2` 的 pwd 为明文字面量 `123456`（历史漂移；旧代码即比对失败，非本分支引入）。按主人指示修复为规范裸 MD5 并随即实测登录+补盐；`wcy/lilei/123/litaibai` 保持 legacy（`salt=''`）不动作 |
+| 2026-09-29 | **发现④（A6 阻断点）：需求 §4 清单外的残留泄露** `Server/mytcpsocket.cpp:390-396` | 每次收到报文即打印 `caData`（含用户名+密码哈希）与 `caMsg`（验证码），实测日志中裸哈希出现 13 次；该文件不在需求允许清单内。**主人决策（2026-09-29）：本分支不改，A6 记为"部分满足"（7 处 DIAG 已清零），残留移交 REQ-LOG-007**。记录见 `log-check.txt` |
+| 2026-09-29 | 端到端人工验证完成（TCP 协议级 harness `build/reqauth002/verify.py`，不入库） | `part1` 7 PASS（A1/A2/N1/A3/N2/A3+×2）、`part2` 4 PASS（N3/A5/N4/N4+）；`db1/db2` 证实 `pwd=MD5(MD5(明文)+salt)`、盐 32 位、老数据自动补盐、注销真删行、失败注销非破坏性。验证前把三个 fixture 重置回 legacy 基线（`db0-reset`）以保证 A3/A4 测试真实性。证据目录 `build/evidence/fix-auth-security-baseline/64804fe.../` |
+| 2026-09-29 | 环境注记：本机 Qt 安装缺 QMYSQL 驱动插件 | 验证服务器用 `build-Server-Desktop_Qt_5_14_2_MinGW_64_bit-Debug/debug`（release-ABI，objdump 核实导入 Qt5Core/Qt5Sql）经 `QT_PLUGIN_PATH` 加载，该目录同时在 PATH 提供 `libmysql.dll`；验证服务器已停止 |
