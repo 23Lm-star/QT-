@@ -4,7 +4,7 @@
 - **tier 依据**: 触碰生产源码（`Server/msghandler.h/.cpp`）但不触碰 `frozen_paths`（两个 `protocol.h`）、不改对外协议、单分支单主题可回滚；基线 `b5d7bb3`，分支 `fix/path-traversal-and-ownership`
 - **owner_agent**: claude-code
 - **date**: 2026-09-29
-- **状态**: dev+pipeline 完成，分支提交 `f808daf`，**待独立审计会话**（审计通过后由主人通知合并；本会话未合并 master）
+- **状态**: 独立审计 FAIL（F-1）→ owner 修复会话完成 @`a518e35` + 重盖章 28/28，**待独立复审会话**（复审通过并经主人通知后才合并 master）
 
 ## 需求（业务语言）
 
@@ -49,3 +49,7 @@
 | 2026-09-29 | 测试材料纪律：victim 等临时文件只建在 `build/reqfs003_out/`；沙箱工作目录测后移入 `build/reqfs003/trash_*`，未用 rm/del 手工删（禁止事项 #11） | changedir "C:/Windows" 仅作探测断言（isExist=false），无写入动作 |
 | 2026-09-29 | 工具链注记：Server.exe 为 GUI 子系统，日志需 `QT_FORCE_STDERR_LOGGING=1` 才进管道且输出 GBK 编码；v1.7 脚本需 `py -3.13`（PATH 上的 Anaconda Python 3.6.5 语法不兼容） | 建议后续写入 manifest notes（非本需求范围，未动） |
 | 2026-09-29 | **独立审计会话判定 FAIL，禁止合并**：F-1（High）`renamefile` 名称段（`oldFileName/newFileName`，caData 64 字节）无校验直接拼接，`../` 可绕过 dirPath 校验改名沙箱外文件，A6 被绕；其余 A1–A5/A7–A12 通过，范围合规通过 | 报告 `project-docs/evidence/REQ-FS-003/audit-report.md`（含残余观察 O-1–O-4）；需 owner 新会话修复（校验拼接后 `oldFilePath` 或名称段分隔符检查，同 MKDIR 模式）并重审 |
+| 2026-09-29 | **修复会话：F-1 按审计方向②落地 @`a518e35`**：renamefile 名称段 old/new 拒绝 `'/'`、`'\'`（同 MKDIR），名称经 `fixedString`，分享链接联动段复用净化名 | 不选①：`newFilePath` 不存在无法 canonical 校验（A7 陷阱），方向②对源/目标两侧同时闭合且与既有同类修复一致 |
+| 2026-09-29 | **根因定性：需求 §3.2③"校验 dirPath 一处即可"为规格盲区**（默认名称为裸文件名），已同步修订需求文档（§二 A6 扩名称段、§3.2③ 二次修订、§七 增至 10 场景） | 实现忠实于旧规格；冲突时同步修正文档 |
+| 2026-09-29 | **重盖章 @`a518e35`**：端到端 harness 扩 S6b/S6c/S6d（旧名 `../`、新名 `../`、新名 `\`）= **28/28 PASS**；build GREEN / test 0 注册项 / audit PASS；服务端拒绝日志含 3 条"拒绝越权重命名名称段"，victim 完好 | 证据 `project-docs/evidence/REQ-FS-003/repair/`；handoff `req-fs-003-repair-2026-09-29.txt` |
+| 2026-09-29 | **待独立复审会话（auditor ≠ developer）确认 A6 后由主人通知合并**；复审前合并禁令维持（强制门） | 本会话未合并 master |
