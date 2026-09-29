@@ -1,0 +1,46 @@
+# REQ-EXT-SEC-001 服务端身份与授权上下文 — 任务记录
+
+## 档位
+- **LARGE**（goal 节点定档，2026-09-29）：架构前置门，改变服务端授权模型（连接级 actor_context 成为所有业务入口的唯一身份来源）；跨会话（本分支之后，所有群组/秒传/群文件分支依赖它）；不触碰 `protocol.h`（frozen_paths 零命中为本分支硬约束）。需求文档自声明"LARGE 前置门"。
+- 流程版本：Development OS v1.7。分支：`codex/req-ext-sec-001-auth-context`，基线 master@`8a0bb84`。
+- 节点计划：goal（本会话，任务归纳+主人批准）→ design（计划文档已随本记录落分支，批准即视为 design 完成）→ development → independent test（新会话）→ repair → independent audit（新会话、不同代理、只读）→ integration（三事实行）→ merge no-ff。
+
+## 依赖核查（2026-09-29 goal 节点实测）
+| 依赖 | 状态 |
+|---|---|
+| 登录基线 | ✅ `MsgHandler::login()` 成功后写 socket 级 `m_strLoginName`；`MyTcpSocket` 已有 `m_connectionId`（服务端生成）——连接身份可区分，**文档 §5 停止条件一不触发，无需改协议** |
+| 注销基线 | ⚠️ `logoff()` 目前用**客户端 PDU 里的用户名+密码**判身份并删用户目录——正是本需求要收编的"客户端提交即授权"反面样板 |
+| 路径穿越防护 | ✅ REQ-FS-003 已合并 master@`f937c90`（`isPathInSandbox` 统一校验 + renamefile 名称段 `fa88427` 修复，复审 PASS）；`build/evidence/fix-path-traversal-and-ownership/f808daf/` 下的 pending 报告为已被取代的初审 FAIL，非活动阻塞 |
+| 日志分级基线 | ✅ REQ-LOG-007 已合并 @`01ccf89`，拒绝日志复用 `lcAuth/lcFs/lcNet` 分类 |
+
+## 现状盘点（代码事实，master@8a0bb84）
+- `Server/mytcpsocket.cpp handlMsg()` 分发 ~27 个 case：**仅 9 个**入口把服务端连接级 `m_strLoginName` 传入处理器（login/onlineuser/flushfriend/deldir/renamefile/movefile/listdir/createPublishLink/resolvePublishLink）；其余业务入口（MKDIR、changedir、flushfile、uploadfileinit、UPLOADFILE_DATA、sharefile、sharefilemove、downloadfile、chat、finduser、addfriend、addfriendFin、deletefriend、getchatmsg、getuserinformation、queryFilePublishLink、logoff）**既不校验登录态，身份/发送者/路径也取自客户端 PDU 字段**。
+- `chat()`：发送人 `seedName` 取自 caData（客户端可伪造任意发送者）。
+- 文件类入口：`caMsg` 携带客户端拼装的完整路径串，`isPathInSandbox` 只约束沙箱根、不约束"只能进自己的用户目录"——横向越权（拿他人用户名拼路径）当前无服务端拦截。
+- `clientOffLine()` 与注销：未见对 `m_strLoginName` 的连接级撤销动作（design 时逐行确认）。
+- 白名单（天然公开，无需登录态）：REGIST、LOGIN、CAPTCHA、HEARTBEAT。
+
+## 开发任务分解（待批准）
+- **T1 会话内核**：`MyTcpSocket` 建立 actor_context（用户名 + 已登录标志 + 连接标识 `m_connectionId`/会话版本）；`login()` 成功后置位；`logoff()` 改为**仅凭连接级身份**受理（不再信任 PDU 用户名/密码作为授权依据），成功后撤销；`disconnected/clientOffLine` 撤销。
+- **T2 统一入口门**：`handlMsg()` 白名单（REGIST/LOGIN/CAPTCHA/HEARTBEAT）之外一律要求已认证上下文，未登录拒绝并回明确错误响应；为群组/秒传分支预留可复用的校验入口（一个函数，不散落 case）。
+- **T3 存量入口收编**：T2 门落地后，把仍以 PDU 字段作身份语义的点改为服务端派生——`chat()` 发送人以 actor 覆盖校验；`logoff()` 依 T1；其余已传 `m_strLoginName` 的入口复核不变。
+- **T4 规范路径**：文件类入口的 `caMsg` 路径统一解析为"服务端按 actor 生成的用户根目录下的相对路径"（保留 `isPathInSandbox` 作纵深防御）；越出本人用户根一律拒绝。客户端 `Client/file.cpp` 等配合改为相对路径语义，保证 A4 回归。
+- **T5 拒绝审计**：每类拒绝记录原因 + 请求关联标识（连接标识 + 报文类型），走 `qCWarning` 对应分类；不落密码/令牌/文件内容。
+- **T6 负向测试与回归（证据计划）**：仿 REQ-FS-003 模式——构造恶意/未认证 PDU 的端到端脚本 + `server-reject-lines.log`；覆盖验收 A1（未登录拒绝五类操作，群组类以"入口不存在则留待 GROUP 分支补测"记录在案）、A2（伪造用户/发送者/路径字段无效）、A3（注销/断开后旧连接被拒）、A4（正常单聊、上传下载、路径防护回归）；A5 全部证据绑定候选提交哈希（`pipeline/build.ps1`/`test.ps1` 运行时自动落 hash）。`pipeline/test.ps1` 现为 0 注册项，负向脚本按 TEST-008 模式暂以证据文件承载。
+- **T7 收尾**：任务记录+证据归档 `project-docs/evidence/REQ-EXT-SEC-001/`；BRANCH-ORDER 补一行登记（扩展 E 阶段首支）。
+
+## 允许路径
+`Server/mytcpsocket.{h,cpp}`、`Server/msghandler.{h,cpp}`、`Server/server.cpp`（仅只读引用，预期不改）、`Server/operatedb.cpp`（如需在线态配合，goal 预判不改）、`Client/file.cpp`、`Client/msghandler.cpp`、`Client/client.cpp`（仅 T4 相对路径配合）、`project-docs/tasks/REQ-EXT-SEC-001/`、`project-docs/evidence/REQ-EXT-SEC-001/`、handoff。
+**禁止**：两 `protocol.h`（frozen，改结构/枚举编号即违规）、`Server/filesys/` 运行数据入库、新外部依赖、顺手加群组逻辑。
+
+## 待主人批准的决策（approval card）
+- **D1 门覆盖范围**：白名单外**全部**存量业务入口统一加登录门（推荐，A1/停止条件二的要求）vs 仅新增群/文件入口（不满足验收，不可行）。
+- **D2 注销后连接处置**：撤销认证上下文但**保持连接**（推荐，客户端注销后回登录页可复用连接）vs 注销即断连（行为变化大）。
+- **D3 T4 路径语义改造深度**：服务端强制"actor 用户根 + 相对路径"（推荐，A2 根治）需要同时最小化改客户端路径拼装；vs 仅加"路径必须落在本人用户根"校验（服务端独改，客户端零改动，但规范相对路径要求打折扣）。
+- **D4 logoff 破坏性**：现逻辑注销即删用户目录（`removeRecursively`）。本分支只把**授权依据**改为连接级身份，删目录行为保留不变（推荐，范围守恒）vs 顺带停删目录（超出范围，不做）。
+- **D5 群组验收 A1 的延后声明**：群入口本分支不存在，A1 的"创建群/群消息/群成员"三条在本分支以机制就绪 + GROUP 分支补测记录，本分支先以现有五类未登录拒绝实测（推荐）。
+
+## 停止条件（需求 §5 对照）
+- 连接身份可区分：已核实成立（socket 对象 + 服务端 `m_connectionId`/`m_strLoginName`），无需协议变更。
+- 权限入口分散：T2 收敛为单一门函数，审计不得接受客户端隐藏按钮作证据——验收只认服务端拒绝日志与哈希绑定流水线报告。
+- 协议编号：本分支零修改两 `protocol.h`；若开发中发现必须新增字段，停止并回 goal 转 LARGE 协议变更。
