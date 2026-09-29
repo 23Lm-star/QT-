@@ -7,7 +7,7 @@
 | 等级 | SMALL + 不可逆操作 → 专项批准门 |
 | 基线 | 082ebd9（需求文档编写时基线为 b5d7bb3，已漂移，实测事实无变化） |
 | 流程版本 | Development OS v1.7 |
-| 状态 | ⛔ 开发前总结完成，等待主人批准（Q1–Q4） |
+| 状态 | ✅ 已批准，执行中 |
 | owner_agent | claude-code |
 
 ## 一、需求合理性核查（实测）
@@ -62,6 +62,13 @@
 无备份不执行；备份置于仓库外并 rev-list 数量相等验证；禁 filter-branch；禁 force-push（主人另批）；
 本需求内不改数据库密码；备份保留一个版本周期；gc 前不删备份；不改任何源码/配置。
 
-## 六、下一步
+## 六、批准记录（2026-09-29，主人经决策卡回答）
 
-主人回答 Q1–Q4 并批准后 → 新会话按需求 §七 ①–⑩ 执行（开场 state.ps1 确认 clean）。
+- Q1 = **B**：清 `Server/connect.config` + `project-master/`（不含 qtbase）
+- Q2 = **A**：全量重写，所有 commit 哈希改变
+- Q3 = **A**：git-filter-repo（pip 安装）
+- Q4 = 仓库**私有**且密码**仅本地使用** → 按本需求流程执行；force-push 仍另行批准，本需求不含任何推送
+
+## 七、执行记录
+
+（执行中回填：备份路径与 rev-list 验证、filter-repo 输出、前后对照、pipeline 三项、commit-map）
