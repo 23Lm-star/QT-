@@ -7,7 +7,7 @@
 | **任务等级** | **MEDIUM** |
 | **基线 commit** | `b5d7bb3`（编写时 master HEAD） |
 | **流程版本** | Development OS v1.7 |
-| **状态** | 执行中 —— **范围已修订**（2026-09-29 主人批准：漏盘入口全部纳入本需求；isPathInSandbox 增加可选根参数。决策日志见 `project-docs/tasks/REQ-FS-003/task.md`） |
+| **状态** | 已实现待审计 —— 分支提交 `f808daf`，pipeline 三绿 + 端到端越权验证 25/25 PASS；**按主人指令暂停合并**，待独立审计会话通过后合并 |
 
 ---
 
