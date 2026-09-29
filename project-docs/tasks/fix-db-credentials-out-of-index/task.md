@@ -35,6 +35,8 @@
 | 2026-09-29 | `Client/connect.config` 保留跟踪 | 实测其内容只有 IP / 端口 / 路径，**无凭据**，且兼作客户端默认配置 |
 | 2026-09-29 | 保留本地 `Server/connect.config` | `config.qrc` 仍引用它；移除文件会破坏构建。本地备份为 `connect.config.bak-20260929`（已加入 .gitignore） |
 | 2026-09-29 | 历史清除延后为独立任务 | 强制推送属不可逆操作，需单独批准 |
+| 2026-09-29 | **事故与恢复**：`git add <新模板>` 与 `git rm --cached <原文件>` 在**同一批次**执行时，git 的 rename 探测把两者识别为一次 rename，导致工作区的 `Server/connect.config` 被一并清理。已从 `connect.config.bak-20260929` 完整恢复并重新验证（文件存在 / 未被跟踪 / gitignore 生效 / 构建 GREEN）。**教训**：新增与移除混在同一 `git add` 批次会触发 rename 探测，应分开执行。 |
+| 2026-09-29 | 保留 `.bak` 文件在本地 | 恢复来源；已被 `.gitignore` 的 `connect.config.bak-*` 规则覆盖，不会入库 |
 
 ## 证据
 
