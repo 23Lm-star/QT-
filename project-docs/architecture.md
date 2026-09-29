@@ -172,3 +172,10 @@ Server → protocol.h (共用协议定义)
        → 内存池 (ThreadCache/CentralCache/PageCache/ConCurrentAlloc)
 ```
 
+## 8. 日志分级（REQ-LOG-007）
+
+- 全部 213 处日志调用改走 `QLoggingCategory`：服务端 5 类（`xmu.net/db/fs/auth/app`，标识符 `lcNet/lcDb/lcFs/lcAuth/lcApp`），客户端单类（`xmu.cli`，标识符 `lcCli`）；分类文件 `Server/logging.{h,cpp}`、`Client/logging.{h,cpp}`。
+- 默认安静：两个 `main.cpp` 在 `QT_LOGGING_RULES` 未设置时 `setFilterRules("xmu.*.debug=false")`；排查时设 `QT_LOGGING_RULES="xmu.*.debug=true"`（或单类 `xmu.db.debug=true`）打开。
+- 级别映射：纯执行细节 `qCDebug`；操作失败/安全拒绝（SQL 失败、登录凭据不符、路径越权拒绝、下载打开失败等）`qCWarning`；配置/监听失败保持 `qCCritical`。日志语句一条未删，客户端 8 处绝对路径输出改为文件名或 `<path suppressed>`。
+- 约束：`protocol.h` 为 frozen_path 未触碰；不引入第三方日志库。
+
