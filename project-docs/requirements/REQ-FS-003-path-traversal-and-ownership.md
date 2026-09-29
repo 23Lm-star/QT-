@@ -97,7 +97,7 @@ if(ans){ /* 反推 relPath，清理分享链接 */ }                            
 | A3 | 断电续传（resume）功能不受影响 | 中断后重传，从正确 offset 续传 |
 | A4 | 删除不在沙箱内的文件/目录**被拒绝**，且**不执行删除动作** | 构造越权删除请求，返回 `false`，目标文件**依然存在** |
 | A5 | 删除自己沙箱内的文件/目录**正常** | 正常删除，成功 |
-| A6 | 重命名越权路径**被拒绝**，目标文件**依然存在** | 构造越权重命名，返回 `false`，原文件未被改名 |
+| A6 | 重命名越权路径**被拒绝**，目标文件**依然存在**（F-1 修订：含名称段 `../`/`\` 拼接逃逸） | 构造越权重命名（dirPath 逃逸 + 名称段逃逸两类），返回 `false`，原文件未被改名 |
 | A7 | 重命名沙箱内文件**正常** | 正常重命名，成功 |
 | A8 | 所有路径校验逻辑**集中在一处**，不复制粘贴 | 代码审查：只有一个 `isPathInSandbox()` 实现 |
 | A9 | 三项 pipeline 全绿 | `build.ps1` GREEN、`test.ps1` GREEN、`audit.ps1` PASS |
@@ -198,19 +198,23 @@ PDU *MsgHandler::deldir(const QString& loginName)
 
 > ⚠️ **顺序不能颠倒。** 校验必须在 `file.remove()` / `removeRecursively()` **之前**。`removeRecursively()` 是不可逆删除，删完再校验等于没校验。
 
-**③ `renamefile()`（`msghandler.cpp:481`）—— 同样前置校验（2026-09-29 修订：只校验所在目录）**
+**③ `renamefile()`（`msghandler.cpp:481`）—— 前置校验所在目录 + 名称段检查（2026-09-29 二次修订，审计 F-1）**
 
-现状代码里旧名/新名共用**同一个目录** `dirPath`（`pdu->caMsg+sizeof(uint)`，489-490 行），因此只需**校验 `dirPath` 一处**。
+旧名/新名共用同一目录 `dirPath`（`pdu->caMsg+sizeof(uint)`），校验 `dirPath` 一处即可——**但前提是名称段本身不含路径分隔符**。`oldFileName/newFileName` 来自 `caData`（客户端可控），若含 `../`，拼接串 `dirPath+"/"+name` 在路径归一后越过已校验的 `dirPath`（独立审计 F-1，A6 绕过）。修订为：
 
-> ⚠️ **陷阱**：不要校验 `newFilePath`（新文件路径）。目标文件在 rename 前不存在，`canonicalFilePath()` 返回空 → 直接校验它会把**所有正常重命名误拒**（A7 必挂）。
+> ⚠️ **陷阱**：不要对 `newFilePath` 做 `isPathInSandbox`。目标文件在 rename 前不存在，`canonicalFilePath()` 返回空 → 直接校验它会把**所有正常重命名误拒**（A7 必挂）。正确做法是拒绝名称段分隔符，使拼接结果不可能离开 `dirPath`。
 
 ```cpp
 const QString dirPath = QString::fromUtf8(pdu->caMsg + sizeof(uint));
+const QString oldName = fixedString(oldFileName, 32);   // 同 MKDIR 模式
+const QString newName = fixedString(newFileName, 32);
 if (!isPathInSandbox(dirPath)) {
     qWarning() << "[renamefile] 拒绝越权重命名目录:" << dirPath;
-    // 直接返回 ret=false 的 respdu，不做任何 rename
+} else if (oldName.contains('/') || oldName.contains('\\')
+        || newName.contains('/') || newName.contains('\\')) {
+    qWarning() << "[renamefile] 拒绝越权重命名名称段:" << oldName << newName;
 } else {
-    // 原来的 rename 逻辑（含事后的分享链接联动，保持不变）
+    // 原来的 rename 逻辑（含事后的分享链接联动，联动复用净化后的 oldName/newName）
 }
 ```
 
@@ -324,6 +328,7 @@ pipeline 证明不了「越权被拦住」。必须**人工构造越权请求**�
 | 删除逃逸 | `delFilePath` 填沙箱外一个**测试用**文件 | 返回 false，**该文件依然存在** |
 | 删除正常 | 删自己沙箱内的测试文件 | 成功删除 |
 | 重命名逃逸 | 源路径填沙箱外测试文件 | 返回 false，**文件名未变** |
+| 重命名名称段逃逸（F-1 修订新增） | `dirPath` 填合法沙箱目录，旧名或新名段填 `../../../build/<临时文件>` 或含 `\` | 返回 false，服务端日志出现「拒绝越权重命名名称段」，**目标/源文件完好** |
 | mkdir 逃逸（修订新增） | `MKDIR` 的 path 填沙箱外路径（如 `build/` 下临时目录） | 返回 false，目录未创建 |
 | 列目录逃逸（修订新增） | `flushfile` 的 path 填沙箱外目录 | 不回显任何目录项 |
 | 共享读取逃逸（修订新增） | `sharefilemove` 源填沙箱外测试文件 | 返回 false，目标目录**无新文件** |
@@ -336,7 +341,7 @@ pipeline 证明不了「越权被拦住」。必须**人工构造越权请求**�
 ```
 build/evidence/fix-path-traversal-and-ownership/<commit-hash>/
     pipeline-run.log
-    manual-verify.log     # 上面 6 个场景的实际输出
+    manual-verify.log     # 上面 10 个场景的实际输出
     manifest.txt
 ```
 
@@ -398,7 +403,7 @@ python "C:/Users/王晨扬/.codex/skills/development-os-v1-7/scripts/validate-ha
 
 1. 最终 commit 哈希（分支 + 合并）
 2. 三项 pipeline 实际输出（GREEN / GREEN / PASS）
-3. §7 九个场景的实际结果（**尤其"越权被拒且目标完好"的各条**）
+3. §7 十个场景的实际结果（**尤其"越权被拒且目标完好"的各条**）
 4. `isPathInSandbox` 最终实现的代码片段
 5. 第 ④ 步（替换已有校验，movefile/listdir 传用户根）做了没有；若做了，说明行为是否有差异；第 ⑤ 步四处新增拦截全部落地情况
 6. handoff 校验脚本输出
