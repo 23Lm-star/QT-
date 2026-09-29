@@ -40,6 +40,17 @@
 - **D4 logoff 破坏性**：现逻辑注销即删用户目录（`removeRecursively`）。本分支只把**授权依据**改为连接级身份，删目录行为保留不变（推荐，范围守恒）vs 顺带停删目录（超出范围，不做）。
 - **D5 群组验收 A1 的延后声明**：群入口本分支不存在，A1 的"创建群/群消息/群成员"三条在本分支以机制就绪 + GROUP 分支补测记录，本分支先以现有五类未登录拒绝实测（推荐）。
 
+## 开发节点完成记录（2026-09-29，owner: claude-code）
+- 候选提交：`c7c4eed`（feat 主体 `2e3ff69` + 自审修复）。改动仅 4 个服务端文件；**两 protocol.h 零触碰、Client/ 零改动**（合法客户端路径本就落在自身用户根内，D3 在纯服务端达成，"客户端最小配合"实际为零）。
+- 实现要点：登录成功→连接绑定 actor+会话版本；白名单外入口统一门（`isPublicRequestType`/`authRejectPdu`，含逐类型失败响应）；chat/addfriend/addfriendFin/deletefriend/chatmsg/sharefile/sharefilemove/queryFilePublishLink/logoff 的"自己"字段一律服务端 actor 覆盖（chat 转发报文同步改写，接收方看到的是真发送人）；文件七入口（MKDIR/deldir/changedir/flushfile/renamefile/uploadfileinit/downloadfile）路径收敛 `filesPath/<actor>` 本人根；logoff/disconnect 撤销并递增会话版本。
+- 自审发现并修复：sharefilemove 目标路径遗留 `/%3` 占位符（格式串实参不足）→ 修复于 `c7c4eed`。
+- 流水线（绑定 `c7c4eed`）：build GREEN / test honest-0 / **audit PASS**。
+- 端到端（`build/sec001/verify.py`，py -3.13，实时服务端+控制台日志）：**44/44 PASS**，覆盖 G1 未认证拒绝×10、L1 登录后本人操作、X1 伪造路径×7（他人文件完好）、X2 伪造发送者（转发署名=actor）、X3 伪造注销目标（他人账号与目录毫发无损）、R1 注销后同连接被拒+本人目录按既有行为删除、R2 断线在线列表移除、K1 上传/下载/分享/重命名/穿越回归。拒绝日志仅含 conn/type/原因，grep 确认无密码哈希（e10adc… 0 命中）。
+- 证据：`build/evidence/codex-req-ext-sec-001-auth-context/c7c4eed…/`（manifest-sha256 `c56e2035…`，含 verify.py / server-console.log / reject-lines.log / pipeline-run.log / test 日志）。
+- 群组相关验收项（建群/群消息/群成员）按 D5 移交 GROUP 分支补测；秒传"命中"语义待 FILE 分支。
+- 测试数据说明：harness 创建 sec001a/b/r/v 测试账号（密码 123456，filesys/ 为 gitignored 运行数据）；r 已注销删除，其余留存。
+- 节点交接：dev 关闭 → **independent test 需新会话、只读，在 `c7c4eed` 复跑流水线与全部负向用例**。
+
 ## 停止条件（需求 §5 对照）
 - 连接身份可区分：已核实成立（socket 对象 + 服务端 `m_connectionId`/`m_strLoginName`），无需协议变更。
 - 权限入口分散：T2 收敛为单一门函数，审计不得接受客户端隐藏按钮作证据——验收只认服务端拒绝日志与哈希绑定流水线报告。
