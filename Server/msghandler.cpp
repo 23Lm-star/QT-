@@ -535,8 +535,11 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     // 旧名/新名共用同一所在目录 dirPath（现状布局），校验目录一处即可；
     // 不校验 newFilePath：新文件尚不存在，canonical 为空会误拒所有正常重命名
     QString dirPath(QString::fromUtf8(pdu->caMsg+sizeof(uint)));
-    QString oldFilePath(dirPath+"/"+QString::fromUtf8(oldFileName));
-    QString newFilePath(dirPath+"/"+QString::fromUtf8(newFileName));
+    // F-1 修复：名称段同 MKDIR 模式拒绝 '/'、'\\'，堵 "dirPath/../x" 拼接逃逸
+    const QString oldName = fixedString(oldFileName, 32);
+    const QString newName = fixedString(newFileName, 32);
+    QString oldFilePath(dirPath+"/"+oldName);
+    QString newFilePath(dirPath+"/"+newName);
     uint fileType=0;
     memcpy(&fileType,pdu->caMsg,sizeof(fileType));
     qDebug()<<"文件类型:"<<fileType<<" "<<"旧文件路径:"<<oldFilePath<<" "<<"新文件路径:"<<newFilePath<<" ";
@@ -546,6 +549,12 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     if(!isPathInSandbox(dirPath)){
         ret=0;
         qWarning()<<"[renamefile] 拒绝越权重命名目录:"<<dirPath;
+    }
+    else if(oldName.contains('/') || oldName.contains('\\')
+            || newName.contains('/') || newName.contains('\\')){
+        // F-1: 名称段含分隔符时 dirPath 校验可被 "dirPath/../x" 拼接绕过，一律拒绝
+        ret=0;
+        qWarning()<<"[renamefile] 拒绝越权重命名名称段:"<<oldName<<newName;
     }
     else if(fileType==0){//目录
         QDir dir;
@@ -576,10 +585,10 @@ PDU *MsgHandler::renamefile(const QString& loginName)
                          .relativeFilePath(QFileInfo(dirPath).absoluteFilePath());
         }
         if(!relDir.startsWith("..") && !relDir.startsWith("/")){
-            QString oldRel = relDir.isEmpty() ? QString::fromUtf8(oldFileName)
-                                             : relDir + "/" + QString::fromUtf8(oldFileName);
-            QString newRel = relDir.isEmpty() ? QString::fromUtf8(newFileName)
-                                             : relDir + "/" + QString::fromUtf8(newFileName);
+            QString oldRel = relDir.isEmpty() ? oldName
+                                             : relDir + "/" + oldName;
+            QString newRel = relDir.isEmpty() ? newName
+                                             : relDir + "/" + newName;
             OperateDB::instance().updateShareLinkPath(loginName, oldRel, newRel);
             qDebug() << "[renamefile] 已联动更新分享链接: owner=" << loginName
                      << " oldRel=" << oldRel << " newRel=" << newRel;
