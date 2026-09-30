@@ -37,7 +37,7 @@
 - **T8** 收尾：任务记录/证据归档 `project-docs/`；BRANCH-ORDER E 阶段登记；handoff。
 
 ## 允许路径
-`Server/fileobjectstore.{h,cpp}`、`Server/operatedb.{h,cpp}`、`Server/resumableuploadsession.{h,cpp}`、`Server/uploadwritetask.{h,cpp}`、`Server/msghandler.{h,cpp}`、`Server/mytcpsocket.{h,cpp}`（会话持久化配合）、`Server/server.{h,cpp}`（启动版本检查）、`Server/Server.pro`、`Server/migrate_ext_file_001.sql`、`Client/*`（仅回归必需的最小配合，预期零改动）、`project-docs/tasks|evidence/REQ-EXT-FILE-001/`。
+`Server/fileobjectstore.{h,cpp}`、`Server/operatedb.{h,cpp}`、`Server/resumableuploadsession.{h,cpp}`、`Server/uploadwritetask.{h,cpp}`、`Server/msghandler.{h,cpp}`、`Server/mytcpsocket.{h,cpp}`（会话持久化配合）、`Server/server.{h,cpp}`（启动版本检查）、`Server/main.cpp`（T1/T6 挂钩点，见"开发进度 节点2"main.cpp 挂钩叙述；独立审计范围项修正）、`Server/Server.pro`、`Server/migrate_ext_file_001.sql`、`Server/migrate_ext_file_001_rollback.sql`（回滚随行，独立审计范围项修正）、`Client/*`（仅回归必需的最小配合，预期零改动）、`project-docs/tasks|evidence/REQ-EXT-FILE-001/`。
 **禁止**：两 `protocol.h`（frozen）、`Server/filesys/` 入库、新外部依赖、顺手实现秒传 PDU/群文件/乱序并发上传、物理删除用户旧文件。
 
 ## 运行环境事实（T1 实测，独立测试会话需照此准备）
@@ -68,7 +68,19 @@
 - 运行环境补充事实（独立测试节点照此准备）：启动 Server.exe 必须 **PATH 前置 Qt5.14.2/mingw 两个 bin 目录**，否则 Anaconda 等同名 DLL 劫持导致启动崩溃（0xC0000005/0xc0000139）；Python 用 `py -3.13`（Anaconda 3.6 无 capture_output）；SEC 回归需 `SEC001_BASE=<工作树根>` 且预建 `Server/filesys/{sec001a,sec001b,sec001r,sec001v}` 用户根；脚本生命周期参考 `build/start-server.ps1`（gitignore 外，会话自管）。
 - 遗留/边界（证据定格，非阻塞）：路径 >191 字符的旧文件记 failed 不入库映射（超长列宽，MySQL5.7 utf8 191 上限）；未建目录条目的旧目录改名/移动后，其内已迁移条目仅前缀级联（`renameEntriesDir`），旧目录本身无条目行（flushfile 物理回退显示）；隐藏文件不入迁移扫描（QDirIterator Files 默认过滤器）。
 
-**下一节点**：independent test（新会话、只报不改）→ repair（如需，owner 会话）→ independent audit（新会话只读）→ integration 三事实行 → merge no-ff。档位 LARGE 不变；两 `protocol.h` 全程零命中（branch diff 复核通过）。
+## 开发进度（2026-09-30 repair 节点，独立审计 REJECT 后 owner 修复，本会话=claude 代偿 owner）
+- 审计阻塞 F-3/D5 成立并经三层复核确认（代码/契约/独立测试实证）。修复方案=design §2 字面回归：
+  - **逻辑键**：`normalizeParent(owner, raw)` 归一为 owner 相对、用户根内、`'/' 结尾` 的机器无关键（`'/'`=用户根，`'/sub/'`=子目录），接受 PDU 相对/本树绝对/既有逻辑键三形态且幂等；不再调 `absolutePath()`（工作树相关前缀是键漂移根因）。物理 IO 全部保留原始路径（isPathInSandbox/objectAbsPath/staging/movefile dstDir 物理检查）。
+  - **收口面**：store 10 处键生成/前缀级联改 `'/' 结尾`语义（`logicDirKey`+startsWith）；msghandler 9 入口传 owner；movefile 条目分支"物理存在性检查"与逻辑键解耦（`dstNorm`→逻辑、`QDir(dstDir)`→物理）；迁移 `old_path` 改存 design §2 相对形态 `filesys/<user>/...`（跨树重跑天然去重）。
+  - **存量转换**：`OperateDB::normalizeLogicKeys()`（main.cpp 挂钩，先于迁移、幂等可重放）——`user_file`/`upload_session.parent_path` 绝对→逻辑键；`file_migration_map.old_path` 绝对→相对；uk_loc 冲突按 file_id 最早保留、后到 active 行软删+镜像 releaseEntry 减引用（D3 不物理删）。
+  - **F-2**：`sec001_regression.py` 增步骤0 DB 清场（owner 行删净+未引用对象回收，对齐 entry_ops 语义，不再以人工清场豁免冒充 PASS）。
+  - **范围契约**：允许路径清单补 `Server/main.cpp`/`Server/migrate_ext_file_001_rollback.sql`（`17af569` 起即被使用，审计指出清单漏记）。
+  - **新增回归**：`cross_tree_e2e.py`——两棵不同绝对根（`Server/` 与 `build/xtree-file001/`，junction 共享物理 filesys）+ 共享 mydb：同请求跨树同键幂等（不重复行/不加引用）、列表/下载/分享跨树命中、存量绝对键启动转换+重放幂等。K1f 断言改逻辑键字面量（`'/'`）。
+  - **附带发现并修复（验收2 缺口，跨树回归暴露）**：`commitUpload`/`attachEntry` 同请求重复命中在 `(1)` 递推**之后**才判幂等→重复请求会建 `(1)` 重复行并 +1 引用。已改为同对象命中优先（`(1)` 仅用于同名不同对象），dedup/sec001 语义不回退。
+  - **实测（最终二进制单实例连跑）**：entry_ops **36/36**、dedup **13/13**、sec001_regression **48/48**（新步骤0清场生效）、cross_tree_e2e **31/31**；三门于 `915eeff`：build GREEN / test honest-0 / audit PASS（protocol.h 零命中）。运行事实补充：harness 环境变量须用真实 env 传递（bash 内 `set` 无效会静默回落默认 BASE）；taskkill 后目录句柄可瞬态占用，sec001 预清场已带重试。
+  - **证据**：`build/evidence/codex-req-ext-file-001-file-assets/915eeff…/`（四套件日志+gates.txt）；handoff `project-docs/handoffs/req-ext-file-001-repair-2026-09-30.txt`（validate-handoff OK）。
+
+**下一节点**：repair 完成后**重新走 independent test（新会话）→ independent audit（新会话只读）**，通过后方可 integration 三事实行 → merge no-ff。档位 LARGE 不变；两 `protocol.h` 全程零命中（branch diff 复核通过）。
 
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
