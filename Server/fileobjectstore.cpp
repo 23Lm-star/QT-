@@ -127,7 +127,8 @@ QString FileObjectStore::objectAbsPath(qint64 objectId) const
 
 FileObjectStore::CommitResult FileObjectStore::commitUpload(
         const QString& owner, const QString& rawParentPath,
-        const QString& wantedName, qint64 expectedSize, const QString& stagingPath)
+        const QString& wantedName, qint64 expectedSize, const QString& stagingPath,
+        bool copyOnly)
 {
     CommitResult r;
     r.displayName = wantedName;
@@ -152,7 +153,7 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
         r.error = "复算大小与登记不符，拒绝转正";
         qCWarning(lcFs) << "[commitUpload] conn-owner" << owner
                         << "expected" << expectedSize << "actual" << size;
-        QFile::remove(stagingPath);
+        if (!copyOnly) QFile::remove(stagingPath);   // T6：迁移源=用户旧文件，绝不删除（验收5）
         return r;
     }
 
@@ -195,9 +196,13 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
             const QString absRoot = QDir(Server::getinstance().filesPath).absolutePath();
             createdFinalAbs = QDir(absRoot).absoluteFilePath(rel);
             QDir().mkpath(QFileInfo(createdFinalAbs).absolutePath());
-            if (!QFile::rename(stagingPath, createdFinalAbs)) {
-                r.error = "对象转正 rename 失败";
+            const bool moved = copyOnly
+                    ? QFile::copy(stagingPath, createdFinalAbs)   // T6：旧实体复制为对象，源永不删除
+                    : QFile::rename(stagingPath, createdFinalAbs);
+            if (!moved) {
+                r.error = copyOnly ? "对象转正 copy 失败" : "对象转正 rename 失败";
                 qCWarning(lcFs) << "[commitUpload]" << r.error << createdFinalAbs;
+                if (copyOnly) QFile::remove(createdFinalAbs);     // 清理半成品副本
                 createdFinalAbs.clear();
                 break;
             }
@@ -244,7 +249,7 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
                     r.objectId = oid;
                     r.dedupHit = true;
                     if (!db.commit()) { r.error = db.lastError().text(); break; }
-                    if (!objectCreated) QFile::remove(stagingPath);
+                    if (!objectCreated && !copyOnly) QFile::remove(stagingPath);
                     r.ok = true;
                     done = true;
                     break;
@@ -280,7 +285,7 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
             r.error = db.lastError().text();
             break;
         }
-        if (!objectCreated) {
+        if (!objectCreated && !copyOnly) {
             QFile::remove(stagingPath);                           // 内容已在既有对象——物理只留一份（验收1）
         }
         r.fileId = fileId;
@@ -293,7 +298,8 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
     if (!done) {
         db.rollback();
         if (objectCreated && !createdFinalAbs.isEmpty()) {
-            QFile::rename(createdFinalAbs, stagingPath);          // 尽力回退搬移，孤儿对象可恢复
+            if (copyOnly) QFile::remove(createdFinalAbs);          // T6：清理本事务产生的副本，源不动
+            else QFile::rename(createdFinalAbs, stagingPath);      // 尽力回退搬移，孤儿对象可恢复
         }
         qCWarning(lcFs) << "[commitUpload] 失败回滚 owner" << owner << r.error;
     }

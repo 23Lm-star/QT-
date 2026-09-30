@@ -1,10 +1,14 @@
 #include "logging.h"
 #include "operatedb.h"
 #include "databaseconnectionpool.h"
+#include "fileobjectstore.h"
 #include "server.h"
 
 #include <QDebug>
 #include <QCryptographicHash>
+#include <QDir>
+#include <QDirIterator>
+#include <QFileInfo>
 #include <QRandomGenerator>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -93,6 +97,89 @@ bool OperateDB::checkSchemaVersion()
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
     return true;
+}
+
+// ===== REQ-EXT-FILE-001 T6：存量迁移（design §7：幂等、失败不删旧、file_migration_map 双向映射）=====
+void OperateDB::migrateLegacyFiles()
+{
+    {
+        PooledSqlConnection probe = DatabaseConnectionPool::instance().acquire();
+        if (!probe.isValid()) {
+            qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，跳过存量迁移";
+            return;
+        }
+    }
+    const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    int mapped = 0, skipped = 0, failed = 0;
+    const QStringList userDirs = QDir(fsRoot).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QString& user : userDirs) {
+        if (user == "objects" || user == "tmp" || user == ".staging") {
+            continue;   // 非用户根目录（D2 布局/暂存区）
+        }
+        QDirIterator it(QDir(fsRoot).filePath(user), QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString oldAbs = QDir::cleanPath(it.next());
+            bool artifact = false;
+            const QStringList segs = oldAbs.split('/');
+            for (const QString& seg : segs) {
+                if (seg == "objects" || seg == ".staging" || seg.endsWith(".part")) {
+                    artifact = true;
+                    break;
+                }
+            }
+            if (artifact) continue;   // 内容寻址对象与暂存实体不是迁移对象
+            if (oldAbs.size() > 191) {
+                qCWarning(lcDb) << "[migrateLegacy] 路径超 file_migration_map 列宽(191)，未迁移:" << oldAbs;
+                ++failed;
+                continue;
+            }
+            bool already = false;
+            {
+                PooledSqlConnection c = DatabaseConnectionPool::instance().acquire();
+                if (!c.isValid()) { qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，迁移中断（旧文件零删除）"; return; }
+                QSqlQuery q(c.database());
+                q.prepare("SELECT status FROM file_migration_map WHERE old_path=?");
+                q.addBindValue(oldAbs);
+                if (q.exec() && q.next()) already = true;   // 重跑：已有映射记录即跳过（failed 留待人工复核）
+            }
+            if (already) { ++skipped; continue; }
+
+            const QFileInfo fi(oldAbs);
+            const FileObjectStore::CommitResult r = FileObjectStore::instance().commitUpload(
+                user, fi.absolutePath(), fi.fileName(), fi.size(), oldAbs, /*copyOnly=*/true);
+            PooledSqlConnection c2 = DatabaseConnectionPool::instance().acquire();
+            if (!c2.isValid()) { qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，迁移中断（旧文件零删除）"; return; }
+            QSqlQuery m(c2.database());
+            if (r.ok) {
+                // 同名不同内容：不覆盖——条目已按 (1) 安置，映射记 skipped_name_conflict（验收4 后半）
+                const QString status = (r.displayName == fi.fileName()) ? "mapped" : "skipped_name_conflict";
+                m.prepare("INSERT INTO file_migration_map (old_path,file_id,object_id,status) VALUES (?,?,?,?)");
+                m.addBindValue(oldAbs);
+                m.addBindValue(r.fileId);
+                m.addBindValue(r.objectId);
+                m.addBindValue(status);
+                if (m.exec()) {
+                    ++mapped;
+                } else {
+                    qCWarning(lcDb) << "[migrateLegacy] 映射行写入失败:" << oldAbs << m.lastError().text();
+                    ++failed;
+                }
+            } else {
+                // 任一文件失败：记 failed，继续其余，不中断、不删任何旧文件（验收5）
+                qCWarning(lcDb) << "[migrateLegacy] 迁移失败:" << oldAbs << r.error;
+                m.prepare("INSERT INTO file_migration_map (old_path,file_id,object_id,status) VALUES (?,?,NULL,'failed')");
+                m.addBindValue(oldAbs);
+                m.exec();
+                ++failed;
+            }
+        }
+    }
+    if (mapped || skipped || failed) {
+        qCDebug(lcDb) << "[migrateLegacy] mapped" << mapped << "skipped" << skipped << "failed" << failed;
+    }
+    if (failed > 0) {
+        qCWarning(lcDb) << "[migrateLegacy] 存在 failed/超长记录——进 FILE-002/GROUP-003 前必须复核 file_migration_map";
+    }
 }
 
 // ===== REQ-EXT-FILE-001 T4：upload_session 持久化（staging 归属/offset/过期）=====

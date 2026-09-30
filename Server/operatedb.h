@@ -16,6 +16,9 @@ public:
     static const int kFileAssetSchemaVersion = 2026092901;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
+    //REQ-EXT-FILE-001 T6：存量文件启动自动迁移（幂等：file_migration_map 已有记录即跳过；
+    //失败记 failed 继续其余，绝不删除旧文件——验收5）。main 在版本检查通过后调用一次。
+    void migrateLegacyFiles();
     //执行注册用户操作函数
     bool handleRegit(char* strname,char*strpwd);
     //登录用户

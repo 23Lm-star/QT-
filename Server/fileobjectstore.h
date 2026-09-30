@@ -40,9 +40,10 @@ public:
     // 事务内：find-or-create 对象 + 建/复活条目 + 引用计数。
     // expectedSize 为会话登记大小；复算不一致 = 失败（不转正，验收4）。
     // 新对象：staging 原子 rename 到 objects/{sha前2}/{object_id}；命中已有对象：丢弃 staging。
+    // copyOnly=true（T6 存量迁移）：源文件=旧路径实体——只复制不搬移，绝不删除源（验收5）。
     CommitResult commitUpload(const QString& owner, const QString& parentPath,
                               const QString& displayName, qint64 expectedSize,
-                              const QString& stagingPath);
+                              const QString& stagingPath, bool copyOnly = false);
 
     // 删除条目（软删）并释放引用；对象引用归零 → pending_reclaim。
     bool releaseEntry(qint64 fileId, const QString& owner);

@@ -24,6 +24,9 @@ int main(int argc, char *argv[])
         qCCritical(lcApp) << "DB schema not ready (see lcDb critical log). Exiting.";
         return 1;
     }
+    // REQ-EXT-FILE-001 T6：存量迁移在版本检查通过后、事件循环启动前自动执行一次。
+    // 此时尚未处理任何业务请求（a.exec 未开始），且幂等：重跑仅跳过已映射文件。
+    OperateDB::instance().migrateLegacyFiles();
     s.show();
     return a.exec();
 }
