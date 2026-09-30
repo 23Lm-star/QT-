@@ -266,8 +266,13 @@ void MyTcpSocket::handleUploadWriteFinished(qint64 offset, qint64 length, bool s
     if(success){
         success=m_MsgHandler->m_uploadSession.acceptWrittenChunk(offset,length);
     }
-    sendUploadAck(success,m_MsgHandler->m_uploadSession.receivedSize(),
-                  success && m_MsgHandler->m_uploadSession.isComplete());
+    const bool complete = success && m_MsgHandler->m_uploadSession.isComplete();
+    const qint64 ackOffset = m_MsgHandler->m_uploadSession.receivedSize();
+    if(complete){
+        // REQ-EXT-FILE-001 T4：末块写完→服务端复算转正+建条目+引用计数（会 reset 会话）
+        m_MsgHandler->finalizeUploadOnComplete();
+    }
+    sendUploadAck(success, ackOffset, complete);
 }
 
 void MyTcpSocket::sendUploadAck(bool success, qint64 nextOffset, bool complete)

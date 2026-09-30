@@ -52,6 +52,12 @@ public:
     quint64 m_connId = 0;  // 连接关联标识（拒绝审计用）
     QString actorUserRoot() const;                     // 服务端生成的规范用户根：filesPath/<actor>
     bool pathInActorRoot(const QString& path) const;   // 路径必须落在 actor 本人用户根内
+    // REQ-EXT-FILE-001 D5：内容寻址后文件不再物理落用户路径，下载/删除改为
+    // 校验其所在目录（目录由 MKDIR 物理创建，必存在）落在 actor 根内。
+    bool parentDirInActorRoot(const QString& filePath) const;
+    // REQ-EXT-FILE-001 design §6：逻辑条目操作（改名/移动/分享登记）不要求物理存在，
+    // 仅做词法规范化 + actor 根越权判断（isPathInSandbox 原样留给仍在磁盘执行的读写）。
+    bool logicPathInActorRoot(const QString& path) const;
     PDU* createPublishLink(const QString& loginName);//创建外链分享
     
     // 新增：安全外链分享（BUG-ARC-PUBLINK-001）
@@ -79,6 +85,12 @@ public:
 
     //下载文件时存储通过验证的规范路径
     QString m_downloadCanonicalPath;
+
+    // ===== REQ-EXT-FILE-001 T3/T4：内容寻址上传落定 =====
+    qint64 m_uploadSessionId = -1;   // 当前暂存会话 upload_session.session_id
+    // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
+    // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。
+    void finalizeUploadOnComplete();
 
     // REQ-FS-003: 统一路径沙箱校验（集中一处，所有路径入口调用）
     // 根与路径分别做 canonical 归一（解析 ../ 与符号链接）后判前缀；

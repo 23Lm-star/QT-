@@ -1,14 +1,20 @@
 #include "logging.h"
 #include "operatedb.h"
 #include "databaseconnectionpool.h"
+#include "fileobjectstore.h"
 #include "server.h"
 
 #include <QDebug>
 #include <QCryptographicHash>
+#include <QDir>
+#include <QDirIterator>
+#include <QFileInfo>
 #include <QRandomGenerator>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QVector>
 
 namespace {
 // 生成 32 位 hex 随机盐（熵源为 OS 级密码学安全随机数）
@@ -63,6 +69,349 @@ void OperateDB::connect()
     } else {
         qCCritical(lcDb) << "OperateDB::connect - 数据库连接池初始化失败: testConnection 返回 false";
     }
+}
+
+// REQ-EXT-FILE-001 T1：启动 schema 版本检查（D1 fail-fast：库不可达/表缺失/版本低一律拒绝启动，
+// 不静默建表、不自动执行迁移——迁移只由 migrate_ext_file_001.sql 人工受控执行）。
+bool OperateDB::checkSchemaVersion()
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) {
+        qCCritical(lcDb) << "[checkSchemaVersion] 数据库不可达：请先检查 connect.config 与 MySQL 服务";
+        return false;
+    }
+    QSqlQuery q(connection.database());
+    if (!q.exec("SELECT MAX(version) FROM schema_version")) {
+        qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
+                         << q.lastError().text()
+                         << "— 请先执行 Server/migrate_ext_file_001.sql";
+        return false;
+    }
+    int version = 0;
+    if (q.next() && !q.value(0).isNull()) {
+        version = q.value(0).toInt();
+    }
+    const int required = kFileAssetSchemaVersion;
+    if (version < required) {
+        qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
+                         << "— 请先执行 Server/migrate_ext_file_001.sql";
+        return false;
+    }
+    qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
+    return true;
+}
+
+// ===== REQ-EXT-FILE-001 T6：存量迁移（design §7：幂等、失败不删旧、file_migration_map 双向映射）=====
+void OperateDB::migrateLegacyFiles()
+{
+    {
+        PooledSqlConnection probe = DatabaseConnectionPool::instance().acquire();
+        if (!probe.isValid()) {
+            qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，跳过存量迁移";
+            return;
+        }
+    }
+    const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    // F-3/D5 修复：映射键存 design §2 规定的相对形态 "<filesys>/<user>/..."（跨树确定、可重放），
+    // 机器绝对前缀不再进入 file_migration_map。
+    const QString fsBase = QFileInfo(fsRoot).fileName();
+    int mapped = 0, skipped = 0, failed = 0;
+    const QStringList userDirs = QDir(fsRoot).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const QString& user : userDirs) {
+        if (user == "objects" || user == "tmp" || user == ".staging") {
+            continue;   // 非用户根目录（D2 布局/暂存区）
+        }
+        QDirIterator it(QDir(fsRoot).filePath(user), QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString oldAbs = QDir::cleanPath(it.next());
+            bool artifact = false;
+            const QStringList segs = oldAbs.split('/');
+            for (const QString& seg : segs) {
+                if (seg == "objects" || seg == ".staging" || seg.endsWith(".part")) {
+                    artifact = true;
+                    break;
+                }
+            }
+            if (artifact) continue;   // 内容寻址对象与暂存实体不是迁移对象
+            const QString rel = QDir(fsRoot).relativeFilePath(oldAbs);
+            if (rel.isEmpty() || rel.startsWith("..")) {
+                qCWarning(lcDb) << "[migrateLegacy] 文件不在 filesys 根内，未迁移:" << oldAbs;
+                ++failed;
+                continue;
+            }
+            const QString oldKey = fsBase + "/" + rel;      // design §2: filesys/<user>/... 相对键
+            if (oldKey.size() > 191) {
+                qCWarning(lcDb) << "[migrateLegacy] 相对路径超 file_migration_map 列宽(191)，未迁移:" << oldKey;
+                ++failed;
+                continue;
+            }
+            bool already = false;
+            {
+                PooledSqlConnection c = DatabaseConnectionPool::instance().acquire();
+                if (!c.isValid()) { qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，迁移中断（旧文件零删除）"; return; }
+                QSqlQuery q(c.database());
+                q.prepare("SELECT status FROM file_migration_map WHERE old_path=?");
+                q.addBindValue(oldKey);
+                if (q.exec() && q.next()) already = true;   // 重跑：已有映射记录即跳过（failed 留待人工复核）
+            }
+            if (already) { ++skipped; continue; }
+
+            const QFileInfo fi(oldAbs);
+            const FileObjectStore::CommitResult r = FileObjectStore::instance().commitUpload(
+                user, fi.absolutePath(), fi.fileName(), fi.size(), oldAbs, /*copyOnly=*/true);
+            PooledSqlConnection c2 = DatabaseConnectionPool::instance().acquire();
+            if (!c2.isValid()) { qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，迁移中断（旧文件零删除）"; return; }
+            QSqlQuery m(c2.database());
+            if (r.ok) {
+                // 同名不同内容：不覆盖——条目已按 (1) 安置，映射记 skipped_name_conflict（验收4 后半）
+                const QString status = (r.displayName == fi.fileName()) ? "mapped" : "skipped_name_conflict";
+                m.prepare("INSERT INTO file_migration_map (old_path,file_id,object_id,status) VALUES (?,?,?,?)");
+                m.addBindValue(oldKey);
+                m.addBindValue(r.fileId);
+                m.addBindValue(r.objectId);
+                m.addBindValue(status);
+                if (m.exec()) {
+                    ++mapped;
+                } else {
+                    qCWarning(lcDb) << "[migrateLegacy] 映射行写入失败:" << oldAbs << m.lastError().text();
+                    ++failed;
+                }
+            } else {
+                // 任一文件失败：记 failed，继续其余，不中断、不删任何旧文件（验收5）
+                qCWarning(lcDb) << "[migrateLegacy] 迁移失败:" << oldAbs << r.error;
+                m.prepare("INSERT INTO file_migration_map (old_path,file_id,object_id,status) VALUES (?,?,NULL,'failed')");
+                m.addBindValue(oldKey);
+                m.exec();
+                ++failed;
+            }
+        }
+    }
+    if (mapped || skipped || failed) {
+        qCDebug(lcDb) << "[migrateLegacy] mapped" << mapped << "skipped" << skipped << "failed" << failed;
+    }
+    if (failed > 0) {
+        qCWarning(lcDb) << "[migrateLegacy] 存在 failed/超长记录——进 FILE-002/GROUP-003 前必须复核 file_migration_map";
+    }
+}
+
+// ===== REQ-EXT-FILE-001 F-3/D5 修复：存量键一次性确定性转换（幂等可重放）=====
+// user_file/upload_session.parent_path 的旧"绝对机器路径"形态 → owner 相对逻辑键；
+// file_migration_map.old_path → design §2 相对形态 "<filesys>/<user>/..."。
+// 转换后同一逻辑请求在任何工作树命中同一行（跨树幂等/分享/隔离成立）。
+// uk_loc 冲突：按 file_id 最早行保留，后到 active 行软删并镜像 releaseEntry 减引用（D3 不物理删）。
+void OperateDB::normalizeLogicKeys()
+{
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) {
+        qCCritical(lcDb) << "[normalizeLogicKeys] 数据库不可达，跳过存量键转换";
+        return;
+    }
+    QSqlDatabase db = conn.database();
+    const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString fsBase = QFileInfo(fsRoot).fileName();
+    int ufConverted = 0, ufCollapsed = 0, ufSkippedDeleted = 0, sessConverted = 0;
+    int mapConverted = 0, mapDupRemoved = 0, unmapped = 0;
+
+    // 1) user_file——F-5 修复：单遍确定性。判别不依赖首字符 '/'（覆盖 "/filesys/..." 无盘符
+    //    旧形态）：canonical 行（'/' 开头且 '/' 结尾且无 "//"）预种子为冲突基准；其余行按
+    //    file_id 单遍——撞键时 **不改写 loser 的 parent_path**（改写=与存活行同三重撞
+    //    uk_loc→1062 死锁在旧键）。存活优先级：canonical 行 > 最早旧行；loser active→仅
+    //    软删+镜像 releaseEntry 减引用（D3 不物理删），deleted→静默跳过（重放稳定无告警）。
+    QSet<QString> seenUf;
+    {
+        QSqlQuery s(db);
+        if (s.exec("SELECT owner_name,parent_path,display_name FROM user_file "
+                   "WHERE parent_path LIKE '/%' AND parent_path LIKE '%/' AND parent_path NOT LIKE '%//%'")) {
+            while (s.next())
+                seenUf.insert(s.value(0).toString() + "|" + s.value(1).toString() + "|" + s.value(2).toString());
+        }
+    }
+    {
+        QSqlQuery rows(db);
+        if (rows.exec("SELECT file_id,owner_name,parent_path,display_name,object_id,status FROM user_file "
+                      "WHERE parent_path NOT LIKE '/%' OR parent_path NOT LIKE '%/' OR parent_path LIKE '%//%' "
+                      "ORDER BY file_id")) {
+            QVector<QVariantList> batch;
+            while (rows.next()) {
+                QVariantList r;
+                for (int i = 0; i < 6; ++i) r.append(rows.value(i));
+                batch.append(r);
+            }
+            for (const QVariantList& r : batch) {
+                const qint64 fid = r.at(0).toLongLong();
+                const QString owner = r.at(1).toString();
+                const QString stored = r.at(2).toString();
+                const QString name = r.at(3).toString();
+                const QVariant obj = r.at(4);
+                const bool active = (r.at(5).toString() == "active");
+                const QString key = FileObjectStore::normalizeParent(owner, stored);
+                if (key.isEmpty()) {
+                    ++unmapped;
+                    qCWarning(lcDb) << "[normalizeLogicKeys] user_file 行无法映射，保留原值" << fid << owner << stored;
+                    continue;
+                }
+                if (key == stored) {   // 语义已是逻辑键（形态未 canonical）：仅登记
+                    seenUf.insert(owner + "|" + key + "|" + name);
+                    continue;
+                }
+                const QString triple = owner + "|" + key + "|" + name;
+                QSqlQuery u(db);
+                if (seenUf.contains(triple)) {
+                    if (!active) { ++ufSkippedDeleted; continue; }   // 重放稳定：不再触碰、不再告警
+                    u.prepare("UPDATE user_file SET status='deleted' WHERE file_id=?");
+                    u.addBindValue(fid);
+                    if (!u.exec()) { qCWarning(lcDb) << "[normalizeLogicKeys] 冲突收敛失败" << fid << u.lastError().text(); continue; }
+                    if (!obj.isNull()) {
+                        QSqlQuery d(db);
+                        d.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
+                                  "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                        d.addBindValue(obj.toLongLong());
+                        if (!d.exec()) qCWarning(lcDb) << "[normalizeLogicKeys] 收敛减引用失败" << obj.toLongLong() << d.lastError().text();
+                    }
+                    ++ufCollapsed;
+                } else {
+                    u.prepare("UPDATE user_file SET parent_path=? WHERE file_id=?");
+                    u.addBindValue(key);
+                    u.addBindValue(fid);
+                    if (!u.exec()) { qCWarning(lcDb) << "[normalizeLogicKeys] 转换失败" << fid << u.lastError().text(); continue; }
+                    seenUf.insert(triple);
+                    ++ufConverted;
+                }
+            }
+        }
+    }
+
+    // 2) upload_session：同判别（无唯一键，可改写则改写；与会话行同规则跳过 canonical）
+    {
+        QSqlQuery rows(db);
+        if (rows.exec("SELECT session_id,owner_name,parent_path FROM upload_session "
+                      "WHERE parent_path NOT LIKE '/%' OR parent_path NOT LIKE '%/' OR parent_path LIKE '%//%' "
+                      "ORDER BY session_id")) {
+            QVector<QVariantList> batch;
+            while (rows.next()) {
+                QVariantList r;
+                for (int i = 0; i < 3; ++i) r.append(rows.value(i));
+                batch.append(r);
+            }
+            for (const QVariantList& r : batch) {
+                const QString key = FileObjectStore::normalizeParent(r.at(1).toString(), r.at(2).toString());
+                if (key == r.at(2).toString()) continue;
+                if (key.isEmpty()) { ++unmapped; continue; }
+                QSqlQuery u(db);
+                u.prepare("UPDATE upload_session SET parent_path=? WHERE session_id=?");
+                u.addBindValue(key);
+                u.addBindValue(r.at(0).toLongLong());
+                if (u.exec()) ++sessConverted;
+            }
+        }
+    }
+
+    // 3) file_migration_map：机器绝对 old_path → "<filesys>/..." 相对键；
+    //    转换后撞主键（两棵树映射同一旧文件）：按 migrated_at,old_path 序保留先者，删后者。
+    {
+        QVector<QString> legacy;
+        QSqlQuery all(db);
+        if (all.exec("SELECT old_path FROM file_migration_map ORDER BY migrated_at, old_path")) {
+            while (all.next()) {
+                const QString op = all.value(0).toString();
+                if (!op.startsWith(fsBase + "/")) legacy.append(op);
+            }
+        }
+        for (const QString& op : legacy) {
+            QString n = op;
+            n.replace('\\', '/');
+            const QStringList segs = QDir::cleanPath(n).split('/', Qt::SkipEmptyParts);
+            int idx = -1;
+            for (int i = 0; i < segs.size(); ++i) {
+                if (segs.at(i).compare(fsBase, Qt::CaseInsensitive) == 0) { idx = i; break; }
+            }
+            if (idx < 0) {
+                ++unmapped;
+                qCWarning(lcDb) << "[normalizeLogicKeys] 映射行锚定失败，保留原值" << op;
+                continue;
+            }
+            const QString newKey = QStringList(segs.mid(idx)).join('/');
+            if (newKey.size() > 191) { ++unmapped; continue; }
+            QSqlQuery c(db);
+            c.prepare("SELECT COUNT(*) FROM file_migration_map WHERE old_path=?");
+            c.addBindValue(newKey);
+            bool taken = false;
+            if (c.exec() && c.next()) taken = (c.value(0).toLongLong() > 0);
+            QSqlQuery u(db);
+            if (taken) {
+                u.prepare("DELETE FROM file_migration_map WHERE old_path=?");
+                u.addBindValue(op);
+                if (u.exec()) ++mapDupRemoved;
+            } else {
+                u.prepare("UPDATE file_migration_map SET old_path=? WHERE old_path=?");
+                u.addBindValue(newKey);
+                u.addBindValue(op);
+                if (u.exec()) ++mapConverted;
+            }
+        }
+    }
+
+    if (ufConverted || ufCollapsed || ufSkippedDeleted || sessConverted || mapConverted || mapDupRemoved || unmapped) {
+        qCDebug(lcDb) << "[normalizeLogicKeys] user_file" << ufConverted << "收敛" << ufCollapsed
+                      << "deleted跳过" << ufSkippedDeleted
+                      << "upload_session" << sessConverted
+                      << "map" << mapConverted << "去重删" << mapDupRemoved
+                      << "无法映射" << unmapped;
+    }
+}
+
+// ===== REQ-EXT-FILE-001 T4：upload_session 持久化（staging 归属/offset/过期）=====
+qint64 OperateDB::createUploadSession(const QString &owner, const QString &parentPath,
+                                      const QString &displayName, qint64 expectedSize,
+                                      const QString &clientSha256, const QString &stagingPath,
+                                      qint64 confirmedOffset, int ttlSec)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return -1;
+    QSqlQuery q(connection.database());
+    q.prepare("INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,"
+              "client_sha256,staging_path,confirmed_offset,status,expires_at) "
+              "VALUES (?,?,?,?,?,?,?,'uploading',?)");
+    q.addBindValue(owner);
+    q.addBindValue(parentPath);
+    q.addBindValue(displayName);
+    q.addBindValue(expectedSize);
+    q.addBindValue(clientSha256.isEmpty() ? QVariant() : QVariant(clientSha256));
+    q.addBindValue(stagingPath);
+    q.addBindValue(confirmedOffset);
+    q.addBindValue(QDateTime::currentDateTime().addSecs(ttlSec > 0 ? ttlSec : 3600)
+                       .toString("yyyy-MM-dd HH:mm:ss"));
+    if(!q.exec()){
+        qCWarning(lcDb) << "[createUploadSession] 失败:" << q.lastError().text();
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+bool OperateDB::updateUploadOffset(qint64 sessionId, qint64 confirmedOffset)
+{
+    if(sessionId < 0) return false;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE upload_session SET confirmed_offset=? WHERE session_id=? AND status='uploading'");
+    q.addBindValue(confirmedOffset);
+    q.addBindValue(sessionId);
+    return q.exec();
+}
+
+bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status)
+{
+    if(sessionId < 0) return false;
+    if(status != "done" && status != "failed" && status != "expired" && status != "verifying")
+        return false;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE upload_session SET status=? WHERE session_id=?");
+    q.addBindValue(status);
+    q.addBindValue(sessionId);
+    return q.exec();
 }
 
 bool OperateDB::handleRegit(char *strname, char *strpwd)
