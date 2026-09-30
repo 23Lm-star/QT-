@@ -457,21 +457,26 @@ bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
 
         QList<qint64> fileIds;
         QList<QVariant> objectIds;
-        q.prepare("SELECT file_id,object_id FROM user_file "
-                  "WHERE owner_name=? AND status='active' AND (parent_path=? OR parent_path LIKE ?) FOR UPDATE");
+        // F-4 修复：dirPath 以 '/' 结尾，旧 LIKE dirPath+"/%" 形成 '//%'——合法键无 "//"，
+        // 深度≥2 后代全部漏删。改 owner 全行 FOR UPDATE + 内存 startsWith
+        //（与 renameEntriesDir/releaseSubtreeByPath 同构，且免疫名字中的 %/_ 通配）。
+        q.prepare("SELECT file_id,object_id,parent_path FROM user_file "
+                  "WHERE owner_name=? AND status='active' FOR UPDATE");
         q.addBindValue(owner);
-        q.addBindValue(dirPath);
-        q.addBindValue(dirPath + "/%");
         if (!q.exec()) break;
         while (q.next()) {
-            fileIds.append(q.value(0).toLongLong());
-            objectIds.append(q.value(1));
+            const qint64 fid = q.value(0).toLongLong();
+            if (fid == dirFileId) continue;
+            if (q.value(2).toString().startsWith(dirPath)) {   // 直接子项 p==dirPath，深层为前缀
+                fileIds.append(fid);
+                objectIds.append(q.value(1));
+            }
         }
         q.prepare("SELECT file_id,object_id FROM user_file WHERE file_id=? FOR UPDATE");
         q.addBindValue(dirFileId);
         if (q.exec() && q.next()) {
             fileIds.prepend(dirFileId);
-            objectIds.prepend(q.value(0));
+            objectIds.prepend(q.value(1));   // F-4：object_id 在第2列（曾错取 file_id，减到无关对象）
         }
 
         for (int i = 0; i < fileIds.size(); ++i) {

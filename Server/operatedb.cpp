@@ -209,22 +209,28 @@ void OperateDB::normalizeLogicKeys()
     QSqlDatabase db = conn.database();
     const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
     const QString fsBase = QFileInfo(fsRoot).fileName();
-    int ufConverted = 0, ufCollapsed = 0, sessConverted = 0;
+    int ufConverted = 0, ufCollapsed = 0, ufSkippedDeleted = 0, sessConverted = 0;
     int mapConverted = 0, mapDupRemoved = 0, unmapped = 0;
 
-    // 1) user_file：先登记既有逻辑键行（作为冲突判定基准），再转换旧形态行
+    // 1) user_file——F-5 修复：单遍确定性。判别不依赖首字符 '/'（覆盖 "/filesys/..." 无盘符
+    //    旧形态）：canonical 行（'/' 开头且 '/' 结尾且无 "//"）预种子为冲突基准；其余行按
+    //    file_id 单遍——撞键时 **不改写 loser 的 parent_path**（改写=与存活行同三重撞
+    //    uk_loc→1062 死锁在旧键）。存活优先级：canonical 行 > 最早旧行；loser active→仅
+    //    软删+镜像 releaseEntry 减引用（D3 不物理删），deleted→静默跳过（重放稳定无告警）。
     QSet<QString> seenUf;
     {
         QSqlQuery s(db);
-        if (s.exec("SELECT owner_name,parent_path,display_name FROM user_file WHERE parent_path LIKE '/%'")) {
+        if (s.exec("SELECT owner_name,parent_path,display_name FROM user_file "
+                   "WHERE parent_path LIKE '/%' AND parent_path LIKE '%/' AND parent_path NOT LIKE '%//%'")) {
             while (s.next())
                 seenUf.insert(s.value(0).toString() + "|" + s.value(1).toString() + "|" + s.value(2).toString());
         }
     }
     {
         QSqlQuery rows(db);
-        if (rows.exec("SELECT file_id,owner_name,parent_path,display_name,object_id,status "
-                      "FROM user_file WHERE parent_path NOT LIKE '/%' ORDER BY file_id")) {
+        if (rows.exec("SELECT file_id,owner_name,parent_path,display_name,object_id,status FROM user_file "
+                      "WHERE parent_path NOT LIKE '/%' OR parent_path NOT LIKE '%/' OR parent_path LIKE '%//%' "
+                      "ORDER BY file_id")) {
             QVector<QVariantList> batch;
             while (rows.next()) {
                 QVariantList r;
@@ -234,23 +240,28 @@ void OperateDB::normalizeLogicKeys()
             for (const QVariantList& r : batch) {
                 const qint64 fid = r.at(0).toLongLong();
                 const QString owner = r.at(1).toString();
-                const QString key = FileObjectStore::normalizeParent(owner, r.at(2).toString());
+                const QString stored = r.at(2).toString();
                 const QString name = r.at(3).toString();
                 const QVariant obj = r.at(4);
                 const bool active = (r.at(5).toString() == "active");
+                const QString key = FileObjectStore::normalizeParent(owner, stored);
                 if (key.isEmpty()) {
                     ++unmapped;
-                    qCWarning(lcDb) << "[normalizeLogicKeys] user_file 行无法映射，保留原值" << fid << owner << r.at(2).toString();
+                    qCWarning(lcDb) << "[normalizeLogicKeys] user_file 行无法映射，保留原值" << fid << owner << stored;
+                    continue;
+                }
+                if (key == stored) {   // 语义已是逻辑键（形态未 canonical）：仅登记
+                    seenUf.insert(owner + "|" + key + "|" + name);
                     continue;
                 }
                 const QString triple = owner + "|" + key + "|" + name;
                 QSqlQuery u(db);
-                if (seenUf.contains(triple)) {   // 与他树/同树旧行撞 uk_loc：收敛
-                    u.prepare("UPDATE user_file SET parent_path=?,status='deleted' WHERE file_id=?");
-                    u.addBindValue(key);
+                if (seenUf.contains(triple)) {
+                    if (!active) { ++ufSkippedDeleted; continue; }   // 重放稳定：不再触碰、不再告警
+                    u.prepare("UPDATE user_file SET status='deleted' WHERE file_id=?");
                     u.addBindValue(fid);
                     if (!u.exec()) { qCWarning(lcDb) << "[normalizeLogicKeys] 冲突收敛失败" << fid << u.lastError().text(); continue; }
-                    if (active && !obj.isNull()) {
+                    if (!obj.isNull()) {
                         QSqlQuery d(db);
                         d.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
                                   "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
@@ -270,11 +281,12 @@ void OperateDB::normalizeLogicKeys()
         }
     }
 
-    // 2) upload_session：parent_path 同规则转换（无唯一键，直接改写）
+    // 2) upload_session：同判别（无唯一键，可改写则改写；与会话行同规则跳过 canonical）
     {
         QSqlQuery rows(db);
         if (rows.exec("SELECT session_id,owner_name,parent_path FROM upload_session "
-                      "WHERE parent_path NOT LIKE '/%' ORDER BY session_id")) {
+                      "WHERE parent_path NOT LIKE '/%' OR parent_path NOT LIKE '%/' OR parent_path LIKE '%//%' "
+                      "ORDER BY session_id")) {
             QVector<QVariantList> batch;
             while (rows.next()) {
                 QVariantList r;
@@ -283,6 +295,7 @@ void OperateDB::normalizeLogicKeys()
             }
             for (const QVariantList& r : batch) {
                 const QString key = FileObjectStore::normalizeParent(r.at(1).toString(), r.at(2).toString());
+                if (key == r.at(2).toString()) continue;
                 if (key.isEmpty()) { ++unmapped; continue; }
                 QSqlQuery u(db);
                 u.prepare("UPDATE upload_session SET parent_path=? WHERE session_id=?");
@@ -338,8 +351,9 @@ void OperateDB::normalizeLogicKeys()
         }
     }
 
-    if (ufConverted || ufCollapsed || sessConverted || mapConverted || mapDupRemoved || unmapped) {
+    if (ufConverted || ufCollapsed || ufSkippedDeleted || sessConverted || mapConverted || mapDupRemoved || unmapped) {
         qCDebug(lcDb) << "[normalizeLogicKeys] user_file" << ufConverted << "收敛" << ufCollapsed
+                      << "deleted跳过" << ufSkippedDeleted
                       << "upload_session" << sessConverted
                       << "map" << mapConverted << "去重删" << mapDupRemoved
                       << "无法映射" << unmapped;

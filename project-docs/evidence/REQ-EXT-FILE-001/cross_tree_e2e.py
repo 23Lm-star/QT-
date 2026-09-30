@@ -225,12 +225,22 @@ cb1.close(); cb2.close()
 # ---------- 4. 存量"绝对机器路径"行：启动确定性转换 + 幂等重放 ----------
 stop_server()
 LEG = "E:/legacy/roottree/filesys"
-sql(f"DELETE FROM user_file WHERE owner_name='{X1}' AND display_name='oldfile.txt';")
-sql(f"DELETE FROM file_migration_map WHERE old_path LIKE '{LEG}/%';")
+LEG2 = "E:/legacy/roottree-B/filesys"
+sql(f"DELETE FROM user_file WHERE owner_name='{X1}' AND display_name IN ('oldfile.txt','dupf.txt','slashdir');")
+sql(f"DELETE FROM file_migration_map WHERE old_path LIKE '{LEG}/%' OR old_path LIKE '{LEG2}/%';")
+# F-5 夹具：同 triple 撞键对（两他树绝对键、同 owner+名+对象、均 active）+ 无盘符 "/filesys/…" 探针
 ins = (f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
        f"SELECT '{X1}','{LEG}/{X1}','oldfile.txt',0,fo.object_id,'active' "
        f"FROM file_object fo WHERE fo.sha256='{SH(PC)}'; "
-       f"UPDATE file_object SET refcount=refcount+1 WHERE sha256='{SH(PC)}'; "
+       f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+       f"SELECT '{X1}','{LEG}/{X1}','dupf.txt',0,fo.object_id,'active' "
+       f"FROM file_object fo WHERE fo.sha256='{SH(PC)}'; "
+       f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+       f"SELECT '{X1}','{LEG2}/{X1}','dupf.txt',0,fo.object_id,'active' "
+       f"FROM file_object fo WHERE fo.sha256='{SH(PC)}'; "
+       f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+       f"VALUES ('{X1}','/filesys/{X1}','slashdir',1,NULL,'active'); "
+       f"UPDATE file_object SET refcount=refcount+3 WHERE sha256='{SH(PC)}'; "
        f"INSERT INTO file_migration_map (old_path,file_id,object_id,status) "
        f"VALUES ('{LEG}/{X1}/oldfile.txt',NULL,NULL,'failed');")
 subprocess.run([MYSQL] + DB + [ins], capture_output=True, text=True)
@@ -241,12 +251,28 @@ check("CV2", "user_file 旧绝对键 → '/' 逻辑键",
           f"AND parent_path='/' AND status='active'") == "1")
 check("CV3", "file_migration_map 绝对 old_path → 'filesys/...' 相对键",
       wait_sql(f"SELECT COUNT(*) FROM file_migration_map WHERE old_path='filesys/{X1}/oldfile.txt'", "1"))
-check("CV4", "全库无残留非逻辑键 parent_path",
-      sql("SELECT COUNT(*) FROM user_file WHERE parent_path NOT LIKE '/%'") == "0")
+# F-5：撞键收敛=loser 软删且不改写 parent（改写=同三重撞 uk_loc→1062）；存活者最早旧行
+check("CVXA", "dupf 撞键：active 仅 1 行（最早旧行存活）",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='dupf.txt' "
+          f"AND status='active' AND parent_path='/'") == "1")
+check("CVXB", "dupf 撞键：loser 已软删（total 2，deleted 1）",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='dupf.txt' "
+          f"AND status='deleted'") == "1")
+check("CVXC", "dupf loser 保留旧键未被改写（无 1062 路径）",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='dupf.txt' "
+          f"AND status='deleted' AND parent_path='{LEG2}/{X1}'") == "1")
+check("CVXD", "无盘符 '/filesys/<user>' 探针 → '/'",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='slashdir' "
+          f"AND parent_path='/' AND is_dir=1") == "1")
+check("CV4", "active 行零残留非逻辑键（deleted 保留旧键属预期）",
+      sql("SELECT COUNT(*) FROM user_file WHERE status='active' AND parent_path NOT LIKE '/%'") == "0")
 cc, ret = login_conn(X1)
 fl2 = flush_names(cc, f"./filesys/{X1}")
-check("CV5", "转换后条目在树B 列表可见（跨树命中）", "oldfile.txt" in fl2, f"names={fl2}")
+check("CV5", "转换后条目在树B 列表可见（跨树命中）",
+      "oldfile.txt" in fl2 and "dupf.txt" in fl2 and "slashdir" in fl2, f"names={fl2}")
 cc.close()
+check("CVXE", "收敛镜像减引用（5 注入引用→loser -1=4）",
+      sql(f"SELECT refcount FROM file_object WHERE sha256='{SH(PC)}'") == "4")
 stop_server()
 check("CV6", "Server#重放启动", start_server(TREEB))
 time.sleep(1.5)
@@ -254,8 +280,13 @@ check("CV7", "重放幂等：oldfile 行数不变",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='oldfile.txt'") == "1")
 check("CV8", "重放幂等：map 相对键行不变",
       sql(f"SELECT COUNT(*) FROM file_migration_map WHERE old_path='filesys/{X1}/oldfile.txt'") == "1")
-check("CV9", "重放幂等：refcount 仍 3（注入+1 后收敛只发生一次）",
-      sql(f"SELECT refcount FROM file_object WHERE sha256='{SH(PC)}'") == "3")
+check("CV9", "重放幂等：refcount 仍 4（收敛只发生一次，deleted 行静默跳过）",
+      sql(f"SELECT refcount FROM file_object WHERE sha256='{SH(PC)}'") == "4")
+check("CVXF", "重放幂等：dupf 1 active + 1 deleted 不变",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='dupf.txt' "
+          f"AND status='active'") == "1"
+      and sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='dupf.txt' "
+              f"AND status='deleted'") == "1")
 
 # ---------- 5. 收尾清场（不污染后续套件） ----------
 stop_server()

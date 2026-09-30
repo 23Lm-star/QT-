@@ -23,6 +23,7 @@ OP, RC = "e2eop1", "e2eop2"
 C1 = b"LEGACY-CONTENT-ONE" * 20
 C2 = b"UPLOADED-CONTENT-TWO" * 20
 C3 = b"LEGACY-DEEP-CONTENT-THREE" * 20
+ND = b"NESTED-DELETE-FOUR" * 20
 SHA = lambda b: hashlib.sha256(b).hexdigest()
 
 def f32(s): return s.encode("utf-8")[:31].ljust(32, b"\0")
@@ -148,7 +149,7 @@ for u in (OP, RC):
     sql(f"DELETE FROM user_file WHERE owner_name='{u}';")
     sql(f"DELETE FROM upload_session WHERE owner_name='{u}';")
 sql(f"DELETE FROM file_migration_map WHERE old_path LIKE '%filesys/{OP}/%' OR old_path LIKE '%filesys/{RC}/%';")
-sql(f"DELETE FROM file_object WHERE sha256 IN ('{SHA(C1)}','{SHA(C2)}','{SHA(C3)}');")
+sql(f"DELETE FROM file_object WHERE sha256 IN ('{SHA(C1)}','{SHA(C2)}','{SHA(C3)}','{SHA(ND)}');")
 sql(f"DELETE FROM share_link WHERE owner_name IN ('{OP}','{RC}');")
 for u in (OP, RC):
     shutil.rmtree(os.path.join(FS, u), ignore_errors=True)
@@ -244,6 +245,26 @@ check("MV3", "未建条目旧目录物理改名回退", r and r[0][0] == T_RENAM
 r = ca.ask(pdu(T_DEL, msg=f"{rootP}/legdir2".encode(), dat=struct.pack("<I", 0)))
 check("MV4", "deldir 旧目录物理删除+级联空操作", r and r[0][1][0] != 0
       and not os.path.isdir(os.path.join(base, "legdir2")))
+
+# ---------- 4b. F-4 回归：条目优先 deldir 深度≥2 子树软删 + 目录行引用计数正确 ----------
+ca.ask(pdu(T_MKDIR, msg=f"{rootP}".encode(), dat=f32("nd1")))
+ca.ask(pdu(T_MKDIR, msg=f"{rootP}/nd1".encode(), dat=f32("nd2")))
+check("ND0", "上传 nf.txt 到 nd1/nd2（深度2条目）", upload(ca, f"{rootP}/nd1/nd2", "nf.txt", ND))
+check("ND0b", "深层条目键 /nd1/nd2/",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='nf.txt' "
+          f"AND parent_path='/nd1/nd2/' AND status='active'") == "1")
+r = ca.ask(pdu(T_DEL, msg=f"{rootP}/nd1".encode(), dat=struct.pack("<I", 0)))
+check("ND1", "deldir nd1 条目优先成功", r and r[0][1][0] != 0, f"ret={r[0][1][0] if r else 'NR'}")
+check("ND2", "深度≥2 后代 nf.txt 已软删（旧 LIKE '//%' 漏删回归）",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='nf.txt' "
+          f"AND status='deleted'") == "1")
+check("ND3", "中间目录 nd2 与 nd1 自身均软删",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name IN ('nd1','nd2') "
+          f"AND status='deleted'") == "2")
+check("ND4", "nf 对象归零→pending_reclaim，目录行不误减他对象引用（F-4 prepend 列位）",
+      wait_sql(f"SELECT status FROM file_object WHERE sha256='{SHA(ND)}'", "pending_reclaim"))
+check("ND5", "对象文件不物理删（D3）",
+      sql(f"SELECT COUNT(*) FROM file_object WHERE sha256='{SHA(ND)}'") == "1")
 
 # ---------- 5. 分享：条目源→接收者新条目引用同一对象（物理零复制） ----------
 sharemsg = f32(RC) + f"{rootP}/renamed1.txt".encode()
