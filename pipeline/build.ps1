@@ -24,6 +24,31 @@ $QTBIN  = "C:\Qt\5.14.2\mingw73_64\bin"
 $MINGWBIN = "C:\Qt\Tools\mingw730_64\bin"
 $env:Path = "$QTBIN;$MINGWBIN;$env:Path"
 
+# --- Pre-step: sync git-ignored runtime configs (connect.config) from main worktree.
+# Clean detached worktrees miss these untracked files; they are embedded via qrc at
+# build time, so they MUST exist before qmake runs. Copy is verified by SHA256.
+$mainRoot = (& git worktree list --porcelain | Select-Object -First 1) -replace '^worktree ', ''
+foreach ($cfg in @("Client\connect.config", "Server\connect.config")) {
+    $dst = Join-Path $repo $cfg
+    if (Test-Path $dst) { continue }
+    $srcCfg = Join-Path $mainRoot $cfg
+    if (-not (Test-Path $srcCfg)) {
+        "build RED: missing $cfg in this worktree AND in main worktree ($mainRoot)" | Add-Content $log
+        Write-Output "build RED: missing $cfg (also absent in main worktree $mainRoot)"
+        exit 1
+    }
+    Copy-Item $srcCfg $dst -Force
+    $hSrc = (Get-FileHash $srcCfg -Algorithm SHA256).Hash
+    $hDst = (Get-FileHash $dst -Algorithm SHA256).Hash
+    if ($hSrc -ne $hDst) {
+        "build RED: config sync hash mismatch for $cfg" | Add-Content $log
+        Write-Output "build RED: config sync hash mismatch for $cfg"
+        exit 1
+    }
+    "config sync: $cfg <- $mainRoot (sha256 $hDst)" | Add-Content $log
+    Write-Output "config sync: $cfg copied from main worktree (sha256 verified)"
+}
+
 $targets = @("Client\Client.pro", "Server\Server.pro")
 if ($Target -ne "all") { $targets = @($Target) }
 
