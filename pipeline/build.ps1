@@ -2,7 +2,11 @@
 # NOTE: never use the Anaconda qmake on PATH -- explicit toolchain paths below.
 param([string]$Target = "all")
 $ErrorActionPreference = "Continue"   # PS5.1: native stderr must not become terminating errors
-$repo = (git rev-parse --show-toplevel)
+# Repo root from script location, NOT `git rev-parse --show-toplevel` (PS 5.1 codepage issue
+# + CWD fragility: git commands need Set-Location to the repo first, else a caller starting
+# this script from elsewhere gets "fatal: Needed a single revision" and $repo = caller CWD).
+$repo = Split-Path -Parent $PSScriptRoot
+Set-Location $repo  # git commands must run against this repo, not the caller's CWD
 $hash = git rev-parse --short HEAD
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $evDir = Join-Path $repo "build\evidence\current"
