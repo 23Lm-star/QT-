@@ -6,4 +6,5 @@ When the task is governed by Development OS v1.7:
 2. Open every session by running: powershell -ExecutionPolicy Bypass -File pipeline/state.ps1
 3. Read only the reference file INDEX.md routes to for the situation at hand; never read skill files wholesale.
 4. On branch takeover, follow references/multi-agent.md (owner_agent protocol).
+5. A validation step you cannot execute (GUI, human eyes, credentials, device, incompatible env): at most ONE attempt, then output NEEDS-HUMAN with exact steps and WAIT -- never retry-loop.
 Do not apply to projects pinned to another workflow version.
