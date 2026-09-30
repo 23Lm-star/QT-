@@ -51,7 +51,7 @@
 - **T2 ✅**（`cd17507`）：`FileObjectStore` 内容寻址核心——`hashStaging`（流式 SHA-256）+ `commitUpload`（对象 find-or-create / 条目建或复活 / 引用计数，同一事务；新对象 staging 原子 rename 到 `objects/{sha2}/{id}`，命中既有对象丢弃 staging）。`releaseEntry/releaseSubtree`（归零→`pending_reclaim`，绝不物理删）。DB 级事务模拟实测验收 1/2/3。Server.build GREEN。
 - **T4 🟡 groundwork（本次，additive/未接热路径，零回归）**：`ResumableUploadSession::beginStaged`（staging=`.staging/<sha1(owner|parent|display|size)>.part`，确定性路径支持断点续传）+ `OperateDB::{createUploadSession,updateUploadOffset,finishUploadSession}`（upload_session 表 CRUD）。均未被 handler 调用，现网行为不变。Server.build GREEN。
 
-## 剩余开发（下一个 development 节点，必须原子落地）
+## 剩余开发（节点2 已全部落地，见"开发进度 2026-09-30 节点2"）
 读/写权威切换（T3+T5）+ 迁移（T6）+ e2e（T7）互相依赖，不能分批否则回归：
 1. **写侧切换**：`uploadfileinit`→`beginStaged`+`createUploadSession`；`handleUploadWriteFinished` 完成时→`MsgHandler::finalizeUpload()`=`commitUpload`+`finishUploadSession`。
 2. **读侧切换（与写侧同批）**：`flushfile`/`listdir`→`FileObjectStore::listEntries`（DB 优先，某 parent 零条目且物理目录存在→回退 QDir，兼容未迁移用户）；`downloadfile`→`entryByPath`→`objectAbsPath`（对象缺失回退 canonical 物理）。
@@ -60,6 +60,15 @@
 5. **T7**：验收 1-5 端到端脚本（仿 SEC-001 48/48 模式，Python 造 PDU + 服务端日志/DB 断言）+ pipeline 三门 + 证据绑定候选哈希；随后 independent test（新会话）、independent audit（新会话只读）、integration 三事实行、merge。
 
 **D5（owner 批准 2026-09-29）**：对象+逻辑条目为权威——新上传唯一物理副本进 `objects/`，客户端界面无改动靠服务端从 `user_file` 合成列表；旧目录仅作未迁移回退与审计映射。每 handler 采用"先查条目、无则回退物理"的兼容模式，可按 handler 分批落地而不回归。
+
+## 开发进度（2026-09-30 development 节点2，完成）
+- 提交链：`11e01de` D5 修复（parentDirInActorRoot）→ `64e3b40` dedup_e2e.py 入证据 → `51f38ef` rename/move/share/MKDIR 条目优先切换（`insertDirEntry`/`attachEntry`/`relocateEntry` 目录级联/`renameEntriesDir`/`releaseSubtreeByPath`；分享=接收者条目引用同一对象物理零复制；握手键 canonical-或-词法绝对，`logicPathInActorRoot` 按 design §6；并修复 `releaseSubtree` 循环中途失败仍 commit 的部分提交隐患→§5 一致性）→ `17af569` T6 存量迁移（`OperateDB::migrateLegacyFiles()` 启动自动一次；`commitUpload copyOnly` 变体：源绝不删除/半成品副本清理；映射 mapped/skipped_name_conflict/failed；重跑跳过=幂等；main.cpp 挂钩沿 T1 先例）。
+- 实测（本机 MySQL5.7/mydb + wt-claude Server.exe 实链路）：**验收1/2/3 复跑 13/13**；**验收4/5+操作面 36/36**（`entry_ops_e2e.py`：迁移三态/幂等重跑/`(1)` 安置/旧文件零删除/rename+move+目录回退/条目分享零复制+引用计数/伪造大小→session failed 无条目无对象/跨用户拒绝/B-1 分享他人源拒）；**SEC-001 全量回归 48/48**（`sec001_regression.py`=原 verify.py 的 D5 适配副本，仅 K1c/K1f/K2a/K2b 物理落盘期望→条目+对象等价断言，安全断言零改动，原件不动）。
+- §6 停止条件核查：未触发——`file_migration_map` 对测试集构成可审计双向映射（M1-M4/I1-I2 断言）。
+- 运行环境补充事实（独立测试节点照此准备）：启动 Server.exe 必须 **PATH 前置 Qt5.14.2/mingw 两个 bin 目录**，否则 Anaconda 等同名 DLL 劫持导致启动崩溃（0xC0000005/0xc0000139）；Python 用 `py -3.13`（Anaconda 3.6 无 capture_output）；SEC 回归需 `SEC001_BASE=<工作树根>` 且预建 `Server/filesys/{sec001a,sec001b,sec001r,sec001v}` 用户根；脚本生命周期参考 `build/start-server.ps1`（gitignore 外，会话自管）。
+- 遗留/边界（证据定格，非阻塞）：路径 >191 字符的旧文件记 failed 不入库映射（超长列宽，MySQL5.7 utf8 191 上限）；未建目录条目的旧目录改名/移动后，其内已迁移条目仅前缀级联（`renameEntriesDir`），旧目录本身无条目行（flushfile 物理回退显示）；隐藏文件不入迁移扫描（QDirIterator Files 默认过滤器）。
+
+**下一节点**：independent test（新会话、只报不改）→ repair（如需，owner 会话）→ independent audit（新会话只读）→ integration 三事实行 → merge no-ff。档位 LARGE 不变；两 `protocol.h` 全程零命中（branch diff 复核通过）。
 
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
