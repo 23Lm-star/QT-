@@ -117,15 +117,42 @@ def ensure_user(name):
     print(f"FATAL: 用户 {name} 既注册不上也登录不了 ret={ret}")
     sys.exit(2)
 
+print("=== 0. DB 清场（F-2 修复：他树/上轮残留不得以清场豁免冒充 PASS） ===")
+for u in (A, B, R, V):
+    sql(f"DELETE FROM user_file WHERE owner_name='{u}';")
+    sql(f"DELETE FROM upload_session WHERE owner_name='{u}';")
+    sql(f"DELETE FROM share_link WHERE owner_name='{u}';")
+    sql(f"DELETE FROM file_migration_map WHERE old_path LIKE 'filesys/{u}/%' "
+        f"OR old_path LIKE '%/filesys/{u}/%';")
+sql("DELETE fo FROM file_object fo LEFT JOIN user_file uf ON uf.object_id=fo.object_id WHERE uf.file_id IS NULL;")
+
 for u in (A, B, R, V):
     ensure_user(u)
 
 import shutil
+
+def rmtree_retry(path):
+    # taskkill 后句柄可能瞬态占用目录：重试保证清场确定性（F-2 修复的一部分）
+    for _ in range(10):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.isdir(path):
+            return
+        time.sleep(0.5)
+
+def remove_retry(path):
+    for _ in range(10):
+        if not os.path.isfile(path):
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        time.sleep(0.5)
+
 wd = os.path.join(SBX, A, "workdir")
-shutil.rmtree(wd, ignore_errors=True)
+rmtree_retry(wd)
 for leftover in (os.path.join(SBX, B, "up.bin"), os.path.join(SBX, B, "up2.bin")):
-    if os.path.isfile(leftover):
-        os.remove(leftover)
+    remove_retry(leftover)
 
 secret = os.path.join(SBX, B, "secret.txt")
 os.makedirs(os.path.join(SBX, B), exist_ok=True)
@@ -276,7 +303,8 @@ if sh_ok:
     r = c2.ask(pdu(T_AGREE_R, msg=ag[0][2], dat=f32(A)))  # B 故意谎报投递目标为 A
     fin = [p for p in ([r[0]] if r else []) if p[0] == T_FINISH]
     entry_b = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{B}' AND display_name='up.bin' AND status='active'")
-    entry_a = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{A}' AND parent_path LIKE '%/{A}' AND display_name='up.bin' AND status='active'")
+    # F-3/D5 修复：A 本人根的逻辑键为 '/'（owner 相对，跨树确定）
+    entry_a = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{A}' AND parent_path='/' AND display_name='up.bin' AND status='active'")
     check("K1f", "接收者谎报目标名：条目仍只落 B 本人根(D5适配)",
           fin and bf(fin[0][1]) and entry_b == "1" and entry_a == "0",
           f"ret={bf(fin[0][1]) if fin else 'NORESP'} inB={entry_b} inA={entry_a}")

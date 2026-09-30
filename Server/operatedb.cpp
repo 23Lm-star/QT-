@@ -10,9 +10,11 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QRandomGenerator>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QVector>
 
 namespace {
 // 生成 32 位 hex 随机盐（熵源为 OS 级密码学安全随机数）
@@ -110,6 +112,9 @@ void OperateDB::migrateLegacyFiles()
         }
     }
     const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    // F-3/D5 修复：映射键存 design §2 规定的相对形态 "<filesys>/<user>/..."（跨树确定、可重放），
+    // 机器绝对前缀不再进入 file_migration_map。
+    const QString fsBase = QFileInfo(fsRoot).fileName();
     int mapped = 0, skipped = 0, failed = 0;
     const QStringList userDirs = QDir(fsRoot).entryList(QDir::Dirs | QDir::NoDotAndDotDot);
     for (const QString& user : userDirs) {
@@ -128,8 +133,15 @@ void OperateDB::migrateLegacyFiles()
                 }
             }
             if (artifact) continue;   // 内容寻址对象与暂存实体不是迁移对象
-            if (oldAbs.size() > 191) {
-                qCWarning(lcDb) << "[migrateLegacy] 路径超 file_migration_map 列宽(191)，未迁移:" << oldAbs;
+            const QString rel = QDir(fsRoot).relativeFilePath(oldAbs);
+            if (rel.isEmpty() || rel.startsWith("..")) {
+                qCWarning(lcDb) << "[migrateLegacy] 文件不在 filesys 根内，未迁移:" << oldAbs;
+                ++failed;
+                continue;
+            }
+            const QString oldKey = fsBase + "/" + rel;      // design §2: filesys/<user>/... 相对键
+            if (oldKey.size() > 191) {
+                qCWarning(lcDb) << "[migrateLegacy] 相对路径超 file_migration_map 列宽(191)，未迁移:" << oldKey;
                 ++failed;
                 continue;
             }
@@ -139,7 +151,7 @@ void OperateDB::migrateLegacyFiles()
                 if (!c.isValid()) { qCCritical(lcDb) << "[migrateLegacy] 数据库不可达，迁移中断（旧文件零删除）"; return; }
                 QSqlQuery q(c.database());
                 q.prepare("SELECT status FROM file_migration_map WHERE old_path=?");
-                q.addBindValue(oldAbs);
+                q.addBindValue(oldKey);
                 if (q.exec() && q.next()) already = true;   // 重跑：已有映射记录即跳过（failed 留待人工复核）
             }
             if (already) { ++skipped; continue; }
@@ -154,7 +166,7 @@ void OperateDB::migrateLegacyFiles()
                 // 同名不同内容：不覆盖——条目已按 (1) 安置，映射记 skipped_name_conflict（验收4 后半）
                 const QString status = (r.displayName == fi.fileName()) ? "mapped" : "skipped_name_conflict";
                 m.prepare("INSERT INTO file_migration_map (old_path,file_id,object_id,status) VALUES (?,?,?,?)");
-                m.addBindValue(oldAbs);
+                m.addBindValue(oldKey);
                 m.addBindValue(r.fileId);
                 m.addBindValue(r.objectId);
                 m.addBindValue(status);
@@ -168,7 +180,7 @@ void OperateDB::migrateLegacyFiles()
                 // 任一文件失败：记 failed，继续其余，不中断、不删任何旧文件（验收5）
                 qCWarning(lcDb) << "[migrateLegacy] 迁移失败:" << oldAbs << r.error;
                 m.prepare("INSERT INTO file_migration_map (old_path,file_id,object_id,status) VALUES (?,?,NULL,'failed')");
-                m.addBindValue(oldAbs);
+                m.addBindValue(oldKey);
                 m.exec();
                 ++failed;
             }
@@ -179,6 +191,158 @@ void OperateDB::migrateLegacyFiles()
     }
     if (failed > 0) {
         qCWarning(lcDb) << "[migrateLegacy] 存在 failed/超长记录——进 FILE-002/GROUP-003 前必须复核 file_migration_map";
+    }
+}
+
+// ===== REQ-EXT-FILE-001 F-3/D5 修复：存量键一次性确定性转换（幂等可重放）=====
+// user_file/upload_session.parent_path 的旧"绝对机器路径"形态 → owner 相对逻辑键；
+// file_migration_map.old_path → design §2 相对形态 "<filesys>/<user>/..."。
+// 转换后同一逻辑请求在任何工作树命中同一行（跨树幂等/分享/隔离成立）。
+// uk_loc 冲突：按 file_id 最早行保留，后到 active 行软删并镜像 releaseEntry 减引用（D3 不物理删）。
+void OperateDB::normalizeLogicKeys()
+{
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) {
+        qCCritical(lcDb) << "[normalizeLogicKeys] 数据库不可达，跳过存量键转换";
+        return;
+    }
+    QSqlDatabase db = conn.database();
+    const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString fsBase = QFileInfo(fsRoot).fileName();
+    int ufConverted = 0, ufCollapsed = 0, sessConverted = 0;
+    int mapConverted = 0, mapDupRemoved = 0, unmapped = 0;
+
+    // 1) user_file：先登记既有逻辑键行（作为冲突判定基准），再转换旧形态行
+    QSet<QString> seenUf;
+    {
+        QSqlQuery s(db);
+        if (s.exec("SELECT owner_name,parent_path,display_name FROM user_file WHERE parent_path LIKE '/%'")) {
+            while (s.next())
+                seenUf.insert(s.value(0).toString() + "|" + s.value(1).toString() + "|" + s.value(2).toString());
+        }
+    }
+    {
+        QSqlQuery rows(db);
+        if (rows.exec("SELECT file_id,owner_name,parent_path,display_name,object_id,status "
+                      "FROM user_file WHERE parent_path NOT LIKE '/%' ORDER BY file_id")) {
+            QVector<QVariantList> batch;
+            while (rows.next()) {
+                QVariantList r;
+                for (int i = 0; i < 6; ++i) r.append(rows.value(i));
+                batch.append(r);
+            }
+            for (const QVariantList& r : batch) {
+                const qint64 fid = r.at(0).toLongLong();
+                const QString owner = r.at(1).toString();
+                const QString key = FileObjectStore::normalizeParent(owner, r.at(2).toString());
+                const QString name = r.at(3).toString();
+                const QVariant obj = r.at(4);
+                const bool active = (r.at(5).toString() == "active");
+                if (key.isEmpty()) {
+                    ++unmapped;
+                    qCWarning(lcDb) << "[normalizeLogicKeys] user_file 行无法映射，保留原值" << fid << owner << r.at(2).toString();
+                    continue;
+                }
+                const QString triple = owner + "|" + key + "|" + name;
+                QSqlQuery u(db);
+                if (seenUf.contains(triple)) {   // 与他树/同树旧行撞 uk_loc：收敛
+                    u.prepare("UPDATE user_file SET parent_path=?,status='deleted' WHERE file_id=?");
+                    u.addBindValue(key);
+                    u.addBindValue(fid);
+                    if (!u.exec()) { qCWarning(lcDb) << "[normalizeLogicKeys] 冲突收敛失败" << fid << u.lastError().text(); continue; }
+                    if (active && !obj.isNull()) {
+                        QSqlQuery d(db);
+                        d.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
+                                  "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                        d.addBindValue(obj.toLongLong());
+                        if (!d.exec()) qCWarning(lcDb) << "[normalizeLogicKeys] 收敛减引用失败" << obj.toLongLong() << d.lastError().text();
+                    }
+                    ++ufCollapsed;
+                } else {
+                    u.prepare("UPDATE user_file SET parent_path=? WHERE file_id=?");
+                    u.addBindValue(key);
+                    u.addBindValue(fid);
+                    if (!u.exec()) { qCWarning(lcDb) << "[normalizeLogicKeys] 转换失败" << fid << u.lastError().text(); continue; }
+                    seenUf.insert(triple);
+                    ++ufConverted;
+                }
+            }
+        }
+    }
+
+    // 2) upload_session：parent_path 同规则转换（无唯一键，直接改写）
+    {
+        QSqlQuery rows(db);
+        if (rows.exec("SELECT session_id,owner_name,parent_path FROM upload_session "
+                      "WHERE parent_path NOT LIKE '/%' ORDER BY session_id")) {
+            QVector<QVariantList> batch;
+            while (rows.next()) {
+                QVariantList r;
+                for (int i = 0; i < 3; ++i) r.append(rows.value(i));
+                batch.append(r);
+            }
+            for (const QVariantList& r : batch) {
+                const QString key = FileObjectStore::normalizeParent(r.at(1).toString(), r.at(2).toString());
+                if (key.isEmpty()) { ++unmapped; continue; }
+                QSqlQuery u(db);
+                u.prepare("UPDATE upload_session SET parent_path=? WHERE session_id=?");
+                u.addBindValue(key);
+                u.addBindValue(r.at(0).toLongLong());
+                if (u.exec()) ++sessConverted;
+            }
+        }
+    }
+
+    // 3) file_migration_map：机器绝对 old_path → "<filesys>/..." 相对键；
+    //    转换后撞主键（两棵树映射同一旧文件）：按 migrated_at,old_path 序保留先者，删后者。
+    {
+        QVector<QString> legacy;
+        QSqlQuery all(db);
+        if (all.exec("SELECT old_path FROM file_migration_map ORDER BY migrated_at, old_path")) {
+            while (all.next()) {
+                const QString op = all.value(0).toString();
+                if (!op.startsWith(fsBase + "/")) legacy.append(op);
+            }
+        }
+        for (const QString& op : legacy) {
+            QString n = op;
+            n.replace('\\', '/');
+            const QStringList segs = QDir::cleanPath(n).split('/', Qt::SkipEmptyParts);
+            int idx = -1;
+            for (int i = 0; i < segs.size(); ++i) {
+                if (segs.at(i).compare(fsBase, Qt::CaseInsensitive) == 0) { idx = i; break; }
+            }
+            if (idx < 0) {
+                ++unmapped;
+                qCWarning(lcDb) << "[normalizeLogicKeys] 映射行锚定失败，保留原值" << op;
+                continue;
+            }
+            const QString newKey = QStringList(segs.mid(idx)).join('/');
+            if (newKey.size() > 191) { ++unmapped; continue; }
+            QSqlQuery c(db);
+            c.prepare("SELECT COUNT(*) FROM file_migration_map WHERE old_path=?");
+            c.addBindValue(newKey);
+            bool taken = false;
+            if (c.exec() && c.next()) taken = (c.value(0).toLongLong() > 0);
+            QSqlQuery u(db);
+            if (taken) {
+                u.prepare("DELETE FROM file_migration_map WHERE old_path=?");
+                u.addBindValue(op);
+                if (u.exec()) ++mapDupRemoved;
+            } else {
+                u.prepare("UPDATE file_migration_map SET old_path=? WHERE old_path=?");
+                u.addBindValue(newKey);
+                u.addBindValue(op);
+                if (u.exec()) ++mapConverted;
+            }
+        }
+    }
+
+    if (ufConverted || ufCollapsed || sessConverted || mapConverted || mapDupRemoved || unmapped) {
+        qCDebug(lcDb) << "[normalizeLogicKeys] user_file" << ufConverted << "收敛" << ufCollapsed
+                      << "upload_session" << sessConverted
+                      << "map" << mapConverted << "去重删" << mapDupRemoved
+                      << "无法映射" << unmapped;
     }
 }
 

@@ -536,7 +536,7 @@ PDU *MsgHandler::deldir(const QString& loginName)
         // REQ-EXT-FILE-001 D5：先按逻辑条目解引用（验收3：减引用，归零→待回收，不物理删对象）；
         // 无条目则回退物理删除（未迁移存量文件）。
         const QFileInfo delInfo(delFilePath);
-        const QString delParent = FileObjectStore::normalizeParent(delInfo.absolutePath());
+        const QString delParent = FileObjectStore::normalizeParent(loginName, delInfo.absolutePath());
         const QString delName = delInfo.fileName();
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, delParent, delName);
@@ -638,7 +638,7 @@ PDU *MsgHandler::flushfile()
     struct Row { QString name; bool isDir; };
     QVector<Row> rows;
     QSet<QString> seen;
-    const QString parent = FileObjectStore::normalizeParent(path);
+    const QString parent = FileObjectStore::normalizeParent(m_actorName, path);
     const QList<FileObjectStore::EntryInfo> entries =
             FileObjectStore::instance().listEntries(m_actorName, parent);
     for(const FileObjectStore::EntryInfo& e : entries){
@@ -700,7 +700,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     else {
         // REQ-EXT-FILE-001 D5：条目优先。有条目→只动逻辑键（目录条目级联子树，同事务），
         // 物理实体若存在（已迁移旧文件）尽力同步改名防回退视图幽灵；无条目→回退纯物理改名（未迁移）。
-        const QString renParent = FileObjectStore::normalizeParent(dirPath);
+        const QString renParent = FileObjectStore::normalizeParent(loginName, dirPath);
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, renParent, oldName);
         if(e.valid()){
@@ -809,7 +809,7 @@ PDU *MsgHandler::sharefile()
             : QDir::cleanPath(QFileInfo(shareSrcRaw).absoluteFilePath());
     const QFileInfo srcRawInfo(shareSrcRaw);
     const FileObjectStore::EntryInfo srcEntry = FileObjectStore::instance().entryByPath(
-        m_actorName, FileObjectStore::normalizeParent(srcRawInfo.absolutePath()), srcRawInfo.fileName());
+        m_actorName, FileObjectStore::normalizeParent(m_actorName, srcRawInfo.absolutePath()), srcRawInfo.fileName());
     // B-1 修复（增量复审）：分享源必须落在分享人本人用户根内——只能分享自己的文件；
     // 源不存在或属他人时不登记握手也不转发邀请，杜绝"自我登记+自我同意"复制他人文件
     const bool sourceOwned = (srcEntry.valid() && !srcEntry.isDir && logicPathInActorRoot(shareSrcRaw))
@@ -875,7 +875,7 @@ PDU *MsgHandler::sharefilemove()
             const QFileInfo ki(srcKey);
             e = FileObjectStore::instance().entryByPath(
                     rel.section('/',0,0),
-                    FileObjectStore::normalizeParent(ki.absolutePath()), ki.fileName());
+                    FileObjectStore::normalizeParent(rel.section('/',0,0), ki.absolutePath()), ki.fileName());
         }
         if(e.valid() && !e.isDir){
             // 条目优先：接收者新条目引用同一 object（+1 引用，物理零复制）；
@@ -946,12 +946,14 @@ PDU *MsgHandler::movefile(const QString& loginName)
     QString entryFinalName;
     // REQ-EXT-FILE-001 D5：条目优先——relocateEntry 只动逻辑键（目录条目同事务级联子树）；
     // 物理实体若存在（已迁移旧文件/旧目录）尽力同步搬移防回退视图幽灵；无条目→回退纯物理。
-    const QString mvSrcParent = FileObjectStore::normalizeParent(srcInfo.absolutePath());
+    const QString mvSrcParent = FileObjectStore::normalizeParent(loginName, srcInfo.absolutePath());
     const FileObjectStore::EntryInfo mvEntry =
             FileObjectStore::instance().entryByPath(loginName, mvSrcParent, fileName);
     if(mvEntry.valid()){
-        const QString dstNorm = FileObjectStore::normalizeParent(dstDir);
-        const QString oldDirAbs = QDir(mvSrcParent).filePath(fileName);
+        const QString dstNorm = FileObjectStore::normalizeParent(loginName, dstDir);
+        // F-3/D5：mvSrcParent/dstNorm 为逻辑键；"目录自身键"只在逻辑空间拼接，
+        // 物理存在性检查一律用原始物理路径 dstDir（键与物理已解耦）。
+        const QString dirSelfKey = mvSrcParent + fileName + "/";
         if(!logicPathInActorRoot(srcPath) || !logicPathInActorRoot(dstDir)){
             qCWarning(lcFs)<<"movefile 拒绝：越权移动（逻辑）conn="<<m_connId<<":"<<srcPath<<" -> "<<dstDir;
         }
@@ -962,7 +964,7 @@ PDU *MsgHandler::movefile(const QString& loginName)
             ret=true;
             qCDebug(lcFs)<<"movefile 原地移动（条目），无需操作";
         }
-        else if(mvEntry.isDir && (dstNorm == oldDirAbs || dstNorm.startsWith(oldDirAbs + "/"))){
+        else if(mvEntry.isDir && dstNorm.startsWith(dirSelfKey)){
             qCWarning(lcFs)<<"movefile 拒绝：不能把目录移进自身或其子目录";
         }
         else {
@@ -971,7 +973,7 @@ PDU *MsgHandler::movefile(const QString& loginName)
             if(dot>0){ base=fileName.left(dot); ext=fileName.mid(dot); }
             QString finalName=fileName;
             for(int n=1; n<=1000 && (FileObjectStore::instance().entryByPath(loginName, dstNorm, finalName).valid()
-                                     || QFileInfo(QDir(dstNorm).filePath(finalName)).exists()); ++n){
+                                     || QFileInfo(QDir(dstDir).filePath(finalName)).exists()); ++n){
                 finalName=QString("%1(%2)%3").arg(base).arg(n).arg(ext);
             }
             QString relErr;
@@ -1130,7 +1132,7 @@ PDU *MsgHandler::uploadfileinit()
     // REQ-FS-003①/SEC-001：所在目录须在 actor 本人用户根内；父路径规范化后作逻辑条目键。
     ResumableUploadSession::BeginResult result = {false, 0, false};
     m_uploadSessionId = -1;
-    const QString parentPath = FileObjectStore::normalizeParent(dirPath);
+    const QString parentPath = FileObjectStore::normalizeParent(m_actorName, dirPath);
     if (pathInActorRoot(dirPath) && !m_actorName.isEmpty()) {
         result = m_uploadSession.beginStaged(m_actorName, parentPath, fileName, fileSize, resumeEnabled);
         if (result.ok) {
@@ -1246,7 +1248,7 @@ PDU *MsgHandler::downloadfile()
     // REQ-EXT-FILE-001 D5：对象文件不物理落用户路径，改为校验所在目录在 actor 根内
     if(parentDirInActorRoot(filePath) && !fileName.isEmpty()){
         // REQ-EXT-FILE-001 D5：优先解析逻辑条目→对象绝对路径；对象缺失回退物理文件（未迁移）。
-        const QString dlParent = FileObjectStore::normalizeParent(fileInfo.absolutePath());
+        const QString dlParent = FileObjectStore::normalizeParent(m_actorName, fileInfo.absolutePath());
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(m_actorName, dlParent, fileName);
         const QString objAbs = (e.valid() && !e.isDir)

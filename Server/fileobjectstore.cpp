@@ -54,6 +54,29 @@ QString makeSuffixed(const QString& base, const QString& ext, int n)
     return clampUtf8(base, kMaxNameBytes - suffixBytes) + QString("(%1)").arg(n) + ext;
 }
 
+// 逻辑键形态判定：'/' 开头结尾、无反斜杠、无空段、无 ./.. 段（normalizeParent 幂等入口）
+bool isLogicKeyForm(const QString& x)
+{
+    if (!x.startsWith(QLatin1Char('/')) || !x.endsWith(QLatin1Char('/')) || x.contains(QLatin1Char('\\')))
+        return false;
+    if (x == QLatin1String("/"))
+        return true;
+    if (x.contains(QLatin1String("//")))
+        return false;
+    const QStringList segs = x.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+    for (const QString& s : segs) {
+        if (s == QLatin1String(".") || s == QLatin1String(".."))
+            return false;
+    }
+    return true;
+}
+
+// 逻辑键拼接：parentKey（'/' 结尾）+ 目录名 → 目录自身键（'/' 结尾）
+QString logicDirKey(const QString& parentKey, const QString& name)
+{
+    return parentKey + name + QLatin1Char('/');
+}
+
 bool nameTaken(const QString& owner, const QString& parent, const QString& display, QSqlDatabase& db)
 {
     QSqlQuery q(db);
@@ -73,17 +96,57 @@ FileObjectStore& FileObjectStore::instance()
 
 FileObjectStore::FileObjectStore(QObject* parent) : QObject(parent) {}
 
-QString FileObjectStore::normalizeParent(const QString& dirPath)
+// F-3/D5 修复：不再绝对化（绝对化=工作树相关，跨树键漂移的根因）。
+// 归一为 owner 相对逻辑键："用户根内、'/' 结尾"，机器无关、可跨树重放。
+QString FileObjectStore::normalizeParent(const QString& owner, const QString& dirPath)
 {
-    if (dirPath.isEmpty()) {
-        return dirPath;
+    if (owner.isEmpty() || dirPath.isEmpty()) {
+        return QString();
     }
-    QString p = QDir::cleanPath(dirPath);
-    if (QDir(p).isRelative()) {
-        p = QDir(p).absolutePath();
+    QString x = dirPath;
+    x.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    if (isLogicKeyForm(x)) {
+        return x;                                   // 幂等：已是逻辑键
     }
-    p = QDir::cleanPath(p);
-    return p;
+    x = QDir::cleanPath(x);
+    if (x.isEmpty()) {
+        return QString();
+    }
+
+    const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString rootAbs = fsRoot + QLatin1Char('/') + owner;
+    QString rest;
+    bool hit = false;
+    if (x == rootAbs) {
+        hit = true;                                 // actor 用户根 → "/"
+    } else if (x.startsWith(rootAbs + QLatin1Char('/'))) {
+        rest = x.mid(rootAbs.size() + 1);
+        hit = true;
+    } else {
+        // 相对形态（PDU "./filesys/<user>/..."）与任意树前缀统一走段锚定
+        const QString fsBase = QFileInfo(fsRoot).fileName();   // 如 "filesys"
+        const QStringList segs = x.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+        for (int i = 0; i + 1 < segs.size(); ++i) {
+            if (segs.at(i).compare(fsBase, Qt::CaseInsensitive) == 0
+                && segs.at(i + 1).compare(owner, Qt::CaseInsensitive) == 0) {
+                rest = QStringList(segs.mid(i + 2)).join(QLatin1Char('/'));
+                hit = true;
+                break;
+            }
+        }
+    }
+    if (!hit) {
+        return QString();                           // 不含 <filesys>/<owner> 段：不在 actor 根，无效
+    }
+    rest = QDir::cleanPath(rest);
+    if (rest.isEmpty() || rest == QLatin1String(".")) {
+        return QStringLiteral("/");
+    }
+    if (rest == QLatin1String("..") || rest.startsWith(QLatin1String("../"))
+        || rest.contains(QLatin1String("/../"))) {
+        return QString();                           // 词法逃逸纵深防御（入口授权应先拦截）
+    }
+    return QLatin1Char('/') + rest + QLatin1Char('/');
 }
 
 bool FileObjectStore::hashStaging(const QString& stagingPath, QString& shaHex, qint64& sizeBytes) const
@@ -136,7 +199,7 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
         r.error = "参数为空";
         return r;
     }
-    const QString parent = normalizeParent(rawParentPath);
+    const QString parent = normalizeParent(owner, rawParentPath);
     if (parent.isEmpty() || parent.size() > kMaxParentChars) {
         r.error = "父路径规范化失败或超长";
         qCWarning(lcFs) << "[commitUpload]" << r.error << rawParentPath;
@@ -209,9 +272,22 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
             objectCreated = true;
         }
 
-        // 2) 同名不同内容：递推 "base(N).ext"
+        // 2) 同名安置：active 同名同对象=幂等命中（保留原名，步骤3 FOR UPDATE 命中即返回，
+        //    验收2/跨树重复请求不建重复行、不重复计数）；active 同名不同对象（含目录占名）
+        //    才递推 "base(N).ext"；deleted 同名不占名（步骤3 复活原行）。
         QString finalName = clampUtf8(wantedName, kMaxNameBytes);
-        if (nameTaken(owner, parent, finalName, db)) {
+        bool needSuffix = false;
+        q.prepare("SELECT object_id,status FROM user_file "
+                  "WHERE owner_name=? AND parent_path=? AND display_name=?");
+        q.addBindValue(owner);
+        q.addBindValue(parent);
+        q.addBindValue(finalName);
+        if (q.exec() && q.next() && q.value(1).toString() == "active") {
+            const QVariant o = q.value(0);
+            if (!(o.isValid() && !o.isNull() && o.toLongLong() == oid))
+                needSuffix = true;
+        }
+        if (needSuffix) {
             QString base, ext;
             splitName(finalName, base, ext);
             bool freed = false;
@@ -377,7 +453,7 @@ bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
         if (!q.value(2).toBool()) break;            // 非目录请走 releaseEntry
         const QString dirParent = q.value(0).toString();
         const QString dirName = q.value(1).toString();
-        const QString dirPath = QDir(dirParent).filePath(dirName);
+        const QString dirPath = logicDirKey(dirParent, dirName);
 
         QList<qint64> fileIds;
         QList<QVariant> objectIds;
@@ -425,7 +501,7 @@ QList<FileObjectStore::EntryInfo> FileObjectStore::listEntries(
         const QString& owner, const QString& rawParentPath) const
 {
     QList<EntryInfo> out;
-    const QString parent = normalizeParent(rawParentPath);
+    const QString parent = normalizeParent(owner, rawParentPath);
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
     if (!conn.isValid()) return out;
     QSqlQuery q(conn.database());
@@ -451,7 +527,7 @@ FileObjectStore::EntryInfo FileObjectStore::entryByPath(
         const QString& owner, const QString& rawParentPath, const QString& displayName) const
 {
     EntryInfo e;
-    const QString parent = normalizeParent(rawParentPath);
+    const QString parent = normalizeParent(owner, rawParentPath);
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
     if (!conn.isValid()) return e;
     QSqlQuery q(conn.database());
@@ -474,7 +550,7 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
                                     QString& err)
 {
     err.clear();
-    const QString newParent = normalizeParent(newRawParent);
+    const QString newParent = normalizeParent(owner, newRawParent);
     if (fileId < 0 || owner.isEmpty() || newParent.isEmpty() || newDisplayName.isEmpty()
         || newParent.size() > kMaxParentChars) {
         err = "参数为空或父路径超长";
@@ -498,9 +574,9 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
         const QString oldName = q.value(1).toString();
         const bool isDir = q.value(2).toBool();
         const QString finalName = clampUtf8(newDisplayName, kMaxNameBytes);
-        const QString oldDir = QDir::cleanPath(QDir(oldParent).filePath(oldName));
-        const QString newDir = QDir::cleanPath(QDir(newParent).filePath(finalName));
-        if (isDir && (newParent == oldDir || newParent.startsWith(oldDir + "/"))) {
+        const QString oldDir = logicDirKey(oldParent, oldName);
+        const QString newDir = logicDirKey(newParent, finalName);
+        if (isDir && newParent.startsWith(oldDir)) {
             err = "不能移入自身或其子目录";   // 与物理 movefile 同语义
             break;
         }
@@ -521,8 +597,8 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
             q.addBindValue(owner);
             if (!q.exec()) { err = q.lastError().text(); break; }
             while (q.next()) {
-                const QString p = QDir::cleanPath(q.value(1).toString());
-                if (p == oldDir || p.startsWith(oldDir + "/")) {
+                const QString p = q.value(1).toString();
+                if (p.startsWith(oldDir)) {   // 键 '/' 结尾：直接子项 p==oldDir，深层 p 前缀命中
                     ids.append(q.value(0).toLongLong());
                     paths.append(p);
                 }
@@ -556,7 +632,7 @@ bool FileObjectStore::insertDirEntry(const QString& owner, const QString& rawPar
                                      const QString& displayName, QString& err)
 {
     err.clear();
-    const QString parent = normalizeParent(rawParent);
+    const QString parent = normalizeParent(owner, rawParent);
     const QString name = clampUtf8(displayName, kMaxNameBytes);
     if (owner.isEmpty() || parent.isEmpty() || name.isEmpty()
         || parent.size() > kMaxParentChars) {
@@ -606,7 +682,7 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
                                     const QString& wantedName, qint64 objectId, QString& err)
 {
     err.clear();
-    const QString parent = normalizeParent(rawParent);
+    const QString parent = normalizeParent(owner, rawParent);
     if (owner.isEmpty() || parent.isEmpty() || parent.size() > kMaxParentChars
         || wantedName.isEmpty() || objectId < 0) {
         err = "参数为空或父路径超长";
@@ -624,9 +700,21 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
         q.addBindValue(objectId);
         if (!q.exec() || !q.next()) { err = "对象不存在"; break; }
 
-        // 同名不同对象：与 commitUpload 一致的 (1) 递推规则
+        // 同名安置（与 commitUpload 一致）：active 同名同对象=幂等命中保留原名（跨树重复
+        // 分享不建重复行）；同名不同对象才 (1) 递推；deleted 同名由下方复活分支承接。
         QString finalName = clampUtf8(wantedName, kMaxNameBytes);
-        if (nameTaken(owner, parent, finalName, db)) {
+        bool needSuffix = false;
+        q.prepare("SELECT object_id,status FROM user_file "
+                  "WHERE owner_name=? AND parent_path=? AND display_name=?");
+        q.addBindValue(owner);
+        q.addBindValue(parent);
+        q.addBindValue(finalName);
+        if (q.exec() && q.next() && q.value(1).toString() == "active") {
+            const QVariant o = q.value(0);
+            if (!(o.isValid() && !o.isNull() && o.toLongLong() == objectId))
+                needSuffix = true;
+        }
+        if (needSuffix) {
             QString base, ext;
             splitName(finalName, base, ext);
             bool freed = false;
@@ -687,8 +775,8 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
                                        const QString& newDirRaw, QString& err)
 {
     err.clear();
-    const QString oldDir = normalizeParent(oldDirRaw);
-    const QString newDir = normalizeParent(newDirRaw);
+    const QString oldDir = normalizeParent(owner, oldDirRaw);
+    const QString newDir = normalizeParent(owner, newDirRaw);
     if (owner.isEmpty() || oldDir.isEmpty() || newDir.isEmpty()) { err = "参数为空"; return false; }
     if (oldDir == newDir) return true;
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
@@ -704,8 +792,8 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
         QList<qint64> ids;
         QList<QString> paths;
         while (q.next()) {
-            const QString p = QDir::cleanPath(q.value(1).toString());
-            if (p == oldDir || p.startsWith(oldDir + "/")) { ids.append(q.value(0).toLongLong()); paths.append(p); }
+            const QString p = q.value(1).toString();
+            if (p.startsWith(oldDir)) { ids.append(q.value(0).toLongLong()); paths.append(p); }
         }
         for (int i = 0; i < ids.size(); ++i) {
             const QString shifted = newDir + paths[i].mid(oldDir.size());
@@ -728,7 +816,7 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
 bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& dirRaw, QString& err)
 {
     err.clear();
-    const QString dir = normalizeParent(dirRaw);
+    const QString dir = normalizeParent(owner, dirRaw);
     if (owner.isEmpty() || dir.isEmpty()) { err = "参数为空"; return false; }
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
     if (!conn.isValid()) { err = "数据库不可达"; return false; }
@@ -743,8 +831,8 @@ bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& 
         QList<qint64> ids;
         QList<QVariant> objs;
         while (q.next()) {
-            const QString p = QDir::cleanPath(q.value(2).toString());
-            if (p == dir || p.startsWith(dir + "/")) { ids.append(q.value(0).toLongLong()); objs.append(q.value(1)); }
+            const QString p = q.value(2).toString();
+            if (p.startsWith(dir)) { ids.append(q.value(0).toLongLong()); objs.append(q.value(1)); }
         }
         if (ids.isEmpty()) { ok = db.commit(); break; }   // 空操作
         for (int i = 0; i < ids.size(); ++i) {

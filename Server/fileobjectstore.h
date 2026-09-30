@@ -86,9 +86,13 @@ public:
     // 旧目录物理删除后的子树条目软删+减引用（无条目则空操作，成功返回）。
     bool releaseSubtreeByPath(const QString& owner, const QString& dirPath, QString& err);
 
-    // 逻辑父路径规范化：cleanPath+绝对化（以 filesPath 根为基准），
-    // 所有入口统一经此函数，保证 user_file.parent_path 只有唯一字面形式。
-    static QString normalizeParent(const QString& dirPath);
+    // REQ-EXT-FILE-001 F-3/D5 修复：owner 相对规范逻辑键。
+    // 接受 PDU 相对路径、本树绝对路径、既有逻辑键（幂等）三形态，归一为
+    // "用户根内、'/' 结尾"的机器无关键（design §2/§6），保证同一逻辑请求
+    // 在任何工作树得到同一 user_file.parent_path 字面值。
+    // 无法映射（路径不含 <filesys根名>/<owner> 段）→ 返回空 = 无效输入。
+    // 物理 IO 一律使用原始路径，不经过本函数。
+    static QString normalizeParent(const QString& owner, const QString& dirPath);
 
 private:
     explicit FileObjectStore(QObject* parent = nullptr);

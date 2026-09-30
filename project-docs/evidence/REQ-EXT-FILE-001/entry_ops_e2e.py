@@ -182,15 +182,19 @@ check("S2", "Server#2 启动（触发 T6 迁移）", start_server())
 pLegacy = (base + "/legacyL1.txt").replace("\\", "/")
 pConflict = (base + "/a.txt").replace("\\", "/")
 pDeep = (base + "/legdir/l2.txt").replace("\\", "/")
+# F-3/D5 修复：old_path 为跨树确定相对键 "filesys/<user>/..."（design §2），不再存机器绝对路径
+kLegacy = f"filesys/{OP}/legacyL1.txt"
+kConflict = f"filesys/{OP}/a.txt"
+kDeep = f"filesys/{OP}/legdir/l2.txt"
 check("M1", "legacyL1 映射 mapped",
-      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{pLegacy}'", "mapped"))
+      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{kLegacy}'", "mapped"))
 check("M2", "a.txt 冲突→skipped_name_conflict",
-      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{pConflict}'", "skipped_name_conflict"))
+      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{kConflict}'", "skipped_name_conflict"))
 check("M3", "a(1).txt 条目落定→对象shaC1",
       sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
           f"WHERE uf.owner_name='{OP}' AND uf.display_name='a(1).txt' AND uf.status='active' AND fo.sha256='{SHA(C1)}'") == "1")
 check("M4", "深层 legdir/l2.txt 映射+mapped",
-      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{pDeep}'", "mapped"))
+      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{kDeep}'", "mapped"))
 check("M5", "旧文件零删除（验收5）",
       all(os.path.isfile(x) for x in (pLegacy.replace("/", os.sep),
                                        pConflict.replace("/", os.sep),
@@ -230,9 +234,9 @@ mvdat = f32("l2.txt")
 mvmsg = b"legdir/l2.txt\0mvd\0"
 r = ca.ask(pdu(T_MOVE, msg=mvmsg, dat=mvdat))
 check("MV1", "movefile 条目 legdir/l2.txt→mvd", r and r[0][0] == T_MOVE_R and r[0][1][0] != 0)
-check("MV2", "条目 parent_path=mvd",
+check("MV2", "条目 parent_path=/mvd/（owner 相对逻辑键，跨树确定）",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='l2.txt' "
-          f"AND parent_path LIKE '%/mvd' AND status='active'") == "1")
+          f"AND parent_path='/mvd/' AND status='active'") == "1")
 ren2 = struct.pack("<I", 0) + f"{rootP}".encode()
 r = ca.ask(pdu(T_RENAME, msg=ren2, dat=f32("legdir") + f32("legdir2")))
 check("MV3", "未建条目旧目录物理改名回退", r and r[0][0] == T_RENAME_R and r[0][1][0] != 0
