@@ -3,6 +3,8 @@
 
 #include "protocol.h"
 #include <QListWidget>
+#include <QComboBox>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QWidget>
 
@@ -23,14 +25,28 @@ private slots:
     void createGroup();
     void refreshGroups();
     void refreshInvitations();
+    void inviteMember();
+    void acceptInvitation();
+    void rejectInvitation();
+    void listMembers();
+    void leaveGroup();
+    void removeMember();
+    void setRole();
+    void transferOwner();
+    void dissolveGroup();
 
 private:
     void sendRequest(uint type, quint64 groupId = 0, const QByteArray &body = QByteArray());
     QByteArray envelope(quint64 groupId, const QByteArray &body);
+    quint64 selectedGroupId() const;
+    quint64 selectedInvitationId() const;
     QPushButton *m_createButton;
     QPushButton *m_refreshButton;
     QPushButton *m_invitationButton;
     QListWidget *m_groupList;
+    QListWidget *m_invitationList;
+    QLineEdit *m_targetEdit;
+    QComboBox *m_roleBox;
     QLabel *m_statusLabel;
     quint64 m_requestId;
     bool m_loaded;
