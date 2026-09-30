@@ -52,6 +52,9 @@ public:
     quint64 m_connId = 0;  // 连接关联标识（拒绝审计用）
     QString actorUserRoot() const;                     // 服务端生成的规范用户根：filesPath/<actor>
     bool pathInActorRoot(const QString& path) const;   // 路径必须落在 actor 本人用户根内
+    // REQ-EXT-FILE-001 D5：内容寻址后文件不再物理落用户路径，下载/删除改为
+    // 校验其所在目录（目录由 MKDIR 物理创建，必存在）落在 actor 根内。
+    bool parentDirInActorRoot(const QString& filePath) const;
     PDU* createPublishLink(const QString& loginName);//创建外链分享
     
     // 新增：安全外链分享（BUG-ARC-PUBLINK-001）

@@ -173,6 +173,17 @@ bool MsgHandler::pathInActorRoot(const QString &path) const
     return isPathInSandbox(path, root);
 }
 
+// REQ-EXT-FILE-001 D5：对象文件不落用户路径，改校验其所在目录在 actor 根内且存在
+bool MsgHandler::parentDirInActorRoot(const QString &filePath) const
+{
+    const QString parent = QFileInfo(filePath).absolutePath();
+    const QString root = actorUserRoot();
+    if(root.isEmpty()){
+        return false;
+    }
+    return isPathInSandbox(parent, root);
+}
+
 PDU *MsgHandler::captcha()
 {
     QDateTime now = QDateTime::currentDateTime();
@@ -496,7 +507,8 @@ PDU *MsgHandler::deldir(const QString& loginName)
     bool ans=0;//记录删除结果，默认删除失败
     // REQ-FS-003②: 先校验后删除，顺序不可颠倒（removeRecursively 不可逆）
     // REQ-EXT-SEC-001: 只能删除 actor 本人用户根内的路径（loginName 参数即连接级身份）
-    if(!pathInActorRoot(delFilePath)){
+    // REQ-EXT-FILE-001 D5：对象文件不物理落用户路径，改为校验所在目录在 actor 根内
+    if(!parentDirInActorRoot(delFilePath)){
         qCWarning(lcFs)<<"[deldir] 拒绝越权删除 conn="<<m_connId<<" 路径:"<<delFilePath;
     }
     else {
@@ -1064,7 +1076,8 @@ PDU *MsgHandler::downloadfile()
     m_downloadCanonicalPath.clear();
 
     // REQ-EXT-SEC-001: 下载范围收敛为 actor 本人用户根，他人文件不可下载
-    if(pathInActorRoot(filePath) && !fileName.isEmpty()){
+    // REQ-EXT-FILE-001 D5：对象文件不物理落用户路径，改为校验所在目录在 actor 根内
+    if(parentDirInActorRoot(filePath) && !fileName.isEmpty()){
         // REQ-EXT-FILE-001 D5：优先解析逻辑条目→对象绝对路径；对象缺失回退物理文件（未迁移）。
         const QString dlParent = FileObjectStore::normalizeParent(fileInfo.absolutePath());
         const FileObjectStore::EntryInfo e =
