@@ -231,6 +231,27 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->queryFilePublishLink();
         break;
     }
+    case ENUM_MSG_TYPE_CREATE_GROUP_REQUEST:
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST:
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST:
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST:
+    case ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST:
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST:
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST:
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST:
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST:
+    case ENUM_MSG_TYPE_LIST_GROUPS_REQUEST:
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST:
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST:
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST:
+        respdu=m_MsgHandler->groupRequest(pdu->uiType);
+        break;
+    case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
+    case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
+        // 事件只能由服务端生成，客户端发入的同名类型一律丢弃并记审计日志。
+        qCWarning(lcNet) << "[GROUP] 拒绝客户端伪造事件 type=" << pdu->uiType
+                         << "conn=" << m_connectionId;
+        break;
         default:
             break;
     }
@@ -514,6 +535,18 @@ bool MyTcpSocket::isPublicRequestType(uint uiType)
 // REQ-EXT-SEC-001：未认证拒绝时按请求类型回对应失败响应（caData 清零即 false/空列表/异常码）
 PDU* MyTcpSocket::authRejectPdu(uint uiType)
 {
+    auto groupReject=[&](uint responseType){
+        QByteArray body;
+        groupAppendU16(body, GROUP_PROTOCOL_VERSION);
+        groupAppendU16(body, GROUP_ENVELOPE_LENGTH);
+        groupAppendU64(body, 0);
+        groupAppendU64(body, 0);
+        groupAppendU32(body, quint32(-1001));
+        PDU* r=mkPDU(uint(body.size()));
+        r->uiType=responseType;
+        memcpy(r->caMsg,body.constData(),size_t(body.size()));
+        return r;
+    };
     auto reject=[&](uint respType){
         PDU* r=mkPDU();
         r->uiType=respType;
@@ -568,6 +601,32 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return reject(ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND);
     case ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST:
         return reject(ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND);
+    case ENUM_MSG_TYPE_CREATE_GROUP_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_CREATE_GROUP_RESPOND);
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_RESPOND);
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_RESPOND);
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_RESPOND);
+    case ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_LEAVE_GROUP_RESPOND);
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_RESPOND);
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_SET_GROUP_ROLE_RESPOND);
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_RESPOND);
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_DISSOLVE_GROUP_RESPOND);
+    case ENUM_MSG_TYPE_LIST_GROUPS_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_LIST_GROUPS_RESPOND);
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND);
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND);
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND);
     case ENUM_MSG_TYPE_CHAT_REQUEST:
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
         return nullptr; // 无响应语义的投递型请求，拒绝仅落审计日志

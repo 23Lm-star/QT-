@@ -26,6 +26,11 @@ File *Index::getFile()
     return ui->filePage;
 }
 
+Group *Index::getGroup()
+{
+    return ui->groupPage;
+}
+
 Index::~Index()
 {
     delete ui;
@@ -44,6 +49,11 @@ void Index::on_file_PB_clicked()
     QTimer::singleShot(0, [this](){
         ui->filePage->flushfile();
     });
+}
+
+void Index::on_group_PB_clicked()
+{
+    ui->stackedWidget->setCurrentWidget(ui->groupPage);
 }
 void Index::on_pushButton_clicked()
 {

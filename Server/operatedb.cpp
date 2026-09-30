@@ -10,6 +10,7 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QRandomGenerator>
+#include <QRegExp>
 #include <QSet>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -84,17 +85,17 @@ bool OperateDB::checkSchemaVersion()
     if (!q.exec("SELECT MAX(version) FROM schema_version")) {
         qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
                          << q.lastError().text()
-                         << "— 请先执行 Server/migrate_ext_file_001.sql";
+                         << "— 请先执行 Server/migrate_ext_file_001.sql 与 migrate_ext_group_001.sql";
         return false;
     }
     int version = 0;
     if (q.next() && !q.value(0).isNull()) {
         version = q.value(0).toInt();
     }
-    const int required = kFileAssetSchemaVersion;
+    const int required = qMax(kFileAssetSchemaVersion, kGroupSchemaVersion);
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
-                         << "— 请先执行 Server/migrate_ext_file_001.sql";
+                         << "— 请先执行 Server/migrate_ext_file_001.sql 与 migrate_ext_group_001.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -1078,4 +1079,318 @@ bool OperateDB::createPublishLink(const QString &code, const QString &path, cons
     q.addBindValue(path);
     q.addBindValue(creator);
     return q.exec();
+}
+
+namespace {
+OperateDB::GroupResult groupFailure(int code)
+{
+    OperateDB::GroupResult result;
+    result.code = code;
+    result.groupId = 0;
+    result.version = 0;
+    result.eventType = 0;
+    return result;
+}
+
+bool groupIsValidName(const QString &value, int maxLength)
+{
+    return !value.isEmpty() && value.size() <= maxLength && !value.contains(QChar('\0'))
+            && !value.contains(QRegExp("[\\r\\n\\t]"));
+}
+
+QString groupRole(QSqlDatabase &db, quint64 groupId, const QString &actor)
+{
+    QSqlQuery q(db);
+    q.prepare("SELECT role FROM group_member WHERE group_id=? AND user_name=? AND status='active'");
+    q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+    q.addBindValue(actor);
+    return q.exec() && q.next() ? q.value(0).toString() : QString();
+}
+
+QStringList groupActiveUsers(QSqlDatabase &db, quint64 groupId)
+{
+    QStringList users;
+    QSqlQuery q(db);
+    q.prepare("SELECT user_name FROM group_member WHERE group_id=? AND status='active'");
+    q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+    if (q.exec()) {
+        while (q.next()) users.append(q.value(0).toString());
+    }
+    return users;
+}
+
+void groupAppendRecord(QByteArray &body, quint64 groupId, const QString &groupName,
+                       const QString &status, const QString &role, quint64 version)
+{
+    groupAppendU64(body, groupId);
+    groupAppendString(body, groupName.toUtf8());
+    groupAppendString(body, status.toUtf8());
+    groupAppendString(body, role.toUtf8());
+    groupAppendU64(body, version);
+}
+}
+
+OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &request,
+                                                       const QString &actor)
+{
+    if (actor.isEmpty()) return groupFailure(-1001); // 未认证主体
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return groupFailure(-1002); // 数据库不可达
+    QSqlDatabase db = connection.database();
+    GroupResult result = groupFailure(-1000);
+    QSqlQuery q(db);
+
+    if (request.operation == GroupCreate) {
+        if (!groupIsValidName(request.groupName, 128)) return groupFailure(-1003);
+        if (!db.transaction()) return groupFailure(-1004);
+        q.prepare("INSERT INTO group_info (group_name, creator_name, status, version) VALUES (?, ?, 'active', 1)");
+        q.addBindValue(request.groupName);
+        q.addBindValue(actor);
+        if (!q.exec()) { db.rollback(); return groupFailure(-1005); }
+        const quint64 groupId = q.lastInsertId().toULongLong();
+        q.prepare("INSERT INTO group_member (group_id,user_name,role,status) VALUES (?,?,'owner','active')");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        q.addBindValue(actor);
+        if (!q.exec() || !db.commit()) { db.rollback(); return groupFailure(-1006); }
+        result = groupFailure(0);
+        result.groupId = groupId;
+        result.version = 1;
+        result.notifyUsers << actor;
+        result.eventType = 1;
+        groupAppendU64(result.responseBody, groupId);
+        return result;
+    }
+
+    if (request.operation == GroupList) {
+        q.prepare("SELECT gi.group_id,gi.group_name,gi.status,gm.role,gi.version "
+                  "FROM group_member gm JOIN group_info gi ON gi.group_id=gm.group_id "
+                  "WHERE gm.user_name=? AND gm.status='active' ORDER BY gi.updated_at DESC");
+        q.addBindValue(actor);
+        if (!q.exec()) return groupFailure(-1007);
+        QByteArray body;
+        QList<QByteArray> rows;
+        while (q.next()) {
+            QByteArray row;
+            groupAppendRecord(row, q.value(0).toULongLong(), q.value(1).toString(),
+                              q.value(2).toString(), q.value(3).toString(), q.value(4).toULongLong());
+            rows.append(row);
+        }
+        groupAppendU32(body, quint32(rows.size()));
+        for (const QByteArray &row : rows) body.append(row);
+        result = groupFailure(0);
+        result.responseBody = body;
+        return result;
+    }
+
+    if (request.operation == GroupQueryInvitations) {
+        q.prepare("SELECT i.invitation_id,i.group_id,gi.group_name,i.inviter_name,i.status,"
+                  "UNIX_TIMESTAMP(i.expires_at) FROM group_invitation i "
+                  "JOIN group_info gi ON gi.group_id=i.group_id "
+                  "WHERE i.target_name=? AND i.status='pending' ORDER BY i.created_at DESC");
+        q.addBindValue(actor);
+        if (!q.exec()) return groupFailure(-1008);
+        QList<QByteArray> rows;
+        while (q.next()) {
+            QByteArray row;
+            groupAppendU64(row, q.value(0).toULongLong());
+            groupAppendU64(row, q.value(1).toULongLong());
+            groupAppendString(row, q.value(2).toString().toUtf8());
+            groupAppendString(row, q.value(3).toString().toUtf8());
+            groupAppendString(row, q.value(4).toString().toUtf8());
+            groupAppendU64(row, q.value(5).toULongLong());
+            rows.append(row);
+        }
+        QByteArray body;
+        groupAppendU32(body, quint32(rows.size()));
+        for (const QByteArray &row : rows) body.append(row);
+        result = groupFailure(0);
+        result.responseBody = body;
+        return result;
+    }
+
+    if (request.groupId == 0 && request.operation != GroupAcceptInvitation
+            && request.operation != GroupRejectInvitation) return groupFailure(-1009);
+
+    quint64 groupId = request.groupId;
+    if (request.operation == GroupAcceptInvitation || request.operation == GroupRejectInvitation) {
+        q.prepare("SELECT group_id FROM group_invitation WHERE invitation_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.invitationId));
+        if (!q.exec() || !q.next()) return groupFailure(-1010);
+        groupId = q.value(0).toULongLong();
+    }
+
+    if (request.operation == GroupListMembers || request.operation == GroupSummary) {
+        q.prepare("SELECT status FROM group_info WHERE group_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        if (!q.exec() || !q.next()) return groupFailure(-1011);
+        const QString groupStatus = q.value(0).toString();
+        if (groupRole(db, groupId, actor).isEmpty()) return groupFailure(-1012);
+        if (request.operation == GroupListMembers) {
+            q.prepare("SELECT user_name,role,status FROM group_member WHERE group_id=? AND status='active' ORDER BY joined_at");
+            q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+            if (!q.exec()) return groupFailure(-1013);
+            QList<QByteArray> rows;
+            while (q.next()) {
+                QByteArray row;
+                groupAppendString(row, q.value(0).toString().toUtf8());
+                groupAppendString(row, q.value(1).toString().toUtf8());
+                groupAppendString(row, q.value(2).toString().toUtf8());
+                rows.append(row);
+            }
+            QByteArray body;
+            groupAppendU32(body, quint32(rows.size()));
+            for (const QByteArray &row : rows) body.append(row);
+            result = groupFailure(0);
+            result.groupId = groupId;
+            result.responseBody = body;
+            return result;
+        }
+        q.prepare("SELECT group_name,status,version FROM group_info WHERE group_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        if (!q.exec() || !q.next()) return groupFailure(-1014);
+        const QString name = q.value(0).toString();
+        const quint64 version = q.value(2).toULongLong();
+        q.prepare("SELECT COUNT(*) FROM group_member WHERE group_id=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        if (!q.exec() || !q.next()) return groupFailure(-1015);
+        QByteArray body;
+        groupAppendU64(body, groupId);
+        groupAppendString(body, name.toUtf8());
+        groupAppendString(body, groupStatus.toUtf8());
+        groupAppendU64(body, version);
+        groupAppendU32(body, q.value(0).toUInt());
+        result = groupFailure(0);
+        result.groupId = groupId;
+        result.version = version;
+        result.responseBody = body;
+        return result;
+    }
+
+    if (!db.transaction()) return groupFailure(-1016);
+    q.prepare("SELECT status,version FROM group_info WHERE group_id=? FOR UPDATE");
+    q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+    if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-1017); }
+    const QString groupStatus = q.value(0).toString();
+    quint64 version = q.value(1).toULongLong();
+
+    if (request.operation == GroupAcceptInvitation || request.operation == GroupRejectInvitation) {
+        q.prepare("SELECT target_name,status,expires_at,inviter_name FROM group_invitation WHERE invitation_id=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.invitationId));
+        if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-1018); }
+        if (q.value(0).toString() != actor || q.value(1).toString() != "pending") {
+            db.rollback(); return groupFailure(-1019);
+        }
+        const bool expired = q.value(2).toDateTime() < QDateTime::currentDateTime();
+        if (request.operation == GroupAcceptInvitation) {
+            if (expired || groupStatus != "active") { db.rollback(); return groupFailure(-1020); }
+            q.prepare("SELECT status FROM group_member WHERE group_id=? AND user_name=? FOR UPDATE");
+            q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
+            if (!q.exec()) { db.rollback(); return groupFailure(-1021); }
+            if (q.next()) {
+                q.prepare("UPDATE group_member SET status='active',role='member',updated_at=CURRENT_TIMESTAMP "
+                          "WHERE group_id=? AND user_name=?");
+            } else {
+                q.prepare("INSERT INTO group_member(group_id,user_name,role,status) VALUES (?,?,'member','active')");
+            }
+            q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
+            if (!q.exec()) { db.rollback(); return groupFailure(-1022); }
+            q.prepare("UPDATE group_invitation SET status='accepted',handled_at=NOW() WHERE invitation_id=?");
+            q.addBindValue(QVariant::fromValue<qulonglong>(request.invitationId));
+            if (!q.exec()) { db.rollback(); return groupFailure(-1023); }
+            ++version;
+            q.prepare("UPDATE group_info SET version=? WHERE group_id=?");
+            q.addBindValue(QVariant::fromValue<qulonglong>(version)); q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+            if (!q.exec() || !db.commit()) { db.rollback(); return groupFailure(-1024); }
+            result = groupFailure(0); result.groupId = groupId; result.version = version;
+            result.notifyUsers = groupActiveUsers(db, groupId); result.eventType = 1;
+            groupAppendU64(result.responseBody, groupId);
+            return result;
+        }
+        q.prepare("UPDATE group_invitation SET status=?,handled_at=NOW() WHERE invitation_id=?");
+        q.addBindValue(expired ? "expired" : "rejected");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.invitationId));
+        if (!q.exec() || !db.commit()) { db.rollback(); return groupFailure(-1025); }
+        result = groupFailure(0); result.groupId = groupId; result.eventType = 2;
+        return result;
+    }
+
+    const QString actorRole = groupRole(db, groupId, actor);
+    if (actorRole.isEmpty()) { db.rollback(); return groupFailure(-1026); }
+    if (groupStatus != "active") { db.rollback(); return groupFailure(-1027); }
+
+    if (request.operation == GroupInvite) {
+        if (actorRole != "owner" && actorRole != "admin") { db.rollback(); return groupFailure(-1028); }
+        if (!groupIsValidName(request.targetName, 32) || !groupIsValidName(request.requestKey, 64)) { db.rollback(); return groupFailure(-1029); }
+        q.prepare("SELECT 1 FROM user_info WHERE name=?"); q.addBindValue(request.targetName);
+        if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-1030); }
+        q.prepare("SELECT status FROM group_member WHERE group_id=? AND user_name=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
+        if (!q.exec()) { db.rollback(); return groupFailure(-1031); }
+        if (q.next() && q.value(0).toString() == "active") { db.rollback(); return groupFailure(-1032); }
+        q.prepare("SELECT invitation_id,status FROM group_invitation WHERE group_id=? AND request_key=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.requestKey);
+        if (q.exec() && q.next()) {
+            const quint64 invitationId = q.value(0).toULongLong();
+            if (!db.commit()) { db.rollback(); return groupFailure(-1033); }
+            result = groupFailure(0); result.groupId = groupId; result.eventType = 2; result.notifyUsers << request.targetName;
+            groupAppendU64(result.responseBody, invitationId); return result;
+        }
+        q.prepare("SELECT 1 FROM group_invitation WHERE group_id=? AND target_name=? AND status='pending' FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
+        if (q.exec() && q.next()) { db.rollback(); return groupFailure(-1034); }
+        q.prepare("INSERT INTO group_invitation(group_id,inviter_name,target_name,status,expires_at,request_key) "
+                  "VALUES (?,?,?,'pending',DATE_ADD(NOW(),INTERVAL 7 DAY),?)");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
+        q.addBindValue(request.targetName); q.addBindValue(request.requestKey);
+        if (!q.exec() || !db.commit()) { db.rollback(); return groupFailure(-1035); }
+        result = groupFailure(0); result.groupId = groupId; result.eventType = 2; result.notifyUsers << request.targetName;
+        groupAppendU64(result.responseBody, q.lastInsertId().toULongLong()); return result;
+    }
+
+    if (request.operation == GroupLeave) {
+        if (actorRole == "owner") { db.rollback(); return groupFailure(-1036); }
+        q.prepare("UPDATE group_member SET status='left',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
+        if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1037); }
+    } else if (request.operation == GroupRemoveMember) {
+        if (actorRole != "owner" && actorRole != "admin") { db.rollback(); return groupFailure(-1038); }
+        q.prepare("SELECT role,status FROM group_member WHERE group_id=? AND user_name=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
+        if (!q.exec() || !q.next() || q.value(1).toString() != "active" || q.value(0).toString() != "member") { db.rollback(); return groupFailure(-1039); }
+        q.prepare("UPDATE group_member SET status='removed',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
+        if (!q.exec()) { db.rollback(); return groupFailure(-1040); }
+    } else if (request.operation == GroupSetRole) {
+        if (actorRole != "owner" || (request.role != "admin" && request.role != "member")) { db.rollback(); return groupFailure(-1041); }
+        q.prepare("UPDATE group_member SET role=?,updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active' AND role<>'owner'");
+        q.addBindValue(request.role); q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
+        if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1042); }
+    } else if (request.operation == GroupTransferOwner) {
+        if (actorRole != "owner") { db.rollback(); return groupFailure(-1043); }
+        q.prepare("UPDATE group_member SET role='owner',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active' AND role<>'owner'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
+        if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1044); }
+        q.prepare("UPDATE group_member SET role='admin',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active' AND role='owner'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
+        if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1045); }
+    } else if (request.operation == GroupDissolve) {
+        if (actorRole != "owner") { db.rollback(); return groupFailure(-1046); }
+        q.prepare("UPDATE group_info SET status='dissolved' WHERE group_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        if (!q.exec()) { db.rollback(); return groupFailure(-1047); }
+    } else {
+        db.rollback(); return groupFailure(-1048);
+    }
+
+    ++version;
+    q.prepare("UPDATE group_info SET version=? WHERE group_id=?");
+    q.addBindValue(QVariant::fromValue<qulonglong>(version)); q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+    if (!q.exec() || !db.commit()) { db.rollback(); return groupFailure(-1049); }
+    result = groupFailure(0);
+    result.groupId = groupId;
+    result.version = version;
+    result.notifyUsers = groupActiveUsers(db, groupId);
+    result.eventType = 1;
+    groupAppendU64(result.responseBody, groupId);
+    return result;
 }

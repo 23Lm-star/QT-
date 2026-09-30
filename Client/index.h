@@ -4,6 +4,7 @@
 #include <QWidget>
 #include "file.h"
 #include "friend.h"
+#include "group.h"
 namespace Ui {
 class Index;
 }
@@ -21,6 +22,7 @@ public:
     Friend* getFriend();
     //获取File界面的ui指针
     File  * getFile();
+    Group * getGroup();
     //获取char的界面的指针
     ~Index();
 private:
@@ -29,6 +31,8 @@ private slots:
     void on_friend_PB_clicked();
 
     void on_file_PB_clicked();
+
+    void on_group_PB_clicked();
 
     void on_pushButton_clicked();
 

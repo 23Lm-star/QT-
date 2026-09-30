@@ -2,7 +2,9 @@
 #define OPERATEDB_H
 
 #include <QObject>
+#include <QByteArray>
 #include <QDateTime>
+#include <QStringList>
 //数据库操作类
 class OperateDB : public QObject
 {
@@ -14,8 +16,37 @@ public:
     static OperateDB& instance();//单例模式
     //REQ-EXT-FILE-001 T1: 文件资产 schema 版本（D1 启动 fail-fast，不静默建表）
     static const int kFileAssetSchemaVersion = 2026092901;
+    // REQ-EXT-GROUP-001：群生命周期迁移版本；启动时要求数据库至少达到此版本。
+    static const int kGroupSchemaVersion = 2026093001;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
+
+    // 群请求操作编号（业务层内部枚举，不等同于网络 PDU 编号）。
+    enum GroupOperation {
+        GroupCreate = 1, GroupInvite, GroupAcceptInvitation, GroupRejectInvitation,
+        GroupLeave, GroupRemoveMember, GroupSetRole, GroupTransferOwner,
+        GroupDissolve, GroupList, GroupListMembers, GroupQueryInvitations,
+        GroupSummary
+    };
+    struct GroupRequest {
+        GroupOperation operation;
+        quint64 groupId;             // 群标识
+        quint64 invitationId;        // 邀请标识
+        QString groupName;           // 群名称
+        QString targetName;          // 目标用户
+        QString requestKey;          // 幂等键
+        QString role;                // 角色 owner/admin/member
+    };
+    struct GroupResult {
+        int code;                    // 0 成功，负数为业务错误
+        QByteArray responseBody;     // 已编码的响应业务字段
+        QStringList notifyUsers;     // 需要接收成员事件的账号
+        quint64 groupId;             // 事件所属群
+        quint64 version;             // 提交后的群版本
+        int eventType;               // 0 无事件，1 成员变化，2 邀请变化
+    };
+    // 在单个数据库事务中执行群状态变更或隔离查询；actor 来自连接认证上下文。
+    GroupResult handleGroupOperation(const GroupRequest &request, const QString &actor);
     //REQ-EXT-FILE-001 T6：存量文件启动自动迁移（幂等：file_migration_map 已有记录即跳过；
     //失败记 failed 继续其余，绝不删除旧文件——验收5）。main 在版本检查通过后调用一次。
     void migrateLegacyFiles();

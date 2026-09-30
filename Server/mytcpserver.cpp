@@ -8,6 +8,7 @@
 #include <QFile>
 #include <QTextStream>
 #include <QCoreApplication>
+#include <QSet>
 MyTcpServer::MyTcpServer(){
     // 读取僵尸连接阈值（zombie_timeout.cfg，单位秒；默认 90s = 3×30s 心跳周期）
     m_zombieTimeoutMs = 90000;
@@ -123,6 +124,29 @@ void MyTcpServer::reseed(char *tarname, PDU *pdu){
             break;
         }
     }
+}
+
+void MyTcpServer::sendGroupEvent(const QStringList& users, PDU *pdu)
+{
+    if (pdu == nullptr || users.isEmpty()) {
+        if (pdu != nullptr) memfree(pdu);
+        return;
+    }
+    QSet<QString> targets;
+    for (const QString& user : users) {
+        if (!user.isEmpty()) targets.insert(user);
+    }
+    QMutexLocker locker(&m_tcpsocketlistMutex);
+    QSet<QString> delivered;
+    for (MyTcpSocket* socket : tcpsocketlist) {
+        if (socket == nullptr || !socket->m_actorAuthenticated || delivered.contains(socket->m_strLoginName)
+                || !targets.contains(socket->m_strLoginName)) {
+            continue;
+        }
+        socket->write(reinterpret_cast<const char*>(pdu), pdu->uiTotalLen);
+        delivered.insert(socket->m_strLoginName);
+    }
+    memfree(pdu);
 }
 
 // REQ-EXT-SEC-001 M-1：分享握手登记（仅主线程访问）
