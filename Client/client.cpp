@@ -1,8 +1,8 @@
 #include "logging.h"
 #include "client.h"
+#include "index.h"
 #include "ui_client.h"
 #include "process.h"
-#include "index.h"
 #include "file.h"
 #include <string.h>
 #include <QByteArray>
@@ -292,6 +292,23 @@ void Client::handlMsg(PDU *&pdu)
         break;
     case ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND:
         m_mhptr->handleResolvePublishLink(pdu);
+        break;
+    case ENUM_MSG_TYPE_CREATE_GROUP_RESPOND:
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_RESPOND:
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_RESPOND:
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_RESPOND:
+    case ENUM_MSG_TYPE_LEAVE_GROUP_RESPOND:
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_RESPOND:
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_RESPOND:
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_RESPOND:
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_RESPOND:
+    case ENUM_MSG_TYPE_LIST_GROUPS_RESPOND:
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND:
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND:
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND:
+    case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
+    case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
+        Index::getinstance().getGroup()->handleResponse(pdu);
         break;
     default:
         break;

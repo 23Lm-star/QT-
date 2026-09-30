@@ -46,6 +46,8 @@ public:
     QString generateCaptchaCode(int length = 6);
     PDU* getuserinformation();//获取用户信息
     PDU* logoff(bool& revoked);//注销账户（REQ-EXT-SEC-001：授权依据为连接级身份，revoked 供会话撤销）
+    // REQ-EXT-GROUP-001：统一解析、校验并处理 60-87 群协议请求。
+    PDU* groupRequest(uint requestType);
 
     // ===== REQ-EXT-SEC-001：连接级 actor_context（仅服务端登录成功时写入，客户端 PDU 字段不作为授权依据） =====
     QString m_actorName;   // 服务端派生的操作者用户名

@@ -63,6 +63,26 @@
         </widget>
        </item>
        <item>
+        <widget class="QPushButton" name="group_PB">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Minimum" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>0</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="font">
+          <font>
+           <family>Agency FB</family>
+           <pointsize>22</pointsize>
+          </font>
+         </property>
+         <property name="text">
+          <string>群
+聊</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QPushButton" name="pushButton">
          <property name="sizePolicy">
           <sizepolicy hsizetype="Minimum" vsizetype="Expanding">
@@ -91,6 +111,7 @@
        </property>
        <widget class="Friend" name="friendPage"/>
        <widget class="File" name="filePage"/>
+       <widget class="Group" name="groupPage"/>
       </widget>
      </item>
     </layout>
@@ -102,6 +123,12 @@
    <class>Friend</class>
    <extends>QWidget</extends>
    <header location="global">friend.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>Group</class>
+   <extends>QWidget</extends>
+   <header location="global">group.h</header>
    <container>1</container>
   </customwidget>
   <customwidget>

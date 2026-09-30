@@ -5,6 +5,7 @@
 #include <QTcpServer>
 #include <QMutex>
 #include <QHash>
+#include <QStringList>
 #include "mytcpsocket.h"
 //管理所有客户端连接的一个类
 class MyTcpServer : public QTcpServer
@@ -26,6 +27,8 @@ public:
     void sendAddFriendAndRelease(char* tarname, PDU* pdu);
     //信息转发
     void reseed(char*tarname,PDU*pdu);
+    // REQ-EXT-GROUP-001：向当前在线群成员广播已提交的成员/邀请事件。
+    void sendGroupEvent(const QStringList& users, PDU* pdu);
     // REQ-EXT-SEC-001 M-1: 分享握手登记表——分享人发出邀请时登记 (接收者, 服务端 canonical 源路径)，
     // 接收者同意移动时仅放行有登记的条目并在成功后消费。仅事件循环主线程（socket 处理器）访问，无需加锁。
     void addPendingShare(const QString& receiver, const QString& canonicalSource);

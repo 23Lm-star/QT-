@@ -1510,3 +1510,127 @@ PDU* MsgHandler::queryFilePublishLink() {
     }
     return respdu;
 }
+
+namespace {
+uint groupRespondType(uint requestType)
+{
+    switch (requestType) {
+    case ENUM_MSG_TYPE_CREATE_GROUP_REQUEST: return ENUM_MSG_TYPE_CREATE_GROUP_RESPOND;
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST: return ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_RESPOND;
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST: return ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_RESPOND;
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST: return ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_RESPOND;
+    case ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST: return ENUM_MSG_TYPE_LEAVE_GROUP_RESPOND;
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST: return ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_RESPOND;
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST: return ENUM_MSG_TYPE_SET_GROUP_ROLE_RESPOND;
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST: return ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_RESPOND;
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST: return ENUM_MSG_TYPE_DISSOLVE_GROUP_RESPOND;
+    case ENUM_MSG_TYPE_LIST_GROUPS_REQUEST: return ENUM_MSG_TYPE_LIST_GROUPS_RESPOND;
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST: return ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND;
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST: return ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND;
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST: return ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND;
+    default: return ENUM_MSG_TYPE_MAX;
+    }
+}
+
+OperateDB::GroupOperation groupOperation(uint requestType)
+{
+    switch (requestType) {
+    case ENUM_MSG_TYPE_CREATE_GROUP_REQUEST: return OperateDB::GroupCreate;
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST: return OperateDB::GroupInvite;
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST: return OperateDB::GroupAcceptInvitation;
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST: return OperateDB::GroupRejectInvitation;
+    case ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST: return OperateDB::GroupLeave;
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST: return OperateDB::GroupRemoveMember;
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST: return OperateDB::GroupSetRole;
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST: return OperateDB::GroupTransferOwner;
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST: return OperateDB::GroupDissolve;
+    case ENUM_MSG_TYPE_LIST_GROUPS_REQUEST: return OperateDB::GroupList;
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST: return OperateDB::GroupListMembers;
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST: return OperateDB::GroupQueryInvitations;
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST: return OperateDB::GroupSummary;
+    default: return OperateDB::GroupList;
+    }
+}
+}
+
+PDU* MsgHandler::groupRequest(uint requestType)
+{
+    const uint responseType = groupRespondType(requestType);
+    if (responseType == ENUM_MSG_TYPE_MAX) return nullptr;
+    const QByteArray payload(pdu->caMsg, int(pdu->uiMsgLen));
+    int offset = 0;
+    quint16 version = 0;
+    quint16 envelopeLength = 0;
+    quint64 requestId = 0;
+    quint64 groupId = 0;
+    auto response = [&](int code, const QByteArray &body, quint64 id, quint64 gid) {
+        QByteArray encoded;
+        groupAppendU16(encoded, GROUP_PROTOCOL_VERSION);
+        groupAppendU16(encoded, GROUP_ENVELOPE_LENGTH);
+        groupAppendU64(encoded, id);
+        groupAppendU64(encoded, gid);
+        groupAppendU32(encoded, quint32(code));
+        encoded.append(body);
+        PDU *out = mkPDU(uint(encoded.size()));
+        out->uiType = responseType;
+        memcpy(out->caMsg, encoded.constData(), size_t(encoded.size()));
+        return out;
+    };
+    if (!groupReadU16(payload, offset, version) || !groupReadU16(payload, offset, envelopeLength)
+            || !groupReadU64(payload, offset, requestId) || !groupReadU64(payload, offset, groupId)
+            || envelopeLength != GROUP_ENVELOPE_LENGTH || version != GROUP_PROTOCOL_VERSION
+            || payload.size() < envelopeLength) {
+        qCWarning(lcNet) << "[GROUP] 拒绝非法信封 type=" << requestType << "conn=" << m_connId;
+        return response(-2001, QByteArray(), requestId, groupId);
+    }
+
+    OperateDB::GroupRequest request;
+    request.operation = groupOperation(requestType);
+    request.groupId = groupId;
+    request.invitationId = 0;
+    QByteArray value;
+    auto readText = [&](QString &target) {
+        if (!groupReadString(payload, offset, value)) return false;
+        target = QString::fromUtf8(value);
+        return true;
+    };
+    bool parsed = true;
+    switch (request.operation) {
+    case OperateDB::GroupCreate:
+        parsed = readText(request.groupName); break;
+    case OperateDB::GroupInvite:
+        parsed = readText(request.targetName) && readText(request.requestKey); break;
+    case OperateDB::GroupAcceptInvitation:
+    case OperateDB::GroupRejectInvitation:
+        parsed = groupReadU64(payload, offset, request.invitationId); break;
+    case OperateDB::GroupRemoveMember:
+    case OperateDB::GroupTransferOwner:
+        parsed = readText(request.targetName); break;
+    case OperateDB::GroupSetRole:
+        parsed = readText(request.targetName) && readText(request.role); break;
+    default:
+        break;
+    }
+    if (!parsed || offset != payload.size()) {
+        qCWarning(lcNet) << "[GROUP] 拒绝越界载荷 type=" << requestType << "conn=" << m_connId;
+        return response(-2002, QByteArray(), requestId, groupId);
+    }
+
+    const OperateDB::GroupResult result = OperateDB::instance().handleGroupOperation(request, m_actorName);
+    if (!result.notifyUsers.isEmpty() && result.eventType != 0) {
+        QByteArray eventBody;
+        groupAppendU16(eventBody, GROUP_PROTOCOL_VERSION);
+        groupAppendU16(eventBody, GROUP_ENVELOPE_LENGTH);
+        groupAppendU64(eventBody, 0);
+        groupAppendU64(eventBody, result.groupId);
+        groupAppendU32(eventBody, 0);
+        groupAppendU64(eventBody, result.version);
+        groupAppendU32(eventBody, quint32(result.eventType));
+        PDU *event = mkPDU(uint(eventBody.size()));
+        event->uiType = result.eventType == 2 ? ENUM_MSG_TYPE_GROUP_INVITATION_EVENT
+                                              : ENUM_MSG_TYPE_GROUP_MEMBER_EVENT;
+        memcpy(event->caMsg, eventBody.constData(), size_t(eventBody.size()));
+        MyTcpServer::getinstance().sendGroupEvent(result.notifyUsers, event);
+    }
+    return response(result.code, result.responseBody, requestId, result.groupId == 0 ? groupId : result.groupId);
+}
