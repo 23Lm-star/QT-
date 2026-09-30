@@ -239,8 +239,9 @@ bool OperateDB::deleteFriendMessages(const QString &userA, const QString &userB)
     return ok;
 }
 
-int OperateDB::handleLogin(char *strname, char *strpwd)
+int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId, quint64& outVersion)
 {
+    outVersion = 0;
     if(strname==nullptr||strpwd==nullptr){
         return 0;
     }
@@ -289,14 +290,59 @@ int OperateDB::handleLogin(char *strname, char *strpwd)
         }
     }
 
-    q.prepare("update user_info set online = 1 where name = ? and pwd = ?");
-    q.addBindValue(nameParam);
-    q.addBindValue(effectiveHash);
-    qCDebug(lcDb)<<"login update online for:"<<nameParam;
-    if (!q.exec()) {
-        qCCritical(lcDb) << "UPDATE online status failed:" << q.lastError();
+    // ===== REQ-EXT-SESSION-001：登录版本原子分配 + 登录档案 + 在线置位，同一事务 =====
+    // LAST_INSERT_ID(login_version+1)：行锁串行化并发登录，版本号唯一单调；禁止读后加一。
+    if(!db.transaction()){
+        qCCritical(lcDb)<<"login transaction begin failed:"<<db.lastError().text();
         return 0;
     }
+    QSqlQuery vq(db);
+    vq.prepare("UPDATE user_info SET login_version = LAST_INSERT_ID(login_version + 1) WHERE name = ?");
+    vq.addBindValue(nameParam);
+    if(!vq.exec() || vq.numRowsAffected() != 1){
+        qCCritical(lcDb)<<"login version bump failed:"<<vq.lastError().text();
+        db.rollback();
+        return 0;
+    }
+    QSqlQuery lq(db);
+    if(!lq.exec("SELECT LAST_INSERT_ID()") || !lq.next()){
+        qCCritical(lcDb)<<"login version readback failed:"<<lq.lastError().text();
+        db.rollback();
+        return 0;
+    }
+    outVersion = lq.value(0).toULongLong();
+
+    QSqlQuery rq(db);
+    rq.prepare("INSERT INTO login_record(username, client_id, login_version, login_time) VALUES(?,?,?,NOW())");
+    rq.addBindValue(nameParam);
+    rq.addBindValue(clientId);
+    rq.addBindValue(static_cast<qlonglong>(outVersion));
+    if(!rq.exec()){
+        qCCritical(lcDb)<<"login record insert failed:"<<rq.lastError().text();
+        db.rollback();
+        outVersion = 0;
+        return 0;
+    }
+
+    QSqlQuery oq(db);
+    oq.prepare("update user_info set online = 1 where name = ? and pwd = ?");
+    oq.addBindValue(nameParam);
+    oq.addBindValue(effectiveHash);
+    qCDebug(lcDb)<<"login update online for:"<<nameParam;
+    if (!oq.exec()) {
+        qCCritical(lcDb) << "UPDATE online status failed:" << oq.lastError();
+        db.rollback();
+        outVersion = 0;
+        return 0;
+    }
+
+    if(!db.commit()){
+        qCCritical(lcDb)<<"login transaction commit failed:"<<db.lastError().text();
+        db.rollback();
+        outVersion = 0;
+        return 0;
+    }
+    qCDebug(lcDb)<<"[LOGINVER] user="<<nameParam<<" ver="<<outVersion<<" client_id="<<clientId;
     return 1;
 }
 
@@ -652,6 +698,14 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec()){
         qCDebug(lcDb)<<"logoff: warning - failed to delete publish_links (might be empty):"<<QString::fromUtf8(name);
+        // 不回滚，视为成功
+    }
+
+    // 3.7 — REQ-EXT-SESSION-001：清理 login_record 档案（表未迁移时同样视为成功）
+    q.prepare("DELETE FROM login_record WHERE username = ?");
+    q.addBindValue(QString::fromUtf8(name));
+    if(!q.exec()){
+        qCDebug(lcDb)<<"logoff: warning - failed to delete login_records (might be empty):"<<QString::fromUtf8(name);
         // 不回滚，视为成功
     }
 

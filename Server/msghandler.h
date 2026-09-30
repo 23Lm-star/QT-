@@ -21,7 +21,7 @@ public:
     ResumableUploadSession m_uploadSession;
     //各种处理函数，进行各种类型请求的处理
     PDU* rigist();//注册
-    PDU* login(QString& strname, bool& authOk);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context）
+    PDU* login(QString& strname, bool& authOk, quint64& loginVersion);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context；REQ-EXT-SESSION-001：loginVersion 供连接绑定用户域版本）
     PDU* finduser();//查找用户
     PDU *onlineuser(const QString & myname);//在线用户
     PDU* addfriend();//添加用户
