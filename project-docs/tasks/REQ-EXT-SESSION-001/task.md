@@ -55,6 +55,14 @@ Codex 审计结论 REJECT，理由=一次未归因的探针 P4 非确定性失�
 - **low（design.md 旧 NOT NULL 文案）**：已修订为 NULL 形态并加修订注记。
 - 未动产品源码、未动验收标准。复审计要求：保留审计原始日志（不得随 worktree 销毁）、套件串行执行、探针用 `run_supervised.py`。
 
+### 归因取证闭环（同日 repair 续，证据=repair-supervised-run.txt / repair-soak3-run.txt / repair-outoftree-run.txt）
+非确定性失败的全部四种死亡形态均已现场复现并归因到执行环境，产品零崩溃：
+1. rc=0xC0000409 启动即退=Server.exe 未带 Qt-PATH-first 启动（Anaconda DLL 互杀，manifest 已知陷阱）。
+2. rc=1 init 阶段退=端口 5000 被残留实例占用（Server::initialize 失败干净退出，非崩溃）。
+3. 运行中消失=工具进程树回收/并行套件 `taskkill /IM Server.exe` 按镜像名互杀（审计当时多套件重跑即此窗口）。
+4. WER/CrashDumps 全窗口（含审计时段）**零** Server.exe 崩溃记录；裸空闲存活 >200s×2；PID 监督受控跑 8/8 连续多轮；树外分离进程服务器带流量全程存活 8/8。
+结论：探针不稳定发现=测试运行器生命周期缺陷，已在 run_supervised.py/探针监护中根治（端口占用拒跑、PID-only 清理、SERVER_DIED 退出码 3 与断言失败分离）。产品判定：该 medium 发现不构成代码缺陷，复审计按监护方式复跑即可。
+
 ## 停止条件
 - 发现零协议改动无法承载客户端唯一 ID（负载附加区不够用/验证码解析冲突）→ 停在 design，向主人报协议变更决策卡，不自行动 frozen 文件。
 - 版本校验每请求查询构成不可接受性能回归且缓存方案无法证明一致 → 同上上报。
