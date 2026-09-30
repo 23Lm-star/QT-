@@ -20,9 +20,9 @@ function Stamp-Evidence([string]$label) {
 $TESTS = @()
 
 if ($TESTS.Count -eq 0) {
-    Write-Output "test: 0 automated tests registered (fill TESTS in pipeline/test.ps1)"
-    Write-Output "GUI/manual verification is recorded as human-verified evidence, not BLOCKED."
-    "no automated tests registered (hash $hash)" | Out-File $log -Encoding utf8
+    Write-Output "test GREEN-WARN: 0 automated tests registered (fill TESTS in pipeline/test.ps1)"
+    Write-Output "  any GREEN claim must cite a named probe or human-verified evidence, not this gate"
+    "test GREEN-WARN (0 automated tests, hash $hash)" | Out-File $log -Encoding utf8
     Stamp-Evidence "test"
     exit 0
 }
