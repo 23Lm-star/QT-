@@ -65,7 +65,7 @@
 - 提交链：`11e01de` D5 修复（parentDirInActorRoot）→ `64e3b40` dedup_e2e.py 入证据 → `51f38ef` rename/move/share/MKDIR 条目优先切换（`insertDirEntry`/`attachEntry`/`relocateEntry` 目录级联/`renameEntriesDir`/`releaseSubtreeByPath`；分享=接收者条目引用同一对象物理零复制；握手键 canonical-或-词法绝对，`logicPathInActorRoot` 按 design §6；并修复 `releaseSubtree` 循环中途失败仍 commit 的部分提交隐患→§5 一致性）→ `17af569` T6 存量迁移（`OperateDB::migrateLegacyFiles()` 启动自动一次；`commitUpload copyOnly` 变体：源绝不删除/半成品副本清理；映射 mapped/skipped_name_conflict/failed；重跑跳过=幂等；main.cpp 挂钩沿 T1 先例）。
 - 实测（本机 MySQL5.7/mydb + wt-claude Server.exe 实链路）：**验收1/2/3 复跑 13/13**；**验收4/5+操作面 36/36**（`entry_ops_e2e.py`：迁移三态/幂等重跑/`(1)` 安置/旧文件零删除/rename+move+目录回退/条目分享零复制+引用计数/伪造大小→session failed 无条目无对象/跨用户拒绝/B-1 分享他人源拒）；**SEC-001 全量回归 48/48**（`sec001_regression.py`=原 verify.py 的 D5 适配副本，仅 K1c/K1f/K2a/K2b 物理落盘期望→条目+对象等价断言，安全断言零改动，原件不动）。
 - §6 停止条件核查：未触发——`file_migration_map` 对测试集构成可审计双向映射（M1-M4/I1-I2 断言）。
-- 运行环境补充事实（独立测试节点照此准备）：启动 Server.exe 必须 **PATH 前置 Qt5.14.2/mingw 两个 bin 目录**，否则 Anaconda 等同名 DLL 劫持导致启动崩溃（0xC0000005/0xc0000139）；Python 用 `py -3.13`（Anaconda 3.6 无 capture_output）；SEC 回归需 `SEC001_BASE=<工作树根>` 且预建 `Server/filesys/{sec001a,sec001b,sec001r,sec001v}` 用户根；脚本生命周期参考 `build/start-server.ps1`（gitignore 外，会话自管）。
+- 运行环境补充事实（独立测试节点照此准备）：启动 Server.exe 必须 **PATH 前置 Qt5.14.2/mingw 两个 bin 目录**，否则 Anaconda 等同名 DLL 劫持导致启动崩溃（0xC0000005/0xc0000139）；Python 用 `py -3.13`（Anaconda 3.6 无 capture_output）；SEC 回归需 `SEC001_BASE=<工作树根>` 且预建 `Server/filesys/{sec001a,sec001b,sec001r,sec001v}` 用户根；脚本生命周期参考 `build/start-server.ps1`（gitignore 外，会话自管）。**新工作树首次构建前需从既有树拷贝未入库的 `Client/connect.config` 与 `Server/connect.config`（config.qrc 资源输入，缺失则 build RED: No rule to make target），并拷贝 `libmysql.dll`+`sqldrivers/qsqlmysql.dll` 到 exe 旁**（repair2 记录，独立测试会话 F-3 实测）。`SEC001_BASE` 必须以真实环境变量传递（bash 中 cmd 风格 `set` 无效，会静默回落主树）。
 - 遗留/边界（证据定格，非阻塞）：路径 >191 字符的旧文件记 failed 不入库映射（超长列宽，MySQL5.7 utf8 191 上限）；未建目录条目的旧目录改名/移动后，其内已迁移条目仅前缀级联（`renameEntriesDir`），旧目录本身无条目行（flushfile 物理回退显示）；隐藏文件不入迁移扫描（QDirIterator Files 默认过滤器）。
 
 ## 开发进度（2026-09-30 repair 节点，独立审计 REJECT 后 owner 修复，本会话=claude 代偿 owner）
@@ -80,7 +80,14 @@
   - **实测（最终二进制单实例连跑）**：entry_ops **36/36**、dedup **13/13**、sec001_regression **48/48**（新步骤0清场生效）、cross_tree_e2e **31/31**；三门于 `915eeff`：build GREEN / test honest-0 / audit PASS（protocol.h 零命中）。运行事实补充：harness 环境变量须用真实 env 传递（bash 内 `set` 无效会静默回落默认 BASE）；taskkill 后目录句柄可瞬态占用，sec001 预清场已带重试。
   - **证据**：`build/evidence/codex-req-ext-file-001-file-assets/915eeff…/`（四套件日志+gates.txt）；handoff `project-docs/handoffs/req-ext-file-001-repair-2026-09-30.txt`（validate-handoff OK）。
 
-**下一节点**：repair 完成后**重新走 independent test（新会话）→ independent audit（新会话只读）**，通过后方可 integration 三事实行 → merge no-ff。档位 LARGE 不变；两 `protocol.h` 全程零命中（branch diff 复核通过）。
+## 开发进度（2026-09-30 repair2 节点，第二轮审计 REJECT 后）
+- 轮次记录：repair(`915eeff`) → 独立测试 **PASS**（36/36、13/13、48/48、31/31 全一次通过，F-3/D5 主收口成立；非阻塞 F-1..F-4 见 `build/evidence/…/915eeff…/test-report.md`）→ 独立审计 **REJECT**（新阻塞 F-4/F-5，见 `build/evidence/…/cf4f74f…/audit-report.md`）。
+- **F-4**：`releaseSubtree` 在 `'/'` 结尾键下 `LIKE dirPath+"/%"` 变 `//%` 永不命中→深度≥2 后代漏删；改 owner 全行 FOR UPDATE+内存 startsWith（同 renameEntriesDir 模式，免疫通配名）。同函数目录自身行 `objectIds.prepend(value(0))` 错取 file_id 列→deldir 条目优先时减到**无关对象**（`17af569` 既有缺陷，审计误记为本轮引入，一并修复）。夹具 ND0-ND5（entry_ops 36→43）。
+- **F-5**：`normalizeLogicKeys` 撞键收敛把 loser `parent_path` 改写为存活行同三重→必 1062，loser 永远 active+旧键、减引用镜像成死代码、每次启动重复告警。新策略：撞键 loser **仅软删不动 parent**（死行旧键永不命中查询）；deleted 撞键行静默跳过（重放稳定）；判别改 canonical 形态（首尾 `'/'`、无 `//`），覆盖 `/filesys/…` 无盘符形态；upload_session 同规则。夹具 CVXA-CVXF（cross_tree 31→37，含重放稳定与 refcount 5→4 镜像一次）。
+- **非阻塞在册**：`/filesys/…` 判别盲区已随 F-5 收紧；`claim-check` 仍缺 manifest.yaml（工具性缺口，与首轮审计同姿态，不冒充 PASS）；handoff 校验器 `NODES` 无 `independent-test` 枚举（会话用 `node: test`）。
+- 实测（repair2 二进制）：entry_ops **43/43**、dedup **13/13**、sec001 **48/48**、cross_tree **37/37**；三门 `9fbdb70` GREEN/honest-0/PASS；证据 `build/evidence/codex-req-ext-file-001-file-assets/9fbdb70/`。
+
+**下一节点**：第二轮 independent test（新会话）→ 若 PASS 再 independent audit（新会话只读，重点 F-4/F-5 收口与夹具判别力）。两道 ACCEPT 后方可 integration 三事实行 → merge no-ff。档位 LARGE 不变；两 `protocol.h` 全程零命中。
 
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
