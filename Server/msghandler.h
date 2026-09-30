@@ -55,6 +55,9 @@ public:
     // REQ-EXT-FILE-001 D5：内容寻址后文件不再物理落用户路径，下载/删除改为
     // 校验其所在目录（目录由 MKDIR 物理创建，必存在）落在 actor 根内。
     bool parentDirInActorRoot(const QString& filePath) const;
+    // REQ-EXT-FILE-001 design §6：逻辑条目操作（改名/移动/分享登记）不要求物理存在，
+    // 仅做词法规范化 + actor 根越权判断（isPathInSandbox 原样留给仍在磁盘执行的读写）。
+    bool logicPathInActorRoot(const QString& path) const;
     PDU* createPublishLink(const QString& loginName);//创建外链分享
     
     // 新增：安全外链分享（BUG-ARC-PUBLINK-001）

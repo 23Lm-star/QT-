@@ -184,6 +184,19 @@ bool MsgHandler::parentDirInActorRoot(const QString &filePath) const
     return isPathInSandbox(parent, root);
 }
 
+// REQ-EXT-FILE-001 design §6：词法校验（cleanPath+绝对化后须等于或在 actor 根前缀内），
+// 不要求物理存在——逻辑条目改名/移动/分享登记的唯一越权门。
+bool MsgHandler::logicPathInActorRoot(const QString &path) const
+{
+    const QString root = actorUserRoot();
+    if(root.isEmpty() || path.isEmpty()){
+        return false;
+    }
+    const QString p = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    const QString r = QDir::cleanPath(root);
+    return p == r || p.startsWith(r + "/");
+}
+
 PDU *MsgHandler::captcha()
 {
     QDateTime now = QDateTime::currentDateTime();
@@ -486,6 +499,14 @@ PDU *MsgHandler::MKDIR(){
         QDir dir;
         ret1=dir.mkdir(QString("%1").arg(path));
         ret2=dir.mkdir(QString("%1/%2").arg(path).arg(dirName));
+        // REQ-EXT-FILE-001 D5/T3：目录条目与物理 mkdir 同步建立（条目为权威展示源）。
+        // 条目失败不回滚物理结果——flushfile 物理回退保证可见，日志留痕。
+        if(ret2 && !m_actorName.isEmpty()){
+            QString dirErr;
+            if(!FileObjectStore::instance().insertDirEntry(m_actorName, path, dirName, dirErr)){
+                qCWarning(lcFs)<<"[MKDIR] 目录条目建立失败 conn="<<m_connId<<":"<<dirErr;
+            }
+        }
     } else {
         qCWarning(lcFs)<<"[MKDIR] 拒绝越权建目录 conn="<<m_connId<<" 路径:"<<path<<" 名:"<<dirName;
     }
@@ -531,6 +552,13 @@ PDU *MsgHandler::deldir(const QString& loginName)
         } else if(delFileType==0){
             QDir dir(delFilePath);
             ans=dir.removeRecursively();
+            // REQ-EXT-FILE-001：旧目录物理删除后，子树内已迁移条目同步软删+减引用，防幽灵条目
+            if(ans){
+                QString relErr;
+                if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr)){
+                    qCWarning(lcFs)<<"[deldir] 子树条目级联软删失败 conn="<<m_connId<<":"<<relErr;
+                }
+            }
         }
     }
 
@@ -669,13 +697,44 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         ret=0;
         qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名名称段 conn="<<m_connId;
     }
-    else if(fileType==0){//目录
-        QDir dir;
-        ret=dir.rename(oldFilePath,newFilePath);
-    }
-    else if(fileType==1){//文件
-        QFile file;
-        ret=file.rename(oldFilePath,newFilePath);
+    else {
+        // REQ-EXT-FILE-001 D5：条目优先。有条目→只动逻辑键（目录条目级联子树，同事务），
+        // 物理实体若存在（已迁移旧文件）尽力同步改名防回退视图幽灵；无条目→回退纯物理改名（未迁移）。
+        const QString renParent = FileObjectStore::normalizeParent(dirPath);
+        const FileObjectStore::EntryInfo e =
+                FileObjectStore::instance().entryByPath(loginName, renParent, oldName);
+        if(e.valid()){
+            if(!logicPathInActorRoot(dirPath)){
+                ret=0;
+                qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名（逻辑）conn="<<m_connId<<":"<<dirPath;
+            } else {
+                QString relErr;
+                ret = FileObjectStore::instance().relocateEntry(e.fileId, loginName, renParent, newName, relErr);
+                if(!ret){
+                    qCWarning(lcFs)<<"[renamefile] 条目改名失败 conn="<<m_connId<<":"<<relErr;
+                } else if(QFileInfo(oldFilePath).exists()){
+                    bool physOk = (fileType==0) ? QDir().rename(oldFilePath,newFilePath)
+                                                : QFile().rename(oldFilePath,newFilePath);
+                    if(!physOk){
+                        qCWarning(lcFs)<<"[renamefile] 物理实体同步改名失败（条目为准）conn="<<m_connId<<":"<<oldFilePath;
+                    }
+                }
+            }
+        }
+        else if(fileType==0){//目录（未迁移：物理改名 + 子树条目前缀级联，防幽灵键）
+            QDir dir;
+            ret=dir.rename(oldFilePath,newFilePath);
+            if(ret){
+                QString casErr;
+                if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr)){
+                    qCWarning(lcFs)<<"[renamefile] 旧目录改名条目级联失败 conn="<<m_connId<<":"<<casErr;
+                }
+            }
+        }
+        else if(fileType==1){//文件
+            QFile file;
+            ret=file.rename(oldFilePath,newFilePath);
+        }
     }
     qCDebug(lcFs)<<"rename ret"<<ret<<endl;
 
@@ -742,9 +801,19 @@ PDU *MsgHandler::sharefile()
     const QByteArray sharePathBytes(pdu->caMsg+32*revUserCnt, sharePathLen);
     const QString shareSrcRaw = QString::fromUtf8(sharePathBytes).trimmed();
     const QString shareCanonicalSrc = QFileInfo(shareSrcRaw).canonicalFilePath();
+    // REQ-EXT-FILE-001 D5：对象文件无物理实体（canonical 为空）。握手键统一为
+    // "canonical 存在用 canonical，否则用词法绝对路径"，sharefilemove 侧同式计算；
+    // 归属仍由登记门（分享人本人条目/本人用户根）断言。
+    const QString shareKey = !shareCanonicalSrc.isEmpty()
+            ? shareCanonicalSrc
+            : QDir::cleanPath(QFileInfo(shareSrcRaw).absoluteFilePath());
+    const QFileInfo srcRawInfo(shareSrcRaw);
+    const FileObjectStore::EntryInfo srcEntry = FileObjectStore::instance().entryByPath(
+        m_actorName, FileObjectStore::normalizeParent(srcRawInfo.absolutePath()), srcRawInfo.fileName());
     // B-1 修复（增量复审）：分享源必须落在分享人本人用户根内——只能分享自己的文件；
     // 源不存在或属他人时不登记握手也不转发邀请，杜绝"自我登记+自我同意"复制他人文件
-    const bool sourceOwned = !shareCanonicalSrc.isEmpty() && pathInActorRoot(shareSrcRaw);
+    const bool sourceOwned = (srcEntry.valid() && !srcEntry.isDir && logicPathInActorRoot(shareSrcRaw))
+            || (!shareCanonicalSrc.isEmpty() && pathInActorRoot(shareSrcRaw));
     if(!sourceOwned){
         qCWarning(lcFs)<<"[sharefile] 拒绝：分享源不属于分享人，不登记不转发 conn="<<m_connId<<" 源:"<<shareSrcRaw;
     }
@@ -752,7 +821,7 @@ PDU *MsgHandler::sharefile()
         char revName[32]={'\0'};
         memcpy(revName,pdu->caMsg+32*i,32);
         qCDebug(lcFs)<<"revName"<<revName<<" ";
-        MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(), shareCanonicalSrc);
+        MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(), shareKey);
         MyTcpServer::getinstance().reseed(revName,resendpdu);
     }
     memfree(resendpdu);
@@ -784,23 +853,58 @@ PDU *MsgHandler::sharefilemove()
     QString recvDir=QString("%1/%2").arg(Server::getinstance().filesPath).arg(recvName);
     QString tarPath=QString("%1/%2").arg(recvDir).arg(fileName);
     qCDebug(lcFs)<<"sourcePath:"<<sourcePath<<"tarPath："<<tarPath<<endl;
-    // REQ-FS-003⑤: 源与目标目录都必须在沙箱内；目标文件名不得含路径分隔符（Windows 下 "\.." 逃逸）
+    // REQ-FS-003⑤: 目标目录须在 actor 根内；目标文件名不得含路径分隔符（Windows 下 "\.." 逃逸）
     const QString canonicalSrc=QFileInfo(sourcePath).canonicalFilePath();
+    // REQ-EXT-FILE-001 D5：握手键与登记侧同式（canonical 存在用 canonical，否则词法绝对路径）
+    const QString srcKey = !canonicalSrc.isEmpty() ? canonicalSrc
+                           : QDir::cleanPath(QFileInfo(sourcePath).absoluteFilePath());
     bool ret=false;
-    if(!isPathInSandbox(sourcePath)){
-        qCWarning(lcFs)<<"[sharefilemove] 拒绝越权源路径 conn="<<m_connId<<":"<<sourcePath;
-    } else if(!pathInActorRoot(recvDir)){
+    if(!pathInActorRoot(recvDir)){
         qCWarning(lcFs)<<"[sharefilemove] 拒绝越权目标目录 conn="<<m_connId<<":"<<recvDir;
     } else if(fileName.contains('\\') || fileName.contains('/')){
         qCWarning(lcFs)<<"[sharefilemove] 拒绝含路径分隔符的目标名 conn="<<m_connId;
-    } else if(canonicalSrc.isEmpty()
-              || !MyTcpServer::getinstance().hasPendingShare(recvName, canonicalSrc)){
-        // REQ-EXT-SEC-001 M-1: 无握手登记的源一律拒绝；复制执行改用服务端 canonical
+    } else if(!MyTcpServer::getinstance().hasPendingShare(recvName, srcKey)){
+        // REQ-EXT-SEC-001 M-1 + FILE-001 D5: 无握手登记的键一律拒绝（登记门已断言源属分享人本人根/本人条目）
         qCWarning(lcFs)<<"[sharefilemove] 拒绝：源无分享握手登记 conn="<<m_connId<<":"<<sourcePath;
     } else {
-        ret=QFile::copy(canonicalSrc,tarPath);
-        if(ret){
-            MyTcpServer::getinstance().consumePendingShare(recvName, canonicalSrc);
+        const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
+        const QString rel = QDir(fsRoot).relativeFilePath(srcKey);
+        FileObjectStore::EntryInfo e;
+        if(!rel.startsWith("..")
+           && QDir::cleanPath(QDir(fsRoot).filePath(rel)) == srcKey){
+            const QFileInfo ki(srcKey);
+            e = FileObjectStore::instance().entryByPath(
+                    rel.section('/',0,0),
+                    FileObjectStore::normalizeParent(ki.absolutePath()), ki.fileName());
+        }
+        if(e.valid() && !e.isDir){
+            // 条目优先：接收者新条目引用同一 object（+1 引用，物理零复制）；
+            // 同名已占（物理或条目）→ (n) 后缀安置，与 movefile 规则一致
+            QString base=fileName, ext;
+            const int dot=fileName.lastIndexOf('.');
+            if(dot>0){ base=fileName.left(dot); ext=fileName.mid(dot); }
+            QString shareName=fileName;
+            for(int n=1; n<=1000 && QFileInfo(QDir(recvDir).filePath(shareName)).exists(); ++n){
+                shareName=QString("%1(%2)%3").arg(base).arg(n).arg(ext);
+            }
+            QString attachErr;
+            const qint64 newFileId = FileObjectStore::instance().attachEntry(
+                recvName, recvDir, shareName, e.objectId, attachErr);
+            ret = newFileId >= 0;
+            if(!ret){
+                qCWarning(lcFs)<<"[sharefilemove] 接收者条目建立失败 conn="<<m_connId<<":"<<attachErr;
+            } else {
+                MyTcpServer::getinstance().consumePendingShare(recvName, srcKey);
+                qCDebug(lcFs)<<"[sharefilemove] 条目引用完成（物理零复制）fileId="<<newFileId<<" objId="<<e.objectId;
+            }
+        } else if(!canonicalSrc.isEmpty()){
+            // 回退：未迁移旧文件物理复制（M-1 原语义，执行用服务端 canonical）
+            ret=QFile::copy(canonicalSrc,tarPath);
+            if(ret){
+                MyTcpServer::getinstance().consumePendingShare(recvName, srcKey);
+            }
+        } else {
+            qCWarning(lcFs)<<"[sharefilemove] 拒绝：源条目与物理实体均不存在 conn="<<m_connId<<":"<<sourcePath;
         }
     }
     PDU* respdu=mkPDU();
@@ -838,7 +942,60 @@ PDU *MsgHandler::movefile(const QString& loginName)
     QString canonicalDstDir = dstInfo.canonicalFilePath(); // 目标目录必定存在
 
     bool ret=false;
-    if(isPathInSandbox(srcPath, userRoot) && srcInfo.exists()){
+    bool entryMoved=false;
+    QString entryFinalName;
+    // REQ-EXT-FILE-001 D5：条目优先——relocateEntry 只动逻辑键（目录条目同事务级联子树）；
+    // 物理实体若存在（已迁移旧文件/旧目录）尽力同步搬移防回退视图幽灵；无条目→回退纯物理。
+    const QString mvSrcParent = FileObjectStore::normalizeParent(srcInfo.absolutePath());
+    const FileObjectStore::EntryInfo mvEntry =
+            FileObjectStore::instance().entryByPath(loginName, mvSrcParent, fileName);
+    if(mvEntry.valid()){
+        const QString dstNorm = FileObjectStore::normalizeParent(dstDir);
+        const QString oldDirAbs = QDir(mvSrcParent).filePath(fileName);
+        if(!logicPathInActorRoot(srcPath) || !logicPathInActorRoot(dstDir)){
+            qCWarning(lcFs)<<"movefile 拒绝：越权移动（逻辑）conn="<<m_connId<<":"<<srcPath<<" -> "<<dstDir;
+        }
+        else if(!QFileInfo(dstDir).isDir()){
+            qCWarning(lcFs)<<"movefile 拒绝：目标目录不存在 conn="<<m_connId<<":"<<dstDir;
+        }
+        else if(dstNorm == mvSrcParent){
+            ret=true;
+            qCDebug(lcFs)<<"movefile 原地移动（条目），无需操作";
+        }
+        else if(mvEntry.isDir && (dstNorm == oldDirAbs || dstNorm.startsWith(oldDirAbs + "/"))){
+            qCWarning(lcFs)<<"movefile 拒绝：不能把目录移进自身或其子目录";
+        }
+        else {
+            QString base=fileName, ext;
+            const int dot=fileName.lastIndexOf('.');
+            if(dot>0){ base=fileName.left(dot); ext=fileName.mid(dot); }
+            QString finalName=fileName;
+            for(int n=1; n<=1000 && (FileObjectStore::instance().entryByPath(loginName, dstNorm, finalName).valid()
+                                     || QFileInfo(QDir(dstNorm).filePath(finalName)).exists()); ++n){
+                finalName=QString("%1(%2)%3").arg(base).arg(n).arg(ext);
+            }
+            QString relErr;
+            ret = FileObjectStore::instance().relocateEntry(mvEntry.fileId, loginName,
+                                                            dstNorm, finalName, relErr);
+            if(!ret){
+                qCWarning(lcFs)<<"movefile 条目移动失败 conn="<<m_connId<<":"<<relErr;
+            } else {
+                entryMoved=true;
+                entryFinalName=finalName;
+                if(srcInfo.exists()){
+                    const QString physDst = QDir(dstDir).filePath(finalName);
+                    bool physOk = mvEntry.isDir
+                            ? QDir().rename(srcPath, physDst)
+                            : (QFile::rename(srcPath, physDst)
+                               || (QFile::copy(srcPath, physDst) && QFile::remove(srcPath)));
+                    if(!physOk){
+                        qCWarning(lcFs)<<"movefile 物理实体同步搬移失败（条目为准）conn="<<m_connId<<":"<<srcPath;
+                    }
+                }
+            }
+        }
+    }
+    else if(isPathInSandbox(srcPath, userRoot) && srcInfo.exists()){
         //确保目标目录也在用户根目录内
         if(dstInfo.isDir() && isPathInSandbox(dstDir, userRoot)){
             // 防止把目录移进自身或其子目录
@@ -902,9 +1059,19 @@ PDU *MsgHandler::movefile(const QString& loginName)
 
     qCDebug(lcFs)<<"movefile src:"<<srcPath<<"dst:"<<dstPath<<"ret:"<<ret;
 
+    const QString echoName = entryMoved ? entryFinalName : fileName;
+
+    // 旧目录（无条目走物理分支）移动成功后：子树已迁移条目 parent_path 前缀平移（无条目空操作）
+    if(ret && !entryMoved && srcInfo.isDir()){
+        QString casErr;
+        if(!FileObjectStore::instance().renameEntriesDir(loginName, srcPath, finalDstPath, casErr)){
+            qCWarning(lcFs)<<"[movefile] 旧目录移动条目级联失败 conn="<<m_connId<<":"<<casErr;
+        }
+    }
+
     // 跨功能联动：移动成功后，平移该文件的分享链接 relative_path
     if(ret){
-        QString newRel = dstRel.isEmpty() ? fileName : (dstRel + "/" + fileName);
+        QString newRel = dstRel.isEmpty() ? echoName : (dstRel + "/" + echoName);
         OperateDB::instance().updateShareLinkPath(loginName, srcRel, newRel);
         qCDebug(lcFs) << "[movefile] 已联动更新分享链接: owner=" << loginName
                  << " oldRel=" << srcRel << " newRel=" << newRel;
@@ -912,7 +1079,7 @@ PDU *MsgHandler::movefile(const QString& loginName)
 
     PDU* respdu=mkPDU();
     memcpy(respdu->caData,&ret,sizeof(ret));
-    QByteArray fileNameBytes=fileName.toUtf8();
+    QByteArray fileNameBytes=echoName.toUtf8();
     memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
     respdu->uiType=ENUM_MSG_TYPE_MOVEFILE_RESPOND;
     return respdu;

@@ -63,10 +63,27 @@ public:
     // 目录软删：递归释放 parent 及子树全部文件条目（同事务）。
     bool releaseSubtree(qint64 dirFileId, const QString& owner);
 
-    // 条目改名/移动：只动逻辑键，引用不变。
+    // 条目改名/移动：只动逻辑键，引用不变；目录行同事务级联子树 parent_path。
     bool relocateEntry(qint64 fileId, const QString& owner,
                        const QString& newParentPath, const QString& newDisplayName,
                        QString& err);
+
+    // REQ-EXT-FILE-001 D5/T3：目录条目（is_dir=1，object_id NULL）。
+    // 同名 active 目录条目=幂等成功；同名 active 文件=失败。
+    bool insertDirEntry(const QString& owner, const QString& parentPath,
+                        const QString& displayName, QString& err);
+
+    // REQ-EXT-FILE-001 T5：给 owner 新建指向既有对象的条目（分享=物理零复制，+1 引用）。
+    // 同名同对象幂等返回既有行不重复计数；同名不同对象走 (1) 递推。返回 fileId，失败 -1。
+    qint64 attachEntry(const QString& owner, const QString& parentPath,
+                       const QString& wantedName, qint64 objectId, QString& err);
+
+    // 旧目录物理改名/移动后的条目级联（parent_path 前缀平移；无条目则空操作）。
+    bool renameEntriesDir(const QString& owner, const QString& oldDirPath,
+                          const QString& newDirPath, QString& err);
+
+    // 旧目录物理删除后的子树条目软删+减引用（无条目则空操作，成功返回）。
+    bool releaseSubtreeByPath(const QString& owner, const QString& dirPath, QString& err);
 
     // 逻辑父路径规范化：cleanPath+绝对化（以 filesPath 根为基准），
     // 所有入口统一经此函数，保证 user_file.parent_path 只有唯一字面形式。

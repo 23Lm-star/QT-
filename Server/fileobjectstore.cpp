@@ -395,7 +395,7 @@ bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
         for (int i = 0; i < fileIds.size(); ++i) {
             q.prepare("UPDATE user_file SET status='deleted' WHERE file_id=?");
             q.addBindValue(fileIds[i]);
-            if (!q.exec()) break;
+            if (!q.exec()) { ok = false; break; }   // §5：任一步失败必须整体回滚
             const QVariant obj = objectIds[i];
             if (!obj.isNull()) {
                 q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
@@ -469,8 +469,9 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
 {
     err.clear();
     const QString newParent = normalizeParent(newRawParent);
-    if (fileId < 0 || owner.isEmpty() || newParent.isEmpty() || newDisplayName.isEmpty()) {
-        err = "参数为空";
+    if (fileId < 0 || owner.isEmpty() || newParent.isEmpty() || newDisplayName.isEmpty()
+        || newParent.size() > kMaxParentChars) {
+        err = "参数为空或父路径超长";
         return false;
     }
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
@@ -480,20 +481,279 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
     bool ok = false;
     do {
         QSqlQuery q(db);
+        // 先锁自身行：目录改名/移动必须同事务级联子树 parent_path（D5：条目为权威）
+        q.prepare("SELECT parent_path,display_name,is_dir FROM user_file "
+                  "WHERE file_id=? AND owner_name=? AND status='active' FOR UPDATE");
+        q.addBindValue(fileId);
+        q.addBindValue(owner);
+        if (!q.exec()) { err = q.lastError().text(); break; }
+        if (!q.next()) { err = "条目不存在"; break; }
+        const QString oldParent = q.value(0).toString();
+        const QString oldName = q.value(1).toString();
+        const bool isDir = q.value(2).toBool();
+        const QString finalName = clampUtf8(newDisplayName, kMaxNameBytes);
+        const QString oldDir = QDir::cleanPath(QDir(oldParent).filePath(oldName));
+        const QString newDir = QDir::cleanPath(QDir(newParent).filePath(finalName));
+        if (isDir && (newParent == oldDir || newParent.startsWith(oldDir + "/"))) {
+            err = "不能移入自身或其子目录";   // 与物理 movefile 同语义
+            break;
+        }
+
         q.prepare("SELECT file_id FROM user_file "
                   "WHERE owner_name=? AND parent_path=? AND display_name=? AND status='active' LIMIT 1");
         q.addBindValue(owner);
         q.addBindValue(newParent);
-        q.addBindValue(clampUtf8(newDisplayName, kMaxNameBytes));
+        q.addBindValue(finalName);
         if (!q.exec()) { err = q.lastError().text(); break; }
         if (q.next()) { err = "目标名已占用"; break; }
 
+        // 目录：先把所有后代 parent_path 前缀平移（内存前缀比对，避免 LIKE 转义歧义）
+        if (isDir && (newParent != oldParent || finalName != oldName)) {
+            QList<qint64> ids;
+            QList<QString> paths;
+            q.prepare("SELECT file_id,parent_path FROM user_file WHERE owner_name=? AND status='active' FOR UPDATE");
+            q.addBindValue(owner);
+            if (!q.exec()) { err = q.lastError().text(); break; }
+            while (q.next()) {
+                const QString p = QDir::cleanPath(q.value(1).toString());
+                if (p == oldDir || p.startsWith(oldDir + "/")) {
+                    ids.append(q.value(0).toLongLong());
+                    paths.append(p);
+                }
+            }
+            bool cascaded = true;
+            for (int i = 0; i < ids.size(); ++i) {
+                const QString shifted = newDir + paths[i].mid(oldDir.size());
+                if (shifted.size() > kMaxParentChars) { err = "级联子路径超长"; cascaded = false; break; }
+                QSqlQuery u(db);
+                u.prepare("UPDATE user_file SET parent_path=? WHERE file_id=?");
+                u.addBindValue(shifted);
+                u.addBindValue(ids[i]);
+                if (!u.exec()) { err = u.lastError().text(); cascaded = false; break; }
+            }
+            if (!cascaded) break;   // 级联任一步失败 → 整体回滚（§5）
+        }
+
         q.prepare("UPDATE user_file SET parent_path=?,display_name=? WHERE file_id=? AND owner_name=? AND status='active'");
         q.addBindValue(newParent);
-        q.addBindValue(clampUtf8(newDisplayName, kMaxNameBytes));
+        q.addBindValue(finalName);
         q.addBindValue(fileId);
         q.addBindValue(owner);
         if (!q.exec() || q.numRowsAffected() != 1) { err = "更新失败"; break; }
+        ok = db.commit();
+    } while (false);
+    if (!ok) db.rollback();
+    return ok;
+}
+
+bool FileObjectStore::insertDirEntry(const QString& owner, const QString& rawParent,
+                                     const QString& displayName, QString& err)
+{
+    err.clear();
+    const QString parent = normalizeParent(rawParent);
+    const QString name = clampUtf8(displayName, kMaxNameBytes);
+    if (owner.isEmpty() || parent.isEmpty() || name.isEmpty()
+        || parent.size() > kMaxParentChars) {
+        err = "参数为空或父路径超长";
+        return false;
+    }
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) { err = "数据库不可达"; return false; }
+    QSqlDatabase db = conn.database();
+    if (!db.transaction()) { err = "事务开启失败"; return false; }
+    bool ok = false;
+    do {
+        QSqlQuery q(db);
+        q.prepare("SELECT file_id,is_dir,status FROM user_file "
+                  "WHERE owner_name=? AND parent_path=? AND display_name=? FOR UPDATE");
+        q.addBindValue(owner);
+        q.addBindValue(parent);
+        q.addBindValue(name);
+        if (!q.exec()) { err = q.lastError().text(); break; }
+        if (q.next()) {
+            const qint64 rowId = q.value(0).toLongLong();
+            const bool rowDir = q.value(1).toBool();
+            const QString st = q.value(2).toString();
+            if (st == "active") {
+                if (rowDir) { ok = db.commit(); break; }   // 幂等：目录条目已在
+                err = "同名文件条目已占用";
+                break;
+            }
+            q.prepare("UPDATE user_file SET object_id=NULL,is_dir=1,status='active' WHERE file_id=?");
+            q.addBindValue(rowId);
+            if (!q.exec()) { err = q.lastError().text(); break; }
+        } else {
+            q.prepare("INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+                      "VALUES (?,?,?,1,NULL,'active')");
+            q.addBindValue(owner);
+            q.addBindValue(parent);
+            q.addBindValue(name);
+            if (!q.exec()) { err = q.lastError().text(); break; }
+        }
+        ok = db.commit();
+    } while (false);
+    if (!ok) db.rollback();
+    return ok;
+}
+
+qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawParent,
+                                    const QString& wantedName, qint64 objectId, QString& err)
+{
+    err.clear();
+    const QString parent = normalizeParent(rawParent);
+    if (owner.isEmpty() || parent.isEmpty() || parent.size() > kMaxParentChars
+        || wantedName.isEmpty() || objectId < 0) {
+        err = "参数为空或父路径超长";
+        return -1;
+    }
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) { err = "数据库不可达"; return -1; }
+    QSqlDatabase db = conn.database();
+    if (!db.transaction()) { err = "事务开启失败"; return -1; }
+    qint64 resultId = -1;
+    bool done = false;
+    do {
+        QSqlQuery q(db);
+        q.prepare("SELECT object_id FROM file_object WHERE object_id=? FOR UPDATE");
+        q.addBindValue(objectId);
+        if (!q.exec() || !q.next()) { err = "对象不存在"; break; }
+
+        // 同名不同对象：与 commitUpload 一致的 (1) 递推规则
+        QString finalName = clampUtf8(wantedName, kMaxNameBytes);
+        if (nameTaken(owner, parent, finalName, db)) {
+            QString base, ext;
+            splitName(finalName, base, ext);
+            bool freed = false;
+            for (int n = 1; n <= kNameSuffixCap; ++n) {
+                const QString cand = makeSuffixed(base, ext, n);
+                if (!nameTaken(owner, parent, cand, db)) { finalName = cand; freed = true; break; }
+            }
+            if (!freed) { err = "同目录同名候选耗尽"; break; }
+        }
+
+        q.prepare("SELECT file_id,object_id,status FROM user_file "
+                  "WHERE owner_name=? AND parent_path=? AND display_name=? FOR UPDATE");
+        q.addBindValue(owner);
+        q.addBindValue(parent);
+        q.addBindValue(finalName);
+        if (!q.exec()) { err = q.lastError().text(); break; }
+        if (q.next()) {
+            const qint64 rowId = q.value(0).toLongLong();
+            const qint64 rowObj = q.value(1).isNull() ? -1 : q.value(1).toLongLong();
+            const QString st = q.value(2).toString();
+            if (st == "active") {
+                if (rowObj == objectId) {          // 幂等：同(位置,对象)已存在，不重复计数
+                    resultId = rowId;
+                    done = true;
+                    break;
+                }
+                err = "并发同名冲突";
+                break;
+            }
+            q.prepare("UPDATE user_file SET object_id=?,is_dir=0,status='active' WHERE file_id=?");
+            q.addBindValue(objectId);
+            q.addBindValue(rowId);
+            if (!q.exec()) { err = q.lastError().text(); break; }
+            resultId = rowId;
+        } else {
+            q.prepare("INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+                      "VALUES (?,?,?,0,?,'active')");
+            q.addBindValue(owner);
+            q.addBindValue(parent);
+            q.addBindValue(finalName);
+            q.addBindValue(objectId);
+            if (!q.exec()) { err = q.lastError().text(); break; }
+            resultId = q.lastInsertId().toLongLong();
+        }
+
+        q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+        q.addBindValue(objectId);
+        if (!q.exec()) { err = q.lastError().text(); break; }
+        done = true;
+    } while (false);
+
+    if (!done) { db.rollback(); return -1; }
+    if (!db.commit()) { db.rollback(); err = db.lastError().text(); return -1; }
+    return resultId;
+}
+
+bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldDirRaw,
+                                       const QString& newDirRaw, QString& err)
+{
+    err.clear();
+    const QString oldDir = normalizeParent(oldDirRaw);
+    const QString newDir = normalizeParent(newDirRaw);
+    if (owner.isEmpty() || oldDir.isEmpty() || newDir.isEmpty()) { err = "参数为空"; return false; }
+    if (oldDir == newDir) return true;
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) { err = "数据库不可达"; return false; }
+    QSqlDatabase db = conn.database();
+    if (!db.transaction()) { err = "事务开启失败"; return false; }
+    bool ok = false;
+    do {
+        QSqlQuery q(db);
+        q.prepare("SELECT file_id,parent_path FROM user_file WHERE owner_name=? AND status='active' FOR UPDATE");
+        q.addBindValue(owner);
+        if (!q.exec()) { err = q.lastError().text(); break; }
+        QList<qint64> ids;
+        QList<QString> paths;
+        while (q.next()) {
+            const QString p = QDir::cleanPath(q.value(1).toString());
+            if (p == oldDir || p.startsWith(oldDir + "/")) { ids.append(q.value(0).toLongLong()); paths.append(p); }
+        }
+        for (int i = 0; i < ids.size(); ++i) {
+            const QString shifted = newDir + paths[i].mid(oldDir.size());
+            if (shifted.size() > kMaxParentChars) { err = "级联子路径超长"; ok = false; break; }
+            QSqlQuery u(db);
+            u.prepare("UPDATE user_file SET parent_path=? WHERE file_id=?");
+            u.addBindValue(shifted);
+            u.addBindValue(ids[i]);
+            if (!u.exec()) { err = u.lastError().text(); ok = false; break; }
+            ok = true;
+        }
+        if (ids.isEmpty()) ok = true;   // 空操作（未迁移旧树无条目）
+        if (!ok) break;
+        ok = db.commit();
+    } while (false);
+    if (!ok) db.rollback();
+    return ok;
+}
+
+bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& dirRaw, QString& err)
+{
+    err.clear();
+    const QString dir = normalizeParent(dirRaw);
+    if (owner.isEmpty() || dir.isEmpty()) { err = "参数为空"; return false; }
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) { err = "数据库不可达"; return false; }
+    QSqlDatabase db = conn.database();
+    if (!db.transaction()) { err = "事务开启失败"; return false; }
+    bool ok = false;
+    do {
+        QSqlQuery q(db);
+        q.prepare("SELECT file_id,object_id,parent_path FROM user_file WHERE owner_name=? AND status='active' FOR UPDATE");
+        q.addBindValue(owner);
+        if (!q.exec()) { err = q.lastError().text(); break; }
+        QList<qint64> ids;
+        QList<QVariant> objs;
+        while (q.next()) {
+            const QString p = QDir::cleanPath(q.value(2).toString());
+            if (p == dir || p.startsWith(dir + "/")) { ids.append(q.value(0).toLongLong()); objs.append(q.value(1)); }
+        }
+        if (ids.isEmpty()) { ok = db.commit(); break; }   // 空操作
+        for (int i = 0; i < ids.size(); ++i) {
+            q.prepare("UPDATE user_file SET status='deleted' WHERE file_id=?");
+            q.addBindValue(ids[i]);
+            if (!q.exec()) { err = q.lastError().text(); ok = false; break; }
+            if (!objs[i].isNull()) {
+                q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
+                          "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                q.addBindValue(objs[i].toLongLong());
+                if (!q.exec()) { err = q.lastError().text(); ok = false; break; }
+            }
+            ok = true;
+        }
+        if (!ok) break;
         ok = db.commit();
     } while (false);
     if (!ok) db.rollback();
