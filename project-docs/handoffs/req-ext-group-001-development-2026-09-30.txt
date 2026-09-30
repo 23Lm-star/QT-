@@ -1,6 +1,6 @@
 # handoff: REQ-EXT-GROUP-001
 branch: codex/req-ext-group-001-membership
-head: 8757ad6
+head: 4dcc5a6
 tier: LARGE
 node: development
 audit: pending
