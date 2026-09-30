@@ -95,7 +95,15 @@
 
 **下一节点**：integration（owner 执行 no-ff 合并 + 合并结果三门复跑）→ merged。
 
-## 关键风险（design 对照）
+## 集成（2026-09-30，完成）
+- **merge**：`codex/req-ext-file-001-file-assets@bf43c58` no-ff 合入 master（主人授权、不 push）→ **`master@9faae6c93eea55674eb1b3bd8f9699232c16a7b7`**，与并行已合 SESSION-001（`cf2103e`）零冲突。
+- **三事实行（全部达成）**：①独立审计 ACCEPT（`5a07316…/audit-report.md`，无阻塞）②冻结面 diff 空（protocol.h×2 零命中）③合并结果 pipeline green（`9faae6c`：build GREEN / test honest-0 / audit PASS）。
+- **合并态复跑（file-001 面）**：entry_ops 43/43、dedup 13/13、sec001 适配副本 48/48、cross_tree 37/37。
+- **合并态跨面复核（SESSION-001 面）**：supervised 对抗探针 **8/8 PASS**（唯一登录特性与 file-001 无互相破坏）；其 e2e **15/16**，唯一 FAIL=E7a 调用**冻结原件** `REQ-EXT-SEC-001/verify.py` 断言"物理落盘"语义，被 D5（owner 批准）按设计失效——权威 post-D5 回归=适配副本（本需求 48/48）。判别实验：清净 DB 复跑原件只剩 K1c/K1f/K2b 三条物理断言（设计预期），此前附加的 K1i 失败=残留条目+原件无清场（F-2 族）非产品回归。
+- **台账（非阻塞）**：session-001 侧若在合并后重跑 e2e，E7a 应改指适配副本 `project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py`（或接受其 16→15 的语义差异并在其记录注明）；原件 `verify.py` 按 file-001 决策保持冻结不动。
+- 证据：`build/evidence/codex-req-ext-file-001-file-assets/9faae6c…/`（四套件+三门+跨面 e2e/probes/原件判别实验日志）；push 待主人明示。
+
+**下一节点**：merged（已达成）；push 待主人指令。
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
 2. 32 字节展示名 + `(1)` 后缀溢出 → 后缀插入时截基名保留扩展名，规则写进 T3 测试。
 3. MySQL 事务与连接池：引用计数并发必须同连接 `SELECT...FOR UPDATE` + `COMMIT`；池按线程隔离，单连接对象操作串行化在 socket 线程内（现状 handlMsg 即同线程）。
