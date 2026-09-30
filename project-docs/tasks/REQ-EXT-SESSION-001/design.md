@@ -36,7 +36,7 @@
 ## 4. 客户端改动点
 
 1. `Client`：QSettings 键 `client/unique_id`，首启生成 `QUuid::createUuid()` 32hex 并落盘（loadconfig 区，client.cpp:51-81）。
-2. 登录发送点（`on_login_PB_clicked`，dev 段实测打包代码后）：caMsg 在验证码 NUL 之后追加 32 字节 ID；uiMsgLen 相应 +33。
+2. 登录发送点 `on_login_PB_clicked`(Client/client.cpp:375-381)：caMsg 在验证码 NUL 之后追加 32 字节 ID；`mkPDU(captchaBytes.size()+1)` 与 memcpy 长度相应扩 +32。
 3. 被踢 UX：复用既有 `onSocketDisconnected`→(m_loggedIn)→提示文案改为含"账号已在其他设备登录或连接被服务端关闭"+ `forceReLogin` 回登录页；**不新增 PDU、不加原因通知**。
 
 ## 5. 验收映射（evidence harness，仿 sec001/entry_ops 双件套模式，py3.13）
@@ -52,7 +52,7 @@
 | E7 SEC-001 全量 48 回归 + 一对一/离线/文件冒烟 + `git diff master...HEAD` 对两 protocol.h 零命中 + pipeline 三脚本绿 | §6.7 |
 
 ## 6. 风险与对策
-- R1 验证码负载兼容：若 dev 实测老客户端验证码段**无** NUL 结尾（fromUtf8 依赖 malloc 尾零），改为按 `uiMsgLen` 与固定 6 字符验证码长度切分（6 后跳填充取 ID）——两方案都在零协议约束内，实测后择一。
+- R1 验证码负载兼容：**已实测关闭**——客户端登录打包本就 NUL 结尾（Client/client.cpp:376 `mkPDU(size+1)`、:381 memcpy `size+1`），D1 NUL 分隔方案一成立；老客户端（不追加 ID）剩余字节=0，解析得空 ID，兼容闭环。
 - R2 登记表与库脱节：仅存登录成功路径写表；任何手工 SQL 改 login_version 不反映到运行中进程——档案语义而非访问语义，文档声明，不做轮询同步。
 - R3 abort 时机与在途写：handlMsg 内 abort 后仍 return nullptr，既有 bytesWritten/下载清理路径已被 clientOffLine 覆盖（:443-449），断言 E1/E4 含下载中断场景。
 
