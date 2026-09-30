@@ -87,7 +87,13 @@
 - **非阻塞在册**：`/filesys/…` 判别盲区已随 F-5 收紧；`claim-check` 仍缺 manifest.yaml（工具性缺口，与首轮审计同姿态，不冒充 PASS）；handoff 校验器 `NODES` 无 `independent-test` 枚举（会话用 `node: test`）。
 - 实测（repair2 二进制）：entry_ops **43/43**、dedup **13/13**、sec001 **48/48**、cross_tree **37/37**；三门 `9fbdb70` GREEN/honest-0/PASS；证据 `build/evidence/codex-req-ext-file-001-file-assets/9fbdb70/`。
 
-**下一节点**：第二轮 independent test（新会话）→ 若 PASS 再 independent audit（新会话只读，重点 F-4/F-5 收口与夹具判别力）。两道 ACCEPT 后方可 integration 三事实行 → merge no-ff。档位 LARGE 不变；两 `protocol.h` 全程零命中。
+## 门次结果（2026-09-30）：第二轮独立测试 **PASS** + 第二轮独立审计 **ACCEPT**
+- 测试（`9fbdb70` clean worktree，只报不改）：entry_ops 43/43、dedup 13/13、sec001 48/48、cross_tree 37/37（含首轮干扰轮次原样转录，根因=他需求测试节点整机 taskkill，见 F-6）；三门 GREEN/honest-0/PASS；自造 rp2probe 撞键对验证收敛策略 boot1/boot2 逐字节稳定。报告 `build/evidence/…/9fbdb70…/test-report.md`。
+- 审计（detached @`5a07316`，纯静态只读）：F-4/F-5 判定 CLOSED（De Morgan 判别分区无缝、loser 无 parent 改写无 1062、deleted 静默跳过重放稳定、dir-self prepend 取列正确、NULL 跳引用、失败全回滚）；夹具判别力对 `915eeff` 逐条核验；诚实性核验（4/4 harness 盘=提交、原始日志 FAIL=0）；F-3/F-2/范围契约重采样均闭合；协议零命中。**无阻塞**。ACCEPT 报告 `build/evidence/…/5a07316…/audit-report.md`。
+- 残留非阻塞台账：F-6 并行节点错峰（共享 5000/MySQL 与整机 taskkill 风险）；带盘符+尾部斜杠旧行的告警泄漏（夹具不可触发，FILE-002 收紧）；handoffs 路径清单外先例；validator NODES/`manifest.yaml` 工具缺口；connect.config 未入库构建输入（环境事实已录）。
+- **集成三事实行状态**：①独立审计 ACCEPT ✓（本报告+证据在案）②冻结面 diff 空 ✓（protocol.h×2 零命中）③pipeline green on merged result = **待 merge 后主链复跑**。三事实齐即 merge no-ff 进主干；push 单独待主人。
+
+**下一节点**：integration（owner 执行 no-ff 合并 + 合并结果三门复跑）→ merged。
 
 ## 关键风险（design 对照）
 1. `flushfile` 从 DB 渲染后，未迁移目录显示为空 → T6 先迁移后切换渲染，或渲染层 DB 优先 + 物理回退（双读过渡，本分支取后者更稳）。
