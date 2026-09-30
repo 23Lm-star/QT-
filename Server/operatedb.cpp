@@ -1274,6 +1274,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
     quint64 version = q.value(1).toULongLong();
 
     if (request.operation == GroupAcceptInvitation || request.operation == GroupRejectInvitation) {
+        if (groupStatus != "active") { db.rollback(); return groupFailure(-1020); }
         q.prepare("SELECT target_name,status,expires_at,inviter_name FROM group_invitation WHERE invitation_id=? FOR UPDATE");
         q.addBindValue(QVariant::fromValue<qulonglong>(request.invitationId));
         if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-1018); }
@@ -1282,7 +1283,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         }
         const bool expired = q.value(2).toDateTime() < QDateTime::currentDateTime();
         if (request.operation == GroupAcceptInvitation) {
-            if (expired || groupStatus != "active") { db.rollback(); return groupFailure(-1020); }
+            if (expired) { db.rollback(); return groupFailure(-1020); }
             q.prepare("SELECT status FROM group_member WHERE group_id=? AND user_name=? FOR UPDATE");
             q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
             if (!q.exec()) { db.rollback(); return groupFailure(-1021); }
