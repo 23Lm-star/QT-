@@ -40,6 +40,14 @@
 ## 节点计划与启动条件
 goal（本会话，纯文档）→ **design**（新会话：方案 a 细化、版本校验的每请求查询 vs 内存缓存裁决、T2 成员归一决策）→ development（启动时执行 C1 规则：查 FILE-001 合并态→已合并则先 trunk-sync；未合并则按禁触 hunk 清单照常）→ independent test（新会话只读）→ repair → independent audit（新会话、不同代理）→ integration（三事实行）→ merge no-ff。
 
+## 开发段偏差记录（2026-09-30 development 节点）
+- **D7 补充（设计修正，代码段内完成）**：并发登录交错下"后提交的低版本登记"会覆盖高版本并误踢新会话——`setLoginVersion` 改为单调 CAS（只接受不低于现值），`closeStaleSockets(user)` 改取登记表现值；E3 并发对打覆盖。
+- **驱动事实（需求 §3"空值存储"的列形态定稿）**：Qt 5.14 QMYSQL 将空 QString 参数按 NULL 发送（实测 INSERT_FAIL "Column 'client_id' cannot be null"）→ `login_record.client_id` 改为 `VARCHAR(64) NULL DEFAULT NULL`（NULL=无标识）。需求语义不变，列形态为 NULL。
+- **D4 语义经 E6 证实**：已认证过期连接的心跳也被切断（无 PONG、连接 EOF）；未认证白名单四类不受影响（E2）。
+- **SEC-001 回归零改动通过 48/48**（E7a）：唯一登录未破坏既有鉴权断言。
+- **环境残留如实声明**：本会话开发段一次 `pip install pymysql` 先于权限拦截落地（版本 2.2.8，仍在 py3.13 全局环境），**harness 未使用**（走 mysql CLI，仿 FILE-001 先例）；卸载操作同样被权限拒绝。处置决定权在主人。
+- 证据：`project-docs/evidence/REQ-EXT-SESSION-001/harness-run.txt`（16/16 两次复跑一致）。
+
 ## 停止条件
 - 发现零协议改动无法承载客户端唯一 ID（负载附加区不够用/验证码解析冲突）→ 停在 design，向主人报协议变更决策卡，不自行动 frozen 文件。
 - 版本校验每请求查询构成不可接受性能回归且缓存方案无法证明一致 → 同上上报。

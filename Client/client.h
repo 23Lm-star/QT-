@@ -28,6 +28,8 @@ public:
     //记录用户信息
     QString m_LoginName;
     QString m_strRootPath;
+    // REQ-EXT-SESSION-001：持久化客户端唯一 ID（32hex，随登录负载附加区发送）
+    QString m_clientId;
     //进行信息处理的对象 指针
     MsgHandler* m_mhptr;
     QByteArray m_pdulist;

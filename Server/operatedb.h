@@ -15,7 +15,9 @@ public:
     //执行注册用户操作函数
     bool handleRegit(char* strname,char*strpwd);
     //登录用户
-    int handleLogin(char*strname,char*strpwd);
+    // REQ-EXT-SESSION-001：clientId=登录携带的客户端唯一标识（可空）；成功(ret==1)时
+    // outVersion=本次登录在事务内原子分配的用户域版本号
+    int handleLogin(char*strname,char*strpwd,const QString& clientId,quint64& outVersion);
     //下线
     void handleOffLine(const char* strname);
     //查找用户

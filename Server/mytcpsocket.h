@@ -22,6 +22,8 @@ public:
     // REQ-EXT-SEC-001：连接认证状态（仅服务端登录成功/注销/断线时写入，客户端不可覆盖）
     bool m_actorAuthenticated = false;
     quint64 m_actorSessionVersion = 0;
+    // REQ-EXT-SESSION-001：登录时服务端事务分配的用户域版本（0=未认证），每请求处理前比对登记表
+    quint64 m_loginVersion = 0;
     //存储传输的pdu字节流
     int a;
     QByteArray m_dpulist;

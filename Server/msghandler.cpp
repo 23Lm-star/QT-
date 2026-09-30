@@ -247,9 +247,12 @@ PDU *MsgHandler::rigist()
 }
 //处理登录请求，同时需要更新socket对象的客户用户名
 // REQ-EXT-SEC-001：authOk 仅在服务端凭据校验通过时为 true，由连接层据此绑定 actor_context
-PDU *MsgHandler::login(QString &strname, bool &authOk)
+// REQ-EXT-SESSION-001 D1：客户端唯一 ID 走登录 caMsg 验证码 NUL 之后的附加区（零协议改动）；
+// loginVersion=服务端事务内分配的版本号，由连接层绑定为权威会话版本
+PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
 {
     authOk = false;
+    loginVersion = 0;
     int remaining = 0;
     int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen, remaining);
     if (captchaRet != 0) {
@@ -264,12 +267,32 @@ PDU *MsgHandler::login(QString &strname, bool &authOk)
     //取出用户名和密码
     QString username=fixedString(pdu->caData,32);
     QString userpwd=fixedString(pdu->caData+32,32);
+    // D1：验证码串（首个 NUL 前，NUL 必在 uiMsgLen 界内查找）之后的剩余字节=客户端 ID；
+    // 无附加区/越界=空 ID（老客户端兼容）；只保留可打印 ASCII，截断 64（DB 列宽）
+    QString clientId;
+    {
+        const uint cap=pdu->uiMsgLen;
+        uint nul=0;
+        while(nul<cap && pdu->caMsg[nul]!='\0'){ ++nul; }
+        if(nul<cap && cap>nul+1){
+            QByteArray raw(pdu->caMsg+nul+1, static_cast<int>(cap-nul-1));
+            QByteArray clean;
+            for(char c: raw){
+                if(c=='\0'){ break; }
+                if(c>=0x21 && c<=0x7e){ clean.append(c); }
+                if(clean.size()>=64){ break; }
+            }
+            clientId=QString::fromUtf8(clean);
+        }
+    }
     //在数据库中检查用户名和密码是否一致或有问题
-    int ret=OperateDB::instance().handleLogin(username.toUtf8().data(),userpwd.toUtf8().data());
+    int ret=OperateDB::instance().handleLogin(username.toUtf8().data(),userpwd.toUtf8().data(),clientId,loginVersion);
     qCDebug(lcAuth)<<"login ret"<<ret<<endl;
     if(ret==1){//记录已登录的用户名
         strname=username;
         authOk=true;
+    }else{
+        loginVersion=0;
     }
     //将登录结果打包进响应报文并返回
     PDU* respdu=mkPDU();
