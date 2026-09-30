@@ -48,6 +48,13 @@ goal（本会话，纯文档）→ **design**（新会话：方案 a 细化、�
 - **环境残留如实声明**：本会话开发段一次 `pip install pymysql` 先于权限拦截落地（版本 2.2.8，仍在 py3.13 全局环境），**harness 未使用**（走 mysql CLI，仿 FILE-001 先例）；卸载操作同样被权限拒绝。处置决定权在主人。
 - 证据：`project-docs/evidence/REQ-EXT-SESSION-001/harness-run.txt`（16/16 两次复跑一致）。
 
+## 审计节点 REJECT 处置（2026-09-30 repair 节点）
+Codex 审计结论 REJECT，理由=一次未归因的探针 P4 非确定性失败（-99 后端口拒绝连接；诊断与最后一次复跑正常，原始临时日志随 worktree 销毁）。三项发现 + 处置：
+- **medium（探针不稳定）**：产品侧证伪。P4 原序列定向复现 3/3 干净（服务端全程存活）；失败签名"端口拒绝"= Server 进程缺席，harness 与探针均按镜像名 `taskkill /IM Server.exe` 互杀是唯一致命公共点（端口 5000 单实例）。处置：新增 `run_supervised.py`（端口占用即拒跑、启动记 PID、只按 PID 清理、子进程 UTF-8 编码修正）+ 探针加 PID 监护 `guard()`（死亡=SERVER_DIED 退出码 3，归因外部杀进程/崩溃而非断言失败；监护改字节比对防 GBK 误判）。修复后监督跑 8/8 PASS、进程存活。
+- **low（test.ps1 注册数 0）**：仓库基线事实（manifest: test=0 registered；注册归 REQ-TEST-008B），非本分支缺陷，不改。
+- **low（design.md 旧 NOT NULL 文案）**：已修订为 NULL 形态并加修订注记。
+- 未动产品源码、未动验收标准。复审计要求：保留审计原始日志（不得随 worktree 销毁）、套件串行执行、探针用 `run_supervised.py`。
+
 ## 停止条件
 - 发现零协议改动无法承载客户端唯一 ID（负载附加区不够用/验证码解析冲突）→ 停在 design，向主人报协议变更决策卡，不自行动 frozen 文件。
 - 版本校验每请求查询构成不可接受性能回归且缓存方案无法证明一致 → 同上上报。

@@ -1,0 +1,1 @@
+[E] 端口 5000 已被占用：先按 PID 停掉现有 Server.exe（taskkill /PID <pid> /F），不要用 /IM Server.exe 与并行套件互杀

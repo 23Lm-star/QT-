@@ -18,7 +18,8 @@
 
 - `Server/migrate_ext_session_001.sql`（+`_rollback.sql`，仿 FILE-001 双文件先例）：
   - `ALTER TABLE user_info ADD COLUMN login_version BIGINT NOT NULL DEFAULT 0;`
-  - `CREATE TABLE login_record (id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(32) NOT NULL, client_id VARCHAR(64) NOT NULL DEFAULT '', login_version BIGINT NOT NULL, login_time DATETIME NOT NULL, KEY idx_user_ver (username, login_version)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
+  - `CREATE TABLE login_record (id INT AUTO_INCREMENT PRIMARY KEY, username VARCHAR(32) NOT NULL, client_id VARCHAR(64) NULL DEFAULT NULL, login_version BIGINT NOT NULL, login_time DATETIME NOT NULL, KEY idx_user_ver (username, login_version)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
+    （修订 2026-09-30：审计发现本行残留旧 `NOT NULL DEFAULT ''` 表述——实测 QMYSQL 空 QString 参数按 NULL 发送，实现/迁移/种子均为 NULL 可空形态，见 task.md 偏差记录；本行同步为事实。）
 - `project-docs/init_test_data.sql`：user_info 建表加同列 + login_record 建表（种子不插登录行）。
 - `handleLogin` 签名扩展（唯一调用点 msghandler.cpp:268）：`int handleLogin(char* name, char* pwd, const QString& clientId, quint64& outVersion)`；返回 1 时 outVersion=新版本。凭据失败路径不 +1、不写记录（登录记录=成功登录档案，验收 §6.2 措辞即此）。
 
