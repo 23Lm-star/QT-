@@ -61,5 +61,10 @@
   - **FINDING-DEV-4**：验收 5 的"过期临时会话清理"在代码库本无调度器（FILE-001 亦无）；本节点不新增清理器，改为验证不变式（清理后对象/条目零影响）。
   - **FINDING-DEV-5**：`MKDIR` 非幂等（目录已存在回 `ret=0`）；用户根仅首次注册时创建——既有行为，仅记录。
 
+- 2026-10-01 **independent test**：全新会话，detached worktree @ `c452eb3`（只读），从零构建并独立重跑。**结论 PASS**（0 条归因候选缺陷）：`fastupload_e2e.py` 46/46（dist 形态 ×2 + Server-cwd 形态 ×2，重跑稳定）；FILE-001 四套件 13/43/37/48 全绿；build GREEN；`test.ps1` honest-0；`audit.ps1` RED = **两个** frozen 命中（Client + Server/protocol.h），判为批准范围内预期签名。详见 `project-docs/evidence/REQ-EXT-FILE-002/independent-test/report.md`。
+  - **偏差复核**：`schema_version=2026100102`（`operatedb.h:22` GROUP-002=2026100101、`:26` FILE-002=2026100102；`operatedb.cpp:96-98` 并入 required）——事实成立、属批准范围，`design.md:87` 数值应更正。
+  - **FINDING-DEV-1 判为不可复现**：本机 PS5.1（默认 gb2312 / ACP 936）下，默认、`-Encoding Default`、cmd `chcp 936`、`chcp 65001`、LF/CRLF 六种组合，`audit.ps1` **均**解析出两条冻结路径并报两个 HIT；dev 的 `run-logs/audit.log` 仅一项，与当前环境不符。副结论：冻结检查实际覆盖 `Server/protocol.h`。待 dev 提供确切调用环境或撤回。
+  - **FINDING-DEV-2/3/4/5 复核**：全部确认（2 属运行形态，本轮已复现其假红并规避；3 代码事实成立且当前库 `LIKE '/filesys/%'` 计数=0，潜伏未触发；4 无清理调度器；5 `MKDIR` 非幂等）。
+
 ## 下一节点
-独立测试（新会话、建议不同 agent）：干净 detached worktree @ `c452eb3`，独立重跑 `fastupload_e2e.py` + FILE-001 四套件 + pipeline 三门，并复核上述 DEV-1/FINDING-DEV-1..5。按 L6 沿用 `node: test`。
+独立审计（新会话、不同代理、detached worktree 只读 `c452eb3`）：复核冻结面三项、`schema_version` 偏差、FINDING-DEV-1（不可复现）与 CodeGraph 影响闭包，不采信测试节点 harness 结论。
