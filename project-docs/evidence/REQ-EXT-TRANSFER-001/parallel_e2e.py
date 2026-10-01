@@ -5,7 +5,8 @@
 # 第 4 个 29 / 暂停继续取消按钮 / 大文件摘要不卡 UI）属 design §6.3 人工清单，见文件末尾 NOTE。
 # 例外：T-19 逐字节复现真实客户端的并行上传握手序列（97→98→29→30→31/32）——裸 29 看不见
 # "97 秒传占位吞掉上传名额"（AUD-1 回归锚点）；T-20 为空闲/写盘竞态不变量（AUD-4 回归锚点）；
-# T-21 为 98 回带请求标识契约（AUD-3 服务端锚点）；T-22 为客户端队列静态契约（AUD-2/F-3）。
+# T-21 为 98 回带请求标识契约（AUD-3 服务端锚点）；T-22 为客户端队列静态契约（AUD-2/F-3）；
+# T-23 为 97 纯占位纳入空闲回收（N-1 回归锚点，复用 T-13 静默窗口）。
 #
 # 与 design §6.2 的历史差异（已收口）：
 #   D-a T-06：原 design 写"8MB×1 + 64KB×3"共 4 条下载流，与主人裁定的 D6（下载上限 3）冲突；
@@ -565,11 +566,23 @@ for i in (701, 702, 703):
     up_init(c9, i, DST, f"t13_{i}.bin", 800)
 r = up_init(c9, 704, DST, "t13_704.bin", 800)
 check("T-13a", "3 槽占满时第 4 个 INIT 被拒", r is not None and r[1][0] == 0, "")
+# T-23（N-1 回归锚点，复用本用例 82s 静默窗口，零额外耗时）：97 未命中的 id=0 纯占位建槽后
+# 必须起空闲计时，静默 >60s 由 D5 回收——否则残留暂存槽/会话行只能等 3600s TTL。
+_pl23 = NONCE + b"T23" + b"N" * 600
+_r23 = fastcheck(c9, SHA(_pl23), "t23_n1.bin", DST, len(_pl23), "d4" * 16)
+_q23 = ("SELECT status FROM upload_session WHERE owner_name='"
+        + U + "' AND display_name='t23_n1.bin' ORDER BY session_id DESC LIMIT 1")
+_st23_before = sql(_q23)
 time.sleep(82)
 r = up_init(c9, 704, DST, "t13_704.bin", 800)
 st = sql(f"SELECT COUNT(*) FROM upload_session WHERE owner_name='{U}' AND status='expired'")
 check("T-13b", "静默 > 60s 后槽位回收（第 4 个 INIT 成功）", r is not None and r[1][0] != 0, "")
 check("T-13c", "被回收会话置 expired", int(st) >= 3, f"expired={st}")
+_st23_after = sql(_q23)
+check("T-23", "97 纯占位静默 >60s 被空闲回收（N-1 回归锚点）",
+      _r23 is not None and _r23[1][0] != 0 and _r23[1][1] == 0
+      and _st23_before == "uploading" and _st23_after == "expired",
+      f"97ret={_r23[1][0] if _r23 else None} before={_st23_before} after={_st23_after}")
 abort(c9, 704)
 c9.close()
 

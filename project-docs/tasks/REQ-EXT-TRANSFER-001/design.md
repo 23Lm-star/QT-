@@ -179,6 +179,11 @@ int     m_rrCursor = 0;
 - `UPLOAD_IDLE_REAP_SEC = 60` 定义在 `Server/mytcpsocket.h`（服务端本地调优常量，**不入冻结面**）。
 - 下载不参与回收（D5）；下载流的超时由既有 90s 僵尸连接清扫兜底。
 
+> **repair 补充（N-1，2026-10-01）**：97 秒传预检查留下的 id=0 **纯占位**在**建槽时即写 `lastProgressMs`**，纳入上述回收口径。
+> 此前该字段恒为 0，而回收条件要求 `lastProgressMs > 0`，故占位槽与其 `upload_session` 行**永不被回收**，只能等会话 3600s TTL
+> 或下一次 97 覆盖（有界，但残留）。另：占位被回收时同步使"待 29 采纳"登记 `m_pendingFastcheck` 失效（按 `sessionId` 精确匹配），
+> 避免 60s 后迟到的 29 去采纳一条已 `expired` 的会话行。回归锚点见 `parallel_e2e.py` **T-23**（复用 T-13 静默窗口）。
+
 ### 3.5 断线语义
 
 `clientOffLine()` 中：清空 `m_downloads`（逐个 close+delete）、清空 `m_downloadRing`、对每个 `m_uploads` 走 Aborted 并清表，**不写 DB**（与今日一致：staging 与 `upload_session` 行留给既有 3600s TTL 收敛）。今日 `clientOffLine` 对单流不做 DB 写，本设计保持同一语义（最小改动）。

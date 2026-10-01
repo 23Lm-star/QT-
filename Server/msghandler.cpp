@@ -1288,6 +1288,12 @@ void MsgHandler::abortUpload(quint64 id)
         OperateDB::instance().updateUploadOffset(cp->sessionId, confirmed);
         OperateDB::instance().finishUploadSession(cp->sessionId, "expired");
     }
+    // N-1 连带：97 占位被空闲回收时，其"待 29 采纳"的登记（m_pendingFastcheck）必须一并失效——
+    // 否则 60s 后到达的 29 会采纳一条已 expired 的 upload_session 行。按 sessionId 精确匹配，
+    // 只影响被回收的正是该挂起会话的场合。
+    if (m_pendingFastcheck.active && m_pendingFastcheck.sessionId == cp->sessionId) {
+        m_pendingFastcheck.active = false;
+    }
     cp->session.reset();
     m_uploads.remove(id);
     qCWarning(lcFs) << "[transfer] 释放上传槽 id=" << id << " conn=" << m_connId
@@ -1322,6 +1328,10 @@ PDU *MsgHandler::uploadfilefastcheck()
     // 97 无 transfer_id（P2：客户端预检查保持单飞）→ 始终落在旧单流槽（id=0）
     m_uploads.remove(TRANSFER_ID_LEGACY);
     UploadCtx& ctx = currentUpload();
+    // N-1：97 纯占位此前从不置 lastProgressMs，永不满足 D5 的空闲回收条件（要求 lastProgressMs > 0），
+    // 残留的 id=0 暂存槽与 upload_session 行只能等 3600s TTL 或下一次 97 覆盖。建槽即起空闲计时，
+    // 使其纳入既有回收口径（60s 无进展即 Active→Aborted，会话 expired、staging 保留）。
+    ctx.lastProgressMs = QDateTime::currentMSecsSinceEpoch();
     // AUD-1 修复：97 是**预检查/暂存登记**，不是一次上传，其 id=0 槽不得占用上传并发名额
     // （activeUploadCount() 按此标记排除）。否则并行客户端"每文件先 97 再 29"会为每个文件留下
     // 一个被计入的占位，使同一连接第 3 路新个人上传的 INIT 被上限误拒（违背 D6 上传=3 / 验收 5）。
