@@ -337,3 +337,94 @@ void* ConCurrentAlloc(size_t size);
 void  ConCurrentFree(void* ptr);
 ```
 
+---
+
+## 8. 群接口（REQ-EXT-GROUP-001 / 002）
+
+### 8.1 群消息 PDU（88–96，REQ-EXT-GROUP-002）
+
+| 枚举值 | 常量 | 方向 | 说明 |
+|--------|------|------|------|
+| 88 | `ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_REQUEST` | C→S | 发送群消息；载荷 `client_msg_id` + `content`，无 sender 字段 |
+| 89 | `ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_RESPOND` | S→C | 已持久化确认：`code` + `client_msg_id` + `seq` + `server_msg_id` + `created_at_ms` |
+| 90 | `ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT` | S→C | 在线成员推送（仅服务端生成）：`group_id` + `seq` + `server_msg_id` + `sender` + `msg_type` + `created_at_ms` + `content` |
+| 91 | `ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST` | C→S | 按游标拉取：`mode`(0 前向补齐/1 后向翻页) + `cursor_seq` + `limit`(1–100) |
+| 92 | `ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_RESPOND` | S→C | `code` + `mode` + `has_more` + `next_cursor` + `group_last_seq` + `unread_count` + `count` + N×消息记录 |
+| 93 | `ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST` | C→S | 已读确认：`read_seq` |
+| 94 | `ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND` | S→C | `code` + `effective_seq`（服务端实际生效的单调游标） |
+| 95 | `ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST` | C→S | 未读摘要，无业务字段；按 actor 汇总其全部 active 群 |
+| 96 | `ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND` | S→C | `code` + `count` + N×{`group_id` + `last_seq` + `last_read_seq` + `unread`} |
+
+- 88/90/91/93/95 必须进 SEC-001 actor 门（未加白名单）；90 由服务端生成，客户端发入的同名类型一律丢弃并记审计日志。
+- 生命周期 PDU（GROUP-001）为 60–87：建群/邀请/接受/拒绝/退出/移除/任免/转让/解散/群列表/成员列表/邀请查询请求-响应，成员事件 84、邀请事件 85。编号只追加、不重排。
+
+### 8.2 群信封与载荷编码
+
+```cpp
+// 文件：protocol.h（Client / Server 同值同名）
+static const quint16 GROUP_PROTOCOL_VERSION = 1;
+static const quint16 GROUP_ENVELOPE_LENGTH  = 20;
+// 信封 = version(u16) + envelope_length(u16) + request_id(u64) + group_id(u64)，全部小端手写编解码
+inline void groupAppendU16/U32/U64(...);   // groupAppendString = u32 length + UTF-8 bytes
+inline bool groupReadU16/U32/U64/String(...);  // 越界返回 false
+```
+
+- 响应在信封后附 `code`(u32，0 成功 / 负数为业务错误)，再附业务字段；业务字段为定宽整数或 `u32 length + UTF-8 bytes` 字符串。
+- 服务端先验 `uiMsgLen`、信封长度、版本与每个字段边界，`offset != payload.size()` 即判越界载荷并拒绝；未知类型不进群入口。
+- 校验：`content` 非空且 ≤2000B UTF-8；`client_msg_id` 非空且 ≤64B；`limit` ∈ [1,100]；`mode` 只能 0/1。
+- 消息记录编码（92 内复用）：`seq`(u64) + `server_msg_id`(u64) + `sender`(string) + `msg_type`(u8: 0 文本/1 系统) + `created_at_ms`(u64) + `content`(string)。
+
+### 8.3 `group_*` 表契约
+
+| 表 | 来源 | 关键列与键 | 语义 |
+|----|------|-----------|------|
+| `group_info` | GROUP-001 | `group_id` 自增主键；`group_name`、`creator_name`、`status('active'/'dissolved')`、`version`；`last_seq`（GROUP-002 追加） | 群基本信息。`version` 随成员/角色/资料变化递增；`last_seq` 为群内序号水位，事务内原子递增；解散用状态更新不物理删除 |
+| `group_member` | GROUP-001 | 主键 `(group_id, user_name)`；`role('owner'/'admin'/'member')`、`status('active'/'left'/'removed')`、`last_read_seq`、`joined_at` | 成员关系唯一事实源，也是未读游标载体。重入只改回 `active` 不插第二行；有效成员由 `status='active'` 判定 |
+| `group_invitation` | GROUP-001 | `invitation_id` 主键；`status('pending'/'accepted'/'rejected'/'expired')`；唯一键 `(group_id, request_key)` | 群邀请及其幂等键；接受前重新比较 `expires_at` |
+| `group_message` | GROUP-002 | `msg_id` 自增主键；唯一键 `uk_group_seq(group_id, seq)`、`uk_group_client_msg(group_id, client_msg_id)`；索引 `idx_group_created(group_id, created_at)`；`sender_name`、`msg_type('text'/'system')`、`content TEXT`、`created_at DATETIME(3)` | 群消息持久化。`sender_name` 由服务端 actor 推导；`client_msg_id` 为幂等键（系统消息为 NULL，NULL 互不相等故可多行）；排序游标一律以 `seq` 为准 |
+
+- 迁移版本：GROUP-001 `2026093001`、GROUP-002 `2026100101`，写入 `schema_version`；`OperateDB::checkSchemaVersion()` 取文件资产/群/群消息三者 `qMax`，低版本 fail-fast，不运行时静默建表。
+
+### 8.4 OperateDB 群接口
+
+```cpp
+// 业务层内部操作码（非网络 PDU 编号）
+enum GroupOperation {
+    GroupCreate = 1, GroupInvite, GroupAcceptInvitation, GroupRejectInvitation,
+    GroupLeave, GroupRemoveMember, GroupSetRole, GroupTransferOwner,
+    GroupDissolve, GroupList, GroupListMembers, GroupQueryInvitations, GroupSummary,
+    GroupSendMessage, GroupPullMessages, GroupReadConfirm, GroupUnreadSummary
+};
+struct GroupRequest { /* groupId, targetName, requestKey, role,
+                        clientMsgId, content, pullMode, cursorSeq, limit, readSeq */ };
+struct GroupMessageRecord { quint64 seq, msgId; QString sender; quint8 msgType;
+                            quint64 createdAtMs; QString content; };
+struct GroupResult { int code; QByteArray responseBody; QStringList notifyUsers;
+                     quint64 groupId, version; int eventType;
+                     GroupMessageRecord message; bool broadcastMessage; };
+
+GroupResult handleGroupOperation(const GroupRequest&, const QString &actor);        // 生命周期
+GroupResult handleGroupMessageOperation(const GroupRequest&, const QString &actor); // 88–96
+```
+
+### 8.5 业务错误码
+
+| 码 | 含义 |
+|----|------|
+| 0 | 成功 |
+| -1001 / -1002 | 未认证主体 / 数据库不可达 |
+| -2001 / -2002 | 非法信封（版本或长度不符）/ 越界载荷（字段边界或取值非法） |
+| -2101 | 非成员（非成员/已退出/被移除即时失效） |
+| -2102 | 群不存在或已解散 |
+| -2103 | 内容或幂等键非法（空/超长） |
+| -2104 | 幂等冲突异常（同键异发送者等） |
+| -2105 | 序号分配或入库失败（含 DB 失败） |
+
+### 8.6 客户端可见操作
+
+- 发送：发 88，收 89 前为「发送中」，成功转「已发送」，失败可对同一 `client_msg_id` 重试（服务端幂等）。
+- 接收：`Client::handlMsg` 收 90，按 `group_id` 路由到对应 `GroupChat`；未打开窗口只累加未读并提示；90 与 92 结果按 `seq` 去重。
+- 历史：打开窗口经 95/96 定位游标，再以 91/92 `mode=0` 前向补齐，到达水位后可 `mode=1` 上翻；`mode=1` 为 `seq <= cursor` 含边界语义，调用方须传 `next_cursor - 1`。
+- 已读：93/94 单调推进 `last_read_seq`（不可回退、不可代推、不超过群水位）。
+- 未读：群列表经 95/96 显示徽标，服务端计算未读数，客户端不可自报。
+

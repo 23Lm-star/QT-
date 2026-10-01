@@ -179,3 +179,52 @@ Server → protocol.h (共用协议定义)
 - 级别映射：纯执行细节 `qCDebug`；操作失败/安全拒绝（SQL 失败、登录凭据不符、路径越权拒绝、下载打开失败等）`qCWarning`；配置/监听失败保持 `qCCritical`。日志语句一条未删，客户端 8 处绝对路径输出改为文件名或 `<path suppressed>`。
 - 约束：`protocol.h` 为 frozen_path 未触碰；不引入第三方日志库。
 
+---
+
+## 9. 群聊子系统（REQ-EXT-GROUP-001 / 002）
+
+### 9.1 定位与事实源
+
+- 群功能以 `group_member` 的成员关系为唯一事实源：`group_info.status='active'` 且 `group_member.status='active'` 同时成立才允许群读写；解散、退出、被移除即时失效。
+- 操作者身份一律取连接级 actor（SEC-001 `m_actorAuthenticated`），忽略客户端载荷中的自报字段；群消息发送载荷不含 sender 字段。
+- 群协议是 §3 之上的独立段：GROUP-001 生命周期 PDU 60–87，GROUP-002 群消息 PDU 88–96。群请求共用 20B 信封（`version`+`envelope_length`+`request_id`+`group_id`，小端手写编解码），响应统一 `code + body`，与一对一聊天的 `Msg` 模型相互独立。
+
+### 9.2 数据流
+
+**发送（先持久化，后广播）**：
+
+```
+Client GroupChat ──88──> MyTcpSocket（actor 门；伪造事件 84/85/90 丢弃）
+   └─> MsgHandler::groupRequest（先验信封/载荷边界）──> OperateDB::handleGroupMessageOperation
+         事务：SELECT group_info FOR UPDATE（群行锁）
+              → 成员门 group_member.status='active'
+              → 幂等短路（同 client_msg_id 命中即返回原消息）
+              → UPDATE group_info SET last_seq=LAST_INSERT_ID(last_seq+1)
+              → INSERT group_message → COMMIT
+   ──> 89 已持久化确认（仅发送者）
+   ──> 提交成功后由 MsgHandler 触发 90 事件
+         MyTcpServer::broadcastGroupMessage（持锁仅取连接快照，锁外投递）
+           └─> MyTcpSocket::enqueueOutbound（每连接有界队列）→ pumpOutboundQueue → 在线成员
+```
+
+**拉取 / 已读 / 未读**：
+
+```
+打开群聊 ──> 95/96 未读摘要（按 actor 汇总其全部 active 群）
+        ──> 91/92 以 last_read_seq 为游标前向补齐（mode=0, seq>cursor）
+            上翻历史用后向翻页（mode=1, seq<=cursor，响应按 seq 升序回传）
+阅读    ──> 93/94 单调推进 last_read_seq（钳制到 [last_read_seq, group_info.last_seq]）
+未读数 = 服务端 COUNT(seq > last_read_seq AND seq <= group_info.last_seq)，客户端不可自报
+```
+
+- 系统消息（成员加入/退出/移除）在 GROUP-001 成员事务内以 `msg_type='system'` 追加进同一 seq 通道，因此群内时间线连续，同样经 90 与拉取下发。
+
+### 9.3 关键不变式
+
+- **先提交后广播**：广播只在 `db.commit()` 成功后触发（`GroupResult.broadcastMessage=true` 仅在成功提交路径置位；幂等重放置 `false`，DB 失败路径不置位）。提交失败 ⇒ 不广播；广播失败 ⇒ 已提交消息仍在库，由游标拉取补齐。
+- **每连接有界出站队列**：取代旧 `reseed()`/`sendGroupEvent()` 持 `m_tcpsocketlistMutex` 同步 `write()` 的 fan-out。`broadcastGroupMessage` 持全局锁**只**复制目标连接指针快照，锁外逐连接 `enqueueOutbound`；队列上限 256 条 / 256KB（先到者），满则丢弃该连接实时投递并 `drops` 计数告警——慢成员既不阻塞 DB 事务也不影响其他成员，改由下次拉取补齐；连接断开在 `clientOffLine` 清空队列。
+  - 范围提示：GROUP-001 的成员/邀请事件（84/85）仍走 `sendGroupEvent()` 的同步持锁 fan-out，只有群消息（90）走有界队列。
+- **群内序号原子分配**：`group_info.last_seq` 在发送事务内以 `LAST_INSERT_ID(last_seq+1)` 递增，群行 `FOR UPDATE` 串行化同群发送；`uk_group_seq(group_id,seq)` 唯一索引兜底。`LAST_INSERT_ID()` 为连接级，由 `PooledSqlConnection` 保证同事务同连接。
+- **幂等**：`uk_group_client_msg(group_id, client_msg_id)` + 事务内短路；同键重放返回原 `(seq, msg_id)` 且不重复广播，异发送者同键返回业务错误。
+- 排序与分页游标一律以 `seq` 为准，`created_at`(DATETIME(3)) 仅用于展示排序稳定性。
+

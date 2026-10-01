@@ -157,3 +157,40 @@ cd Server && qmake Server.pro && make
 
 **当前开发环境**：Qt 5.14.2 MinGW 64-bit
 
+---
+
+## 5. 群聊模块（REQ-EXT-GROUP-001 / 002）
+
+### 5.1 客户端
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **Group** | `group.{h,cpp}` | 群聊模块主界面：我的群聊列表、待处理邀请、群聊窗口、成员列表与群主/管理员操作区（建群/邀请/接受/拒绝/退出/移除/任免/转让/解散/摘要查询），进入模块后按需查询。GROUP-002 起兼群消息窗口入口与未读徽标，把 89/92/94 响应路由到对应群窗口（`handleMessageResponse`），把 90 事件按 `group_id` 路由（`handleMessageEvent`） |
+| **GroupChat** | `groupchat.{h,cpp}` | 单群聊天窗口（可靠文本消息）：发送 88 → 89 已持久化确认（发送中/已发送/失败重试，`QUuid` 作幂等键）；接收 90 在线事件，并按 `seq` 与拉取结果去重渲染；打开窗口经 95/96 定位未读游标，再以 91/92 前向补齐、上翻历史走后向翻页；已读经 93/94 单调推进。系统消息居中渲染 |
+| **Protocol** | `protocol.{h,cpp}` | 群信封编解码（`groupAppendU16/U32/U64/String`、`groupRead*`）与 60–96 枚举定义；`GROUP_PROTOCOL_VERSION=1`、`GROUP_ENVELOPE_LENGTH=20` |
+
+- `Client.pro` 已纳入 `group.{h,cpp}`、`groupchat.{h,cpp}`；`Client::handlMsg` 将群响应（60–87 与 95/96）分发到 `Group`，将消息类响应（89/92/94）与事件（90）分发到 `Group`/`GroupChat`。
+
+### 5.2 服务端
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **MyTcpSocket** | `mytcpsocket.{h,cpp}` | actor 门与事件伪造拒绝（客户端发入的 84/85/90 一律丢弃并记审计日志）；**每连接有界出站队列** `enqueueOutbound`（上限 256 条 / 256KB，先到者，满则丢弃并计数）、`pumpOutboundQueue`（256KB 高水位停写，`onBytesWritten` 回落续冲），断线在 `clientOffLine` 清空 |
+| **MyTcpServer** | `mytcpserver.{h,cpp}` | `broadcastGroupMessage`：持 `m_tcpsocketlistMutex` 仅收集目标连接快照，释放锁后锁外逐连接入队（绝不持全局锁写 socket）；GROUP-001 的 `sendGroupEvent`（成员/邀请事件）保持同步 fan-out 不变 |
+| **MsgHandler** | `msghandler.{h,cpp}` | `groupRequest`：群请求统一入口，先验 20B 信封（版本/长度/字段边界）再经 `groupOperation` 分派，经 `groupRespondType` 统一 `code+body` 响应；DB 提交成功后触发 90 广播（`code==0 && broadcastMessage`） |
+| **OperateDB** | `operatedb.{h,cpp}` | `handleGroupOperation`（生命周期）与 `handleGroupMessageOperation`（发送/拉取/已读/未读）；`GroupOperation`/`GroupRequest`/`GroupMessageRecord`/`GroupResult`；群消息事务含序号原子分配、幂等短路、游标分页、未读计数；`kGroupMessageSchemaVersion=2026100101`，`checkSchemaVersion()` 取文件资产/群/群消息三者 `qMax` |
+| **Protocol** | `protocol.{h,cpp}` | 群信封编解码 + 60–96 枚举（与客户端同值同名） |
+| **迁移** | `migrate_ext_group_001.sql`、`migrate_ext_group_002.sql`（+ rollback） | 群表（`group_info`/`group_member`/`group_invitation`）与群消息表（`group_info.last_seq`、`group_message`）；幂等、可重复执行，服务端 fail-fast 不静默建表 |
+
+### 5.3 依赖关系
+
+```
+Client  Index → Group → GroupChat
+                 └── protocol.h（群信封 + 60–96）
+
+Server  MyTcpSocket（actor 门 / 出站队列）
+          └── MsgHandler::groupRequest ──> OperateDB::handleGroupMessageOperation
+                                              └── DatabaseConnectionPool（RAII、线程隔离）
+          ↖ MyTcpServer::broadcastGroupMessage（锁内快照 → 锁外 enqueueOutbound）
+```
+
