@@ -47,3 +47,15 @@
 - 无法证明"先提交后广播"（提交失败不得出现广播；广播失败不得丢已提交消息）→ 独立测试报 **BLOCKED**。
 - 序号分配拿不到数据库层并发正确性证据（对打测试或 SQL 事务证明）→ 同上 BLOCKED。
 - SEC-001/GROUP-001 合并后出现与本盘点冲突的事实 → 回 goal 重估，不在开发节点即兴扩面。
+
+---
+
+## 决策日志（append-only）
+
+- **2026-10-01 分支接手（takeover）**：owner_agent 由 goal 会话的 claude-code 延续，本会话即 claude-code，无跨代理写权冲突。按 multi-agent takeover 协议执行：运行 pipeline → 刷新交接 → 更新 owner。
+- **2026-10-01 开节点前清账**：trunk 存在上一会话遗留的未提交基础设施改动（`pipeline/build.ps1` mingw 链接器插件路径修复 + `Client/Server.pro` Release 输出改 `dist/` + `.gitignore`）。按 branching 规则「先清账后开节点」处理：主人选择「切 SMALL 分支提交并合入 trunk」。结果：`small/build-env-and-dist-deploy` → `3933e3c`（pipeline GREEN）→ no-ff `1af57ac` 合入 master。此改动与 GROUP-002 范围无关，不占用本需求分支。
+- **2026-10-01 依赖终态**：`REQ-EXT-GROUP-001` ✅ 已合并 `master@ee75441`（审计 PASS 15/15、主人已接受）；`REQ-EXT-SEC-001` ✅ 在树内。goal 节点的两个硬前置全部解除，D1（开发启动时机）条件满足。
+- **2026-10-01 trunk 同步**：本分支 `git merge master` → head `b6b3145`（含 GROUP-001 全部生产代码、SEC-001、build/dist 基础设施）。同步后 pipeline **build GREEN**（`b6b3145`, 2026-10-01 10:04）。分支上仅文档差异的盘点结论不变，无需回 goal。
+- **2026-10-01 design 节点完成**：产出 `project-docs/tasks/REQ-EXT-GROUP-002/design.md`（协议编号 88–96 分配表、`group_message`+`group_info.last_seq` 数据模型、`LAST_INSERT_ID` 事务内序号分配与幂等短路、先提交后广播不变式、每连接有界广播队列、游标分页与单调已读、系统消息同序号通道、权限三断、客户端群聊窗口、T7 验证矩阵、停止条件）。**未改任何生产源码**（design 节点边界）。
+- **2026-10-01 待批准 D2**：协议编号表将 GROUP-001 预留的 88–95 扩至 **88–96**（未读摘要需独立请求/响应对，95 单槽不足），只追加不重排。两份 `protocol.h` 属 frozen_paths，须主人一次性批准后方可进入 development。审批卡见 design.md §14。
+- **2026-10-01 本会话只做设计**：主人指示「开发阶段先不用做，先做好设计阶段」，故 development 不在本会话开启，等 D2 批准后另开会话。
