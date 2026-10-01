@@ -336,6 +336,50 @@ void MsgHandler::uploadfileinit()
     }
 }
 
+// REQ-EXT-FILE-002 §4：秒传预检查响应——hit 零正文（提示 + 刷新即可见），
+// miss 复用既有 Uploader 从 nextOffset 起走原顺序分块路径（该 PDU 与状态机零改动）。
+void MsgHandler::uploadfilefastcheck()
+{
+    bool ret=false;
+    bool hit=false;
+    uint version=0, nameLen=0;
+    qint64 fileId=-1, sessionId=-1, nextOffset=0;
+    memcpy(&ret,pdu->caData+FASTCHECK_RESP_RET_OFFSET,sizeof(ret));
+    memcpy(&hit,pdu->caData+FASTCHECK_RESP_HIT_OFFSET,sizeof(hit));
+    memcpy(&version,pdu->caData+FASTCHECK_RESP_VERSION_OFFSET,sizeof(version));
+    memcpy(&fileId,pdu->caData+FASTCHECK_RESP_FILE_ID_OFFSET,sizeof(fileId));
+    memcpy(&sessionId,pdu->caData+FASTCHECK_RESP_SESSION_ID_OFFSET,sizeof(sessionId));
+    memcpy(&nextOffset,pdu->caData+FASTCHECK_RESP_NEXT_OFFSET,sizeof(nextOffset));
+    memcpy(&nameLen,pdu->caData+FASTCHECK_RESP_NAME_LEN_OFFSET,sizeof(nameLen));
+    QString finalName;
+    if(nameLen>0 && nameLen<=pdu->uiMsgLen){
+        finalName=QString::fromUtf8(pdu->caMsg,int(nameLen));
+    }
+    qCDebug(lcCli)<<"秒传预检查响应 ret"<<ret<<"hit"<<hit<<"fileId"<<fileId
+                  <<"sessionId"<<sessionId<<"nextOffset"<<nextOffset<<endl;
+    if(version!=FASTCHECK_VERSION){
+        QMessageBox::information(&Index::getinstance(),"提示","服务端协议版本不匹配，请升级客户端");
+        return;
+    }
+    if(!ret){
+        QMessageBox::information(&Index::getinstance(),"提示","上传失败：服务端拒绝秒传预检查");
+        return;
+    }
+    if(hit){
+        QMessageBox::information(&Index::getinstance(),"提示",
+            QString("秒传成功：%1").arg(finalName.isEmpty()?"文件已存在":finalName));
+        Index::getinstance().getFile()->flushfile();
+        return;
+    }
+    QFile localFile(Index::getinstance().getFile()->m_strUploadPath);
+    if(localFile.exists() && nextOffset>=localFile.size()){
+        // 已齐（含 0 字节）：服务端已落定，直接刷新即可
+        Index::getinstance().getFile()->flushfile();
+        return;
+    }
+    Index::getinstance().getFile()->uploadfile(nextOffset);
+}
+
 void MsgHandler::uploadfiledata()
 {
     // 上传数据块响应处理：仅根据服务端状态更新界面或继续上传，移除与文件改名无关的逻辑

@@ -252,6 +252,11 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->uploadfileinit();
         break;
     }
+    // REQ-EXT-FILE-002：秒传预检查响应（旧 INIT 路径保留不动，客户端不再发送）
+    case ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND:{
+        m_mhptr->uploadfilefastcheck();
+        break;
+    }
     case ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND:{
         m_mhptr->downloadfile();
         break;

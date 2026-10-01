@@ -6,6 +6,7 @@
 #include "uploader.h"
 
 #include <QByteArray>
+#include <QCryptographicHash>
 #include <QDate>
 #include <QDir>
 #include <QFile>
@@ -14,6 +15,7 @@
 #include <QShowEvent>
 #include <QStringList>
 #include <QTimer>
+#include <QUuid>
 #include <qinputdialog.h>
 #include <qmessagebox.h>
 #include <cstring>
@@ -393,23 +395,61 @@ void File::on_upload_PB_clicked()
     //获取要上传的文件路径，并记录下来
     m_strUploadPath=QFileDialog::getOpenFileName();
     qCDebug(lcCli)<<"上传文件源路径"<<m_strUploadPath.section('/', -1)<<endl;
-    //取出要上传的文件名和文件大小
+    //取出要上传的文件名
     int index=m_strUploadPath.lastIndexOf('/');
     QString uploadName=m_strUploadPath.right(m_strUploadPath.size()-index-1);//取出文件名
     if(!isValidFileName(uploadName)){
         QMessageBox::information(this,"提示","文件名不合法");
         return;
     }
+    // REQ-EXT-FILE-002 §4：秒传预检查——先流式计算 SHA-256（1MiB 分块，内存 O(1)，验收6），
+    // 再发 FASTCHECK 请求；命中则服务端零正文建条目，未命中回 nextOffset 走既有分块路径。
     QFile file(m_strUploadPath);
-    qint64 fileSize=file.size();//获取文件大小
-    PDU* pdu=mkPDU(m_strCurPath.toUtf8().toStdString().size()+1);
-    pdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST;
-    uint resumeMagic=UPLOAD_RESUME_MAGIC;
-    copyFixedField(pdu->caData,32,uploadName.toUtf8());
-    memcpy(pdu->caData+UPLOAD_FILE_SIZE_OFFSET,&fileSize,sizeof(fileSize));
-    memcpy(pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
-    memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),m_strCurPath.toUtf8().toStdString().size());//当前路径
-    qCDebug(lcCli)<<"文件名"<<pdu->caData<<"文件大小"<<fileSize<<" 上传路径"<<"<path suppressed>"<<endl;
+    if(!file.open(QIODevice::ReadOnly)){
+        QMessageBox::information(this,"提示","无法读取所选文件");
+        return;
+    }
+    QCryptographicHash hasher(QCryptographicHash::Sha256);
+    while(!file.atEnd()){
+        const QByteArray chunk=file.read(1024*1024);
+        if(chunk.isEmpty() && file.error()!=QFile::NoError){
+            QMessageBox::information(this,"提示","读取文件失败");
+            return;
+        }
+        hasher.addData(chunk);
+    }
+    const qint64 fileSize=file.size();
+    file.close();
+    const QByteArray shaHex=hasher.result().toHex();          // 64 hex（小写）
+
+    // 请求级唯一标识（32hex）：同一文件一次上传的键固定，重试即可命中服务端幂等短路
+    const QByteArray reqId=QUuid::createUuid().toRfc4122().toHex();
+
+    const QByteArray nameBytes=uploadName.toUtf8();
+    const QByteArray dirBytes=m_strCurPath.toUtf8();
+    QByteArray msg;
+    msg.append(shaHex);
+    msg.append(nameBytes);
+    msg.append(dirBytes);
+    msg.append(reqId);
+
+    PDU* pdu=mkPDU(uint(msg.size()));
+    pdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST;
+    const uint version=FASTCHECK_VERSION;
+    const uint magic=FASTCHECK_MAGIC;
+    const uint shaLen=uint(FASTCHECK_SHA_HEX_LEN);
+    const uint nameLen=uint(nameBytes.size());
+    const uint dirLen=uint(dirBytes.size());
+    const uint reqIdLen=uint(reqId.size());
+    memcpy(pdu->caData+FASTCHECK_VERSION_OFFSET,&version,sizeof(version));
+    memcpy(pdu->caData+FASTCHECK_MAGIC_OFFSET,&magic,sizeof(magic));
+    memcpy(pdu->caData+FASTCHECK_FILE_SIZE_OFFSET,&fileSize,sizeof(fileSize));
+    memcpy(pdu->caData+FASTCHECK_SHA_LEN_OFFSET,&shaLen,sizeof(shaLen));
+    memcpy(pdu->caData+FASTCHECK_NAME_LEN_OFFSET,&nameLen,sizeof(nameLen));
+    memcpy(pdu->caData+FASTCHECK_DIR_LEN_OFFSET,&dirLen,sizeof(dirLen));
+    memcpy(pdu->caData+FASTCHECK_REQID_LEN_OFFSET,&reqIdLen,sizeof(reqIdLen));
+    memcpy(pdu->caMsg,msg.constData(),size_t(msg.size()));
+    qCDebug(lcCli)<<"秒传预检查 文件名"<<nameBytes.constData()<<"文件大小"<<fileSize<<endl;
     Client::getinstance().seedMsg(pdu);
 }
 

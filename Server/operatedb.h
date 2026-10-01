@@ -20,6 +20,10 @@ public:
     static const int kGroupSchemaVersion = 2026093001;
     // REQ-EXT-GROUP-002：群消息迁移版本（group_info.last_seq + group_message 表）。
     static const int kGroupMessageSchemaVersion = 2026100101;
+    // REQ-EXT-FILE-002：秒传预检查迁移版本（upload_session.client_request_id/file_id + uk_req）。
+    // 取独立版本号：与 GROUP-002 的 2026100101 同名会让"未执行 FILE-002 迁移"的库通过启动检查，
+    // fail-fast 失效（见 development 节点实测记录）。
+    static const int kFastUploadSchemaVersion = 2026100102;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
@@ -129,13 +133,45 @@ public:
 
     // ===== REQ-EXT-FILE-001 T4：上传会话持久化（upload_session 表） =====
     // 登记暂存会话；返回 session_id（<0 失败）。ttlSec<=0 时默认 3600。
+    // REQ-EXT-FILE-002：clientRequestId 非空则落请求级幂等键（uk_req），旧调用方传空＝不写该列。
     qint64 createUploadSession(const QString &owner, const QString &parentPath,
                                const QString &displayName, qint64 expectedSize,
                                const QString &clientSha256, const QString &stagingPath,
-                               qint64 confirmedOffset, int ttlSec);
+                               qint64 confirmedOffset, int ttlSec,
+                               const QString &clientRequestId = QString());
     bool updateUploadOffset(qint64 sessionId, qint64 confirmedOffset);
-    // 完成/失败：写 status（done|failed|expired|verifying）
-    bool finishUploadSession(qint64 sessionId, const QString &status);
+    // 完成/失败：写 status（done|failed|expired|verifying）；fileId>=0 时同写 file_id，
+    // 使"已完成会话"能被请求级幂等短路直接命中（无需回退到内容预检查）。
+    bool finishUploadSession(qint64 sessionId, const QString &status, qint64 fileId = -1);
+
+    // ===== REQ-EXT-FILE-002：请求级幂等短路的读侧（§2 步骤3） =====
+    // parentPath/displayName/expectedSize/clientSha256 取自会话行（非本次请求），
+    // 保证续传时 staging 令牌（owner|parent|display|size）与首次一致。
+    struct UploadSessionLookup {
+        bool found = false;
+        qint64 sessionId = -1;
+        QString status;              // uploading|verifying|done|failed|expired
+        qint64 confirmedOffset = 0;
+        qint64 fileId = -1;          // done 时的逻辑条目（无则 -1）
+        QString displayName;         // 最终展示名：优先 user_file（含 (1) 后缀），否则请求名
+        QString parentPath;          // 会话登记的逻辑父路径
+        qint64 expectedSize = 0;
+        QString clientSha256;
+    };
+    UploadSessionLookup lookupUploadSessionByRequestId(const QString &owner,
+                                                       const QString &clientRequestId);
+
+    // 失败/过期/半途会话以同一请求键重试：原地重置为 uploading（避免 uk_req 唯一键冲突）。
+    bool restartUploadSession(qint64 sessionId, const QString &parentPath,
+                              const QString &displayName, qint64 expectedSize,
+                              const QString &clientSha256, const QString &stagingPath,
+                              qint64 confirmedOffset, int ttlSec);
+
+    // 秒传命中：登记 status='done' 的会话行（零正文传输的完成态），返回 session_id（<0 失败）。
+    qint64 insertCompletedUploadSession(const QString &owner, const QString &parentPath,
+                                        const QString &displayName, qint64 expectedSize,
+                                        const QString &clientSha256,
+                                        const QString &clientRequestId, qint64 fileId);
 
     explicit OperateDB(QObject *parent = nullptr);
     OperateDB(const OperateDB&)=delete;

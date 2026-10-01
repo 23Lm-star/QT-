@@ -157,6 +157,10 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->uploadfileinit();
         break;
     }
+    case ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST:{
+        respdu=m_MsgHandler->uploadfilefastcheck();
+        break;
+    }
     case ENUM_MSG_TYPE_RENAMEFILE_REQUEST:{
         respdu=m_MsgHandler->renamefile(this->m_strLoginName);
         break;
@@ -628,6 +632,8 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return reject(ENUM_MSG_TYPE_FLUSHFILE_RESPOND);
     case ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST:
         return reject(ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND);
+    case ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST:
+        return reject(ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND);
     case ENUM_MSG_TYPE_RENAMEFILE_REQUEST:
         return reject(ENUM_MSG_TYPE_RENAMEFILE_RESPOND);
     case ENUM_MSG_TYPE_SHAREFILE_REQUEST:

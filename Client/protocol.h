@@ -122,10 +122,38 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND = 94,
     ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST = 95,
     ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND = 96,
-    // 97-99 继续预留
+
+    // ===== REQ-EXT-FILE-002：顺序上传秒传预检查（仅追加，旧编号 1-96 不变） =====
+    ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST = 97,   // 秒传预检查请求
+    ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND = 98,   // 秒传预检查响应
 
     ENUM_MSG_TYPE_MAX = 99999,
 };
+
+// ===== REQ-EXT-FILE-002 秒传预检查：请求/响应布局常量（两端逐字节一致，只追加） =====
+static const uint FASTCHECK_MAGIC = 0x4643484b;    // "FCHK"
+static const uint FASTCHECK_VERSION = 1;
+static const int FASTCHECK_MAX_MSG_LEN = 1024;     // 64(sha) + 210(名) + 450(路径) + 96(reqId) + 余量
+
+// 请求 caData：定长字段与长度字段；可变长度一律进 caMsg
+static const int FASTCHECK_VERSION_OFFSET    = 0;   // u32，服务端不等则拒
+static const int FASTCHECK_MAGIC_OFFSET      = 4;   // u32
+static const int FASTCHECK_FILE_SIZE_OFFSET  = 8;   // qint64
+static const int FASTCHECK_SHA_LEN_OFFSET    = 16;  // u32，须为 64
+static const int FASTCHECK_NAME_LEN_OFFSET   = 20;  // u32
+static const int FASTCHECK_DIR_LEN_OFFSET    = 24;  // u32
+static const int FASTCHECK_REQID_LEN_OFFSET  = 28;  // u32
+static const int FASTCHECK_SHA_HEX_LEN       = 64;
+static const int FASTCHECK_REQID_HEX_LEN     = 32;
+
+// 响应 caData：ret/hit 后接定长字段；最终展示名进 caMsg（hit 时非空）
+static const int FASTCHECK_RESP_RET_OFFSET        = 0;   // bool
+static const int FASTCHECK_RESP_HIT_OFFSET        = 1;   // bool
+static const int FASTCHECK_RESP_VERSION_OFFSET    = 2;   // u32
+static const int FASTCHECK_RESP_FILE_ID_OFFSET    = 8;   // qint64
+static const int FASTCHECK_RESP_SESSION_ID_OFFSET = 16;  // qint64
+static const int FASTCHECK_RESP_NEXT_OFFSET       = 24;  // qint64，miss 时续传起点
+static const int FASTCHECK_RESP_NAME_LEN_OFFSET   = 32;  // u32
 
 struct PDU{//协议数据单元
     uint uiTotalLen;    //总长度
