@@ -1,4 +1,4 @@
-QT       += core gui network
+QT       += core gui network concurrent
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -42,6 +42,7 @@ SOURCES += \
     sharelinkdialog.cpp \
     folderselectdialog.cpp \
     reconnectdialog.cpp \
+    transfertask.cpp \
     uploader.cpp \
     simplecaptcha.cpp \
     userinformation.cpp
@@ -63,6 +64,7 @@ HEADERS += \
     sharelinkdialog.h \
     folderselectdialog.h \
     reconnectdialog.h \
+    transfertask.h \
     uploader.h \
     simplecaptcha.h \
     userinformation.h

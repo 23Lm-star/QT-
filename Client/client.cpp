@@ -4,6 +4,7 @@
 #include "ui_client.h"
 #include "process.h"
 #include "file.h"
+#include "transfertask.h"
 #include <string.h>
 #include <QByteArray>
 #include <QFile>
@@ -244,35 +245,37 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->sharefilefinsh();
         break;
     }
+    // REQ-EXT-TRANSFER-001：32 确认按 transfer_id 路由到该上传任务（id=0 时无任务，忽略）
     case ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND:{
-        // REQ-EXT-GROUP-003：群上传进行中时，32 确认路由到群文件窗口的 Uploader
-        GroupFile *gf = GroupFile::uploadingInstance();
-        if (gf != nullptr) {
-            gf->acknowledgeUploadChunk(pdu);
-        } else {
-            m_mhptr->uploadfiledata();
-        }
+        TransferManager::instance().onUploadDataRespond(pdu);
         break;
     }
+    // REQ-EXT-TRANSFER-001：30 初始化响应按 id 路由（个人上传握手 = 97 → 29 → 30）
     case ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND:{
-        m_mhptr->uploadfileinit();
+        TransferManager::instance().onUploadInitRespond(pdu);
         break;
     }
-    // REQ-EXT-FILE-002：秒传预检查响应（旧 INIT 路径保留不动，客户端不再发送）
+    // REQ-EXT-TRANSFER-001：98 秒传预检查响应（无 transfer_id，按连接级单飞槽归属）
     case ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND:{
-        m_mhptr->uploadfilefastcheck();
+        TransferManager::instance().onFastcheckRespond(pdu);
         break;
     }
+    // REQ-EXT-TRANSFER-001：107/108 上传任务释放响应
+    case ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND:{
+        TransferManager::instance().onAbortRespond(pdu);
+        break;
+    }
+    // REQ-EXT-TRANSFER-001：41/42/43 按 id 路由到该下载任务的接收槽（§5.4）
     case ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND:{
-        m_mhptr->downloadfile();
+        TransferManager::instance().onDownloadRespond(pdu);
         break;
     }
     case ENUM_MSG_TYPE_DOWNLOADFILE_DATA:{
-        m_mhptr->handleDownloadData();
+        TransferManager::instance().onDownloadData(pdu);
         break;
     }
     case ENUM_MSG_TYPE_DOWNLOADFILE_FINISH:{
-        m_mhptr->handleDownloadFinish();
+        TransferManager::instance().onDownloadFinish(pdu);
         break;
     }
     case ENUM_MSG_TYPE_CAPTCHA_RESPOND:{
@@ -331,15 +334,17 @@ void Client::handlMsg(PDU *&pdu)
     case ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT:
         Index::getinstance().getGroup()->handleMessageEvent(pdu);
         break;
-    // REQ-EXT-GROUP-003：群文件响应。100/102/104 按 group_id 路由到群文件窗口；
-    // 106 元数据由客户端 MsgHandler 统一准备落盘，正文随后走既有 42/43。
+    // REQ-EXT-GROUP-003：群文件响应。100/104 按 group_id 路由到群文件窗口。
     case ENUM_MSG_TYPE_GROUP_FILE_LIST_RESPOND:
-    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND:
     case ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND:
         Index::getinstance().getGroup()->handleFileResponse(pdu);
         break;
+    // REQ-EXT-TRANSFER-001：102/106 按 transfer_id 路由到群上传/群下载任务
+    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND:
+        TransferManager::instance().onGroupUploadInitRespond(pdu);
+        break;
     case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND:
-        m_mhptr->handleGroupFileDownloadRespond(pdu);
+        TransferManager::instance().onGroupDownloadRespond(pdu);
         break;
     default:
         break;

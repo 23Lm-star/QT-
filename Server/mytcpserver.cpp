@@ -49,13 +49,13 @@ void MyTcpServer::incomingConnection(qintptr handle)
     qCDebug(lcNet)<<"新客户端连接完成"<<endl;
 }
 
-void MyTcpServer::handleUploadWriteFinished(quint64 connectionId, qint64 offset,
-                                            qint64 length, bool success)
+void MyTcpServer::handleUploadWriteFinished(quint64 connectionId, quint64 transferId,
+                                            qint64 offset, qint64 length, bool success)
 {
     QMutexLocker locker(&m_tcpsocketlistMutex);
     for(MyTcpSocket* socket : tcpsocketlist){
         if(socket->m_connectionId == connectionId){
-            socket->handleUploadWriteFinished(offset,length,success);
+            socket->handleUploadWriteFinished(transferId,offset,length,success);
             return;
         }
     }

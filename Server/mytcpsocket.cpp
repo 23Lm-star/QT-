@@ -21,24 +21,37 @@ MyTcpSocket::MyTcpSocket()
     connect(this,&MyTcpSocket::disconnected,this,&MyTcpSocket::clientOffLine);
     m_MsgHandler=new MsgHandler;
     a=0;
-    m_downloadFile=nullptr;
-    m_downloadTotalSize=0;
-    m_downloadSentSize=0;
-    m_downloadActive=false;
     m_downloadNextChunkScheduled=false;
-    m_uploadWriteInFlight=false;
+    m_rrCursor=0;
     m_connectionId=0;
     m_invalidPduCount=0;
     m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
+    // D5：上传上下文空闲回收（连接级；参照 MyTcpServer 僵尸清扫的定时器模式）
+    m_reapTimer=new QTimer(this);
+    connect(m_reapTimer,&QTimer::timeout,this,&MyTcpSocket::onReapTimeout);
+    m_reapTimer->start(15000);
 }
 
 MyTcpSocket::~MyTcpSocket(){
-    if(m_downloadFile){
-        m_downloadFile->close();
-        delete m_downloadFile;
-        m_downloadFile=nullptr;
+    for(QHash<quint64,DownloadStream>::iterator it=m_downloads.begin();it!=m_downloads.end();++it){
+        if(it->file){
+            it->file->close();
+            delete it->file;
+            it->file=nullptr;
+        }
     }
+    m_downloads.clear();
+    m_downloadRing.clear();
     delete m_MsgHandler;
+}
+
+// D5：空闲上传上下文回收（写盘在途不回收）
+void MyTcpSocket::onReapTimeout()
+{
+    if(m_MsgHandler==nullptr){
+        return;
+    }
+    m_MsgHandler->reapIdleUploads(QDateTime::currentMSecsSinceEpoch(),UPLOAD_IDLE_REAP_SEC);
 }
 
 PDU *MyTcpSocket::handlMsg(PDU *pdu)
@@ -47,6 +60,22 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     PDU* respdu=nullptr;
     m_MsgHandler->pdu=pdu;
 
+    // ===== REQ-EXT-TRANSFER-001：按 PDU 落位读 transfer_id（请求侧传输族；D2 统一 [48..55]） =====
+    quint64 transferId=TRANSFER_ID_LEGACY;
+    switch(pdu->uiType){
+    case ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST:
+    case ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST:
+    case ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST:
+    case ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST:
+        memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
+        break;
+    default:
+        break;
+    }
+    m_MsgHandler->m_currentTransferId=transferId;
+
     // ===== REQ-EXT-SEC-001 T2: 统一入口门 =====
     // 白名单（注册/登录/验证码/心跳）之外的一切业务请求，必须携带连接级认证上下文；
     // 拒绝原因与连接关联标识入日志（不含密码/令牌/文件内容），并回失败响应。
@@ -54,7 +83,7 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         qCWarning(lcAuth)<<"[AUTHGATE] 拒绝：未认证连接发送业务请求 conn="<<m_connectionId
                          <<" type="<<pdu->uiType<<" session="<<m_actorSessionVersion;
         if(pdu->uiType==ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST){
-            sendUploadAck(false,m_MsgHandler->m_uploadSession.receivedSize(),false);
+            sendUploadAck(transferId,false,0,false);
             return nullptr;
         }
         return authRejectPdu(pdu->uiType);
@@ -182,6 +211,9 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         break;
     }
     case ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST:{
+        // D7：超下载上限时 41 回 ret=false（同 id 重发视为替换，不占额外名额）
+        m_MsgHandler->m_downloadSlotAvailable =
+                (m_downloads.contains(transferId) || m_downloads.size() < int(MAX_PARALLEL_DOWNLOADS));
         respdu=m_MsgHandler->downloadfile();
         if(respdu){
             bool valid=false;
@@ -189,10 +221,14 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
             sendAndRelease(respdu);
             respdu=nullptr;
             if(valid && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
-                startDownloadStream(m_MsgHandler->m_downloadCanonicalPath);
+                startDownloadStream(m_MsgHandler->m_downloadCanonicalPath,transferId);
             }
         }
         return nullptr;
+    }
+    // REQ-EXT-TRANSFER-001：上传任务释放（暂停/取消共用；108 回带 id）
+    case ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST:{
+        return handleUploadAbort(pdu);
     }
     case ENUM_MSG_TYPE_CAPTCHA_REQUEST:{
         respdu=m_MsgHandler->captcha();
@@ -263,13 +299,16 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         break;
     // 105 群文件下载：先回 106 元数据，再走既有 42/43 分块流（源路径由服务端解析）
     case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST:{
+        // D7：超下载上限时 106 的 code = -2107（同 id 重发视为替换）
+        m_MsgHandler->m_downloadSlotAvailable =
+                (m_downloads.contains(transferId) || m_downloads.size() < int(MAX_PARALLEL_DOWNLOADS));
         respdu=m_MsgHandler->groupFileRequest(pdu->uiType);
         if(respdu){
             const QString src=m_MsgHandler->m_downloadCanonicalPath;
             sendAndRelease(respdu);
             respdu=nullptr;
             if(!src.isEmpty()){
-                startDownloadStream(src);
+                startDownloadStream(src,transferId);
             }
         }
         return nullptr;
@@ -287,45 +326,78 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
    return respdu;
 }
 
-//启动流式下载
+// 上传数据：按 transfer_id 取上下文（未知 id 拒绝且不回退，P7）
 void MyTcpSocket::handleUploadData(PDU* pdu)
 {
+    quint64 transferId=TRANSFER_ID_LEGACY;
+    memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
+    MsgHandler::UploadCtx* cp=m_MsgHandler->findUpload(transferId);
+    if(cp==nullptr){
+        qCWarning(lcNet)<<"[transfer] 未知上传 id 拒绝 conn="<<m_connectionId<<" id="<<transferId;
+        sendUploadAck(transferId,false,0,false);
+        return;
+    }
+
     uint resumeMagic=0;
     qint64 chunkOffset=0;
     memcpy(&resumeMagic,pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,sizeof(resumeMagic));
     memcpy(&chunkOffset,pdu->caData+UPLOAD_CHUNK_OFFSET,sizeof(chunkOffset));
 
-    const qint64 expectedOffset=m_MsgHandler->m_uploadSession.receivedSize();
-    if(resumeMagic != UPLOAD_RESUME_MAGIC || m_uploadWriteInFlight
+    const qint64 expectedOffset=cp->session.receivedSize();
+    if(resumeMagic != UPLOAD_RESUME_MAGIC || cp->writeInFlight
             || chunkOffset != expectedOffset || pdu->uiMsgLen == 0
-            || pdu->uiMsgLen > m_MsgHandler->m_uploadSession.totalSize()-expectedOffset
-            || m_MsgHandler->m_uploadSession.stagingFilePath().isEmpty()){
-        sendUploadAck(false,expectedOffset,m_MsgHandler->m_uploadSession.isComplete());
+            || pdu->uiMsgLen > cp->session.totalSize()-expectedOffset
+            || cp->session.stagingFilePath().isEmpty()){
+        sendUploadAck(transferId,false,expectedOffset,cp->session.isComplete());
         return;
     }
 
-    m_uploadWriteInFlight=true;
+    cp->writeInFlight=true;
     const QByteArray data(pdu->caMsg,pdu->uiMsgLen);
     QThreadPool::globalInstance()->start(new UploadWriteTask(
-            m_connectionId,m_MsgHandler->m_uploadSession.stagingFilePath(),chunkOffset,data));
+            m_connectionId,transferId,cp->session.stagingFilePath(),chunkOffset,data));
 }
 
-void MyTcpSocket::handleUploadWriteFinished(qint64 offset, qint64 length, bool success)
+void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, qint64 length, bool success)
 {
-    m_uploadWriteInFlight=false;
+    MsgHandler::UploadCtx* cp=m_MsgHandler->findUpload(transferId);
+    if(cp==nullptr){
+        return;   // 上下文已被 abort/回收；客户端已收 108 或不再等待
+    }
+    cp->writeInFlight=false;
     if(success){
-        success=m_MsgHandler->m_uploadSession.acceptWrittenChunk(offset,length);
+        success=cp->session.acceptWrittenChunk(offset,length);
     }
-    const bool complete = success && m_MsgHandler->m_uploadSession.isComplete();
-    const qint64 ackOffset = m_MsgHandler->m_uploadSession.receivedSize();
+    const bool complete = success && cp->session.isComplete();
+    const qint64 ackOffset = cp->session.receivedSize();
     if(complete){
-        // REQ-EXT-FILE-001 T4：末块写完→服务端复算转正+建条目+引用计数（会 reset 会话）
+        // REQ-EXT-FILE-001 T4：末块写完→服务端复算转正+建条目+引用计数（会释放上下文）
+        m_MsgHandler->m_currentTransferId=transferId;
         m_MsgHandler->finalizeUploadOnComplete();
+    }else if(success){
+        cp->lastProgressMs=QDateTime::currentMSecsSinceEpoch();   // 推进空闲回收计时
     }
-    sendUploadAck(success, ackOffset, complete);
+    sendUploadAck(transferId,success,ackOffset,complete);
 }
 
-void MyTcpSocket::sendUploadAck(bool success, qint64 nextOffset, bool complete)
+// 107：释放上传槽位（暂停/取消同处置：会话 expired，staging 保留）；未知 id → ret=false
+PDU* MyTcpSocket::handleUploadAbort(PDU* pdu)
+{
+    quint64 transferId=TRANSFER_ID_LEGACY;
+    memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
+    bool ret=false;
+    if(transferId!=TRANSFER_ID_LEGACY && m_MsgHandler->findUpload(transferId)!=nullptr){
+        m_MsgHandler->abortUpload(transferId);
+        ret=true;
+    }
+    PDU* resp=mkPDU();
+    resp->uiType=ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND;
+    memcpy(resp->caData,&ret,sizeof(ret));
+    memcpy(resp->caData+TRANSFER_ID_OFFSET,&transferId,sizeof(transferId));
+    return resp;
+}
+
+void MyTcpSocket::sendUploadAck(quint64 transferId, bool success, qint64 nextOffset, bool complete)
 {
     PDU* response=mkPDU();
     const uint resumeMagic=UPLOAD_RESUME_MAGIC;
@@ -334,44 +406,77 @@ void MyTcpSocket::sendUploadAck(bool success, qint64 nextOffset, bool complete)
     memcpy(response->caData+UPLOAD_ACK_NEXT_OFFSET,&nextOffset,sizeof(nextOffset));
     memcpy(response->caData+UPLOAD_ACK_COMPLETE_OFFSET,&complete,sizeof(complete));
     memcpy(response->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
+    memcpy(response->caData+TRANSFER_ID_OFFSET,&transferId,sizeof(transferId));   // R3：回带 id
     seedMsg(response);
 }
 
-void MyTcpSocket::startDownloadStream(const QString& filePath)
+// 43 完成 PDU（携带 id）
+void MyTcpSocket::seedDownloadFinish(quint64 transferId, bool success)
 {
-    if(m_downloadFile){
-        m_downloadFile->close();
-        delete m_downloadFile;
-        m_downloadFile=nullptr;
+    PDU* finishPdu=mkPDU();
+    finishPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_FINISH;
+    memcpy(finishPdu->caData,&success,sizeof(success));
+    memcpy(finishPdu->caData+TRANSFER_ID_OFFSET,&transferId,sizeof(transferId));
+    seedMsg(finishPdu);
+}
+
+// 新流加入环尾（id=0 = 旧单流路径）
+void MyTcpSocket::startDownloadStream(const QString& filePath, quint64 transferId)
+{
+    DownloadStream& st=m_downloads[transferId];
+    st.id=transferId;
+    if(st.file){
+        st.file->close();
+        delete st.file;
+        st.file=nullptr;
     }
-
-    m_downloadFile=new QFile(filePath);
-    if(!m_downloadFile->open(QIODevice::ReadOnly)){
+    st.file=new QFile(filePath);
+    if(!st.file->open(QIODevice::ReadOnly)){
         qCWarning(lcNet)<<"下载文件打开失败:"<<filePath;
-        delete m_downloadFile;
-        m_downloadFile=nullptr;
-
-        //发送失败完成 PDU
-        PDU* finishPdu=mkPDU();
-        finishPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_FINISH;
-        bool success=false;
-        memcpy(finishPdu->caData,&success,sizeof(success));
-        seedMsg(finishPdu);
+        delete st.file;
+        st.file=nullptr;
+        m_downloads.remove(transferId);
+        seedDownloadFinish(transferId,false);
         return;
     }
-
-    m_downloadTotalSize=m_downloadFile->size();
-    m_downloadSentSize=0;
-    m_downloadActive=true;
-
-    qCDebug(lcNet)<<"开始流式下载:"<<filePath<<"大小:"<<m_downloadTotalSize;
-    //用 0ms 延迟的单次定时器启动分块发送（异步，避免阻塞事件循环）
+    st.totalSize=st.file->size();
+    st.sentSize=0;
+    if(!m_downloadRing.contains(transferId)){
+        m_downloadRing.append(transferId);
+    }
+    qCDebug(lcNet)<<"开始流式下载:"<<filePath<<"大小:"<<st.totalSize<<"id"<<transferId;
     scheduleNextDownloadChunk();
+}
+
+// 摘环：完成/读失败/被 abort 时移除；被摘下标 < 游标时游标减一（§4.1）
+void MyTcpSocket::removeDownloadStream(quint64 id)
+{
+    const int idx=m_downloadRing.indexOf(id);
+    if(idx>=0){
+        if(idx<m_rrCursor){
+            --m_rrCursor;
+        }
+        m_downloadRing.removeAt(idx);
+    }
+    QHash<quint64,DownloadStream>::iterator it=m_downloads.find(id);
+    if(it!=m_downloads.end()){
+        if(it->file){
+            it->file->close();
+            delete it->file;
+            it->file=nullptr;
+        }
+        m_downloads.erase(it);
+    }
+    if(m_downloadRing.isEmpty()){
+        m_rrCursor=0;
+    }else if(m_rrCursor>=m_downloadRing.size()){
+        m_rrCursor=0;
+    }
 }
 
 void MyTcpSocket::scheduleNextDownloadChunk()
 {
-    if(!m_downloadActive || m_downloadNextChunkScheduled){
+    if(m_downloadRing.isEmpty() || m_downloadNextChunkScheduled){
         return;
     }
     m_downloadNextChunkScheduled=true;
@@ -380,7 +485,7 @@ void MyTcpSocket::scheduleNextDownloadChunk()
 
 void MyTcpSocket::onBytesWritten(qint64)
 {
-    if(m_downloadActive && bytesToWrite()<DOWNLOAD_WRITE_HIGH_WATER){
+    if(!m_downloadRing.isEmpty() && bytesToWrite()<DOWNLOAD_WRITE_HIGH_WATER){
         scheduleNextDownloadChunk();
     }
     // REQ-EXT-GROUP-002 T3：出站队列随 socket 缓冲回落继续冲刷
@@ -425,66 +530,61 @@ void MyTcpSocket::pumpOutboundQueue()
     }
 }
 
-//发送下一个数据块
+// 下载调度 tick：每个 tick 只发 1 块（round-robin，§4.1）；背压时本轮不发，等 onBytesWritten
 void MyTcpSocket::sendNextChunk()
 {
     m_downloadNextChunkScheduled=false;
-    if(!m_downloadActive || !m_downloadFile || !m_downloadFile->isOpen()){
-        qCDebug(lcNet)<<"下载状态无效，停止分块发送";
-        m_downloadActive=false;
+    if(m_downloadRing.isEmpty()){
         return;
     }
-
     if(bytesToWrite()+DOWNLOAD_CHUNK_SIZE+static_cast<qint64>(sizeof(PDU))
             > DOWNLOAD_WRITE_HIGH_WATER){
         return;
     }
 
-    qint64 remaining=m_downloadTotalSize-m_downloadSentSize;
-    if(remaining<=0){
-        //发送完成 PDU
-        PDU* finishPdu=mkPDU();
-        finishPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_FINISH;
-        bool success=true;
-        memcpy(finishPdu->caData,&success,sizeof(success));
-        seedMsg(finishPdu);
+    int attempts=m_downloadRing.size();
+    while(attempts-->0 && !m_downloadRing.isEmpty()){
+        if(m_rrCursor>=m_downloadRing.size()){
+            m_rrCursor=0;
+        }
+        const quint64 id=m_downloadRing.at(m_rrCursor);
+        QHash<quint64,DownloadStream>::iterator it=m_downloads.find(id);
+        if(it==m_downloads.end() || it->file==nullptr || !it->file->isOpen()){
+            seedDownloadFinish(id,false);
+            removeDownloadStream(id);
+            continue;
+        }
 
-        qCDebug(lcNet)<<"下载完成，总发送:"<<m_downloadSentSize<<"字节";
-        m_downloadFile->close();
-        delete m_downloadFile;
-        m_downloadFile=nullptr;
-        m_downloadActive=false;
+        const qint64 remaining=it->remaining();
+        if(remaining<=0){
+            qCDebug(lcNet)<<"下载完成 id="<<id<<"总发送:"<<it->sentSize<<"字节";
+            seedDownloadFinish(id,true);
+            removeDownloadStream(id);   // 摘环时游标规则内置，不前进
+            continue;
+        }
+
+        const int chunkSize=int(qMin((qint64)DOWNLOAD_CHUNK_SIZE,remaining));
+        const QByteArray chunk=it->file->read(chunkSize);
+        if(chunk.isEmpty()){
+            qCWarning(lcNet)<<"读取文件块失败 id="<<id;
+            seedDownloadFinish(id,false);
+            removeDownloadStream(id);
+            continue;
+        }
+
+        PDU* dataPdu=mkPDU(uint(chunk.size()));
+        dataPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_DATA;
+        memcpy(dataPdu->caData+TRANSFER_ID_OFFSET,&id,sizeof(id));   // R3：42 携带 id
+        memcpy(dataPdu->caMsg,chunk.constData(),size_t(chunk.size()));
+        it->sentSize+=chunk.size();
+        m_rrCursor=(m_rrCursor+1)%m_downloadRing.size();   // 一次只发一块
+        seedMsg(dataPdu);
+        scheduleNextDownloadChunk();
         return;
     }
-
-    int chunkSize=qMin((qint64)DOWNLOAD_CHUNK_SIZE,remaining);
-    QByteArray chunk=m_downloadFile->read(chunkSize);
-    if(chunk.isEmpty()){
-        qCWarning(lcNet)<<"读取文件块失败";
-        m_downloadFile->close();
-        delete m_downloadFile;
-        m_downloadFile=nullptr;
-        m_downloadActive=false;
-
-        //发送失败完成 PDU
-        PDU* finishPdu=mkPDU();
-        finishPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_FINISH;
-        bool success=false;
-        memcpy(finishPdu->caData,&success,sizeof(success));
-        seedMsg(finishPdu);
-        return;
+    if(!m_downloadRing.isEmpty()){
+        scheduleNextDownloadChunk();
     }
-
-    //构建数据块 PDU
-    PDU* dataPdu=mkPDU(chunk.size());
-    dataPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_DATA;
-    memcpy(dataPdu->caMsg,chunk.constData(),chunk.size());
-    m_downloadSentSize+=chunk.size();
-
-    seedMsg(dataPdu);
-
-    //调度下一个块
-    scheduleNextDownloadChunk();
 }
 //接收客户端消息
 void MyTcpSocket::recvmsg(){
@@ -555,13 +655,22 @@ void MyTcpSocket::recvmsg(){
 }
 //客户端下线->更改客户端的登录状态，并且移除sorket对应的
 void MyTcpSocket::clientOffLine(){
-    //清理下载状态
-    if(m_downloadFile){
-        m_downloadFile->close();
-        delete m_downloadFile;
-        m_downloadFile=nullptr;
+    // REQ-EXT-TRANSFER-001 §3.5：断线清理全部下载流与上传上下文；不写 DB
+    //（staging 与 upload_session 行留给既有 3600s TTL 收敛，与今日单流语义一致）
+    for(QHash<quint64,DownloadStream>::iterator it=m_downloads.begin();it!=m_downloads.end();++it){
+        if(it->file){
+            it->file->close();
+            delete it->file;
+            it->file=nullptr;
+        }
     }
-    m_downloadActive=false;
+    m_downloads.clear();
+    m_downloadRing.clear();
+    m_rrCursor=0;
+    m_downloadNextChunkScheduled=false;
+    if(m_MsgHandler!=nullptr){
+        m_MsgHandler->m_uploads.clear();
+    }
     // REQ-EXT-GROUP-002 T3：断线清空出站队列（实时投递丢弃由拉取兜底）
     m_outboundQueue.clear();
     m_outboundQueueBytes=0;
@@ -653,6 +762,16 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return reject(ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND);
     case ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST:
         return reject(ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND);
+    // REQ-EXT-TRANSFER-001：未认证 107 → 108{ret=false}（回带 id）
+    case ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST:{
+        PDU* r=reject(ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND);
+        quint64 tid=TRANSFER_ID_LEGACY;
+        if(m_MsgHandler!=nullptr && m_MsgHandler->pdu!=nullptr){
+            memcpy(&tid,m_MsgHandler->pdu->caData+TRANSFER_ID_OFFSET,sizeof(tid));
+        }
+        memcpy(r->caData+TRANSFER_ID_OFFSET,&tid,sizeof(tid));
+        return r;
+    }
     case ENUM_MSG_TYPE_RENAMEFILE_REQUEST:
         return reject(ENUM_MSG_TYPE_RENAMEFILE_RESPOND);
     case ENUM_MSG_TYPE_SHAREFILE_REQUEST:

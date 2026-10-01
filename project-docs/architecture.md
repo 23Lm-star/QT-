@@ -96,8 +96,11 @@ sizeof(PDU) = 76 字节 (uint=4B 平台)
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-- 枚举消息类型：43 种（注册/登录/好友/聊天/文件/验证码等）
+- 枚举消息类型：编号 1–108（注册/登录/好友/聊天/文件/群/传输等；`ENUM_MSG_TYPE_MAX=99999` 为哨兵）
 - `caData[64]` 复用规则：前32B 和 后32B 根据消息类型承载不同参数
+- **传输族 transfer_id**（REQ-EXT-TRANSFER-001）：29/30/31/32/40/42/43/101/102/105/106/107/108 在
+  `caData[48..55]` 携带 u64 连接内传输编号；仅 41 例外，落在 `caData[16..23]`（其 [32..62] 被文件名字段占用）。
+  `0` = 保留值 = 旧协议单流路径
 - 客户端：`malloc/free` 分配释放
 - 服务端：`memalloc/memfree` 分配释放（走内存池）
 - **禁止混用**两端分配/释放函数
@@ -110,7 +113,9 @@ sizeof(PDU) = 76 字节 (uint=4B 平台)
 |------|----------|
 | 服务端监听 | 主线程（QApplication 事件循环） |
 | 客户端连接处理 | QThreadPool（max 8），但实际 I/O 由 Socket 所在线程的事件循环驱动 |
-| 文件上传 | `Uploader` 通过 `moveToThread` 在独立 QThread 运行 |
+| 文件上传 | `Uploader` 在 UI 线程事件循环内按块推进（单块在途，等 32 再发下一块） |
+| 传输摘要 | 多文件上传的 SHA-256 经 `QtConcurrent::run` 在工作线程池计算（M5），完成后回主线程 |
+| 服务端上传写盘 | `QThreadPool` + `UploadWriteTask`；每 transfer 单块在途位 |
 | 数据库访问 | 连接池按 `QThread::currentThreadId()` 隔离，每线程上限 8 连接 |
 
 ---
@@ -272,5 +277,56 @@ Client File（流式 SHA-256 + 32hex 请求键）──97 FASTCHECK──> MyTcp
 - **请求级幂等**：`upload_session.uk_req(owner_name, client_request_id)` 唯一，同一用户同一请求键只允许一条会话行；失败会话同键可重试。
 - **附加式迁移 + 启动 fail-fast**：FILE-001 `2026092901`、FILE-002 `2026100102`（与 GROUP-002 `2026100101` 区分，避免同名使 fail-fast 失效）；`checkSchemaVersion()` 取四者 `qMax`，低版本拒绝监听，不运行时静默建表。
 - **对象回收安全**：条目软删除后对象在 `refcount==0` 且无引用时转 `pending_reclaim`，不由删除路径直接物理删除。
+
+---
+
+## 11. 多文件并行传输子系统（REQ-EXT-TRANSFER-001）
+
+### 11.1 定位与事实源
+
+- 在 §10 的单流文件通道上做**协议级多路复用**：同一连接内并发推进多条传输，方向各 3 条
+  （上传 3 + 下载 3，D6/Q1 主人裁决），超限排队不报错。
+- 事实源：`project-docs/requirements/REQ-EXT-TRANSFER-001-multi-file-parallel-transfer.md`、
+  `project-docs/tasks/REQ-EXT-TRANSFER-001/design.md`（§9 为冻结面逐字批准稿）。
+- **只追加**：旧编号 1–106 与旧语义零改动；`transfer_id=0` 即旧单流路径（D2/M2），
+  旧 e2e 脚本与旧编号帧逐字节不变。
+- 传输族 `transfer_id` 落位见 §3；新增 `UPLOADFILE_ABORT` 107/108（上传任务释放，暂停/取消共用）。
+
+### 11.2 数据流
+
+**个人上传（首次：97 预检查 → 29 建槽 → 31/32）**：
+
+```
+Client File（后台 SHA-256，M5）──97 FASTCHECK（连接级单飞，不带 id）──> 服务端
+   ├ 命中 → 98{hit=1} → 任务完成（零正文）
+   └ 未命中 → 98{session_id,nextOffset}；服务端暂存该会话（供采纳）
+Client TransferManager ──29 INIT(id)──> MsgHandler::uploadfileinit
+   └ acquireUploadSlot(id)：id=0 重置旧槽；id≠0 查重（T-17）+ 上限（D7）→ 采纳 97 的会话
+      → 30{ret,resumeOffset,id}
+   └ Uploader ──31 DATA(id, offset)──> MyTcpSocket::handleUploadData → UploadWriteTask
+        └ 32{ok,nextOffset,complete,id}；末块 → finalizeUploadOnComplete（释放上下文）
+```
+
+**群上传**：`101(id) → 102{code,hit,nextOffset,id} → 31/32`；群作用域随上下文携带，落定时建群引用。
+
+**下载（round-robin）**：`40/105(id) → 41/106(带 id) → 42/43(带 id)`。
+服务端连接级**单调度环 + 单定时器**：每个 tick 只发一块，游标轮转（§4.1），
+与既有 256KB 出站高水位联动（心跳/控制消息不被饿死）。
+
+**暂停/取消**：客户端停发 + `107(id)` → 服务端 `108{ret,id}`（会话置 `expired`、staging 保留）。
+恢复 = 以**新 id** 重走 29/101，服务端由确定性 staging 路径继续（S3），不重传前缀。
+
+**空闲回收**：连接级 15s 定时器扫描上传上下文，`lastProgressMs` 超 60s 且无写盘在途 → 按 Aborted 处置（D5）。
+
+### 11.3 关键不变式
+
+- **id=0 逐字节等价**：新增字段在 id=0 时为 0，且 `mkPDU` 全量清零 → 旧路径输出由构造决定（I1/I3）；
+  6 套既有 e2e + 新套件全绿即证明。
+- **未知 id 拒绝不回退**（P7）：数据类请求回失败响应，控制类回错误码，连接保持存活。
+- **两方向预算独立**（D6）：`MAX_PARALLEL_UPLOADS` / `MAX_PARALLEL_DOWNLOADS` 各 3，互不占用；
+  服务端硬兜底（超上限 29/101 → ret=false、40/105 → ret=false/-2107），客户端排队保证守规矩时不触发。
+- **每 transfer 单块在途 + 顺序 offset**：不引入单文件乱序分片；`chunkOffset` 连续性/长度边界/magic 校验语义不变。
+- **无 DB schema 变更**：全部为协议附加值；`upload_session.status='expired'` 复用既有枚举值。
+- **落盘语义零改动**：下载 `(N)` 递推去重、落盘目录规则与单流时代一致，仅由单槽改按 id 分桶。
 
 

@@ -3,7 +3,11 @@
 #include "file.h"
 #include "index.h"
 #include "ui_file.h"
-#include "uploader.h"
+#include "transfertask.h"
+
+#include <QPushButton>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <QByteArray>
 #include <QCryptographicHash>
@@ -71,10 +75,94 @@ File::File(QWidget *parent) :
     qCDebug(lcCli)<<"创建用户目录:"<<m_strUserPath.section('/', -1)<<" "<<dir.mkdir(m_strUserPath)<<endl;
     qCDebug(lcCli)<<"创建用户今日目录:"<<QDate::currentDate().toString("yyyy-MM")<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
     m_shareFile=new ShareFile;
-    
+
+    // REQ-EXT-TRANSFER-001：支持多选（下载可一次并发多个）
+    ui->file_LW->setSelectionMode(QAbstractItemView::ExtendedSelection);
+
     // 初始化右键菜单
     ui->file_LW->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(ui->file_LW, &QListWidget::customContextMenuRequested, this, &File::onFileListContextMenu);
+
+    // REQ-EXT-TRANSFER-001：文件级任务列表入口（程序化插入，不改 .ui）
+    m_tasksBtn = new QPushButton(QStringLiteral("传输列表"), this);
+    if (ui->upload_PB->parentWidget() && ui->upload_PB->parentWidget()->layout()) {
+        ui->upload_PB->parentWidget()->layout()->addWidget(m_tasksBtn);
+    }
+    connect(m_tasksBtn, &QPushButton::clicked, this, &File::onTasks_PB_clicked);
+
+    // REQ-EXT-TRANSFER-001：上传任务的摘要计算与 97 预检查由本窗口承担（P4/P5：客户端入口发 FASTCHECK）
+    connect(&TransferManager::instance(), &TransferManager::hashDue, this, &File::onHashDue);
+    connect(&TransferManager::instance(), &TransferManager::fastcheckDue, this, &File::onFastcheckDue);
+}
+
+void File::onTasks_PB_clicked()
+{
+    TransferManager::instance().showPanel();
+}
+
+// M5：SHA-256 在后台线程计算（1MiB 分块，算法与分段大小不变）
+void File::onHashDue(quint64 key, const QString& localPath)
+{
+    auto* watcher = new QFutureWatcher<QByteArray>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher, key]() {
+        const QByteArray shaHex = watcher->result();
+        watcher->deleteLater();
+        if (shaHex.isEmpty()) {
+            TransferManager::instance().failTask(key, QStringLiteral("读取文件失败"));
+            return;
+        }
+        TransferManager::instance().submitFastcheck(key, shaHex);
+    });
+    watcher->setFuture(QtConcurrent::run([localPath]() -> QByteArray {
+        QFile file(localPath);
+        if (!file.open(QIODevice::ReadOnly)) return QByteArray();
+        QCryptographicHash hasher(QCryptographicHash::Sha256);
+        while (!file.atEnd()) {
+            const QByteArray chunk = file.read(1024*1024);
+            if (chunk.isEmpty() && file.error() != QFile::NoError) return QByteArray();
+            hasher.addData(chunk);
+        }
+        return hasher.result().toHex();          // 64 hex（小写）
+    }));
+}
+
+// 97 秒传预检查请求（P2：97/98 不加 transfer_id，连接级单飞；未命中后续走 29/30）
+void File::onFastcheckDue(quint64 key)
+{
+    TransferManager::Task* t = TransferManager::instance().taskByKey(key);
+    if (t == nullptr) {
+        return;
+    }
+    const QByteArray shaHex = t->shaHex;
+    const QByteArray nameBytes = t->displayName.toUtf8();
+    const QByteArray dirBytes = t->dirPath.toUtf8();
+    const qint64 fileSize = t->totalBytes;
+    const QByteArray reqId = QUuid::createUuid().toRfc4122().toHex();
+
+    QByteArray msg;
+    msg.append(shaHex);
+    msg.append(nameBytes);
+    msg.append(dirBytes);
+    msg.append(reqId);
+
+    PDU* pdu = mkPDU(uint(msg.size()));
+    pdu->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST;
+    const uint version = FASTCHECK_VERSION;
+    const uint magic = FASTCHECK_MAGIC;
+    const uint shaLen = uint(FASTCHECK_SHA_HEX_LEN);
+    const uint nameLen = uint(nameBytes.size());
+    const uint dirLen = uint(dirBytes.size());
+    const uint reqIdLen = uint(reqId.size());
+    memcpy(pdu->caData+FASTCHECK_VERSION_OFFSET,&version,sizeof(version));
+    memcpy(pdu->caData+FASTCHECK_MAGIC_OFFSET,&magic,sizeof(magic));
+    memcpy(pdu->caData+FASTCHECK_FILE_SIZE_OFFSET,&fileSize,sizeof(fileSize));
+    memcpy(pdu->caData+FASTCHECK_SHA_LEN_OFFSET,&shaLen,sizeof(shaLen));
+    memcpy(pdu->caData+FASTCHECK_NAME_LEN_OFFSET,&nameLen,sizeof(nameLen));
+    memcpy(pdu->caData+FASTCHECK_DIR_LEN_OFFSET,&dirLen,sizeof(dirLen));
+    memcpy(pdu->caData+FASTCHECK_REQID_LEN_OFFSET,&reqIdLen,sizeof(reqIdLen));
+    memcpy(pdu->caMsg,msg.constData(),size_t(msg.size()));
+    qCDebug(lcCli) << "秒传预检查" << nameBytes.constData() << "大小" << fileSize;
+    Client::getinstance().seedMsg(pdu);
 }
 
 File::~File()
@@ -91,31 +179,6 @@ void File::flushfile()
     pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
     memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),curPathLen);
     Client::getinstance().seedMsg(pdu);
-}
-
-void File::uploadfile(qint64 resumeOffset)
-{
-    if(m_uploader){
-        return;
-    }
-    m_uploader=new Uploader(m_strUploadPath,resumeOffset,this);
-    connect(m_uploader,&Uploader::seedMsg,&Client::getinstance(),&Client::seedMsg);
-    connect(m_uploader,&Uploader::errnoMsg,this,&File::errnoMsg);
-    connect(m_uploader,&Uploader::finished,this,[this](bool success){
-        if(success){
-            flushfile();
-        }
-        m_uploader->deleteLater();
-        m_uploader=nullptr;
-    });
-    m_uploader->start();
-}
-
-void File::acknowledgeUploadChunk(bool success, qint64 nextOffset, bool complete)
-{
-    if(m_uploader){
-        m_uploader->acknowledge(success,nextOffset,complete);
-    }
 }
 
 void File::updateCurrfile(QList<FileInfo *> qFileinfolist){
@@ -390,100 +453,60 @@ void File::on_inputPath_PB_clicked(){
     memcpy(pdu->caMsg,tarPath.toUtf8().toStdString().c_str(),tarPathLen);
     Client::getinstance().seedMsg(pdu);
 }
+// REQ-EXT-TRANSFER-001 §5.5：多选选择器 → 每个文件建一个任务，交 TransferManager 队列（上限 3）
+// 摘要由任务在后台线程计算（M5），随后单飞发 97 预检查（file.cpp 为客户端上传入口，P4/P5）。
 void File::on_upload_PB_clicked()
 {
-    //获取要上传的文件路径，并记录下来
-    m_strUploadPath=QFileDialog::getOpenFileName();
-    qCDebug(lcCli)<<"上传文件源路径"<<m_strUploadPath.section('/', -1)<<endl;
-    //取出要上传的文件名
-    int index=m_strUploadPath.lastIndexOf('/');
-    QString uploadName=m_strUploadPath.right(m_strUploadPath.size()-index-1);//取出文件名
-    if(!isValidFileName(uploadName)){
-        QMessageBox::information(this,"提示","文件名不合法");
+    const QStringList paths=QFileDialog::getOpenFileNames(this,"选择要上传的文件");
+    if(paths.isEmpty()){
         return;
     }
-    // REQ-EXT-FILE-002 §4：秒传预检查——先流式计算 SHA-256（1MiB 分块，内存 O(1)，验收6），
-    // 再发 FASTCHECK 请求；命中则服务端零正文建条目，未命中回 nextOffset 走既有分块路径。
-    QFile file(m_strUploadPath);
-    if(!file.open(QIODevice::ReadOnly)){
-        QMessageBox::information(this,"提示","无法读取所选文件");
-        return;
-    }
-    QCryptographicHash hasher(QCryptographicHash::Sha256);
-    while(!file.atEnd()){
-        const QByteArray chunk=file.read(1024*1024);
-        if(chunk.isEmpty() && file.error()!=QFile::NoError){
-            QMessageBox::information(this,"提示","读取文件失败");
-            return;
+    int enqueued=0;
+    for(const QString& path:paths){
+        const QString uploadName=QFileInfo(path).fileName();
+        if(!isValidFileName(uploadName)){
+            QMessageBox::information(this,"提示",QString("文件名不合法：%1").arg(uploadName));
+            continue;
         }
-        hasher.addData(chunk);
+        TransferManager::instance().enqueuePersonalUpload(path,m_strCurPath,uploadName);
+        ++enqueued;
     }
-    const qint64 fileSize=file.size();
-    file.close();
-    const QByteArray shaHex=hasher.result().toHex();          // 64 hex（小写）
-
-    // 请求级唯一标识（32hex）：同一文件一次上传的键固定，重试即可命中服务端幂等短路
-    const QByteArray reqId=QUuid::createUuid().toRfc4122().toHex();
-
-    const QByteArray nameBytes=uploadName.toUtf8();
-    const QByteArray dirBytes=m_strCurPath.toUtf8();
-    QByteArray msg;
-    msg.append(shaHex);
-    msg.append(nameBytes);
-    msg.append(dirBytes);
-    msg.append(reqId);
-
-    PDU* pdu=mkPDU(uint(msg.size()));
-    pdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST;
-    const uint version=FASTCHECK_VERSION;
-    const uint magic=FASTCHECK_MAGIC;
-    const uint shaLen=uint(FASTCHECK_SHA_HEX_LEN);
-    const uint nameLen=uint(nameBytes.size());
-    const uint dirLen=uint(dirBytes.size());
-    const uint reqIdLen=uint(reqId.size());
-    memcpy(pdu->caData+FASTCHECK_VERSION_OFFSET,&version,sizeof(version));
-    memcpy(pdu->caData+FASTCHECK_MAGIC_OFFSET,&magic,sizeof(magic));
-    memcpy(pdu->caData+FASTCHECK_FILE_SIZE_OFFSET,&fileSize,sizeof(fileSize));
-    memcpy(pdu->caData+FASTCHECK_SHA_LEN_OFFSET,&shaLen,sizeof(shaLen));
-    memcpy(pdu->caData+FASTCHECK_NAME_LEN_OFFSET,&nameLen,sizeof(nameLen));
-    memcpy(pdu->caData+FASTCHECK_DIR_LEN_OFFSET,&dirLen,sizeof(dirLen));
-    memcpy(pdu->caData+FASTCHECK_REQID_LEN_OFFSET,&reqIdLen,sizeof(reqIdLen));
-    memcpy(pdu->caMsg,msg.constData(),size_t(msg.size()));
-    qCDebug(lcCli)<<"秒传预检查 文件名"<<nameBytes.constData()<<"文件大小"<<fileSize<<endl;
-    Client::getinstance().seedMsg(pdu);
+    if(enqueued>0){
+        TransferManager::instance().showPanel();
+    }
 }
 
+// REQ-EXT-TRANSFER-001 §5.5：下载支持多选并发（仅普通文件；目录跳过）
 void File::on_download_PB_clicked()
 {
-    QListWidgetItem* fileItem=ui->file_LW->currentItem();
-    if(fileItem==nullptr){
+    const QList<QListWidgetItem*> items=ui->file_LW->selectedItems();
+    if(items.isEmpty()){
         QMessageBox::information(this,"提示","请选择要下载的文件");
         return;
     }
-
-    uint fileType=0;
-    bool found=false;
-    for(int i=0;i<this->m_fileInfoList.size();i++){
-        if(QString::fromUtf8(m_fileInfoList[i]->caName)==fileItem->text()){
-            fileType=m_fileInfoList[i]->uiType;
-            found=true;
-            break;
+    int enqueued=0;
+    for(QListWidgetItem* fileItem:items){
+        uint fileType=0;
+        bool found=false;
+        for(int i=0;i<this->m_fileInfoList.size();i++){
+            if(QString::fromUtf8(m_fileInfoList[i]->caName)==fileItem->text()){
+                fileType=m_fileInfoList[i]->uiType;
+                found=true;
+                break;
+            }
         }
+        if(!found || fileType!=1){
+            continue;   // 目录不可下载
+        }
+        const QString filePath=QString("%1/%2").arg(this->m_strCurPath).arg(fileItem->text());
+        TransferManager::instance().enqueuePersonalDownload(filePath,fileItem->text());
+        ++enqueued;
     }
-    if(!found || fileType!=1){
+    if(enqueued==0){
         QMessageBox::information(this,"提示","只能下载普通文件");
         return;
     }
-
-    QString filePath=QString("%1/%2").arg(this->m_strCurPath).arg(fileItem->text());
-    QByteArray filePathBytes=filePath.toUtf8();
-    PDU* pdu=mkPDU(filePathBytes.size()+1);
-    pdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST;
-    QByteArray fileNameBytes=fileItem->text().toUtf8();
-    memcpy(pdu->caData,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
-    memcpy(pdu->caMsg,filePathBytes.constData(),filePathBytes.size());
-    Client::getinstance().seedMsg(pdu);
-
+    TransferManager::instance().showPanel();
 }
 
 void File::on_share_PB_clicked()

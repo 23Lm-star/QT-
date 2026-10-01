@@ -15,7 +15,7 @@ E:\qt\xiangmu/
 ├── AGENTS.md                            # AI 工程协作增强规则（用户级）
 │
 ├── Client/                              # 客户端（Qt 5 Widgets GUI）
-│   ├── Client.pro                       # qmake 构建文件（core gui network）
+│   ├── Client.pro                       # qmake 构建文件（core gui network concurrent）
 │   ├── main.cpp                         # 入口（设默认日志过滤规则）
 │   ├── logging.h / logging.cpp          # 日志分类：lcCli(xmu.cli)，安静默认+QT_LOGGING_RULES 开关（REQ-LOG-007）
 │   ├── protocol.h / protocol.cpp        # PDU 协议定义 + malloc/free 构造
@@ -29,7 +29,8 @@ E:\qt\xiangmu/
 │   ├── sharefile.h / .cpp / .ui         # 既有好友文件分享：选择目标好友 UI（保护区）
 │   ├── clientheartbeat.{h,cpp}           # ⚠️ 延后：基础心跳已内嵌于 client.cpp（PING/PONG），组件化延后至下迭代
 │   ├── sharelinkdialog.{h,cpp,.ui}       # ⚠️ 待创建：分享链接展示弹窗（R18 fix-spec 任务 C）
-│   ├── uploader.h / uploader.cpp        # 文件上传工作线程（独立 QThread）
+│   ├── uploader.h / uploader.cpp        # 单文件分块上传（带 transferId，单块在途）
+│   ├── transfertask.{h,cpp}             # REQ-EXT-TRANSFER-001：并行传输任务管理与列表（TransferManager/TransferTaskPanel）
 │   ├── userinformation.h / .cpp / .ui   # 用户信息弹窗
 │   ├── simplecaptcha.h / .cpp           # 验证码组件（本地绘制）
 │   ├── connect.config                   # 连接配置（IP/端口/文件路径等）
@@ -48,7 +49,8 @@ E:\qt\xiangmu/
 │   ├── msghandler.h / .cpp              # 请求处理：注册/登录/好友/聊天/文件/验证码
 │   ├── operatedb.h / .cpp               # 数据库操作集（单例）
 │   ├── databaseconnectionpool.h / .cpp  # 数据库连接池（RAII，按线程隔离）
-│   ├── resumableuploadsession.h / .cpp  # 断点续传会话管理
+│   ├── resumableuploadsession.h / .cpp  # 断点续传会话管理（REQ-EXT-TRANSFER-001 起按 transfer_id 持有于 UploadCtx）
+│   ├── uploadwritetask.h / .cpp         # 分块写盘任务（回带 transferId）
 │   ├── sharelinkservice.{h,cpp}          # ⚠️ 待创建：安全 token 生成/哈希/路径校验（R18 fix-spec 任务 B 3.2）
 │   ├── connect.config
 │   ├── config.qrc                       # Qt 资源文件索引
@@ -118,7 +120,11 @@ Server 依赖关系：
 | 数据库查询 | `operatedb.cpp` | 各 `handle*()` 方法，已全部迁移到 `prepare()`+`bindValue()` |
 | 连接池获取 | `databaseconnectionpool.cpp` | `PooledSqlConnection acquire()` (RAII) |
 | 内存分配 | `memalloc.h` | `void* memalloc(size_t)` / `void memfree(void*)` |
-| 断点续传 | `resumableuploadsession.h` | `BeginResult begin(...)` / `bool append(...)` |
+| 断点续传 | `resumableuploadsession.h` | `BeginResult beginStaged(owner,parent,display,size,resumeEnabled)` / `acceptWrittenChunk(offset,len)` |
+| 并行传输调度 | `Client/transfertask.h` | `TransferManager::enqueuePersonalUpload/enqueueGroupUpload/enqueuePersonalDownload/enqueueGroupDownload(...)`、`transferIdOf(PDU*)`、`pause/resume/cancel` |
+| 传输 id 取值 | `Client/transfertask.cpp` | `quint64 TransferManager::transferIdOf(const PDU*)`（41 读 `[16..23]`，其余 `[48..55]`） |
+| 服务端上传槽 | `Server/msghandler.h` | `UploadCtx* findUpload(quint64)` / `bool acquireUploadSlot(quint64)` / `void abortUpload(quint64)` / `void reapIdleUploads(nowMs,idleSec)` |
+| 服务端下载环 | `Server/mytcpsocket.h` | `void startDownloadStream(path,id)` / `void removeDownloadStream(id)`（`m_downloadRing` round-robin） |
 
 ---
 
@@ -142,8 +148,8 @@ Server 依赖关系：
 PDU (76B 固定头 + 柔性数组)
 ├── uiTotalLen: uint  — 报文总长度
 ├── uiMsgLen: uint    — 消息体长度
-├── uiType: uint      — 消息类型枚举（当前已显式分配至 53；规划追加 54~55）
-├── caData[64]        — 固定参数区（按 uiType 复用）
+├── uiType: uint      — 消息类型枚举（当前已分配至 108；1–55 基础段，60–96 群，97–98 秒传，99–106 群文件，107–108 传输释放）
+├── caData[64]        — 固定参数区（按 uiType 复用；传输族在 [48..55] 追加 u64 transfer_id，41 例外为 [16..23]）
 └── caMsg[]           — 柔性数组
 
 Msg (聊天消息体，嵌入 PDU.caMsg)
@@ -175,7 +181,9 @@ Msg (聊天消息体，嵌入 PDU.caMsg)
 | 中文注释乱码 | ✅ 已修复 | BUG-POOL-008，UTF-8 中文注释可读 |
 | 内存池分配说明不足 | ✅ 已修复 | BUG-POOL-003/007，所有权/配对注释已补充 |
 | 功能基线被错误 Git 回退 | 严重 | BUG-ARC-RECOVERY-001：`git reset HEAD~1` 使 REQ-AUTH-001 及扩展代码不在当前 HEAD；历史提交混入 PDU 释放/好友转发等危险回退，必须定点恢复。 |
-| 安全注销功能被回退 | 严重 | REQ-AUTH-001：历史存在实现但当前基线缺失；需在协议编号稳定后恢复密码校验、事务清理和用户目录清理。 |
+| 安全注销功能被回退 | 严重 | REQ-AUTH-001：历史存在实现但基线缺失；需在协议编号稳定后恢复密码校验、事务清理和用户目录清理。 |
+| 下载不可 abort | 一般 | REQ-EXT-TRANSFER-001 §10 R1：客户端放弃某下载后服务端仍发完（有界 ≤ 文件大小，断线即止）；列入后续需求 |
+| 传输热路径并发状态 | 一般 | REQ-EXT-TRANSFER-001：上传上下文与下载环均为**单连接单线程**访问（Qt 事件循环 + 写盘回调经 queued invoke 回主线程），新增状态不加锁；修改时须保持"所有 m_uploads/m_downloads 访问都在主线程"这一前提 |
 
 ---
 
