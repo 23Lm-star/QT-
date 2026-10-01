@@ -51,6 +51,8 @@
 
 ## 门次与事件（append-only）
 - 2026-10-01 **goal**：定档 LARGE。依赖 8 项逐条以代码/DB 实测通过（见上表）。产出 `task.md` + `design.md`（协议 99–106 逐字段/偏移、`group_file` DDL、权限判定点、路径负向面、验收 1–6 验证手段、允许路径）。契约变更批准卡已提交主人，**待批准**。本会话不写实现代码、不开 development 节点。
+- 2026-10-01 **approval**：主人批准契约变更（PDU 99–106 追加 + `group_file` 新表 + `schema_version=2026100103`），并指示开 development 节点。冻结面命中（两端 `protocol.h`）按批准清单执行，判读口径见 design §9。
+- 2026-10-01 **development**（提交 `0b83aab`）：实现协议 99–106（只追加，两端常量块逐字节一致）、`group_file` 迁移（`migrate_ext_group_003.sql` + 版本 `2026100103`）、`FileObjectStore::attachGroupFile/releaseGroupFile`（refcount = user_file(active) ∪ group_file(active)）、`OperateDB::handleGroupFileOperation`（P0–P7 即时判定）、`MsgHandler::groupFileRequest` + 分派登记 + `authRejectPdu` 映射、客户端群文件窗口（上传/下载/删除/列表，32 确认按上传上下文路由）。群上传复用 31/32、群下载复用 42/43，源路径仅由服务端 `object_id→storage_path` 解析。pipeline：build GREEN、test GREEN-WARN(0 注册用例，如实)、audit 仅报预期冻结面命中。验收：`groupfile_e2e.py` 45/45；既有回归 entry_ops 43/43、dedup 13/13、cross_tree 37/37、sec001 48/48、fastupload 46/46；群生命周期 15/15。**未 push**；未跨分支合并。
 
 ## 下一节点
-主人批准契约变更（PDU 99–106 追加 + `group_file` 新表 + `schema_version=2026100103`）→ 开 development 节点（新会话，从本分支施工）。
+independent test（新会话、异代理）：在 `0b83aab` 的干净 detached worktree 复跑 pipeline 与 `groupfile_e2e.py`，证据落 `project-docs/evidence/REQ-EXT-GROUP-003/independent-test/`。之后 repair（如需）→ independent audit（新会话、异代理、只读）→ integration 三事实行 → merge no-ff。
