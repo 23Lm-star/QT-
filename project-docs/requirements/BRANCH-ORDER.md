@@ -226,4 +226,5 @@
 | E3 | REQ-EXT-GROUP-002 可靠群文本消息 | `codex/req-ext-group-002-group-messaging` | LARGE | ✅ 已完成（merge `ffaaacf`，PDU 88–96，独立测试 PASS + 独立审计 PASS，e2e 全绿，2026-10-01） |
 | E4 | REQ-EXT-FILE-001 文件资产与内容寻址 | `codex/req-ext-file-001-file-assets` | LARGE | ✅ 已完成（merge `9faae6c`，对象仓 + 五表 + 逻辑键，四套件 43/13/48/37 全绿，protocol.h 零碰，2026-09-30） |
 | E5 | REQ-EXT-FILE-002 顺序上传秒传与去重 | `codex/req-ext-file-002-fast-upload` | LARGE | ✅ 已完成（merge `abe2e5d`，PDU 97/98 追加 + 秒传预检查/去重，独立测试 46/46 与独立审计 ACCEPT，2026-10-01） |
-| E6+ | REQ-EXT-GROUP-003 | 自 master 切出 | LARGE | 未开工；依赖 E1 的 actor 门语义 |
+| E6+ | REQ-EXT-GROUP-003 | 自 master 切出 | LARGE | 未开工；依赖 E1 的 actor 门语义（注：实际已 merge `495e552`，本表滞后） |
+| UX1 | REQ-UX-001 客户端可用性与视觉统一 | `fix/req-ux-001-client-usability` | MEDIUM | ✅ 已完成（merge `8cf7e3b`，2026-10-01；五套 e2e 195/195 + A2 定向探针 5/5，证据 `project-docs/evidence/REQ-UX-001/`；GUI 目视 NEEDS-HUMAN） |
