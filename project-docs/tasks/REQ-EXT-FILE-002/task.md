@@ -50,7 +50,8 @@
 > 说明：L1/L2 是同一函数的同一处判别缺陷，属"本需求自身触碰面内的既有缺陷"，非无关缺陷——按 v1.7「无关缺陷另开 SMALL 分支」不适用；若设计阶段实测证明其修复超出该函数局部（如需改 SQL 谓词语义），则降级为独立 SMALL 分支并记入台账。
 
 ## 门次与事件（append-only）
-- 2026-10-01 goal：定档 LARGE，依赖四项实测通过，FILE-001 遗留 L1/L2 纳入本分支，契约变更批准卡提交主人（待答）。
+- 2026-10-01 goal：定档 LARGE，依赖四项实测通过，FILE-001 遗留 L1/L2 纳入本分支，契约变更批准卡提交主人。
+- 2026-10-01 **主人批准**（原话"同意（推荐）"）：批准范围为设计 §1 的协议追加（`protocol.h` 两端新增 `UPLOADFILE_FASTCHECK_REQUEST=97` / `_RESPOND=98`，只追加不重编号 + 新偏移/magic 常量）与 §3 的 `upload_session` 加三列（`client_request_id`、`file_id`、`uk_req`）+ `schema_version` 提升至 `2026100101`。批准即签核 design（`design.md`）。**不含**：改动既有 PDU 编号、既有分块协议语义、新增外部依赖。
 
 ## 下一节点
-design 已成文（`design.md`）→ 等主人对契约变更批准卡作答 → 批准后进 development。
+development（owner 会话）：dev worktree 从本分支切出 → 按 design §1–§4 落地 → pipeline 三门 → handoff。契约变更已批准，无待决门。
