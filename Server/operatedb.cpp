@@ -218,24 +218,30 @@ void OperateDB::normalizeLogicKeys()
     int ufConverted = 0, ufCollapsed = 0, ufSkippedDeleted = 0, sessConverted = 0;
     int mapConverted = 0, mapDupRemoved = 0, unmapped = 0;
 
-    // 1) user_file——F-5 修复：单遍确定性。判别不依赖首字符 '/'（覆盖 "/filesys/..." 无盘符
-    //    旧形态）：canonical 行（'/' 开头且 '/' 结尾且无 "//"）预种子为冲突基准；其余行按
+    // 1) user_file——F-5 修复：单遍确定性。判别与 FileObjectStore::isLogicKeyForm 对齐
+    //    （T3/FINDING-DEV-3 修复）：旧 SQL 形状谓词（'/' 开头且 '/' 结尾且无 "//"）把
+    //    "/filesys/<owner>/…/"、含盘符 ':'、含 '\'、含 "."/".." 段的旧行误判为 canonical，
+    //    与 normalizeParent 的 fs 根 basename 判别不一致，存量行因此不被转换（数据面未收口）。
+    //    现判据 canonical ⟺ normalizeParent 原样回显：canonical 行预种子为冲突基准；其余行按
     //    file_id 单遍——撞键时 **不改写 loser 的 parent_path**（改写=与存活行同三重撞
     //    uk_loc→1062 死锁在旧键）。存活优先级：canonical 行 > 最早旧行；loser active→仅
     //    软删+镜像 releaseEntry 减引用（D3 不物理删），deleted→静默跳过（重放稳定无告警）。
     QSet<QString> seenUf;
     {
         QSqlQuery s(db);
-        if (s.exec("SELECT owner_name,parent_path,display_name FROM user_file "
-                   "WHERE parent_path LIKE '/%' AND parent_path LIKE '%/' AND parent_path NOT LIKE '%//%'")) {
-            while (s.next())
-                seenUf.insert(s.value(0).toString() + "|" + s.value(1).toString() + "|" + s.value(2).toString());
+        if (s.exec("SELECT owner_name,parent_path,display_name FROM user_file")) {
+            while (s.next()) {
+                const QString owner = s.value(0).toString();
+                const QString pp = s.value(1).toString();
+                if (pp.isEmpty() || FileObjectStore::normalizeParent(owner, pp) != pp)
+                    continue;                       // 非 canonical：交第 2 段转换
+                seenUf.insert(owner + "|" + pp + "|" + s.value(2).toString());
+            }
         }
     }
     {
         QSqlQuery rows(db);
         if (rows.exec("SELECT file_id,owner_name,parent_path,display_name,object_id,status FROM user_file "
-                      "WHERE parent_path NOT LIKE '/%' OR parent_path NOT LIKE '%/' OR parent_path LIKE '%//%' "
                       "ORDER BY file_id")) {
             QVector<QVariantList> batch;
             while (rows.next()) {
@@ -256,10 +262,7 @@ void OperateDB::normalizeLogicKeys()
                     qCWarning(lcDb) << "[normalizeLogicKeys] user_file 行无法映射，保留原值" << fid << owner << stored;
                     continue;
                 }
-                if (key == stored) {   // 语义已是逻辑键（形态未 canonical）：仅登记
-                    seenUf.insert(owner + "|" + key + "|" + name);
-                    continue;
-                }
+                if (key == stored) continue;   // 已 canonical：基线阶段已登记
                 const QString triple = owner + "|" + key + "|" + name;
                 QSqlQuery u(db);
                 if (seenUf.contains(triple)) {
@@ -291,7 +294,6 @@ void OperateDB::normalizeLogicKeys()
     {
         QSqlQuery rows(db);
         if (rows.exec("SELECT session_id,owner_name,parent_path FROM upload_session "
-                      "WHERE parent_path NOT LIKE '/%' OR parent_path NOT LIKE '%/' OR parent_path LIKE '%//%' "
                       "ORDER BY session_id")) {
             QVector<QVariantList> batch;
             while (rows.next()) {

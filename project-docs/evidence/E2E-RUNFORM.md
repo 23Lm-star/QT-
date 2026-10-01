@@ -38,7 +38,7 @@
 |---|---|---|
 | entry_ops | 43 | `REQ-EXT-FILE-001/entry_ops_e2e.py` |
 | dedup | 13 | `REQ-EXT-FILE-001/dedup_e2e.py` |
-| cross_tree | 37 | `REQ-EXT-FILE-001/cross_tree_e2e.py` |
+| cross_tree | 41 | `REQ-EXT-FILE-001/cross_tree_e2e.py` |
 | sec001 | 48 | `REQ-EXT-FILE-001/sec001_regression.py` |
 | fastupload | 46 | `REQ-EXT-FILE-002/fastupload_e2e.py` |
 
