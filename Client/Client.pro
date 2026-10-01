@@ -29,6 +29,7 @@ SOURCES += \
     file.cpp \
     friend.cpp \
     group.cpp \
+    groupchat.cpp \
     index.cpp \
     logging.cpp \
     main.cpp \
@@ -51,6 +52,7 @@ HEADERS += \
     file.h \
     friend.h \
     group.h \
+    groupchat.h \
     index.h \
     msghandler.h \
     onlineuser.h \

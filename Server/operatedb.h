@@ -18,6 +18,8 @@ public:
     static const int kFileAssetSchemaVersion = 2026092901;
     // REQ-EXT-GROUP-001：群生命周期迁移版本；启动时要求数据库至少达到此版本。
     static const int kGroupSchemaVersion = 2026093001;
+    // REQ-EXT-GROUP-002：群消息迁移版本（group_info.last_seq + group_message 表）。
+    static const int kGroupMessageSchemaVersion = 2026100101;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
@@ -26,7 +28,9 @@ public:
         GroupCreate = 1, GroupInvite, GroupAcceptInvitation, GroupRejectInvitation,
         GroupLeave, GroupRemoveMember, GroupSetRole, GroupTransferOwner,
         GroupDissolve, GroupList, GroupListMembers, GroupQueryInvitations,
-        GroupSummary
+        GroupSummary,
+        // REQ-EXT-GROUP-002：群消息（发送/拉取/已读/未读）
+        GroupSendMessage, GroupPullMessages, GroupReadConfirm, GroupUnreadSummary
     };
     struct GroupRequest {
         GroupOperation operation;
@@ -36,6 +40,22 @@ public:
         QString targetName;          // 目标用户
         QString requestKey;          // 幂等键
         QString role;                // 角色 owner/admin/member
+        // REQ-EXT-GROUP-002 字段
+        QString clientMsgId;         // 发送幂等键（非空，<=64B）
+        QString content;             // 消息正文（<=2000B UTF-8，非空）
+        quint8 pullMode = 0;         // 0 前向补齐 / 1 后向翻页
+        quint64 cursorSeq = 0;       // 拉取游标 seq
+        quint16 limit = 50;          // 拉取条数（已钳制 1-100）
+        quint64 readSeq = 0;         // 已读确认目标 seq（服务端单调钳制）
+    };
+    // REQ-EXT-GROUP-002：需要在线广播（PDU 90）的群消息记录
+    struct GroupMessageRecord {
+        quint64 seq = 0;
+        quint64 msgId = 0;
+        QString sender;
+        quint8 msgType = 0;          // 0 文本 / 1 系统
+        quint64 createdAtMs = 0;
+        QString content;
     };
     struct GroupResult {
         int code;                    // 0 成功，负数为业务错误
@@ -44,9 +64,13 @@ public:
         quint64 groupId;             // 事件所属群
         quint64 version;             // 提交后的群版本
         int eventType;               // 0 无事件，1 成员变化，2 邀请变化
+        GroupMessageRecord message;  // REQ-EXT-GROUP-002：广播用消息记录
+        bool broadcastMessage = false; // true=提交成功后广播（幂等重放=false）
     };
     // 在单个数据库事务中执行群状态变更或隔离查询；actor 来自连接认证上下文。
     GroupResult handleGroupOperation(const GroupRequest &request, const QString &actor);
+    // REQ-EXT-GROUP-002：群消息操作（发送/拉取/已读确认/未读摘要）；actor 来自连接认证上下文。
+    GroupResult handleGroupMessageOperation(const GroupRequest &request, const QString &actor);
     //REQ-EXT-FILE-001 T6：存量文件启动自动迁移（幂等：file_migration_map 已有记录即跳过；
     //失败记 failed 继续其余，绝不删除旧文件——验收5）。main 在版本检查通过后调用一次。
     void migrateLegacyFiles();

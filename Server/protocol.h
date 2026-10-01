@@ -111,7 +111,18 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_GROUP_INVITATION_EVENT = 85,        // 邀请事件
     ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST = 86,   // 群摘要请求
     ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND = 87,   // 群摘要响应
-    // 88-95 预留给 REQ-EXT-GROUP-002 群消息，不在本需求实现
+
+    // ===== REQ-EXT-GROUP-002：可靠群文本消息（仅追加，旧编号 1-87 不变） =====
+    ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_REQUEST = 88,     // 发送群消息请求
+    ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_RESPOND = 89,     // 发送群消息响应（已持久化确认）
+    ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT = 90,            // 群消息在线投递事件（仅服务端生成）
+    ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST = 91,    // 按游标拉取群消息请求
+    ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_RESPOND = 92,    // 拉取群消息响应
+    ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST = 93,     // 已读游标确认请求
+    ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND = 94,     // 已读游标确认响应
+    ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST = 95,   // 未读摘要请求
+    ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND = 96,   // 未读摘要响应
+    // 97-99 继续预留
 
     ENUM_MSG_TYPE_MAX = 99999,
 };

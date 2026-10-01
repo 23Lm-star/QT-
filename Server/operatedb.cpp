@@ -85,17 +85,20 @@ bool OperateDB::checkSchemaVersion()
     if (!q.exec("SELECT MAX(version) FROM schema_version")) {
         qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
                          << q.lastError().text()
-                         << "— 请先执行 Server/migrate_ext_file_001.sql 与 migrate_ext_group_001.sql";
+                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql "
+                            "与 migrate_ext_group_002.sql";
         return false;
     }
     int version = 0;
     if (q.next() && !q.value(0).isNull()) {
         version = q.value(0).toInt();
     }
-    const int required = qMax(kFileAssetSchemaVersion, kGroupSchemaVersion);
+    const int required = qMax(kFileAssetSchemaVersion,
+                              qMax(kGroupSchemaVersion, kGroupMessageSchemaVersion));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
-                         << "— 请先执行 Server/migrate_ext_file_001.sql 与 migrate_ext_group_001.sql";
+                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql "
+                            "与 migrate_ext_group_002.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -1128,6 +1131,40 @@ void groupAppendRecord(QByteArray &body, quint64 groupId, const QString &groupNa
     groupAppendString(body, role.toUtf8());
     groupAppendU64(body, version);
 }
+
+// REQ-EXT-GROUP-002 T6：成员事件系统消息——调用方已在同一事务内，本函数沿用同一
+// 序号通道（group_info.last_seq 原子递增）追加一条 msg_type='system' 行。
+// 返回 false 时调用方必须回滚；code 为业务失败码（-2105 序号分配/入库失败）。
+bool groupAppendSystemMessage(QSqlDatabase &db, quint64 groupId, const QString &sender,
+                              const QString &content, OperateDB::GroupMessageRecord &out, int &code)
+{
+    QSqlQuery q(db);
+    q.prepare("UPDATE group_info SET last_seq=LAST_INSERT_ID(last_seq+1) WHERE group_id=?");
+    q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+    if (!q.exec() || q.numRowsAffected() != 1) { code = -2105; return false; }
+    q.prepare("SELECT LAST_INSERT_ID()");
+    if (!q.exec() || !q.next()) { code = -2105; return false; }
+    const quint64 seq = q.value(0).toULongLong();
+    if (seq == 0) { code = -2105; return false; }
+    q.prepare("INSERT INTO group_message(group_id,seq,client_msg_id,sender_name,msg_type,content) "
+              "VALUES (?,?,NULL,?,'system',?)");
+    q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+    q.addBindValue(QVariant::fromValue<qulonglong>(seq));
+    q.addBindValue(sender);
+    q.addBindValue(content);
+    if (!q.exec()) { code = -2105; return false; }
+    const quint64 msgId = q.lastInsertId().toULongLong();
+    q.prepare("SELECT ROUND(UNIX_TIMESTAMP(created_at)*1000) FROM group_message WHERE msg_id=?");
+    q.addBindValue(QVariant::fromValue<qulonglong>(msgId));
+    if (!q.exec() || !q.next()) { code = -2105; return false; }
+    out.seq = seq;
+    out.msgId = msgId;
+    out.sender = sender;
+    out.msgType = 1;
+    out.createdAtMs = q.value(0).toULongLong();
+    out.content = content;
+    return true;
+}
 }
 
 OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &request,
@@ -1206,6 +1243,12 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         result = groupFailure(0);
         result.responseBody = body;
         return result;
+    }
+
+    // REQ-EXT-GROUP-002：群消息操作走独立子路径（发送/拉取/已读/未读摘要）
+    if (request.operation == GroupSendMessage || request.operation == GroupPullMessages
+            || request.operation == GroupReadConfirm || request.operation == GroupUnreadSummary) {
+        return handleGroupMessageOperation(request, actor);
     }
 
     if (request.groupId == 0 && request.operation != GroupAcceptInvitation
@@ -1298,12 +1341,20 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
             q.prepare("UPDATE group_invitation SET status='accepted',handled_at=NOW() WHERE invitation_id=?");
             q.addBindValue(QVariant::fromValue<qulonglong>(request.invitationId));
             if (!q.exec()) { db.rollback(); return groupFailure(-1023); }
+            // REQ-EXT-GROUP-002 T6：加入事件在同一事务、同一序号通道追加系统消息
+            GroupMessageRecord joinMsg;
+            int sysCode = 0;
+            if (!groupAppendSystemMessage(db, groupId, actor,
+                                          actor + QStringLiteral(" 加入了群聊"), joinMsg, sysCode)) {
+                db.rollback(); return groupFailure(sysCode);
+            }
             ++version;
             q.prepare("UPDATE group_info SET version=? WHERE group_id=?");
             q.addBindValue(QVariant::fromValue<qulonglong>(version)); q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
             if (!q.exec() || !db.commit()) { db.rollback(); return groupFailure(-1024); }
             result = groupFailure(0); result.groupId = groupId; result.version = version;
             result.notifyUsers = groupActiveUsers(db, groupId); result.eventType = 1;
+            result.message = joinMsg; result.broadcastMessage = true;
             groupAppendU64(result.responseBody, groupId);
             return result;
         }
@@ -1348,11 +1399,20 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         groupAppendU64(result.responseBody, q.lastInsertId().toULongLong()); return result;
     }
 
+    GroupMessageRecord sysMsg;
+    bool sysMsgPending = false;
+    int sysCode = 0;
     if (request.operation == GroupLeave) {
         if (actorRole == "owner") { db.rollback(); return groupFailure(-1036); }
         q.prepare("UPDATE group_member SET status='left',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active'");
         q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
         if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1037); }
+        // REQ-EXT-GROUP-002 T6：退出事件系统消息（同一事务/序号通道）
+        if (!groupAppendSystemMessage(db, groupId, actor,
+                                      actor + QStringLiteral(" 退出了群聊"), sysMsg, sysCode)) {
+            db.rollback(); return groupFailure(sysCode);
+        }
+        sysMsgPending = true;
     } else if (request.operation == GroupRemoveMember) {
         if (actorRole != "owner" && actorRole != "admin") { db.rollback(); return groupFailure(-1038); }
         q.prepare("SELECT role,status FROM group_member WHERE group_id=? AND user_name=? FOR UPDATE");
@@ -1361,6 +1421,12 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         q.prepare("UPDATE group_member SET status='removed',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=?");
         q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
         if (!q.exec()) { db.rollback(); return groupFailure(-1040); }
+        // REQ-EXT-GROUP-002 T6：移除事件系统消息（同一事务/序号通道）
+        if (!groupAppendSystemMessage(db, groupId, actor,
+                                      request.targetName + QStringLiteral(" 被移出群聊"), sysMsg, sysCode)) {
+            db.rollback(); return groupFailure(sysCode);
+        }
+        sysMsgPending = true;
     } else if (request.operation == GroupSetRole) {
         if (actorRole != "owner" || (request.role != "admin" && request.role != "member")) { db.rollback(); return groupFailure(-1041); }
         q.prepare("UPDATE group_member SET role=?,updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active' AND role<>'owner'");
@@ -1392,6 +1458,237 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
     result.version = version;
     result.notifyUsers = groupActiveUsers(db, groupId);
     result.eventType = 1;
+    if (sysMsgPending) { result.message = sysMsg; result.broadcastMessage = true; }
     groupAppendU64(result.responseBody, groupId);
     return result;
+}
+
+// ===== REQ-EXT-GROUP-002：群消息操作（发送/拉取/已读/未读摘要） =====
+// 权限事实源与 GROUP-001 同源：group_info.status='active' + group_member.status='active'。
+// 失败码段 -2xxx：-2101 非成员 / -2102 群不存在或已解散 / -2103 内容/幂等键非法 /
+// -2104 幂等冲突异常 / -2105 序号分配或入库失败。不泄露他群存在性。
+OperateDB::GroupResult OperateDB::handleGroupMessageOperation(const GroupRequest &request,
+                                                              const QString &actor)
+{
+    if (actor.isEmpty()) return groupFailure(-1001); // 未认证主体
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return groupFailure(-1002); // 数据库不可达
+    QSqlDatabase db = connection.database();
+    GroupResult result = groupFailure(-2000);
+    QSqlQuery q(db);
+
+    // ---- 未读摘要（95/96）：按 actor 汇总其全部 active 群，不需要 group_id ----
+    if (request.operation == GroupUnreadSummary) {
+        q.prepare("SELECT gm.group_id,gi.last_seq,gm.last_read_seq,"
+                  "(SELECT COUNT(*) FROM group_message m WHERE m.group_id=gm.group_id "
+                  " AND m.seq>gm.last_read_seq AND m.seq<=gi.last_seq) "
+                  "FROM group_member gm JOIN group_info gi ON gi.group_id=gm.group_id "
+                  "WHERE gm.user_name=? AND gm.status='active' AND gi.status='active' "
+                  "ORDER BY gm.group_id");
+        q.addBindValue(actor);
+        if (!q.exec()) return groupFailure(-2105);
+        QList<QByteArray> rows;
+        while (q.next()) {
+            QByteArray row;
+            groupAppendU64(row, q.value(0).toULongLong());
+            groupAppendU64(row, q.value(1).toULongLong());
+            groupAppendU64(row, q.value(2).toULongLong());
+            groupAppendU64(row, q.value(3).toULongLong());
+            rows.append(row);
+        }
+        QByteArray body;
+        groupAppendU32(body, quint32(rows.size()));
+        for (const QByteArray &row : rows) body.append(row);
+        result = groupFailure(0);
+        result.responseBody = body;
+        return result;
+    }
+
+    // 以下三类操作必须携带有效 group_id
+    if (request.groupId == 0) return groupFailure(-2102);
+
+    if (request.operation == GroupSendMessage) {
+        // 服务端权威校验：内容非空且 <=2000B UTF-8；幂等键非空且 <=64B。
+        // 载荷无 sender 字段——发送者一律取 actor。
+        const QByteArray contentUtf8 = request.content.toUtf8();
+        const QByteArray clientKeyUtf8 = request.clientMsgId.toUtf8();
+        if (contentUtf8.isEmpty() || contentUtf8.size() > 2000
+                || clientKeyUtf8.isEmpty() || clientKeyUtf8.size() > 64) {
+            return groupFailure(-2103);
+        }
+        if (!db.transaction()) return groupFailure(-2105);
+        // 群行锁：串行化同群发送，序号不重复、不倒退由行锁保证，uk_group_seq 兜底
+        q.prepare("SELECT status,last_seq FROM group_info WHERE group_id=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        if (!q.exec() || !q.next() || q.value(0).toString() != "active") {
+            db.rollback(); return groupFailure(-2102);
+        }
+        // 成员门：非成员/已退出/被移除即时失效
+        q.prepare("SELECT role FROM group_member WHERE group_id=? AND user_name=? AND status='active' FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(actor);
+        if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-2101); }
+        // 幂等短路：同 client_msg_id 已存在 → 返回既有消息；REPEATABLE READ 下 gap 锁
+        // 使并发同键重试串行，后到事务命中本分支。
+        q.prepare("SELECT seq,msg_id,sender_name,msg_type,ROUND(UNIX_TIMESTAMP(created_at)*1000),content "
+                  "FROM group_message WHERE group_id=? AND client_msg_id=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(request.clientMsgId);
+        if (!q.exec()) { db.rollback(); return groupFailure(-2105); }
+        if (q.next()) {
+            GroupMessageRecord existing;
+            existing.seq = q.value(0).toULongLong();
+            existing.msgId = q.value(1).toULongLong();
+            existing.sender = q.value(2).toString();
+            existing.msgType = quint8(q.value(3).toString() == "system" ? 1 : 0);
+            existing.createdAtMs = q.value(4).toULongLong();
+            existing.content = q.value(5).toString();
+            if (existing.sender != actor) { db.rollback(); return groupFailure(-2104); }
+            if (!db.commit()) { db.rollback(); return groupFailure(-2104); }
+            result = groupFailure(0);
+            result.groupId = request.groupId;
+            result.message = existing;
+            result.broadcastMessage = false; // 重放不重复广播
+            groupAppendString(result.responseBody, clientKeyUtf8);
+            groupAppendU64(result.responseBody, existing.seq);
+            groupAppendU64(result.responseBody, existing.msgId);
+            groupAppendU64(result.responseBody, existing.createdAtMs);
+            return result;
+        }
+        // 新消息：事务内原子分配序号（LAST_INSERT_ID 为连接级，同事务同连接）
+        q.prepare("UPDATE group_info SET last_seq=LAST_INSERT_ID(last_seq+1),version=version+1 WHERE group_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-2105); }
+        q.prepare("SELECT LAST_INSERT_ID()");
+        if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-2105); }
+        const quint64 seq = q.value(0).toULongLong();
+        if (seq == 0) { db.rollback(); return groupFailure(-2105); }
+        q.prepare("INSERT INTO group_message(group_id,seq,client_msg_id,sender_name,msg_type,content) "
+                  "VALUES (?,?,?,?,'text',?)");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(QVariant::fromValue<qulonglong>(seq));
+        q.addBindValue(request.clientMsgId);
+        q.addBindValue(actor);
+        q.addBindValue(request.content);
+        if (!q.exec()) { db.rollback(); return groupFailure(-2105); }
+        const quint64 msgId = q.lastInsertId().toULongLong();
+        q.prepare("SELECT ROUND(UNIX_TIMESTAMP(created_at)*1000) FROM group_message WHERE msg_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(msgId));
+        if (!q.exec() || !q.next()) { db.rollback(); return groupFailure(-2105); }
+        const quint64 createdAtMs = q.value(0).toULongLong();
+        if (!db.commit()) { db.rollback(); return groupFailure(-2105); }
+        // 先提交后广播：广播动作由 MsgHandler 在本函数返回后触发（设计 §5.2 不变式）
+        result = groupFailure(0);
+        result.groupId = request.groupId;
+        result.message.seq = seq;
+        result.message.msgId = msgId;
+        result.message.sender = actor;
+        result.message.msgType = 0;
+        result.message.createdAtMs = createdAtMs;
+        result.message.content = request.content;
+        result.broadcastMessage = true;
+        result.notifyUsers = groupActiveUsers(db, request.groupId);
+        groupAppendString(result.responseBody, clientKeyUtf8);
+        groupAppendU64(result.responseBody, seq);
+        groupAppendU64(result.responseBody, msgId);
+        groupAppendU64(result.responseBody, createdAtMs);
+        return result;
+    }
+
+    if (request.operation == GroupPullMessages) {
+        const quint8 mode = request.pullMode;       // 0 前向补齐 / 1 后向翻页，越界由解析层拒绝
+        const int limit = qBound(1, int(request.limit), 100);
+        q.prepare("SELECT status,last_seq FROM group_info WHERE group_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        if (!q.exec() || !q.next() || q.value(0).toString() != "active") return groupFailure(-2102);
+        const quint64 groupLastSeq = q.value(1).toULongLong();
+        q.prepare("SELECT last_read_seq FROM group_member WHERE group_id=? AND user_name=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(actor);
+        if (!q.exec() || !q.next()) return groupFailure(-2101);
+        const quint64 lastReadSeq = q.value(0).toULongLong();
+
+        q.prepare(QStringLiteral("SELECT seq,msg_id,sender_name,msg_type,"
+                                 "ROUND(UNIX_TIMESTAMP(created_at)*1000),content FROM group_message "
+                                 "WHERE group_id=? AND seq %1 ? ORDER BY seq %2 LIMIT ?")
+                  .arg(mode == 0 ? QStringLiteral(">") : QStringLiteral("<="),
+                       mode == 0 ? QStringLiteral("ASC") : QStringLiteral("DESC")));
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.cursorSeq));
+        q.addBindValue(limit + 1); // 多取一条判定 has_more
+        if (!q.exec()) return groupFailure(-2105);
+        QList<QByteArray> records;
+        while (q.next()) {
+            const quint64 recSeq = q.value(0).toULongLong();
+            QByteArray row;
+            groupAppendU64(row, recSeq);
+            groupAppendU64(row, q.value(1).toULongLong());
+            groupAppendString(row, q.value(2).toString().toUtf8());
+            row.append(char(quint8(q.value(3).toString() == "system" ? 1 : 0)));
+            groupAppendU64(row, q.value(4).toULongLong());
+            groupAppendString(row, q.value(5).toString().toUtf8());
+            if (mode == 1) records.prepend(row); else records.append(row);
+        }
+        bool hasMore = records.size() > limit;
+        if (hasMore) { if (mode == 1) records.removeFirst(); else records.removeLast(); }
+        // next_cursor = 本批"实际返回"边界 seq（mode0=最大 / mode1=最小）：
+        // 必须在裁掉多取行之后取，否则前向会跳过边界消息、后向会原地踏步。
+        quint64 nextCursor = request.cursorSeq;
+        if (!records.isEmpty()) {
+            int cursorOffset = 0;
+            quint64 boundary = 0;
+            if (mode == 0) groupReadU64(records.last(), cursorOffset, boundary);
+            else groupReadU64(records.first(), cursorOffset, boundary);
+            nextCursor = boundary;
+        }
+        q.prepare("SELECT COUNT(*) FROM group_message WHERE group_id=? AND seq>? AND seq<=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(QVariant::fromValue<qulonglong>(lastReadSeq));
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupLastSeq));
+        if (!q.exec() || !q.next()) return groupFailure(-2105);
+        const quint64 unread = q.value(0).toULongLong();
+
+        QByteArray body;
+        body.append(char(mode));
+        body.append(char(hasMore ? 1 : 0));
+        groupAppendU64(body, nextCursor);
+        groupAppendU64(body, groupLastSeq);
+        groupAppendU64(body, unread);
+        groupAppendU32(body, quint32(records.size()));
+        for (const QByteArray &row : records) body.append(row);
+        result = groupFailure(0);
+        result.groupId = request.groupId;
+        result.responseBody = body;
+        return result;
+    }
+
+    if (request.operation == GroupReadConfirm) {
+        // 单调推进：不可回退、不可越权代推（user_name 恒为 actor）、不可超过群水位
+        q.prepare("SELECT status FROM group_info WHERE group_id=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        if (!q.exec() || !q.next() || q.value(0).toString() != "active") return groupFailure(-2102);
+        q.prepare("SELECT 1 FROM group_member WHERE group_id=? AND user_name=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(actor);
+        if (!q.exec() || !q.next()) return groupFailure(-2101);
+        q.prepare("UPDATE group_member SET last_read_seq="
+                  "LEAST(GREATEST(last_read_seq,?),"
+                  "(SELECT last_seq FROM group_info WHERE group_id=?)) "
+                  "WHERE group_id=? AND user_name=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.readSeq));
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(actor);
+        if (!q.exec()) return groupFailure(-2105);
+        q.prepare("SELECT last_read_seq FROM group_member WHERE group_id=? AND user_name=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(actor);
+        if (!q.exec() || !q.next()) return groupFailure(-2105);
+        result = groupFailure(0);
+        result.groupId = request.groupId;
+        groupAppendU64(result.responseBody, q.value(0).toULongLong());
+        return result;
+    }
+
+    return groupFailure(-2000);
 }
