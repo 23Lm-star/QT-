@@ -1,5 +1,7 @@
 #include "resumableuploadsession.h"
+#include "server.h"
 
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -64,6 +66,65 @@ ResumableUploadSession::BeginResult ResumableUploadSession::begin(const QString 
     return result;
 }
 
+// REQ-EXT-FILE-001 T4：暂存路径 = filesys/.staging/<sha1(owner|parent|display|size)>.part
+// 同参数重连命中同一 staging（断点续传）；完成前不进最终目录（§4）。
+ResumableUploadSession::BeginResult ResumableUploadSession::beginStaged(
+        const QString &owner, const QString &parentPath, const QString &displayName,
+        qint64 totalSize, bool resumeEnabled)
+{
+    reset();
+
+    BeginResult result = {false, 0, false};
+    if (owner.isEmpty() || parentPath.isEmpty() || displayName.isEmpty()
+            || displayName.contains('/') || displayName.contains('\\')
+            || totalSize < 0) {
+        return result;
+    }
+
+    const QByteArray key = (owner + "|" + parentPath + "|" + displayName + "|" + QString::number(totalSize))
+                               .toUtf8();
+    const QString token = QString::fromLatin1(
+        QCryptographicHash::hash(key, QCryptographicHash::Sha1).toHex());
+
+    QDir stageRoot(QDir(Server::getinstance().filesPath).absoluteFilePath(".staging"));
+    if (!stageRoot.exists() && !stageRoot.mkpath(".")) {
+        return result;
+    }
+    m_filePath = stageRoot.filePath(token + ".part");
+    m_owner = owner;
+    m_parent = parentPath;
+    m_display = displayName;
+
+    QFileInfo fileInfo(m_filePath);
+    qint64 offset = 0;
+    if (resumeEnabled && fileInfo.exists() && fileInfo.isFile()) {
+        const qint64 existingSize = fileInfo.size();
+        if (existingSize > 0 && existingSize < totalSize) {
+            offset = existingSize;
+        } else if (existingSize == totalSize) {
+            m_receivedSize = existingSize;
+            m_totalSize = totalSize;
+            return {true, existingSize, true};
+        }
+    }
+
+    QFile file(m_filePath);
+    QIODevice::OpenMode mode = QIODevice::WriteOnly;
+    mode |= ((resumeEnabled && offset > 0) ? QIODevice::Append : QIODevice::Truncate);
+    if (!file.open(mode)) {
+        reset();
+        return result;
+    }
+    file.close();
+
+    m_receivedSize = offset;
+    m_totalSize = totalSize;
+    result.ok = true;
+    result.offset = offset;
+    result.complete = isComplete();
+    return result;
+}
+
 bool ResumableUploadSession::acceptWrittenChunk(qint64 offset, qint64 len)
 {
     if (offset != m_receivedSize || len <= 0 || len > m_totalSize - m_receivedSize) {
@@ -98,4 +159,7 @@ void ResumableUploadSession::reset()
     m_filePath.clear();
     m_receivedSize = 0;
     m_totalSize = 0;
+    m_owner.clear();
+    m_parent.clear();
+    m_display.clear();
 }

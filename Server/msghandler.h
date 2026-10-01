@@ -21,7 +21,7 @@ public:
     ResumableUploadSession m_uploadSession;
     //各种处理函数，进行各种类型请求的处理
     PDU* rigist();//注册
-    PDU* login(QString& strname, bool& authOk);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context）
+    PDU* login(QString& strname, bool& authOk, quint64& loginVersion);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context；REQ-EXT-SESSION-001：loginVersion 供连接绑定用户域版本）
     PDU* finduser();//查找用户
     PDU *onlineuser(const QString & myname);//在线用户
     PDU* addfriend();//添加用户
@@ -46,12 +46,20 @@ public:
     QString generateCaptchaCode(int length = 6);
     PDU* getuserinformation();//获取用户信息
     PDU* logoff(bool& revoked);//注销账户（REQ-EXT-SEC-001：授权依据为连接级身份，revoked 供会话撤销）
+    // REQ-EXT-GROUP-001：统一解析、校验并处理 60-87 群协议请求。
+    PDU* groupRequest(uint requestType);
 
     // ===== REQ-EXT-SEC-001：连接级 actor_context（仅服务端登录成功时写入，客户端 PDU 字段不作为授权依据） =====
     QString m_actorName;   // 服务端派生的操作者用户名
     quint64 m_connId = 0;  // 连接关联标识（拒绝审计用）
     QString actorUserRoot() const;                     // 服务端生成的规范用户根：filesPath/<actor>
     bool pathInActorRoot(const QString& path) const;   // 路径必须落在 actor 本人用户根内
+    // REQ-EXT-FILE-001 D5：内容寻址后文件不再物理落用户路径，下载/删除改为
+    // 校验其所在目录（目录由 MKDIR 物理创建，必存在）落在 actor 根内。
+    bool parentDirInActorRoot(const QString& filePath) const;
+    // REQ-EXT-FILE-001 design §6：逻辑条目操作（改名/移动/分享登记）不要求物理存在，
+    // 仅做词法规范化 + actor 根越权判断（isPathInSandbox 原样留给仍在磁盘执行的读写）。
+    bool logicPathInActorRoot(const QString& path) const;
     PDU* createPublishLink(const QString& loginName);//创建外链分享
     
     // 新增：安全外链分享（BUG-ARC-PUBLINK-001）
@@ -79,6 +87,12 @@ public:
 
     //下载文件时存储通过验证的规范路径
     QString m_downloadCanonicalPath;
+
+    // ===== REQ-EXT-FILE-001 T3/T4：内容寻址上传落定 =====
+    qint64 m_uploadSessionId = -1;   // 当前暂存会话 upload_session.session_id
+    // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
+    // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。
+    void finalizeUploadOnComplete();
 
     // REQ-FS-003: 统一路径沙箱校验（集中一处，所有路径入口调用）
     // 根与路径分别做 canonical 归一（解析 ../ 与符号链接）后判前缀；

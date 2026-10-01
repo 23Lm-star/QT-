@@ -1,6 +1,7 @@
 -- 数据库初始化脚本 (回归原始双名字段结构)
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS friend;
+DROP TABLE IF EXISTS login_record;
 DROP TABLE IF EXISTS user_info;
 SET FOREIGN_KEY_CHECKS = 1;
 
@@ -9,7 +10,18 @@ CREATE TABLE user_info (
     name VARCHAR(32) UNIQUE NOT NULL,
     pwd VARCHAR(32) NOT NULL,
     online INT DEFAULT 0,
-    salt VARCHAR(32) NOT NULL DEFAULT ''
+    salt VARCHAR(32) NOT NULL DEFAULT '',
+    login_version BIGINT NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- REQ-EXT-SESSION-001 登录档案（每次成功登录一行；种子不插登录行）
+CREATE TABLE login_record (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(32) NOT NULL,
+    client_id VARCHAR(64) NULL DEFAULT NULL,
+    login_version BIGINT NOT NULL,
+    login_time DATETIME NOT NULL,
+    KEY idx_user_ver (username, login_version)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE friend (

@@ -79,3 +79,13 @@
 - 过程教训（记录在案）：握手登记表是进程内存态——端到端脚本必须独占全新服务端进程运行，否则跨轮残存登记/落盘目标会污染断言（本轮 K2 三连 FAIL 即此因，非产品缺陷）。
 - F-1 已另立 SMALL 分支修复并合入 master（`4ae532e`→merge `fad502b`，closeout `628e491`，e2e 5/5）。功能分支合并前需先 `git merge master` 预解 `msghandler.cpp` createPublishLink 相邻区域冲突并重跑三脚本。
 - 待办：**增量复审 `eb0ecc1..0efccb9`**（重点：B-1 关闭 + 源归属校验的绕过面 + 邀请转发被拒时对合法客户端的可见行为）→ 三事实行 → 功能分支 merge master 预解冲突 → merge no-ff。
+
+## Integration / 合并记录（2026-09-29，owner）
+- 三事实行核验（合并前）：独立审计链存在且被接受（c7c4eed PASS*→eb0ecc1 REJECT/B-1→0efccb9 ACCEPT）；frozen-path diff `628e491..7fc47c1` 对两 protocol.h、Client/ 零命中；pipeline 在合并结果上实测 GREEN / honest-0 / PASS。
+- 功能分支先 `git merge master`（携入 F-1 修复 `4ae532e`，自动合并零冲突，`dc06365`）→ 三脚本重跑绿 → **no-ff 合入 master @`7fc47c1`**。
+- 合并结果再跑 48/48 端到端（全新服务端、干净握手注册表）：`project-docs/evidence/REQ-EXT-SEC-001/verify-48-final-7fc47c1.log`；三事实与流水线汇总 `pipeline-run-final-7fc47c1.log`；manifest `manifest-final-7fc47c1.txt`（0ebb50c4…）。
+- 证据归档：`project-docs/evidence/REQ-EXT-SEC-001/`（INDEX.md 按时间列出审计链与 e2e）。
+- 交付面：`Server/msghandler.{h,cpp}`、`Server/mytcpsocket.{h,cpp}`、`Server/mytcpserver.{h,cpp}`；Client/ 与两 protocol.h 零改动。
+- 遗留（另立分支，不属本需求）：F-1 ✅ 已修已合并（`fad502b`）；I-4 recvmsg DEBUG 落密码哈希（基线既有，Low）；登记表按 actor 配额（Low-Med）；revUserCnt 钳制（Low）；O-3 char[32] 无终止符（FS-003 观察）。
+- 下游：群组/秒传/群文件分支（REQ-EXT-GROUP-*/FILE-*）现可直接复用 actor 门与 `pathInActorRoot`/握手登记语义。
+- push 未做（待主人指令）。

@@ -1,8 +1,8 @@
 #include "logging.h"
 #include "client.h"
+#include "index.h"
 #include "ui_client.h"
 #include "process.h"
-#include "index.h"
 #include "file.h"
 #include <string.h>
 #include <QByteArray>
@@ -18,6 +18,8 @@
 #include <QTextStream>
 #include <QDateTime>
 #include <QInputDialog>
+#include <QSettings>
+#include <QUuid>
 #include <string>
 
 namespace {
@@ -56,6 +58,15 @@ Client::Client(QWidget *parent)
     setFixedSize(600,420);
     this->m_mhptr=new MsgHandler;
     loadconfig();
+    // REQ-EXT-SESSION-001：持久化客户端唯一 ID（首启生成 32hex 落盘，之后复用；登录负载附加区携带）
+    {
+        QSettings st;
+        m_clientId = st.value("client/unique_id").toString();
+        if(m_clientId.isEmpty()){
+            m_clientId = QUuid::createUuid().toString(QUuid::Id128);
+            st.setValue("client/unique_id", m_clientId);
+        }
+    }
     ui->loadingLabel->hide();
     m_captchaCooldownSec=0;
     m_captchaLocked=false;
@@ -282,6 +293,23 @@ void Client::handlMsg(PDU *&pdu)
     case ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND:
         m_mhptr->handleResolvePublishLink(pdu);
         break;
+    case ENUM_MSG_TYPE_CREATE_GROUP_RESPOND:
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_RESPOND:
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_RESPOND:
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_RESPOND:
+    case ENUM_MSG_TYPE_LEAVE_GROUP_RESPOND:
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_RESPOND:
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_RESPOND:
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_RESPOND:
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_RESPOND:
+    case ENUM_MSG_TYPE_LIST_GROUPS_RESPOND:
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND:
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND:
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND:
+    case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
+    case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
+        Index::getinstance().getGroup()->handleResponse(pdu);
+        break;
     default:
         break;
     }
@@ -373,12 +401,15 @@ void Client::on_login_PB_clicked(){
         return;
     }
     QByteArray captchaBytes=captchaInput.toUtf8();
-    PDU* pdu=mkPDU(captchaBytes.size()+1);
+    // REQ-EXT-SESSION-001 D1：验证码 NUL 之后追加 32 字节客户端 ID（零协议改动，老服务端按 uiMsgLen 忽略）
+    QByteArray clientIdBytes=m_clientId.toUtf8();
+    PDU* pdu=mkPDU(captchaBytes.size()+1+clientIdBytes.size());
     pdu->uiType=ENUM_MSG_TYPE_LOGIN_REQUEST;
     QByteArray passwordHash=passwordHashForProtocol(strpwd);
     copyFixedField(pdu->caData,32,strname.toUtf8());
     copyExactField(pdu->caData+32,32,passwordHash);
     memcpy(pdu->caMsg,captchaBytes.constData(),captchaBytes.size()+1);
+    memcpy(pdu->caMsg+captchaBytes.size()+1,clientIdBytes.constData(),clientIdBytes.size());
     seedMsg(pdu);
 }
 
@@ -480,6 +511,8 @@ void Client::onSocketDisconnected() {
     qCDebug(lcCli) << "[HEARTBEAT] socket disconnected 信号";
     // 已登录才弹窗（未登录在登录界面，连接失败不应弹重连窗口）
     if (m_loggedIn && !m_serverLostShown) {
+        // REQ-EXT-SESSION-001：被服务端版本校验切断时的提示（零协议，仅文案）；后续流程复用既有重连窗口
+        QMessageBox::information(this,"连接已关闭","连接被服务端关闭，账号可能已在其他设备登录。重新连接后请重新登录。");
         onServerLost();
     }
 }

@@ -2,6 +2,9 @@
 #define PROTOCOL_H
 //PDU协议类型定义
 
+#include <QByteArray>
+#include <QtGlobal>
+
 typedef unsigned int uint;
 
 static const uint UPLOAD_RESUME_MAGIC = 0x5253554d; // "RSUM"
@@ -79,6 +82,37 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_LISTDIR_REQUEST = 58,              // 列出某相对目录下的子目录
     ENUM_MSG_TYPE_LISTDIR_RESPOND = 59,              // 返回子目录列表（FileInfo 数组，uiType=0）
 
+    // ===== REQ-EXT-GROUP-001：群生命周期与成员关系（仅追加，旧编号不变） =====
+    ENUM_MSG_TYPE_CREATE_GROUP_REQUEST = 60,          // 建群请求
+    ENUM_MSG_TYPE_CREATE_GROUP_RESPOND = 61,          // 建群响应
+    ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST = 62,   // 邀请成员请求
+    ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_RESPOND = 63,   // 邀请成员响应
+    ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST = 64, // 接受邀请请求
+    ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_RESPOND = 65, // 接受邀请响应
+    ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST = 66, // 拒绝邀请请求
+    ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_RESPOND = 67, // 拒绝邀请响应
+    ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST = 68,           // 退出群请求
+    ENUM_MSG_TYPE_LEAVE_GROUP_RESPOND = 69,           // 退出群响应
+    ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST = 70,   // 移除成员请求
+    ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_RESPOND = 71,   // 移除成员响应
+    ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST = 72,        // 设置群角色请求
+    ENUM_MSG_TYPE_SET_GROUP_ROLE_RESPOND = 73,        // 设置群角色响应
+    ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST = 74,  // 转让群主请求
+    ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_RESPOND = 75,  // 转让群主响应
+    ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST = 76,        // 解散群请求
+    ENUM_MSG_TYPE_DISSOLVE_GROUP_RESPOND = 77,        // 解散群响应
+    ENUM_MSG_TYPE_LIST_GROUPS_REQUEST = 78,           // 群列表请求
+    ENUM_MSG_TYPE_LIST_GROUPS_RESPOND = 79,           // 群列表响应
+    ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST = 80,    // 成员列表请求
+    ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND = 81,    // 成员列表响应
+    ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST = 82, // 邀请查询请求
+    ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND = 83, // 邀请查询响应
+    ENUM_MSG_TYPE_GROUP_MEMBER_EVENT = 84,            // 成员变化事件
+    ENUM_MSG_TYPE_GROUP_INVITATION_EVENT = 85,        // 邀请事件
+    ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST = 86,   // 群摘要请求
+    ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND = 87,   // 群摘要响应
+    // 88-95 预留给 REQ-EXT-GROUP-002 群消息，不在本需求实现
+
     ENUM_MSG_TYPE_MAX = 99999,
 };
 
@@ -108,4 +142,65 @@ struct Msg{
 //构建pdu协议对象的函数
 //返回pdu对象的地址
 PDU* mkPDU(uint uiMsgLen=0);
+
+// 群协议公共信封长度：版本(2)+长度(2)+request_id(8)+group_id(8)，不直接传输 C++ 结构体。
+static const quint16 GROUP_PROTOCOL_VERSION = 1;
+static const quint16 GROUP_ENVELOPE_LENGTH = 20;
+
+inline void groupAppendU16(QByteArray &out, quint16 value)
+{
+    out.append(char(value & 0xff));
+    out.append(char((value >> 8) & 0xff));
+}
+
+inline void groupAppendU32(QByteArray &out, quint32 value)
+{
+    for (int i = 0; i < 4; ++i) out.append(char((value >> (8 * i)) & 0xff));
+}
+
+inline void groupAppendU64(QByteArray &out, quint64 value)
+{
+    for (int i = 0; i < 8; ++i) out.append(char((value >> (8 * i)) & 0xff));
+}
+
+inline bool groupReadU16(const QByteArray &in, int &offset, quint16 &value)
+{
+    if (offset < 0 || offset + 2 > in.size()) return false;
+    value = quint16(quint8(in.at(offset))) | quint16(quint8(in.at(offset + 1)) << 8);
+    offset += 2;
+    return true;
+}
+
+inline bool groupReadU32(const QByteArray &in, int &offset, quint32 &value)
+{
+    if (offset < 0 || offset + 4 > in.size()) return false;
+    value = 0;
+    for (int i = 0; i < 4; ++i) value |= quint32(quint8(in.at(offset + i))) << (8 * i);
+    offset += 4;
+    return true;
+}
+
+inline bool groupReadU64(const QByteArray &in, int &offset, quint64 &value)
+{
+    if (offset < 0 || offset + 8 > in.size()) return false;
+    value = 0;
+    for (int i = 0; i < 8; ++i) value |= quint64(quint8(in.at(offset + i))) << (8 * i);
+    offset += 8;
+    return true;
+}
+
+inline void groupAppendString(QByteArray &out, const QByteArray &value)
+{
+    groupAppendU32(out, quint32(value.size()));
+    out.append(value);
+}
+
+inline bool groupReadString(const QByteArray &in, int &offset, QByteArray &value)
+{
+    quint32 length = 0;
+    if (!groupReadU32(in, offset, length) || length > quint32(in.size() - offset)) return false;
+    value = in.mid(offset, int(length));
+    offset += int(length);
+    return true;
+}
 #endif // PROTOCOL_H

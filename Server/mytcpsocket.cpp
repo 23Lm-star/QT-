@@ -59,6 +59,20 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         }
         return authRejectPdu(pdu->uiType);
     }
+    // ===== REQ-EXT-SESSION-001 D3/D4: 登录版本校验 =====
+    // 已认证连接的一切请求（含心跳，杜绝靠心跳永久存活）处理前比对连接绑定版本与
+    // 该用户最新登录版本；不一致=过期会话，直接切断。未认证连接维持上面的白名单语义。
+    if(m_actorAuthenticated){
+        const quint64 cur=MyTcpServer::getinstance().currentLoginVersion(m_strLoginName);
+        if(m_loginVersion!=cur){
+            qCWarning(lcAuth)<<"[KICK] 版本过期，拒绝并切断 conn="<<m_connectionId
+                             <<" user="<<m_strLoginName<<" ver="<<m_loginVersion
+                             <<" latest="<<cur<<" type="<<pdu->uiType;
+            PDU* rej=authRejectPdu(pdu->uiType);  // 断线前快照响应（断后尽力发送，无害）
+            abort();  // 同步触发 clientOffLine，由权威守卫保护不误清新会话
+            return rej;
+        }
+    }
     // 处理器统一使用服务端派生的 actor（登录时绑定，注销/断线撤销）
     m_MsgHandler->m_actorName=this->m_strLoginName;
     m_MsgHandler->m_connId=this->m_connectionId;
@@ -70,14 +84,20 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         }
          case ENUM_MSG_TYPE_LOGIN_REQUEST :{
             bool authOk=false;
-            respdu=m_MsgHandler->login(this->m_strLoginName,authOk);
+            quint64 loginVersion=0;
+            respdu=m_MsgHandler->login(this->m_strLoginName,authOk,loginVersion);
             if(authOk){
                 // REQ-EXT-SEC-001 T1：登录成功，绑定连接级 actor_context
                 m_actorAuthenticated=true;
                 ++m_actorSessionVersion;
+                // REQ-EXT-SESSION-001：绑定用户域登录版本——先登记再踢旧
+                // （被踢方断开时登记表已指向新版，clientOffLine 守卫走 stale 分支）
+                m_loginVersion=loginVersion;
                 m_MsgHandler->m_actorName=this->m_strLoginName;
+                MyTcpServer::getinstance().setLoginVersion(this->m_strLoginName, loginVersion);
+                MyTcpServer::getinstance().closeStaleSockets(this->m_strLoginName);
                 qCDebug(lcAuth)<<"[AUTH] 登录成功并绑定连接身份 conn="<<m_connectionId
-                                <<" session="<<m_actorSessionVersion;
+                                <<" session="<<m_actorSessionVersion<<" loginver="<<m_loginVersion;
             }
             break;
          }
@@ -211,6 +231,27 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->queryFilePublishLink();
         break;
     }
+    case ENUM_MSG_TYPE_CREATE_GROUP_REQUEST:
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST:
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST:
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST:
+    case ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST:
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST:
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST:
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST:
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST:
+    case ENUM_MSG_TYPE_LIST_GROUPS_REQUEST:
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST:
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST:
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST:
+        respdu=m_MsgHandler->groupRequest(pdu->uiType);
+        break;
+    case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
+    case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
+        // 事件只能由服务端生成，客户端发入的同名类型一律丢弃并记审计日志。
+        qCWarning(lcNet) << "[GROUP] 拒绝客户端伪造事件 type=" << pdu->uiType
+                         << "conn=" << m_connectionId;
+        break;
         default:
             break;
     }
@@ -246,8 +287,13 @@ void MyTcpSocket::handleUploadWriteFinished(qint64 offset, qint64 length, bool s
     if(success){
         success=m_MsgHandler->m_uploadSession.acceptWrittenChunk(offset,length);
     }
-    sendUploadAck(success,m_MsgHandler->m_uploadSession.receivedSize(),
-                  success && m_MsgHandler->m_uploadSession.isComplete());
+    const bool complete = success && m_MsgHandler->m_uploadSession.isComplete();
+    const qint64 ackOffset = m_MsgHandler->m_uploadSession.receivedSize();
+    if(complete){
+        // REQ-EXT-FILE-001 T4：末块写完→服务端复算转正+建条目+引用计数（会 reset 会话）
+        m_MsgHandler->finalizeUploadOnComplete();
+    }
+    sendUploadAck(success, ackOffset, complete);
 }
 
 void MyTcpSocket::sendUploadAck(bool success, qint64 nextOffset, bool complete)
@@ -447,9 +493,24 @@ void MyTcpSocket::clientOffLine(){
         m_downloadFile=nullptr;
     }
     m_downloadActive=false;
-    OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
+    // REQ-EXT-SESSION-001 D6：权威判定——版本不匹配=被踢旧连接，不得清在线状态、不得动登记表，
+    // 否则旧连接死亡会误清新会话的在线态（验收 §6.5 竞态断言）
+    bool authoritative=true;
+    if(m_actorAuthenticated){
+        authoritative=(m_loginVersion==MyTcpServer::getinstance().currentLoginVersion(m_strLoginName));
+    }
+    if(authoritative){
+        OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
+        if(m_actorAuthenticated){
+            MyTcpServer::getinstance().removeLoginVersion(m_strLoginName);
+        }
+    }else{
+        qCWarning(lcAuth)<<"[KICK] 过期连接断开，跳过下线写以保护新会话 conn="<<m_connectionId
+                         <<" user="<<m_strLoginName;
+    }
     // REQ-EXT-SEC-001 T1：断线即撤销连接级 actor_context
     m_actorAuthenticated=false;
+    m_loginVersion=0;
     ++m_actorSessionVersion;
     m_MsgHandler->m_actorName.clear();
     m_strLoginName.clear();
@@ -474,6 +535,18 @@ bool MyTcpSocket::isPublicRequestType(uint uiType)
 // REQ-EXT-SEC-001：未认证拒绝时按请求类型回对应失败响应（caData 清零即 false/空列表/异常码）
 PDU* MyTcpSocket::authRejectPdu(uint uiType)
 {
+    auto groupReject=[&](uint responseType){
+        QByteArray body;
+        groupAppendU16(body, GROUP_PROTOCOL_VERSION);
+        groupAppendU16(body, GROUP_ENVELOPE_LENGTH);
+        groupAppendU64(body, 0);
+        groupAppendU64(body, 0);
+        groupAppendU32(body, quint32(-1001));
+        PDU* r=mkPDU(uint(body.size()));
+        r->uiType=responseType;
+        memcpy(r->caMsg,body.constData(),size_t(body.size()));
+        return r;
+    };
     auto reject=[&](uint respType){
         PDU* r=mkPDU();
         r->uiType=respType;
@@ -528,6 +601,32 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return reject(ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND);
     case ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST:
         return reject(ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND);
+    case ENUM_MSG_TYPE_CREATE_GROUP_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_CREATE_GROUP_RESPOND);
+    case ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_INVITE_GROUP_MEMBER_RESPOND);
+    case ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_ACCEPT_GROUP_INVITATION_RESPOND);
+    case ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_REJECT_GROUP_INVITATION_RESPOND);
+    case ENUM_MSG_TYPE_LEAVE_GROUP_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_LEAVE_GROUP_RESPOND);
+    case ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_REMOVE_GROUP_MEMBER_RESPOND);
+    case ENUM_MSG_TYPE_SET_GROUP_ROLE_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_SET_GROUP_ROLE_RESPOND);
+    case ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_TRANSFER_GROUP_OWNER_RESPOND);
+    case ENUM_MSG_TYPE_DISSOLVE_GROUP_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_DISSOLVE_GROUP_RESPOND);
+    case ENUM_MSG_TYPE_LIST_GROUPS_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_LIST_GROUPS_RESPOND);
+    case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND);
+    case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND);
+    case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND);
     case ENUM_MSG_TYPE_CHAT_REQUEST:
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
         return nullptr; // 无响应语义的投递型请求，拒绝仅落审计日志

@@ -8,6 +8,7 @@
 #include <QFile>
 #include <QTextStream>
 #include <QCoreApplication>
+#include <QSet>
 MyTcpServer::MyTcpServer(){
     // 读取僵尸连接阈值（zombie_timeout.cfg，单位秒；默认 90s = 3×30s 心跳周期）
     m_zombieTimeoutMs = 90000;
@@ -125,6 +126,29 @@ void MyTcpServer::reseed(char *tarname, PDU *pdu){
     }
 }
 
+void MyTcpServer::sendGroupEvent(const QStringList& users, PDU *pdu)
+{
+    if (pdu == nullptr || users.isEmpty()) {
+        if (pdu != nullptr) memfree(pdu);
+        return;
+    }
+    QSet<QString> targets;
+    for (const QString& user : users) {
+        if (!user.isEmpty()) targets.insert(user);
+    }
+    QMutexLocker locker(&m_tcpsocketlistMutex);
+    QSet<QString> delivered;
+    for (MyTcpSocket* socket : tcpsocketlist) {
+        if (socket == nullptr || !socket->m_actorAuthenticated || delivered.contains(socket->m_strLoginName)
+                || !targets.contains(socket->m_strLoginName)) {
+            continue;
+        }
+        socket->write(reinterpret_cast<const char*>(pdu), pdu->uiTotalLen);
+        delivered.insert(socket->m_strLoginName);
+    }
+    memfree(pdu);
+}
+
 // REQ-EXT-SEC-001 M-1：分享握手登记（仅主线程访问）
 void MyTcpServer::addPendingShare(const QString& receiver, const QString& canonicalSource)
 {
@@ -160,6 +184,51 @@ void MyTcpServer::consumePendingShare(const QString& receiver, const QString& ca
             m_pendingShares.removeAt(i);
             return;
         }
+    }
+}
+
+// ===== REQ-EXT-SESSION-001：登录版本登记表与踢旧（D3/D5） =====
+// 单调 CAS：只接受不低于现值的版本——并发双登录时后提交的"低版本"登记不得
+// 覆盖高版本，否则新会话被误踢（E3 并发对打覆盖此路径）
+void MyTcpServer::setLoginVersion(const QString& user, quint64 ver)
+{
+    QMutexLocker locker(&m_registryMutex);
+    auto it = m_loginVersionRegistry.find(user);
+    if(it == m_loginVersionRegistry.end() || ver >= it.value()){
+        m_loginVersionRegistry.insert(user, ver);
+    }
+}
+
+quint64 MyTcpServer::currentLoginVersion(const QString& user)
+{
+    QMutexLocker locker(&m_registryMutex);
+    return m_loginVersionRegistry.value(user, 0);   // 无登记=0（登录版本恒≥1，视为过期）
+}
+
+void MyTcpServer::removeLoginVersion(const QString& user)
+{
+    QMutexLocker locker(&m_registryMutex);
+    m_loginVersionRegistry.remove(user);
+}
+
+void MyTcpServer::closeStaleSockets(const QString& user)
+{
+    const quint64 cur = currentLoginVersion(user);   // 先读单调登记现值（registry 锁先于 socketlist 锁）
+    QList<MyTcpSocket*> stale;
+    {
+        QMutexLocker locker(&m_tcpsocketlistMutex);
+        for (MyTcpSocket* s : tcpsocketlist) {
+            if (s->m_actorAuthenticated && s->m_strLoginName == user
+                    && s->m_loginVersion != cur) {
+                stale.append(s);
+            }
+        }
+    }
+    // 出锁再 abort：abort→disconnected→clientOffLine→removeSocket 会重入同一把锁（同僵尸扫描注释）
+    for (MyTcpSocket* s : stale) {
+        qCWarning(lcAuth) << "[KICK] 登录版本过期，关闭旧连接 conn=" << s->m_connectionId
+                          << " user=" << user << " ver=" << s->m_loginVersion << " latest=" << cur;
+        s->abort();
     }
 }
 

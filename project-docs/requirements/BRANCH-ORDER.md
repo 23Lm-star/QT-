@@ -216,3 +216,10 @@
 | `REQ-CI-009-ci-static-check.md` | 398 | SMALL |
 | `REQ-CFG-010-config-externalization.md` | 451 | MEDIUM |
 | `BRANCH-ORDER.md`（本文档） | — | — |
+
+## 阶段 E（扩展功能，2026-09-29 起）
+
+| 顺序 | 需求 | 分支 | 等级 | 状态 |
+|---|---|---|---|---|
+| E1 | REQ-EXT-SEC-001 服务端身份与授权上下文 | `codex/req-ext-sec-001-auth-context` | LARGE（前置门） | ✅ 已完成（merge `7fc47c1`，审计链 c7c4eed PASS*→B-1 REJECT→0efccb9 ACCEPT，e2e 48/48，证据 `project-docs/evidence/REQ-EXT-SEC-001/`，2026-09-29） |
+| E2+ | REQ-EXT-GROUP-001/002/003、REQ-EXT-FILE-001/002 | 各自分支从 master 切出 | LARGE/MEDIUM | 依赖 E1 的 actor 门与握手登记语义；GROUP-002 分支已并行开工（另行会话） |
