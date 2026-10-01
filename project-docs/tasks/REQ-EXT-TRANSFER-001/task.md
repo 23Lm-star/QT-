@@ -49,5 +49,7 @@
 
 - 2026-10-01 independent test：新会话、detached 干净工作树 `build/wt-test-transfer001`（候选 `520c714`）、只读复跑。**结论 PASS，0 条候选归因缺陷**。三门独立复现：build GREEN、test GREEN-WARN(0 注册)、audit RED = 预期冻结面命中（22 insertions / 0 deletions，与 §9 批准稿逐字一致）；七套 e2e 独立复跑全绿 43/13/41/48/46/45/43；追加确定性复跑 `parallel_e2e` 两次均 43/43。非阻塞发现 F-1..F-5（F-1：design §6.2 T-06 写 4 条流 vs 批准 D6 上限 3，属设计文档自相矛盾，需 design owner 处置，测试节点不放宽 D6）；NEEDS-HUMAN：design §6.3 五条纯客户端行为未执行，不计 pass。跨代理独立性未满足（test 与 dev 同为 claude-code），测试报告已显式披露。证据 `project-docs/evidence/REQ-EXT-TRANSFER-001/independent-test/`。
 
+- 2026-10-01 independent audit：新会话 + **不同模型**（Codex CLI 本机不可用，跨 CLI 未执行，已披露残余限制）、detached 只读工作树 `build/wt-audit-transfer001` @ `520c714`。**结论 FAIL —— 1 条阻塞缺陷 AUD-1**，推翻 test 节点 PASS。AUD-1（FACT，源码级推演并经节点复核）：真实客户端每个新个人上传先发 97，`uploadfilefastcheck` 在 `m_uploads[0]` 留下**不回收**的上下文并被 `activeUploadCount()` 计入，致并发新个人上传**只能 2 个**，第 3 个 INIT 被拒且客户端标记**失败**（违背批准 D6 上传=3 与验收 5）；test 裸 socket 绕过 97 故不可见。非阻塞 AUD-2（上限拒绝应回队而非失败）/AUD-3（迟到 98 误归属）/AUD-4（107 与在途写并发）；F-1 归类为 design 文档自相矛盾（需 design owner 处置，audit 不放宽 D6）；EV-1 证据缺口（test 报告 §8 所列 `manifest-*` 不存在）。冻结面 22 ins/0 del、逐字节合 §9，路径边界与七套件证据复核自洽。报告 `build/evidence/claude-req-ext-transfer-001-audit/520c714.../audit-report.md`。
+
 ## 下一节点
-independent audit（新会话、不同代理、只读、detached 工作树 at `520c714`）：输入 = test 报告 + 七套件/pipeline 日志 + 冻结面 diff + `impact-check` 依赖闭包；对 dev 三条裁定与 test 五条发现做 claim-check；**F-1 须先由 design owner 处置，audit 不得替其放宽 D6**。退出条件：报告落 `build/evidence/feat/.../520c714/audit-report.md` → integration 三事实行。
+**repair**（owner、**新会话**）：修 AUD-1（97 暂存不得占上传名额）+ AUD-2（INIT 上限拒绝→回队重试），重跑 pipeline，并补**客户端级 3 文件并发上传**用例（裸 socket 套件看不见 AUD-1）；随后 re-audit。**F-1 需 design owner 先出处置**（改 §6.2 文本为 3 流，或提请主人改 D6）。**audit FAIL 与 test PASS 冲突 → 由主人裁决**后 repair 方可开工。integration 三事实行暂不成立。

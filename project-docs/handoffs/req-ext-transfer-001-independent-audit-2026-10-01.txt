@@ -1,0 +1,11 @@
+# handoff: REQ-EXT-TRANSFER-001 (audited candidate 520c714, detached worktree build/wt-audit-transfer001, read-only)
+branch: feat/req-ext-transfer-001-parallel-transfer
+head: 520c714
+tier: LARGE
+node: audit
+audit: pending
+next: repair node (owner, NEW session) -- fix AUD-1 and AUD-2, re-run pipeline, then re-audit. Also design owner must dispose F-1 (amend design 6.2 T-06 text to 3 streams, or change D6 -- the audit does NOT relax D6). Repair must add a CLIENT-LEVEL 3-file concurrent upload case: the raw-socket harness bypasses the 97 handshake and cannot see AUD-1.
+blockers: AUD-1 BLOCKING (FACT, code trace): the real client sends a 97 fastcheck before every fresh personal 29 (transfertask.cpp:227-291,304, id=allocId>=1); uploadfilefastcheck leaves a counted m_uploads[0] ctx (msghandler.cpp:1303-1305) that nothing removes or reaps, and activeUploadCount()==m_uploads.size() (msghandler.h:54), so only 2 concurrent new personal uploads succeed -- the 3rd 29 gets ret=false (msghandler.cpp:1160,1256) and the client marks it FAILED (transfertask.cpp:451-453) instead of queuing. Violates approved D6 (upload=3) and acceptance 5. This audit FAIL overturns the test node PASS; user arbitrates.
+evidence: build/evidence/claude-req-ext-transfer-001-audit/520c71444f993f7f74b1da84adb0fdb83bd1d92e/audit-report.md (FAIL: 1 blocking AUD-1; AUD-2/3/4 non-blocking; F-1 doc contradiction; EV-1 evidence gap). Frozen headers: 22 ins/0 del, append-only, byte-identical to design 9 (recomputed EQUAL=True). 7 suites + 3 gates + logs reproduced consistent; path boundary clean.
+owner: claude-code
+date: 2026-10-01
