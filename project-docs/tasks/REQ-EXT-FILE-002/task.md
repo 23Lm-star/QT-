@@ -66,5 +66,8 @@
   - **FINDING-DEV-1 判为不可复现**：本机 PS5.1（默认 gb2312 / ACP 936）下，默认、`-Encoding Default`、cmd `chcp 936`、`chcp 65001`、LF/CRLF 六种组合，`audit.ps1` **均**解析出两条冻结路径并报两个 HIT；dev 的 `run-logs/audit.log` 仅一项，与当前环境不符。副结论：冻结检查实际覆盖 `Server/protocol.h`。待 dev 提供确切调用环境或撤回。
   - **FINDING-DEV-2/3/4/5 复核**：全部确认（2 属运行形态，本轮已复现其假红并规避；3 代码事实成立且当前库 `LIKE '/filesys/%'` 计数=0，潜伏未触发；4 无清理调度器；5 `MKDIR` 非幂等）。
 
+- 2026-10-01 **independent audit**：新会话、detached 只读 `c452eb3`。**结论 PASS（审计）**：批准契约精确落地；冻结面三项（只追加不重编号 / 两端常量块逐字节一致 / 无既有 PDU 语义变更）独立复核通过；**0 条归因产品缺陷**。`schema_version=2026100102` 偏差判为批准范围内。**FINDING-DEV-1 推翻测试节点「不可复现」**：F1 事实成立（manifest LF + 全角 `）` 吞换行 → ACP936 主工作树只解析出 `Client/protocol.h`；全新 checkout 为 CRLF 则两项都解析出）。F1 属 `pipeline/audit.ps1` 仓库契约缺陷（medium），另开独立 SMALL。独立性声明：owner_agent 同为 `claude-code`（未满足跨代理默认，报告 §0 已声明限制）。详见 `independent-audit/report.md`。审计结论经主人接受（`state.ps1` 记 `accepted by user, 2026-10-01`）。
+- 2026-10-01 **integration（本节点）**：三事实行逐项自证齐备 → 合并 `master`，提交 `abe2e5d`（no-ff，零冲突）。① 审计报告 PASS 且被接受；② 冻结面 diff 仅追加 97/98（旧 1–96 零改动，两端常量块逐字节一致），与批准清单相符；③ 合并态 `abe2e5d` 上 `build.ps1` GREEN、`test.ps1` GREEN-WARN(0)、`audit.ps1` PASS。任务状态 `COMPLETED`。报告 `evidence/REQ-EXT-FILE-002/integration/report.md`，handoff `handoffs/req-ext-file-002-merged-2026-10-01.txt`。
+
 ## 下一节点
-独立审计（新会话、不同代理、detached worktree 只读 `c452eb3`）：复核冻结面三项、`schema_version` 偏差、FINDING-DEV-1（不可复现）与 CodeGraph 影响闭包，不采信测试节点 harness 结论。
+无（流程收口）。push 待主人明示。遗留 SMALL 候选（不阻塞）：F1+F2（`pipeline/audit.ps1` 冻结面解析 + impact face）、FINDING-DEV-2（统一 e2e 运行形态）、FINDING-DEV-3（`normalizeLogicKeys` 数据面谓词收口）。观察项：残留 worktree `build/wt-test-group001-repair` 含未提交 GROUP-001 handoff，待主人裁决。
