@@ -53,3 +53,4 @@
 - 2026-10-01 T1 `small/pipeline-audit-frozen-parse` → 合并 `master@488f964`（no-ff）：F1 **FIXED**（清单改按 raw UTF-8 读；主工作树 LF 解析 1→2；临时双冻结分支报 2 个 HIT，分支已删未合并）；F2 **NOT_APPLICABLE**（仓库 0 静态可达自动化测试，manifest 显式声明，不配置 glob 以免空结果被误判 PASS）。build GREEN / test GREEN-WARN(0) / audit PASS。handoff `handoffs/small-pipeline-audit-frozen-parse-2026-10-01.txt`。
 - 2026-10-01 T2 `small/unify-e2e-runform` → 合并 `master@0d92607`（no-ff）：**FIXED**（五套件统一形态 cwd=`<repo>/dist` + `dist/Server.exe` + `filesPath=./filesys`（相对）+ 自管理生命周期 + 脚本自建夹具）；重跑全绿 13/43/37/48/46。**环境变更（不入库，需主人知悉）**：未跟踪的 `Server/connect.config` 第 3 行改回 `./filesys` 且必须 CRLF（`server.cpp:25` 按 `
 ` 切分，LF 会 segfault）。handoff `handoffs/small-unify-e2e-runform-2026-10-01.txt`。
+- 2026-10-01 会话收口：T1、T2 完成并合并 master（488f964、0d92607）。**T3（normalizeLogicKeys 谓词收口）与 T4（本批次统一收口）未开始**——按交接词「会话预算」条款交回下一会话，未压缩验证。下一会话从 `master@f48f651` 起，直接执行 T3。环境现状：`Server/connect.config` 第 3 行 = `./filesys`（CRLF），`dist/Server.exe` 已按该配置重建。
