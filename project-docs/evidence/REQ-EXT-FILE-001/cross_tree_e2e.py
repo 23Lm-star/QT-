@@ -1,8 +1,17 @@
 # REQ-EXT-FILE-001 F-3/D5 修复回归：跨树逻辑键（两棵不同绝对根）。
-# 树A = Server/（默认 cwd），树B = build/xtree-file001/（独立绝对 cwd），
+# 树A = <repo>/dist（默认 cwd），树B = <repo>/build/xtree-file001/（独立 cwd），
 # 树B 的 ./filesys 用 NTFS junction 指向同一物理 filesys（mklink /J，无需管理员），共享同一 MySQL。
 # 断言：同一逻辑请求在两树得到同一 parent_path 键（幂等命中不重复建条目/不加引用）、
 # 分享接收者条目落 '/' 根键、存量"绝对机器路径"行启动时确定性转换且重放幂等。
+#
+# ---- 统一 e2e 运行形态（五套件一致，见 project-docs/evidence/E2E-RUNFORM.md）----
+# 运行：py -3.13 project-docs/evidence/REQ-EXT-FILE-001/cross_tree_e2e.py
+#   cwd     : 任意（脚本自管理；树A 以 <repo>/dist 为 cwd，树B 以 <repo>/build/xtree-file001 为 cwd）
+#   exe     : <repo>/dist/Server.exe（qmake DESTDIR=dist；connect.config 构建期经 qrc 内嵌）
+#   config  : Server/connect.config -> filesPath=./filesys（相对 cwd；两树因此指向各自的 ./filesys）
+#   数据根  : <repo>/dist/filesys（树A）；树B 经 junction 复用同一物理目录
+#   未入库依赖：dist/{Qt5Core,Qt5Gui,Qt5Network,Qt5Sql,Qt5Svg,Qt5Widgets}.dll、dist/libmysql.dll、
+#              dist/sqldrivers/qsqlmysql.dll、dist/platforms/qwindows.dll
 import hashlib, os, shutil, socket, struct, subprocess, sys, time
 
 HOST, PORT = "127.0.0.1", 5000
@@ -15,10 +24,12 @@ T_SHARE, T_AGREE_R, T_SHARE_FINISH = 33, 36, 37
 MAGIC = 0x5253554d
 MYSQL = r"C:/Program Files/MySQL/MySQL Server 5.7/bin/mysql.exe"
 DB = ["-h", "localhost", "-u", "root", "-p123456", "mydb", "-N", "-B", "-e"]
-EXE = os.path.abspath("build/build-Server/release/Server.exe")
-SRV = os.path.abspath("Server")
-FS = os.path.join(SRV, "filesys")
-TREEB = os.path.abspath(os.path.join("build", "xtree-file001"))
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+DIST = os.path.join(REPO, "dist")
+EXE = os.path.join(DIST, "Server.exe")
+SRV = DIST
+FS = os.path.join(DIST, "filesys")
+TREEB = os.path.join(REPO, "build", "xtree-file001")
 X1, X2 = "xtuser1", "xtuser2"
 PC = b"XTREE-CROSS-CONTENT-" * 40
 PS = b"XTREE-SUB-CONTENT-" * 30
