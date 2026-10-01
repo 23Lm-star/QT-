@@ -32,18 +32,40 @@ public:
         bool valid() const { return fileId >= 0; }
     };
 
+    // REQ-EXT-FILE-002：秒传命中安置结果（复用 commitUpload 的同名安置语义）
+    struct AttachResult {
+        bool ok = false;
+        qint64 fileId = -1;
+        QString displayName;     // 服务端最终展示名（含 (1) 后缀规则）
+        bool idempotent = false; // 同名同对象已存在，零写入返回既有条目
+        QString error;
+    };
+
     static FileObjectStore& instance();
 
     // 服务端复算 staging 的 SHA-256 与大小（流式，1MiB 缓冲）
     bool hashStaging(const QString& stagingPath, QString& shaHex, qint64& sizeBytes) const;
 
+    // REQ-EXT-FILE-002 §2 步骤4：摘要+大小去重命中判定；命中返回 object_id，否则 -1。
+    qint64 findObjectBySha(const QString& shaHex, qint64 sizeBytes) const;
+
     // 事务内：find-or-create 对象 + 建/复活条目 + 引用计数。
     // expectedSize 为会话登记大小；复算不一致 = 失败（不转正，验收4）。
+    // expectedSha 非空时另比对复算摘要（REQ-EXT-FILE-002 D2 复算对照，验收3）；
+    // 为空 = 旧路径语义，与 FILE-001 逐字节等价。
     // 新对象：staging 原子 rename 到 objects/{sha前2}/{object_id}；命中已有对象：丢弃 staging。
     // copyOnly=true（T6 存量迁移）：源文件=旧路径实体——只复制不搬移，绝不删除源（验收5）。
     CommitResult commitUpload(const QString& owner, const QString& parentPath,
                               const QString& displayName, qint64 expectedSize,
-                              const QString& stagingPath, bool copyOnly = false);
+                              const QString& stagingPath, bool copyOnly = false,
+                              const QString& expectedSha = QString());
+
+    // REQ-EXT-FILE-002 §2.1：指向既有对象的条目安置（复用 commitUpload 步骤 2/3/4，同事务）。
+    // 不读客户端路径、不复制物理文件、不传输正文；pending_reclaim 对象复用即置回 ready。
+    // expectedSize < 0 = 不校验对象大小。
+    AttachResult attachExistingObject(const QString& owner, const QString& parentPath,
+                                      const QString& wantedName, qint64 objectId,
+                                      qint64 expectedSize = -1);
 
     // 删除条目（软删）并释放引用；对象引用归零 → pending_reclaim。
     bool releaseEntry(qint64 fileId, const QString& owner);

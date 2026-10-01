@@ -55,6 +55,9 @@ QString makeSuffixed(const QString& base, const QString& ext, int n)
 }
 
 // 逻辑键形态判定：'/' 开头结尾、无反斜杠、无空段、无 ./.. 段（normalizeParent 幂等入口）
+// REQ-EXT-FILE-002 L1/L2 收紧：'/filesys/<owner>/...' 与带盘符（含 ':'）的旧行过去被判为
+// canonical，被 normalizeParent 原样回显、静默保留——数据对查询不可见。两者一律判非 canonical，
+// 交回 normalizeParent 走段锚定转换（走转换而非静默保留）。
 bool isLogicKeyForm(const QString& x)
 {
     if (!x.startsWith(QLatin1Char('/')) || !x.endsWith(QLatin1Char('/')) || x.contains(QLatin1Char('\\')))
@@ -63,6 +66,15 @@ bool isLogicKeyForm(const QString& x)
         return true;
     if (x.contains(QLatin1String("//")))
         return false;
+    if (x.contains(QLatin1Char(':')))
+        return false;                                   // 带盘符旧行（"/E:/filesys/<owner>/..."）
+    const int slash = x.indexOf(QLatin1Char('/'), 1);
+    const QString first = (slash < 0) ? x.mid(1) : x.mid(1, slash - 1);
+    if (!first.isEmpty()) {
+        const QString fsBase = QFileInfo(QDir(Server::getinstance().filesPath).absolutePath()).fileName();
+        if (!fsBase.isEmpty() && first.compare(fsBase, Qt::CaseInsensitive) == 0)
+            return false;                               // "/filesys/<owner>/..." 形态
+    }
     const QStringList segs = x.split(QLatin1Char('/'), Qt::SkipEmptyParts);
     for (const QString& s : segs) {
         if (s == QLatin1String(".") || s == QLatin1String(".."))
@@ -171,6 +183,21 @@ bool FileObjectStore::hashStaging(const QString& stagingPath, QString& shaHex, q
     return true;
 }
 
+// REQ-EXT-FILE-002 §2 步骤4：摘要+大小预检查（去重命中判定）。
+// 命中返回 object_id，未命中返回 -1。物理对象唯一性由 uk_sha256 保证，此处只读。
+qint64 FileObjectStore::findObjectBySha(const QString& shaHex, qint64 sizeBytes) const
+{
+    if (shaHex.isEmpty() || sizeBytes < 0) return -1;
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) return -1;
+    QSqlQuery q(conn.database());
+    q.prepare("SELECT object_id FROM file_object WHERE sha256=? AND size_bytes=? FOR UPDATE");
+    q.addBindValue(shaHex);
+    q.addBindValue(sizeBytes);
+    if (!q.exec() || !q.next()) return -1;
+    return q.value(0).toLongLong();
+}
+
 QString FileObjectStore::objectAbsPath(qint64 objectId) const
 {
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
@@ -191,7 +218,7 @@ QString FileObjectStore::objectAbsPath(qint64 objectId) const
 FileObjectStore::CommitResult FileObjectStore::commitUpload(
         const QString& owner, const QString& rawParentPath,
         const QString& wantedName, qint64 expectedSize, const QString& stagingPath,
-        bool copyOnly)
+        bool copyOnly, const QString& expectedSha)
 {
     CommitResult r;
     r.displayName = wantedName;
@@ -217,6 +244,16 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
         qCWarning(lcFs) << "[commitUpload] conn-owner" << owner
                         << "expected" << expectedSize << "actual" << size;
         if (!copyOnly) QFile::remove(stagingPath);   // T6：迁移源=用户旧文件，绝不删除（验收5）
+        return r;
+    }
+    // REQ-EXT-FILE-002 D2：客户端声明的摘要只用于命中判定，这里是执行事实——
+    // 与登记摘要（upload_session.client_sha256）不符一律不转正（验收3）。
+    // expectedSha 为空 = 旧路径（客户端不提交摘要），行为与 FILE-001 逐字节等价。
+    if (!expectedSha.isEmpty() && sha.compare(expectedSha, Qt::CaseInsensitive) != 0) {
+        r.error = "复算摘要与登记不符，拒绝转正";
+        qCWarning(lcFs) << "[commitUpload] 摘要不符 owner" << owner
+                        << "expected" << expectedSha << "actual" << sha;
+        if (!copyOnly) QFile::remove(stagingPath);
         return r;
     }
 
@@ -683,30 +720,38 @@ bool FileObjectStore::insertDirEntry(const QString& owner, const QString& rawPar
     return ok;
 }
 
-qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawParent,
-                                    const QString& wantedName, qint64 objectId, QString& err)
+// REQ-EXT-FILE-002 §2.1：commitUpload 去掉"哈希+rename"两段后的同名安置+条目+计数事务，
+// 供秒传命中分支复用——不复制物理文件、不读客户端路径。与 attachEntry 共用同一实现。
+// expectedSize < 0 = 不校验对象大小。
+FileObjectStore::AttachResult FileObjectStore::attachExistingObject(
+        const QString& owner, const QString& rawParent, const QString& wantedName,
+        qint64 objectId, qint64 expectedSize)
 {
-    err.clear();
+    AttachResult r;
+    r.displayName = wantedName;
     const QString parent = normalizeParent(owner, rawParent);
     if (owner.isEmpty() || parent.isEmpty() || parent.size() > kMaxParentChars
         || wantedName.isEmpty() || objectId < 0) {
-        err = "参数为空或父路径超长";
-        return -1;
+        r.error = "参数为空或父路径超长";
+        return r;
     }
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
-    if (!conn.isValid()) { err = "数据库不可达"; return -1; }
+    if (!conn.isValid()) { r.error = "数据库不可达"; return r; }
     QSqlDatabase db = conn.database();
-    if (!db.transaction()) { err = "事务开启失败"; return -1; }
-    qint64 resultId = -1;
+    if (!db.transaction()) { r.error = "事务开启失败"; return r; }
     bool done = false;
     do {
         QSqlQuery q(db);
-        q.prepare("SELECT object_id FROM file_object WHERE object_id=? FOR UPDATE");
+        q.prepare("SELECT size_bytes FROM file_object WHERE object_id=? FOR UPDATE");
         q.addBindValue(objectId);
-        if (!q.exec() || !q.next()) { err = "对象不存在"; break; }
+        if (!q.exec() || !q.next()) { r.error = "对象不存在"; break; }
+        if (expectedSize >= 0 && q.value(0).toLongLong() != expectedSize) {
+            r.error = "对象大小与声明不符";
+            break;
+        }
 
         // 同名安置（与 commitUpload 一致）：active 同名同对象=幂等命中保留原名（跨树重复
-        // 分享不建重复行）；同名不同对象才 (1) 递推；deleted 同名由下方复活分支承接。
+        // 分享/重复秒传不建重复行）；同名不同对象才 (1) 递推；deleted 同名由下方复活分支承接。
         QString finalName = clampUtf8(wantedName, kMaxNameBytes);
         bool needSuffix = false;
         q.prepare("SELECT object_id,status FROM user_file "
@@ -727,33 +772,35 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
                 const QString cand = makeSuffixed(base, ext, n);
                 if (!nameTaken(owner, parent, cand, db)) { finalName = cand; freed = true; break; }
             }
-            if (!freed) { err = "同目录同名候选耗尽"; break; }
+            if (!freed) { r.error = "同目录同名候选耗尽"; break; }
         }
+        r.displayName = finalName;
 
         q.prepare("SELECT file_id,object_id,status FROM user_file "
                   "WHERE owner_name=? AND parent_path=? AND display_name=? FOR UPDATE");
         q.addBindValue(owner);
         q.addBindValue(parent);
         q.addBindValue(finalName);
-        if (!q.exec()) { err = q.lastError().text(); break; }
+        if (!q.exec()) { r.error = q.lastError().text(); break; }
         if (q.next()) {
             const qint64 rowId = q.value(0).toLongLong();
             const qint64 rowObj = q.value(1).isNull() ? -1 : q.value(1).toLongLong();
             const QString st = q.value(2).toString();
             if (st == "active") {
                 if (rowObj == objectId) {          // 幂等：同(位置,对象)已存在，不重复计数
-                    resultId = rowId;
+                    r.fileId = rowId;
+                    r.idempotent = true;
                     done = true;
                     break;
                 }
-                err = "并发同名冲突";
+                r.error = "并发同名冲突";
                 break;
             }
             q.prepare("UPDATE user_file SET object_id=?,is_dir=0,status='active' WHERE file_id=?");
             q.addBindValue(objectId);
             q.addBindValue(rowId);
-            if (!q.exec()) { err = q.lastError().text(); break; }
-            resultId = rowId;
+            if (!q.exec()) { r.error = q.lastError().text(); break; }
+            r.fileId = rowId;
         } else {
             q.prepare("INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
                       "VALUES (?,?,?,0,?,'active')");
@@ -761,19 +808,29 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
             q.addBindValue(parent);
             q.addBindValue(finalName);
             q.addBindValue(objectId);
-            if (!q.exec()) { err = q.lastError().text(); break; }
-            resultId = q.lastInsertId().toLongLong();
+            if (!q.exec()) { r.error = q.lastError().text(); break; }
+            r.fileId = q.lastInsertId().toLongLong();
         }
 
+        // 引用计数 +1（D3：pending_reclaim 对象被复用即置回 ready，待回收 ≠ 已删除）
         q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
         q.addBindValue(objectId);
-        if (!q.exec()) { err = q.lastError().text(); break; }
+        if (!q.exec()) { r.error = q.lastError().text(); break; }
         done = true;
     } while (false);
 
-    if (!done) { db.rollback(); return -1; }
-    if (!db.commit()) { db.rollback(); err = db.lastError().text(); return -1; }
-    return resultId;
+    if (!done) { db.rollback(); return r; }
+    if (!db.commit()) { db.rollback(); r.error = db.lastError().text(); return r; }
+    r.ok = true;
+    return r;
+}
+
+qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawParent,
+                                    const QString& wantedName, qint64 objectId, QString& err)
+{
+    const AttachResult r = attachExistingObject(owner, rawParent, wantedName, objectId, -1);
+    err = r.error;
+    return r.ok ? r.fileId : -1;
 }
 
 bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldDirRaw,

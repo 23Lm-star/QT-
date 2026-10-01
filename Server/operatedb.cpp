@@ -85,8 +85,8 @@ bool OperateDB::checkSchemaVersion()
     if (!q.exec("SELECT MAX(version) FROM schema_version")) {
         qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
                          << q.lastError().text()
-                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql "
-                            "与 migrate_ext_group_002.sql";
+                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
+                            "migrate_ext_group_002.sql 与 migrate_ext_file_002.sql";
         return false;
     }
     int version = 0;
@@ -94,11 +94,12 @@ bool OperateDB::checkSchemaVersion()
         version = q.value(0).toInt();
     }
     const int required = qMax(kFileAssetSchemaVersion,
-                              qMax(kGroupSchemaVersion, kGroupMessageSchemaVersion));
+                              qMax(kGroupSchemaVersion,
+                                   qMax(kGroupMessageSchemaVersion, kFastUploadSchemaVersion)));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
-                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql "
-                            "与 migrate_ext_group_002.sql";
+                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
+                            "migrate_ext_group_002.sql 与 migrate_ext_file_002.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -368,14 +369,15 @@ void OperateDB::normalizeLogicKeys()
 qint64 OperateDB::createUploadSession(const QString &owner, const QString &parentPath,
                                       const QString &displayName, qint64 expectedSize,
                                       const QString &clientSha256, const QString &stagingPath,
-                                      qint64 confirmedOffset, int ttlSec)
+                                      qint64 confirmedOffset, int ttlSec,
+                                      const QString &clientRequestId)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return -1;
     QSqlQuery q(connection.database());
     q.prepare("INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,"
-              "client_sha256,staging_path,confirmed_offset,status,expires_at) "
-              "VALUES (?,?,?,?,?,?,?,'uploading',?)");
+              "client_sha256,staging_path,confirmed_offset,status,expires_at,client_request_id) "
+              "VALUES (?,?,?,?,?,?,?,'uploading',?,?)");
     q.addBindValue(owner);
     q.addBindValue(parentPath);
     q.addBindValue(displayName);
@@ -385,8 +387,98 @@ qint64 OperateDB::createUploadSession(const QString &owner, const QString &paren
     q.addBindValue(confirmedOffset);
     q.addBindValue(QDateTime::currentDateTime().addSecs(ttlSec > 0 ? ttlSec : 3600)
                        .toString("yyyy-MM-dd HH:mm:ss"));
+    q.addBindValue(clientRequestId.isEmpty() ? QVariant() : QVariant(clientRequestId));
     if(!q.exec()){
         qCWarning(lcDb) << "[createUploadSession] 失败:" << q.lastError().text();
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+
+// REQ-EXT-FILE-002 §2 步骤3：请求级幂等短路的读侧。
+// 展示名优先取 user_file（服务端定名含 (1) 后缀），退化到会话登记的请求名。
+OperateDB::UploadSessionLookup OperateDB::lookupUploadSessionByRequestId(
+        const QString &owner, const QString &clientRequestId)
+{
+    UploadSessionLookup out;
+    if (owner.isEmpty() || clientRequestId.isEmpty()) return out;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return out;
+    QSqlQuery q(connection.database());
+    q.prepare("SELECT s.session_id,s.status,s.confirmed_offset,s.file_id,s.display_name,"
+              "       uf.display_name,s.parent_path,s.expected_size,s.client_sha256 "
+              "FROM upload_session s LEFT JOIN user_file uf ON uf.file_id=s.file_id "
+              "WHERE s.owner_name=? AND s.client_request_id=? FOR UPDATE");
+    q.addBindValue(owner);
+    q.addBindValue(clientRequestId);
+    if (!q.exec() || !q.next()) return out;
+    out.found = true;
+    out.sessionId = q.value(0).toLongLong();
+    out.status = q.value(1).toString();
+    out.confirmedOffset = q.value(2).toLongLong();
+    out.fileId = q.value(3).isNull() ? -1 : q.value(3).toLongLong();
+    out.displayName = q.value(5).isNull() ? q.value(4).toString() : q.value(5).toString();
+    out.parentPath = q.value(6).toString();
+    out.expectedSize = q.value(7).toLongLong();
+    out.clientSha256 = q.value(8).toString();
+    return out;
+}
+
+// REQ-EXT-FILE-002 §2 步骤3：失败/过期会话的"同请求键重试"——原地重置，
+// 绝不再插一行（uk_req 保证 (owner, client_request_id) 唯一）。
+bool OperateDB::restartUploadSession(qint64 sessionId, const QString &parentPath,
+                                     const QString &displayName, qint64 expectedSize,
+                                     const QString &clientSha256, const QString &stagingPath,
+                                     qint64 confirmedOffset, int ttlSec)
+{
+    if (sessionId < 0) return false;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE upload_session SET parent_path=?,display_name=?,expected_size=?,"
+              "client_sha256=?,staging_path=?,confirmed_offset=?,status='uploading',"
+              "expires_at=?,file_id=NULL WHERE session_id=?");
+    q.addBindValue(parentPath);
+    q.addBindValue(displayName);
+    q.addBindValue(expectedSize);
+    q.addBindValue(clientSha256.isEmpty() ? QVariant() : QVariant(clientSha256));
+    q.addBindValue(stagingPath);
+    q.addBindValue(confirmedOffset);
+    q.addBindValue(QDateTime::currentDateTime().addSecs(ttlSec > 0 ? ttlSec : 3600)
+                       .toString("yyyy-MM-dd HH:mm:ss"));
+    q.addBindValue(sessionId);
+    if (!q.exec()) {
+        qCWarning(lcDb) << "[restartUploadSession] 失败:" << q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+// REQ-EXT-FILE-002 §2 步骤4：秒传命中即登记完成态会话（零正文传输）。
+// staging_path 空串表示本次请求没有暂存实体（未落任何碎片文件）。
+qint64 OperateDB::insertCompletedUploadSession(const QString &owner, const QString &parentPath,
+                                              const QString &displayName, qint64 expectedSize,
+                                              const QString &clientSha256,
+                                              const QString &clientRequestId, qint64 fileId)
+{
+    if (owner.isEmpty() || clientRequestId.isEmpty() || fileId < 0) return -1;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return -1;
+    QSqlQuery q(connection.database());
+    q.prepare("INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,"
+              "client_sha256,staging_path,confirmed_offset,status,expires_at,client_request_id,file_id) "
+              "VALUES (?,?,?,?,?,'',?,'done',?,?,?)");
+    q.addBindValue(owner);
+    q.addBindValue(parentPath);
+    q.addBindValue(displayName);
+    q.addBindValue(expectedSize);
+    q.addBindValue(clientSha256.isEmpty() ? QVariant() : QVariant(clientSha256));
+    q.addBindValue(expectedSize);                        // confirmed_offset = size（已完成）
+    q.addBindValue(QDateTime::currentDateTime().addSecs(3600).toString("yyyy-MM-dd HH:mm:ss"));
+    q.addBindValue(clientRequestId);
+    q.addBindValue(fileId);
+    if (!q.exec()) {
+        qCWarning(lcDb) << "[insertCompletedUploadSession] 失败:" << q.lastError().text();
         return -1;
     }
     return q.lastInsertId().toLongLong();
@@ -404,7 +496,7 @@ bool OperateDB::updateUploadOffset(qint64 sessionId, qint64 confirmedOffset)
     return q.exec();
 }
 
-bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status)
+bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status, qint64 fileId)
 {
     if(sessionId < 0) return false;
     if(status != "done" && status != "failed" && status != "expired" && status != "verifying")
@@ -412,8 +504,14 @@ bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status)
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
     QSqlQuery q(connection.database());
-    q.prepare("UPDATE upload_session SET status=? WHERE session_id=?");
-    q.addBindValue(status);
+    if (fileId >= 0) {
+        q.prepare("UPDATE upload_session SET status=?,file_id=? WHERE session_id=?");
+        q.addBindValue(status);
+        q.addBindValue(fileId);
+    } else {
+        q.prepare("UPDATE upload_session SET status=? WHERE session_id=?");
+        q.addBindValue(status);
+    }
     q.addBindValue(sessionId);
     return q.exec();
 }

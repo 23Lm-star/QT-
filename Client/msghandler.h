@@ -27,6 +27,7 @@ public:
     void sharefileagree();
     void sharefilefinsh();
     void uploadfileinit();
+    void uploadfilefastcheck();//REQ-EXT-FILE-002：秒传预检查响应（命中提示+刷新，未命中续传）
     void uploadfiledata();
     void flushfile();
     void downloadfile();

@@ -1192,6 +1192,216 @@ PDU *MsgHandler::uploadfileinit()
     }
     return respdu;
 }
+// REQ-EXT-FILE-002 D2：秒传预检查（新 PDU 97/98）。
+// 三段顺序：请求级幂等短路 → 摘要预检查（命中零正文） → 未命中登记暂存会话交回原顺序上传状态机。
+// 不读客户端物理路径、不复制物理文件；拒绝路径只记长度与类型，不落内容/路径明文（lcFs）。
+PDU *MsgHandler::uploadfilefastcheck()
+{
+    bool ret = false;
+    bool hit = false;
+    qint64 fileId = -1;
+    qint64 sessionId = -1;
+    qint64 nextOffset = 0;
+    QByteArray finalName;
+    // 拒绝响应也带协议版本：客户端据此区分"版本不匹配"与"服务端拒绝"
+    auto rejectResponse = [&]() {
+        PDU* r = mkPDU();
+        const uint respVersion = FASTCHECK_VERSION;
+        r->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
+        memcpy(r->caData + FASTCHECK_RESP_RET_OFFSET, &ret, sizeof(ret));
+        memcpy(r->caData + FASTCHECK_RESP_VERSION_OFFSET, &respVersion, sizeof(respVersion));
+        return r;
+    };
+
+    // 1) 解析与校验：形态任一不合即拒绝，不解析内容
+    uint version = 0, magic = 0, shaHexLen = 0, nameLen = 0, dirLen = 0, reqIdLen = 0;
+    qint64 fileSize = 0;
+    memcpy(&version, pdu->caData + FASTCHECK_VERSION_OFFSET, sizeof(version));
+    memcpy(&magic, pdu->caData + FASTCHECK_MAGIC_OFFSET, sizeof(magic));
+    memcpy(&fileSize, pdu->caData + FASTCHECK_FILE_SIZE_OFFSET, sizeof(fileSize));
+    memcpy(&shaHexLen, pdu->caData + FASTCHECK_SHA_LEN_OFFSET, sizeof(shaHexLen));
+    memcpy(&nameLen, pdu->caData + FASTCHECK_NAME_LEN_OFFSET, sizeof(nameLen));
+    memcpy(&dirLen, pdu->caData + FASTCHECK_DIR_LEN_OFFSET, sizeof(dirLen));
+    memcpy(&reqIdLen, pdu->caData + FASTCHECK_REQID_LEN_OFFSET, sizeof(reqIdLen));
+
+    const uint total = shaHexLen + nameLen + dirLen + reqIdLen;
+    const bool shapeOk = (magic == FASTCHECK_MAGIC) && (version == FASTCHECK_VERSION)
+            && (fileSize >= 0)
+            && (shaHexLen == uint(FASTCHECK_SHA_HEX_LEN))
+            && (nameLen > 0 && nameLen <= 210)
+            && (dirLen > 0 && dirLen <= 450)
+            && (reqIdLen >= 8 && reqIdLen <= 96)
+            && (total <= uint(FASTCHECK_MAX_MSG_LEN))
+            && (total == pdu->uiMsgLen) && (pdu->caMsg != nullptr);
+
+    const QByteArray body = shapeOk ? QByteArray(pdu->caMsg, int(pdu->uiMsgLen)) : QByteArray();
+    QByteArray shaBytes, nameBytes, dirBytes, reqIdBytes;
+    bool shaOk = false;
+    if (shapeOk) {
+        int off = 0;
+        shaBytes = body.mid(off, int(shaHexLen)); off += int(shaHexLen);
+        nameBytes = body.mid(off, int(nameLen)); off += int(nameLen);
+        dirBytes = body.mid(off, int(dirLen)); off += int(dirLen);
+        reqIdBytes = body.mid(off, int(reqIdLen));
+        shaOk = true;
+        for (int i = 0; i < shaBytes.size(); ++i) {      // 严格 [0-9a-f]（客户端 toHex 产出小写）
+            const char c = shaBytes.at(i);
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { shaOk = false; break; }
+        }
+    }
+    if (!shapeOk || !shaOk) {
+        qCWarning(lcFs) << "[fastcheck] 拒绝：请求形态非法 conn=" << m_connId
+                        << " type=" << pdu->uiType << " shapeOk=" << shapeOk << " shaOk=" << shaOk;
+        return rejectResponse();
+    }
+
+    const QString shaHex = QString::fromLatin1(shaBytes);
+    const QString displayName = QString::fromUtf8(nameBytes);
+    const QString dirPath = QString::fromUtf8(dirBytes);
+    const QString reqId = QString::fromLatin1(reqIdBytes);
+
+    // 2) 授权与目录归一：目标目录尚未创建，用逻辑校验（物理存在性留给仍走磁盘的操作）
+    const bool dirOk = !m_actorName.isEmpty()
+            && !displayName.isEmpty()
+            && !displayName.contains('/') && !displayName.contains('\\')
+            && logicPathInActorRoot(dirPath);
+    const QString parent = dirOk ? FileObjectStore::normalizeParent(m_actorName, dirPath) : QString();
+    if (!dirOk || parent.isEmpty()) {
+        qCWarning(lcFs) << "[fastcheck] 拒绝：目录越权或无法归一 conn=" << m_connId
+                        << " dirLen=" << dirLen;
+        return rejectResponse();
+    }
+
+    // 本地：以本次请求的 parent/display/size 建立暂存会话（未命中与"失败重试"共用）。
+    // retrySessionId >= 0 = 复用既有会话行（uk_req 下不可再插一行，只能原地重置）。
+    auto beginStagedSession = [&](qint64 retrySessionId) {
+        const ResumableUploadSession::BeginResult br = m_uploadSession.beginStaged(
+                    m_actorName, parent, displayName, fileSize, true);
+        if (!br.ok) {
+            qCWarning(lcFs) << "[fastcheck] 暂存会话建立失败 conn=" << m_connId;
+            return;
+        }
+        if (retrySessionId >= 0) {
+            if (!OperateDB::instance().restartUploadSession(
+                        retrySessionId, parent, displayName, fileSize, shaHex,
+                        m_uploadSession.stagingFilePath(), br.offset, 3600)) {
+                qCWarning(lcFs) << "[fastcheck] 会话重置失败 conn=" << m_connId;
+                return;
+            }
+            m_uploadSessionId = retrySessionId;
+        } else {
+            m_uploadSessionId = OperateDB::instance().createUploadSession(
+                        m_actorName, parent, displayName, fileSize, shaHex,
+                        m_uploadSession.stagingFilePath(), br.offset, 3600, reqId);
+            if (m_uploadSessionId < 0) {
+                // 同请求键并发插入冲突：回读既有行复用（幂等重放不返回空会话）
+                const OperateDB::UploadSessionLookup ex =
+                        OperateDB::instance().lookupUploadSessionByRequestId(m_actorName, reqId);
+                if (!ex.found || ex.sessionId < 0) {
+                    qCWarning(lcFs) << "[fastcheck] 会话登记失败 conn=" << m_connId;
+                    return;
+                }
+                m_uploadSessionId = ex.sessionId;
+            }
+        }
+        m_uploadExpectedSha = shaHex;
+        ret = true; sessionId = m_uploadSessionId; nextOffset = br.offset;
+        if (br.complete) {
+            const qint64 pending = m_uploadSessionId;
+            const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
+            if (cr.ok) {
+                hit = true; fileId = cr.fileId; sessionId = pending;
+                finalName = cr.displayName.toUtf8();
+            } else {
+                ret = false;
+            }
+        }
+    };
+
+    // 3) 请求级幂等短路（零写入）
+    const OperateDB::UploadSessionLookup prior =
+            OperateDB::instance().lookupUploadSessionByRequestId(m_actorName, reqId);
+    bool handled = false;
+    if (prior.found && prior.status == "done" && prior.fileId >= 0) {
+        ret = true; hit = true; fileId = prior.fileId; sessionId = prior.sessionId;
+        finalName = prior.displayName.toUtf8();
+        handled = true;
+    } else if (prior.found && prior.status == "uploading") {
+        // 断点续传：用会话行（而非本次请求）的 parent/display/size 复原同一 staging 令牌
+        const ResumableUploadSession::BeginResult br = m_uploadSession.beginStaged(
+                    m_actorName, prior.parentPath, prior.displayName, prior.expectedSize, true);
+        if (br.ok) {
+            m_uploadSessionId = prior.sessionId;
+            m_uploadExpectedSha = prior.clientSha256;
+            ret = true; sessionId = prior.sessionId; nextOffset = br.offset;
+            if (br.complete) {
+                const qint64 pending = m_uploadSessionId;
+                const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
+                if (cr.ok) { hit = true; fileId = cr.fileId; sessionId = pending; finalName = cr.displayName.toUtf8(); }
+                else { ret = false; }
+            }
+        }
+        handled = true;
+    } else if (prior.found && (prior.status == "failed" || prior.status == "expired"
+                               || prior.status == "verifying")) {
+        // 同请求键重试：原地重置会话行后重新走暂存登记（uk_req 下不可再插一行）。
+        // 注：status='done' 但 file_id 为空的历史行不在此列——落到步骤 4 由内容预检查收敛。
+        beginStagedSession(prior.sessionId);
+        handled = true;
+    }
+
+    // 4) 摘要预检查（去重命中）：命中则建条目 + 引用计数，零正文传输
+    if (!handled) {
+        const qint64 objectId = FileObjectStore::instance().findObjectBySha(shaHex, fileSize);
+        if (objectId >= 0) {
+            const FileObjectStore::AttachResult ar = FileObjectStore::instance().attachExistingObject(
+                        m_actorName, parent, displayName, objectId, fileSize);
+            if (ar.ok) {
+                qint64 sid = OperateDB::instance().insertCompletedUploadSession(
+                            m_actorName, parent, ar.displayName, fileSize, shaHex, reqId, ar.fileId);
+                if (sid < 0) {
+                    // 同请求键并发登记冲突：回读既有行（条目已落，不回滚）
+                    const OperateDB::UploadSessionLookup ex =
+                            OperateDB::instance().lookupUploadSessionByRequestId(m_actorName, reqId);
+                    sid = ex.found ? ex.sessionId : -1;
+                    qCWarning(lcFs) << "[fastcheck] 命中登记幂等行失败，回读既有会话 conn=" << m_connId;
+                }
+                ret = true; hit = true; fileId = ar.fileId; sessionId = sid;
+                finalName = ar.displayName.toUtf8();
+                qCDebug(lcFs) << "[fastcheck] 命中 fileId=" << ar.fileId << " objId=" << objectId
+                              << " 幂等=" << ar.idempotent << " conn=" << m_connId;
+            } else {
+                qCWarning(lcFs) << "[fastcheck] 条目安置失败 conn=" << m_connId << " 原因=" << ar.error;
+            }
+        } else {
+            // 未命中：不建对象、不建条目，只登记暂存会话（后续走既有分块 PDU，零改动）
+            m_uploadSessionId = -1;
+            m_uploadExpectedSha.clear();
+            beginStagedSession(-1);
+        }
+    }
+
+    qCDebug(lcFs) << "[fastcheck] conn=" << m_connId << " ret=" << ret << " hit=" << hit
+                  << " fileId=" << fileId << " sessionId=" << sessionId
+                  << " nextOffset=" << nextOffset << " nameLen=" << finalName.size();
+
+    PDU* respdu = mkPDU(uint(finalName.size()));
+    respdu->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
+    const uint respVersion = FASTCHECK_VERSION;
+    const uint nameLenOut = uint(finalName.size());
+    memcpy(respdu->caData + FASTCHECK_RESP_RET_OFFSET, &ret, sizeof(ret));
+    memcpy(respdu->caData + FASTCHECK_RESP_HIT_OFFSET, &hit, sizeof(hit));
+    memcpy(respdu->caData + FASTCHECK_RESP_VERSION_OFFSET, &respVersion, sizeof(respVersion));
+    memcpy(respdu->caData + FASTCHECK_RESP_FILE_ID_OFFSET, &fileId, sizeof(fileId));
+    memcpy(respdu->caData + FASTCHECK_RESP_SESSION_ID_OFFSET, &sessionId, sizeof(sessionId));
+    memcpy(respdu->caData + FASTCHECK_RESP_NEXT_OFFSET, &nextOffset, sizeof(nextOffset));
+    memcpy(respdu->caData + FASTCHECK_RESP_NAME_LEN_OFFSET, &nameLenOut, sizeof(nameLenOut));
+    if (!finalName.isEmpty()) {
+        memcpy(respdu->caMsg, finalName.constData(), size_t(finalName.size()));
+    }
+    return respdu;
+}
+
 //上传文件数据
 PDU *MsgHandler::uploadfiledata()
 {
@@ -1227,23 +1437,31 @@ PDU *MsgHandler::uploadfiledata()
 }
 // REQ-EXT-FILE-001 T4：上传完成→服务端复算转正 + 建逻辑条目 + 引用计数（同事务）。
 // commitUpload 失败即拒绝转正（验收4）；staging 由其转正搬移或丢弃（验收1）。
-void MsgHandler::finalizeUploadOnComplete()
+// REQ-EXT-FILE-002 D2：传入会话登记的客户端摘要做复算对照——不符则不转正、不建条目、
+// 会话置 failed、staging 删除（验收3）。摘要只作对照，绝不作为转正依据。
+FileObjectStore::CommitResult MsgHandler::finalizeUploadOnComplete()
 {
+    FileObjectStore::CommitResult r;
     const QString owner = m_actorName;
     const QString parent = m_uploadSession.parentPath();
     const QString display = m_uploadSession.displayName();
     const qint64 expected = m_uploadSession.totalSize();
     const QString staging = m_uploadSession.stagingFilePath();
     if (owner.isEmpty() || parent.isEmpty() || display.isEmpty() || staging.isEmpty()) {
+        r.error = "会话上下文缺失";
         qCWarning(lcFs) << "[finalizeUpload] 会话上下文缺失，拒绝转正 conn=" << m_connId;
-        return;
+        m_uploadSession.reset();
+        m_uploadSessionId = -1;
+        m_uploadExpectedSha.clear();
+        return r;
     }
     qCDebug(lcFs) << "[finalizeUpload] verifying conn=" << m_connId << " owner=" << owner << " display=" << display;
     OperateDB::instance().finishUploadSession(m_uploadSessionId, "verifying");
-    const FileObjectStore::CommitResult r =
-        FileObjectStore::instance().commitUpload(owner, parent, display, expected, staging);
+    r = FileObjectStore::instance().commitUpload(owner, parent, display, expected, staging,
+                                                /*copyOnly=*/false, m_uploadExpectedSha);
     if (r.ok) {
-        OperateDB::instance().finishUploadSession(m_uploadSessionId, "done");
+        // 同写 file_id：使"已完成会话"能被请求级幂等短路直接命中（§2 步骤3）
+        OperateDB::instance().finishUploadSession(m_uploadSessionId, "done", r.fileId);
         qCDebug(lcFs) << "[finalizeUpload] 落定 fileId=" << r.fileId << " objId=" << r.objectId
                       << " dedup=" << r.dedupHit << " 定名=" << r.displayName;
     } else {
@@ -1252,6 +1470,8 @@ void MsgHandler::finalizeUploadOnComplete()
     }
     m_uploadSession.reset();
     m_uploadSessionId = -1;
+    m_uploadExpectedSha.clear();
+    return r;
 }
 
 //下载文件（仅做校验，流式分块由 MyTcpSocket 完成）

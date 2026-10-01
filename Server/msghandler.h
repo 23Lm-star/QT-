@@ -2,6 +2,7 @@
 #define MSGHANDLER_H
 
 #include "protocol.h"
+#include "fileobjectstore.h"
 #include "resumableuploadsession.h"
 
 #include <QString>
@@ -39,6 +40,7 @@ public:
     PDU* movefile(const QString& loginName);//移动文件
     PDU* listdir(const QString& loginName);//列出子目录（移动文件选择目标用）
     PDU* uploadfileinit();//上传文件初始化
+    PDU* uploadfilefastcheck();//REQ-EXT-FILE-002：秒传预检查（命中零正文，未命中登记暂存会话）
     PDU* uploadfiledata();//上传文件数据
     PDU* downloadfile();
     PDU* chatmsg();//获取聊天消息
@@ -90,9 +92,13 @@ public:
 
     // ===== REQ-EXT-FILE-001 T3/T4：内容寻址上传落定 =====
     qint64 m_uploadSessionId = -1;   // 当前暂存会话 upload_session.session_id
+    // REQ-EXT-FILE-002 D2：当前上传声明的 SHA-256（= upload_session.client_sha256），
+    // 只作命中判定与复算对照，永不作为转正依据。
+    QString m_uploadExpectedSha;
     // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
     // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。
-    void finalizeUploadOnComplete();
+    // 返回转正结果（调用方可忽略）；失败时 CommitResult.ok=false。
+    FileObjectStore::CommitResult finalizeUploadOnComplete();
 
     // REQ-FS-003: 统一路径沙箱校验（集中一处，所有路径入口调用）
     // 根与路径分别做 canonical 归一（解析 ../ 与符号链接）后判前缀；
