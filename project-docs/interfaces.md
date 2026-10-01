@@ -39,7 +39,7 @@ struct Msg {
 };
 ```
 
-### 1.3 消息类型枚举（共 43 种）
+### 1.3 消息类型枚举（基础段 1–55；扩展段见 §8 群 60–96、§9 文件 97–98）
 
 | 枚举值 | 常量 | 方向 | 说明 |
 |--------|------|------|------|
@@ -427,4 +427,71 @@ GroupResult handleGroupMessageOperation(const GroupRequest&, const QString &acto
 - 历史：打开窗口经 95/96 定位游标，再以 91/92 `mode=0` 前向补齐，到达水位后可 `mode=1` 上翻；`mode=1` 为 `seq <= cursor` 含边界语义，调用方须传 `next_cursor - 1`。
 - 已读：93/94 单调推进 `last_read_seq`（不可回退、不可代推、不超过群水位）。
 - 未读：群列表经 95/96 显示徽标，服务端计算未读数，客户端不可自报。
+
+---
+
+## 9. 文件接口（REQ-EXT-FILE-001 / 002）
+
+### 9.1 秒传预检查 PDU（97–98，REQ-EXT-FILE-002）
+
+| 枚举值 | 常量 | 方向 | 说明 |
+|--------|------|------|------|
+| 97 | `ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST` | C→S | 秒传预检查；只追加，旧编号 1–96 不变 |
+| 98 | `ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND` | S→C | `ret`+`hit`+`version`+`file_id`+`session_id`+`next`+`name_len`；命中时 `caMsg` 为最终展示名 |
+
+- 97/98 必须进 SEC-001 actor 门；未认证请求拒绝，响应类型正确。
+- 既有分块上传 29–32 语义**零改动**，预检查未命中时复用既有 `Uploader` 链路。
+
+### 9.2 秒传预检查布局常量
+
+```cpp
+// 文件：protocol.h（Client / Server 同值同名，只追加）
+static const uint FASTCHECK_MAGIC      = 0x4643484B;  // "FCHK"
+static const uint FASTCHECK_VERSION    = 1;           // 请求版本不等于服务端即拒
+static const int  FASTCHECK_MAX_MSG_LEN = 1024;
+
+// 请求 caData：定长字段与长度字段；可变长度（sha/名/目录/reqId）一律进 caMsg
+//   0 version(u32) | 4 magic(u32) | 8 file_size(qint64) | 16 sha_len(u32,须=64)
+//   20 name_len(u32) | 24 dir_len(u32) | 28 reqid_len(u32)
+// 响应 caData：0 ret(bool) | 1 hit(bool) | 2 version(u32) | 8 file_id(qint64)
+//   16 session_id(qint64) | 24 next(qint64,未命中续传起点) | 32 name_len(u32)
+static const int FASTCHECK_SHA_HEX_LEN   = 64;   // 小写十六进制
+static const int FASTCHECK_REQID_HEX_LEN = 32;   // 客户端请求级幂等键
+```
+
+- 校验：sha 严格 `[0-9a-f]{64}`；请求总长 == `uiMsgLen` 且不超 `FASTCHECK_MAX_MSG_LEN`；目录经 `logicPathInActorRoot` + `normalizeParent` 双层约束。
+
+### 9.3 文件资产表契约（REQ-EXT-FILE-001）
+
+| 表 | 关键列与键 | 语义 |
+|----|-----------|------|
+| `schema_version` | `version` 主键 | 迁移版本水位；启动 `checkSchemaVersion()` fail-fast |
+| `file_object` | `object_id` 主键；唯一键 `uk_sha256(sha256)`；`size_bytes`、`storage_path`（`objects/<sha前2位>/<object_id>`）、`refcount`、`status('ready'/'pending_reclaim')` | 物理对象层，内容寻址，物理唯一性由 DB 保证 |
+| `user_file` | `file_id` 主键；唯一键 `uk_loc(owner_name, parent_path, display_name)`；索引 `idx_owner(owner_name, parent_path, status)`；`is_dir`、`object_id`、`status('active'/'deleted')` | 逻辑条目层（目录树）；`parent_path` 为 owner 相对逻辑键；外键指向 `file_object` |
+| `upload_session` | `session_id` 主键；`expected_size`、`client_sha256`（仅预检元数据，不作转正依据）、`staging_path`、`confirmed_offset`、`status('uploading'/'verifying'/'done'/'failed'/'expired')`；FILE-002 追加 `client_request_id VARCHAR(64)`、`file_id BIGINT`、唯一键 `uk_req(owner_name, client_request_id)` | 断点续传与秒传会话；`uk_req` 为请求级幂等键（存量行 NULL 不冲突） |
+| `file_migration_map` | `old_path` 主键；`file_id`、`object_id`、`status('mapped'/'skipped_name_conflict'/'failed')` | FILE-001 存量迁移台账，幂等重放 |
+
+- 迁移版本：FILE-001 `2026092901`、FILE-002 `2026100102`；`OperateDB::checkSchemaVersion()` 取文件资产/群/群消息/秒传四者 `qMax`，低版本 fail-fast，不运行时静默建表。
+
+### 9.4 FileObjectStore / OperateDB 文件接口
+
+```cpp
+// Server/fileobjectstore.{h,cpp}
+bool   hashStaging(...);                                   // 暂存文件流式摘要
+int    commitUpload(..., const QString& expectedSha);      // 事务内复算大小+摘要 → 转正/命中安置
+int    attachEntry(...);                                   // 条目建/复活 + refcount++
+int    attachExistingObject(...);                          // 秒传命中：同事务安置条目，丢弃 staging
+bool   findObjectBySha(...);                               // uk_sha256 精确命中查询
+int    releaseEntry(...);                                  // 条目释放 + refcount-- ；归零转 pending_reclaim
+void   normalizeParent(...);                               // 逻辑父路径规范化（owner 相对、'/' 结尾）
+bool   logicPathInActorRoot(...);                          // actor 根内逻辑路径校验
+
+// Server/operatedb.{h,cpp}（文件资产部分）
+int  createUploadSession(...);      int updateUploadOffset(...);   int finishUploadSession(...);
+int  lookupUploadSessionByRequestId(...);   // 秒传请求级幂等短路
+int  restartUploadSession(...);              int insertCompletedUploadSession(...);
+bool isLogicKeyForm(...);            void normalizeLogicKeys(...); // 逻辑键判别与一次性转换
+bool checkSchemaVersion();           // 四版本 qMax 达标检查
+```
+
 

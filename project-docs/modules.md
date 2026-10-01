@@ -194,3 +194,39 @@ Server  MyTcpSocket（actor 门 / 出站队列）
           ↖ MyTcpServer::broadcastGroupMessage（锁内快照 → 锁外 enqueueOutbound）
 ```
 
+---
+
+## 6. 文件子系统（REQ-EXT-FILE-001 / 002）
+
+### 6.1 客户端
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **File** | `file.{h,cpp}`, `file.ui` | 文件管理界面；上传入口在发起前**流式计算 SHA-256**（1MiB 窗口，内存 O(1)）并生成 32hex 请求键，先发 FASTCHECK 预检查；命中则提示并刷新列表（零正文上传），未命中复用既有 `Uploader` 分块上传 |
+| **MsgHandler (Client)** | `msghandler.{h,cpp}` | 新增 `UPLOADFILE_FASTCHECK_RESPOND`(98) 分发；命中时携带服务端返回的最终展示名 |
+
+### 6.2 服务端
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **MsgHandler** | `msghandler.{h,cpp}` | `uploadfilefastcheck()`：请求形态校验 → actor 根逻辑路径校验 → 请求级幂等短路（`client_request_id`）→ 摘要预检查命中（`attachExistingObject`，**零正文**）；未命中登记暂存会话并回续传起点。`finalizeUploadOnComplete()` 落盘时**复算大小 + 摘要**双对照，不符不转正、会话置 `failed` |
+| **FileObjectStore** | `fileobjectstore.{h,cpp}` | 内容寻址对象仓：`hashStaging`/`commitUpload(..., expectedSha)`/`attachEntry`/`attachExistingObject`/`findObjectBySha`/`releaseEntry`/`normalizeParent`/`logicPathInActorRoot`；全部写入在**同一事务**内完成，命中时丢弃 staging，物理只留一份 |
+| **OperateDB** | `operatedb.{h,cpp}` | 文件资产与上传会话 SQL：`createUploadSession`/`updateUploadOffset`/`finishUploadSession` + FILE-002 追加 `lookupUploadSessionByRequestId`/`restartUploadSession`/`insertCompletedUploadSession`；`isLogicKeyForm`/`normalizeLogicKeys` 逻辑键判别与一次性转换；`checkSchemaVersion()` 取文件资产/群/群消息/秒传四者 `qMax` |
+| **ResumableUploadSession** | `resumableuploadsession.{h,cpp}` | 断点续传会话管理：确定性 staging 路径、偏移量连续性校验 |
+| **Protocol** | `protocol.{h,cpp}` | 追加 `UPLOADFILE_FASTCHECK_REQUEST=97`/`_RESPOND=98` 与 `FASTCHECK_*` 偏移/magic 常量（与客户端同值同名） |
+| **迁移** | `migrate_ext_file_001.sql`、`migrate_ext_file_002.sql`（+ rollback） | FILE-001：`schema_version`/`file_object`/`user_file`/`upload_session`/`file_migration_map` 五表；FILE-002：附加式给 `upload_session` 加 `client_request_id`/`file_id` + `uk_req` |
+
+### 6.3 依赖关系
+
+```
+Client  File ──97──> protocol.h（FASTCHECK 布局）
+          └──(未命中) Uploader → 既有分块上传（29/30/31/32）
+          ↖ MsgHandler ←98─ 命中/未命中结果
+
+Server  MyTcpSocket（actor 门）
+          └── MsgHandler::uploadfilefastcheck / finalizeUploadOnComplete
+                ├── OperateDB（upload_session / user_file / file_object）
+                └── FileObjectStore（对象仓：暂存→复算→转正/命中安置）
+                      └── DatabaseConnectionPool（RAII、线程隔离）
+```
+

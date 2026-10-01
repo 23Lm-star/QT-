@@ -228,3 +228,49 @@ Client GroupChat ──88──> MyTcpSocket（actor 门；伪造事件 84/85/90
 - **幂等**：`uk_group_client_msg(group_id, client_msg_id)` + 事务内短路；同键重放返回原 `(seq, msg_id)` 且不重复广播，异发送者同键返回业务错误。
 - 排序与分页游标一律以 `seq` 为准，`created_at`(DATETIME(3)) 仅用于展示排序稳定性。
 
+---
+
+## 10. 文件子系统（REQ-EXT-FILE-001 / 002）
+
+### 10.1 定位与事实源
+
+- 文件存储分为**逻辑条目层**（`user_file`：用户可见的目录树，`uk_loc(owner_name, parent_path, display_name)`）与**物理对象层**（`file_object`：按 `sha256` 内容寻址，`uk_sha256` 保证物理唯一），两层按引用计数关联；同一内容被多个条目引用时物理只存一份。
+- 存储键是**owner 相对逻辑键**：`parent_path` 为 `/` 结尾的 owner 根内相对路径，与机器绝对路径解耦，跨工作树/跨根可复现。
+- 操作者身份一律取连接级 actor（SEC-001），忽略客户端自报字段；所有路径经 actor 根内逻辑校验（`logicPathInActorRoot` / `normalizeParent`）。
+- 协议为 §3 之上的独立段：FILE-002 新增秒传预检查 PDU 97/98（只追加，旧编号 1–96 不变），既有分块上传 `UPLOADFILE_INIT/DATA`(29–32) 语义零改动。
+
+### 10.2 数据流
+
+**秒传预检查（命中 → 零正文）**：
+
+```
+Client File（流式 SHA-256 + 32hex 请求键）──97 FASTCHECK──> MyTcpSocket（actor 门）
+   └─> MsgHandler::uploadfilefastcheck
+         形态校验 → actor 根逻辑路径校验 → 请求级幂等短路（client_request_id）
+         → FileObjectStore::findObjectBySha 命中？
+              是 → attachExistingObject（同事务：建/复活 user_file 条目 + refcount++）
+                   ──> 98 命中响应（最终展示名；无任何数据块传输）
+              否 → 登记/复用 upload_session，回续传起点 ──> 复用既有 Uploader 分块上传
+```
+
+**落盘转正（未命中路径）**：
+
+```
+分块上传全部完成 ──> MsgHandler::finalizeUploadOnComplete
+   └─> FileObjectStore::commitUpload(staging, expectedSha)
+         事务：FOR UPDATE 对象行（uk_sha256 兜底）
+              → 复算 staging 的大小 + 摘要，双对照 expectedSha
+                    不符 → 会话 failed，staging 清零，不建条目、不转正
+                    相符 → 命中既有对象则丢弃 staging 并安置条目；否则转正新对象 → refcount++
+```
+
+### 10.3 关键不变式
+
+- **物理唯一性由 DB 保证**：`file_object.uk_sha256` 为唯一键，并发相同内容由数据库兜底串行化，不依赖应用层约定。
+- **命中零正文**：预检查命中路径只做元数据事务，不传输文件数据块；同名冲突以 `(1)` 递推生成展示名，幂等可重放。
+- **转正双对照**：客户端声明的 `client_sha256` 仅作**预检元数据**，不作转正依据；转正以服务端对 staging 的**大小 + 摘要复算**为准（伪造摘要不命中、复算不符不转正）。
+- **请求级幂等**：`upload_session.uk_req(owner_name, client_request_id)` 唯一，同一用户同一请求键只允许一条会话行；失败会话同键可重试。
+- **附加式迁移 + 启动 fail-fast**：FILE-001 `2026092901`、FILE-002 `2026100102`（与 GROUP-002 `2026100101` 区分，避免同名使 fail-fast 失效）；`checkSchemaVersion()` 取四者 `qMax`，低版本拒绝监听，不运行时静默建表。
+- **对象回收安全**：条目软删除后对象在 `refcount==0` 且无引用时转 `pending_reclaim`，不由删除路径直接物理删除。
+
+

@@ -222,4 +222,8 @@
 | 顺序 | 需求 | 分支 | 等级 | 状态 |
 |---|---|---|---|---|
 | E1 | REQ-EXT-SEC-001 服务端身份与授权上下文 | `codex/req-ext-sec-001-auth-context` | LARGE（前置门） | ✅ 已完成（merge `7fc47c1`，审计链 c7c4eed PASS*→B-1 REJECT→0efccb9 ACCEPT，e2e 48/48，证据 `project-docs/evidence/REQ-EXT-SEC-001/`，2026-09-29） |
-| E2+ | REQ-EXT-GROUP-001/002/003、REQ-EXT-FILE-001/002 | 各自分支从 master 切出 | LARGE/MEDIUM | 依赖 E1 的 actor 门与握手登记语义；GROUP-002 分支已并行开工（另行会话） |
+| E2 | REQ-EXT-GROUP-001 群成员生命周期 | `codex/req-ext-group-001-membership` | LARGE | ✅ 已完成（merge `ee75441`，PDU 60–87，证据 `project-docs/evidence/REQ-EXT-GROUP-001/`，2026-09-30） |
+| E3 | REQ-EXT-GROUP-002 可靠群文本消息 | `codex/req-ext-group-002-group-messaging` | LARGE | ✅ 已完成（merge `ffaaacf`，PDU 88–96，独立测试 PASS + 独立审计 PASS，e2e 全绿，2026-10-01） |
+| E4 | REQ-EXT-FILE-001 文件资产与内容寻址 | `codex/req-ext-file-001-file-assets` | LARGE | ✅ 已完成（merge `9faae6c`，对象仓 + 五表 + 逻辑键，四套件 43/13/48/37 全绿，protocol.h 零碰，2026-09-30） |
+| E5 | REQ-EXT-FILE-002 顺序上传秒传与去重 | `codex/req-ext-file-002-fast-upload` | LARGE | ✅ 已完成（merge `abe2e5d`，PDU 97/98 追加 + 秒传预检查/去重，独立测试 46/46 与独立审计 ACCEPT，2026-10-01） |
+| E6+ | REQ-EXT-GROUP-003 | 自 master 切出 | LARGE | 未开工；依赖 E1 的 actor 门语义 |
