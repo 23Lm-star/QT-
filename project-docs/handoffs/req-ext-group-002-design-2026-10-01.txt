@@ -1,0 +1,11 @@
+# handoff: REQ-EXT-GROUP-002
+branch: codex/req-ext-group-002-group-messaging
+head: b180abb
+tier: LARGE
+node: design
+audit: none
+next: 主人批准 design.md §14 的 D2 编号表（88–96）后，开 development 会话；先跑 pipeline/state.ps1
+blockers: D2 未批准（两份 protocol.h 属 frozen_paths）；未批准前不改生产源码
+evidence: project-docs/tasks/REQ-EXT-GROUP-002/design.md
+owner: claude-code
+date: 2026-10-01
