@@ -56,3 +56,12 @@
 
 ## 下一节点
 independent test（新会话、异代理）：在 `0b83aab` 的干净 detached worktree 复跑 pipeline 与 `groupfile_e2e.py`，证据落 `project-docs/evidence/REQ-EXT-GROUP-003/independent-test/`。之后 repair（如需）→ independent audit（新会话、异代理、只读）→ integration 三事实行 → merge no-ff。
+
+## independent test 节点收口（2026-10-01）
+- **候选**：`0b83aab`；分离工作树 `build/wt-test-group003`（`git worktree add --detach`，干净，只读——本节点零生产源码改动）；本工作树自跑 `pipeline/build.ps1` 现构，`dist/Server.exe` 于 14:01 生成。
+- **结论**：**PASS**（0 条归因候选的缺陷，可交 independent audit）。三门：build GREEN、test GREEN-WARN（0 注册用例，如实）、audit RED = **预期冻结面命中**（两端 `protocol.h`，属已批准契约变更；`impact-check: NOT_APPLICABLE`）。
+- **验收复跑**：`groupfile_e2e.py` **45/45**；既有回归 dedup **13/13**、entry_ops **43/43**、cross_tree **37/37**、sec001 **48/48**、fastupload **46/46**；群生命周期 `group_e2e_regress.py` **15/15**。均与开发节点声称一致。
+- **独立核验（本轮新增）**：`git diff master...0b83aab -- Client/protocol.h Server/protocol.h` 无删除行（append-only）；新增枚举仅 99–106，既有 97/98 原样保留未重编号。
+- **环境**：DB `mydb` 已含 `schema_version=2026100103`，表 `group_file` 在位；统一 e2e 运行形态（cwd=dist / `dist/Server.exe` / `filesPath=./filesys` 相对 / CRLF 配置）；解释器 `py -3.13`。群生命周期 harness 不自管 Server，由外部预置 Qt PATH 启动后运行。
+- **未执行**：GUI 冒烟（无法自动化）；冻结面深度复核与 CodeGraph 影响闭包（属 independent audit 节点，不采信本轮结论）。
+- **下一节点**：independent audit（新会话、不同代理、detached worktree 只读 `0b83aab`）。
