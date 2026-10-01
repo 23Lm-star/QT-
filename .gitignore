@@ -1,4 +1,6 @@
 /build/
+# Unified deploy destination (final exes + deployed DLLs, never tracked)
+/dist/
 # Qt/qmake build artifacts
 build-*/
 Client/_github_bundle_repo/

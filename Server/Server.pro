@@ -4,6 +4,15 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++11 utf8_source
 
+# Deploy destination policy:
+#   Debug   -> stay beside Qt Creator's run config (green triangle works as-is)
+#   Release -> converge into repo-root dist/ (the single deployable artifact)
+CONFIG(debug, debug|release) {
+    DESTDIR =
+} else {
+    DESTDIR = $$PWD/../dist
+}
+
 # The following define makes your compiler emit warnings if you use
 # any Qt feature that has been marked deprecated (the exact warnings
 # depend on your compiler). Please consult the documentation of the
