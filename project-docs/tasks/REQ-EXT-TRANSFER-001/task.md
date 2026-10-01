@@ -43,7 +43,8 @@
 | DB schema | **零变更**、无迁移 | 附加值 |
 
 ## 门次与事件（append-only）
+- 2026-10-01 design：`design.md` 落盘（逐字节落位表 / 107-108 形态 / 两端状态机 / ring 调度 / 60s 回收 / 测试矩阵 18 例 / 兼容不变式 I1-I6 / 冻结面逐字批准稿 §9）。8 项设计裁决 D1-D8 记录在案。契约变更批准卡以业务语言提交，**主人批准：同意**；并发名额 Q1 裁决为**上传 3 + 下载 3（相互独立）**，已回写 `design_status: CONFIRMED`。
 - 2026-10-01 goal：定档 LARGE。方案 B（协议级多路复用）裁决 = **采用，带 6 处修正**（M1 transfer_id 覆盖初始化握手 = 硬缺陷修正；M2 0 值保留 = 免费回归护栏；M3 服务端 per-transfer 状态 + 上限；M4 下载 round-robin 公平调度；M5 SHA-256 移出 UI 线程；M6 文件级任务列表 UI）。排除：多连接并行（与单登录版本模型冲突）、纯客户端串行队列（不产生并行）。需求文档落盘，分支自 `master@53b048b` 切出。契约变更批准卡待 design 节点提交。
 
 ## 下一节点
-design（新会话）：逐字节协议设计（含 transfer_id 各 PDU 落位终稿、ABORT 形态、会话状态迁移）+ 两端状态机 + 下载调度算法 + 空闲回收阈值 + 测试矩阵 → `design.md` → 主人批准契约变更 → 才可 development。
+development（新会话，owner 会话）：按 `design.md` §9 逐字批准稿写入两端 `protocol.h`，随后 T2–T8（服务端 per-transfer 状态表 + ring 调度 + 107/108 + 上限/回收；客户端 TransferManager + 路由改造 + 任务列表 UI + SHA-256 后台线程；新 e2e 套件；六套件回归 + 文档同步）。退出条件：`pipeline/build.ps1` / `test.ps1` / `audit.ps1` 全绿 + 六套件 + `parallel_e2e.py` 全绿 → 交 independent test（新会话）。
