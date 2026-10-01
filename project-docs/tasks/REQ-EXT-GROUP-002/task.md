@@ -99,3 +99,11 @@
 - **合并**：`git checkout master && git merge --no-ff codex/req-ext-group-002-group-messaging` → `ffaaacf`（trunk 为分支纯祖先，无冲突）。分支不删除（与 GROUP-001 收口惯例一致，保留可追溯）；本需求测试工作树 `build/wt-test-group002` 已移除。
 - **交付**：可靠群文本消息 PDU 88–96（T1–T7）；验证面 = development harness 38/38 + independent test 107/108 + GROUP-001 回归 15/15；唯一 FAIL = `FINDING-PRE1`（基线既有）。
 - **遗留（交下一节点/架构师）**：FINDING-PRE1 另开 SMALL 分支修复；`pipeline/audit.ps1` 冻结检查区间修正（SMALL 管线任务）；architecture/modules/interfaces 群模块文档更新（project_architect 范围）；GUI 冒烟维持 NEEDS-HUMAN。
+
+## 遗留缺陷清理（2026-10-01，三条 SMALL 分支，全部已合并）
+
+- **FINDING-PRE1 复核结论 = 未复现（修正此前记录）**：用**未改动的原始代码**（`git diff 03dc01d HEAD -- Server/operatedb.cpp` 为空）、真实 MySQL + 真实服务端复跑 —— 4 轮独立探针 + 2 轮当初报 FAIL 的 `itest_part2.py` 全部通过（`issuccess` 正常翻 1、第二次拉取 `payload_len=0`），服务端控制台 14/14 次 `update msg issuccess=1 ret: true`。原报告 FAIL 最可能来自环境假象（疑似残留旧 `Server.exe`），但无法 100% 证实。**此前 test / audit / task / handoff 中的「FINDING-PRE1 = 基线既有缺陷」据此更正为「未复现」。**
+- **加固仍合并（主人裁决）**：`getchatMsg` 读+标记并入单一事务、`SELECT ... FOR UPDATE`、按主键只标记本次实际返回的行（仍带 `issuccess=0`）、UPDATE/commit 失败回滚并返回空（宁重投不重发）。合并 `65c38bc`；证据 `project-docs/evidence/fix-chatmsg-offline-redelivery/`。
+- **管线脚本修复**：`pipeline/audit.ps1` 冻结检查改分支级（`merge-base master HEAD..HEAD`，合并后自动静默，且能发现分支中段 frozen 变更）、补 docs-only 证据复用（`docs-only commit: evidence from <hash>`）、影响面以可降级方式接入。合并 `1e79197`；证据 `project-docs/evidence/fix-pipeline-audit-frozen-scope/`。
+- **实现文档补齐**：`architecture.md` / `modules.md` / `interfaces.md` 增补群聊子系统（GROUP-001 + GROUP-002）。合并 `59e2bd0`。该代理另记录 4 处 design 与实现出入：① `limit` 越界在协议层被**拒绝**(`-2002`)、非 design §3.2 所述"钳制"；② `-2101/-2102` 群存在性侧信道（审计观察 5 同源）；③ `interfaces.md` §1.3 枚举表陈旧（"共 43 种"、止于 55）；④ `Client/group.*` 未逐字列入 design §11 允许路径。
+- **收口 pipeline**：`build GREEN (65c38bc)`、`test` honest-0、`audit PASS (65c38bc)`；三个代理工作树已移除。

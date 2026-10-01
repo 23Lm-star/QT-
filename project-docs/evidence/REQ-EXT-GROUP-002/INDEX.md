@@ -3,6 +3,13 @@
 > 备注（manifest `commit:` 字段易误读）：下各节点 `manifest/manifest.txt` 的 `commit:` 记的是**归档动作发生时主工作树 HEAD**，
 > 不是被测候选；运行级绑定哈希见候选工作树内的 manifest（`commit: 03dc01d…, dirty: no`）与日志文件名。
 
+> **更正（2026-10-01，遗留缺陷清理）**：下文各节点记载的 `FINDING-PRE1`（"一对一离线消息重复下发、`issuccess` 恒为 0"）
+> **经复核未复现** —— 用未改动的原代码（`git diff 03dc01d HEAD -- Server/operatedb.cpp` 为空）、真实 MySQL + 真实服务端，
+> 4 轮独立探针 + 2 轮当初报 FAIL 的原套件全部通过，控制台 14/14 次 `update msg issuccess=1 ret: true`。原 FAIL 最可能为
+> 环境假象（疑似残留旧 `Server.exe`），未能 100% 证实。`getchatMsg` 的加固（事务 + `FOR UPDATE` + 只标记实际返回行 +
+> 错误不再被吞）经主人裁决后仍合并（`65c38bc`）；完整复核证据见 `project-docs/evidence/fix-chatmsg-offline-redelivery/`。
+> 阅读本索引时，`FINDING-PRE1` 应作"原报告结论、后经复核推翻"理解，而非"已确认的基线既有缺陷"。
+
 ## integration / merged 节点（2026-10-01，合并结果 ffaaacf）
 
 目录 `integration/`：`merge-facts.txt`（三事实行原始输出：审计报告 PASS/接受、`git diff 03dc01d..ffaaacf` 冻结面零差异、
