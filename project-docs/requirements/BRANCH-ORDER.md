@@ -226,4 +226,5 @@
 | E3 | REQ-EXT-GROUP-002 可靠群文本消息 | `codex/req-ext-group-002-group-messaging` | LARGE | ✅ 已完成（merge `ffaaacf`，PDU 88–96，独立测试 PASS + 独立审计 PASS，e2e 全绿，2026-10-01） |
 | E4 | REQ-EXT-FILE-001 文件资产与内容寻址 | `codex/req-ext-file-001-file-assets` | LARGE | ✅ 已完成（merge `9faae6c`，对象仓 + 五表 + 逻辑键，四套件 43/13/48/37 全绿，protocol.h 零碰，2026-09-30） |
 | E5 | REQ-EXT-FILE-002 顺序上传秒传与去重 | `codex/req-ext-file-002-fast-upload` | LARGE | ✅ 已完成（merge `abe2e5d`，PDU 97/98 追加 + 秒传预检查/去重，独立测试 46/46 与独立审计 ACCEPT，2026-10-01） |
-| E6+ | REQ-EXT-GROUP-003 | 自 master 切出 | LARGE | 未开工；依赖 E1 的 actor 门语义 |
+| E6 | REQ-EXT-GROUP-003 群文件目录与访问控制 | `codex/req-ext-group-003-group-files` | LARGE | ✅ 已完成（merge `495e552`，PDU 99–106 + `group_file` 表 + schema_version 2026100103，groupfile 45/45 + 六套回归全绿，独立审计 PASS，2026-10-01） |
+| E7 | REQ-EXT-TRANSFER-001 多文件并行传输（有限并发） | `feat/req-ext-transfer-001-parallel-transfer` | LARGE | goal 完成（2026-10-01，`master@53b048b` 切出）；全路径并行 + 上限 3 + 上传暂停/恢复/取消；待 design → 契约变更批准 |
