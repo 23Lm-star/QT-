@@ -1,4 +1,4 @@
-# 统一 e2e 运行形态（五套件）
+# 统一 e2e 运行形态（六套件）
 
 > 生效 2026-10-01（FINDING-DEV-2 收口）。此前 FILE-001 四套件依赖"旧相对形态"（`filesPath=./filesys` +
 > `cwd=Server` + exe 取自 `build/build-Server/release/`），与 fastupload 的 dist 形态并存，每次复跑都要
@@ -12,7 +12,7 @@
 | exe | `<repo>/dist/Server.exe`（qmake `DESTDIR=dist`，构建期直接落 `dist/`） |
 | filesPath | `./filesys`（相对 cwd）→ 实际数据根 `<repo>/dist/filesys` |
 | config 来源 | `Server/connect.config`，构建期经 `Server/config.qrc` **内嵌**进 exe；该文件**不入库**（模板 `Server/connect.config.template` 亦为 `./filesys`） |
-| 运行方式 | `py -3.13 <脚本绝对路径>`；**cwd 任意**——五个脚本都自管理 Server 生命周期（`taskkill` + `Popen(cwd=dist)`） |
+| 运行方式 | `py -3.13 <脚本绝对路径>`；**cwd 任意**——六个脚本都自管理 Server 生命周期（`taskkill` + `Popen(cwd=dist)`） |
 
 `cross_tree_e2e.py` 的树 B 以 `<repo>/build/xtree-file001` 为 cwd，其 `./filesys` 是 NTFS junction
 指向 `<repo>/dist/filesys`——**正是因为 filesPath 为相对路径**，"两棵不同 cwd 的树"才成立。
@@ -41,5 +41,6 @@
 | cross_tree | 41 | `REQ-EXT-FILE-001/cross_tree_e2e.py` |
 | sec001 | 48 | `REQ-EXT-FILE-001/sec001_regression.py` |
 | fastupload | 46 | `REQ-EXT-FILE-002/fastupload_e2e.py` |
+| groupfile | 45 | `REQ-EXT-GROUP-003/groupfile_e2e.py`（GROUP-003 合入时加入，同形态、自管理） |
 
 > 注：套件自身只统计"断言用例"（`check()` 计数）；Server 启动失败以 `FATAL` 直接退出，不计入用例数。
