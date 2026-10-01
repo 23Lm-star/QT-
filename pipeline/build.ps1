@@ -26,7 +26,10 @@ function Stamp-Evidence([string]$label) {
 
 $QTBIN  = "C:\Qt\5.14.2\mingw73_64\bin"
 $MINGWBIN = "C:\Qt\Tools\mingw730_64\bin"
-$env:Path = "$QTBIN;$MINGWBIN;$env:Path"
+# ld loads liblto_plugin-0.dll via PATH; without this dir linking fails with
+# "-fuse-linker-plugin, but liblto_plugin-0.dll not found" (observed 2026-10-01)
+$MINGWLIBEXEC = "C:\Qt\Tools\mingw730_64\libexec\gcc\x86_64-w64-mingw32\7.3.0"
+$env:Path = "$QTBIN;$MINGWBIN;$MINGWLIBEXEC;$env:Path"
 
 # --- Pre-step: sync git-ignored runtime configs (connect.config) from main worktree.
 # Clean detached worktrees miss these untracked files; they are embedded via qrc at
