@@ -1,6 +1,16 @@
-# REQ-EXT-FILE-001 验收1/2/3 端到端脚本（证据归档，仿 SEC-001 verify.py 模式）。前置：Server.exe 在 127.0.0.1:5000, CWD=Server/
+# REQ-EXT-FILE-001 验收1/2/3 端到端脚本（证据归档，仿 SEC-001 verify.py 模式）。
 # 复用 SEC-001 PDU 构包。断言走 DB：同内容两次上传 -> 1 物理对象 / 2 逻辑条目 / refcount=2；
 # 删一引用 -> refcount=1 对象仍 ready 且另一条目可下载。
+#
+# ---- 统一 e2e 运行形态（五套件一致，见 project-docs/evidence/E2E-RUNFORM.md）----
+# 运行：py -3.13 project-docs/evidence/REQ-EXT-FILE-001/dedup_e2e.py
+#   cwd     : 任意（脚本自管理，Server 以 <repo>/dist 为 cwd 启动）
+#   exe     : <repo>/dist/Server.exe（qmake DESTDIR=dist；connect.config 构建期经 qrc 内嵌）
+#   config  : Server/connect.config -> filesPath=./filesys（相对 cwd）；未入库的机器本地文件
+#   数据根  : <repo>/dist/filesys
+#   未入库依赖：dist/{Qt5Core,Qt5Gui,Qt5Network,Qt5Sql,Qt5Svg,Qt5Widgets}.dll、dist/libmysql.dll、
+#              dist/sqldrivers/qsqlmysql.dll、dist/platforms/qwindows.dll
+# 脚本自管理 Server 生命周期（taskkill + Popen, cwd=<repo>/dist）。
 import hashlib, os, socket, struct, subprocess, sys, time
 
 HOST, PORT = "127.0.0.1", 5000
@@ -12,7 +22,10 @@ MAGIC = 0x5253554d
 MYSQL = r"C:/Program Files/MySQL/MySQL Server 5.7/bin/mysql.exe"
 DB = ["-h", "localhost", "-u", "root", "-p123456", "mydb", "-N", "-B", "-e"]
 A = "dedupuser"
-SBX = os.path.join(os.getcwd(), "filesys")
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+DIST = os.path.join(REPO, "dist")
+EXE = os.path.join(DIST, "Server.exe")
+SBX = os.path.join(DIST, "filesys")
 
 def f32(s): return s.encode("utf-8")[:31].ljust(32, b"\0")
 def creds(name, pwd="123456"):
@@ -50,6 +63,22 @@ def sql(q):
     r = subprocess.run([MYSQL] + DB + [q], capture_output=True, text=True)
     return r.stdout.strip()
 
+def start_server():
+    os.environ["PATH"] = r"C:/Qt/5.14.2/mingw73_64/bin;C:/Qt/Tools/mingw730_64/bin;" + os.environ["PATH"]
+    subprocess.run(["taskkill", "/F", "/IM", "Server.exe"], capture_output=True)
+    time.sleep(1.0)
+    subprocess.Popen([EXE], cwd=DIST, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    dl = time.time() + 25
+    while time.time() < dl:
+        try:
+            socket.create_connection((HOST, PORT), timeout=1).close(); return True
+        except OSError: time.sleep(0.4)
+    return False
+
+def stop_server():
+    subprocess.run(["taskkill", "/F", "/IM", "Server.exe"], capture_output=True)
+    time.sleep(1.0)
+
 results = []
 def check(sid, desc, cond, detail=""):
     results.append((sid, desc, bool(cond)))
@@ -69,12 +98,17 @@ def login_conn(name):
     return c, ret
 
 # FK 安全清理：先删本测试用户全部逻辑条目，再删本测试涉及的两个内容对象
+stop_server()
 sha = hashlib.sha256((b"DEDUP-Payload-CONTENT-12345" * 40)).hexdigest()
 sha2 = hashlib.sha256((b"OTHER-DISTINCT-CONTENT" * 30)).hexdigest()
 sql(f"DELETE FROM user_file WHERE owner_name='{A}';")
 sql(f"DELETE FROM file_object WHERE sha256 IN ('{sha}','{sha2}');")
 sql(f"DELETE FROM upload_session WHERE owner_name='{A}';")
 
+if not start_server():
+    print("FAIL S0 Server 启动并监听 5000"); sys.exit(2)
+# 夹具：服务端用户根只在"首次注册"时创建；账号在多轮运行后已在 DB 中，故显式准备（同 entry_ops/fastupload）
+os.makedirs(os.path.join(SBX, A), exist_ok=True)
 ca, ret = login_conn(A)
 check("L0", "dedupuser 登录成功", ret == 1, f"ret={ret}")
 if ret != 1: sys.exit(2)
@@ -129,6 +163,7 @@ check("A3-no-physical-del", "对象未被删除且 storage_path 不变(D3)",
       objfile_after != "" and objfile_after == objfile_before, f"before={objfile_before} after={objfile_after}")
 
 ca.close()
+stop_server()
 print("\n=== 汇总 ===")
 passed = sum(1 for _, _, ok in results if ok)
 for sid, desc, ok in results:

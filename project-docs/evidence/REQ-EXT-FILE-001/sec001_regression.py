@@ -2,8 +2,16 @@
 # 适配范围：安全断言零改动；仅 K1c/K1f/K2a/K2b 的"物理落盘"期望（D5 批准前的旧语义）
 #   替换为"条目归属+对象摘要"等价断言（上传内容寻址、分享物理零复制——owner 批准 D5，task.md 记录）。
 # 原件保持不动：project-docs/evidence/REQ-EXT-SEC-001/verify.py
-# 前置：Server.exe 已在 127.0.0.1:5000 运行（CWD=Server/），SEC001_BASE 指向工作树根；
-#   filesys/{sec001a,sec001b,sec001r,sec001v} 用户根预建（运行环境事实）。
+#
+# ---- 统一 e2e 运行形态（五套件一致，见 project-docs/evidence/E2E-RUNFORM.md）----
+# 运行：py -3.13 project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py
+#   cwd     : 任意（脚本自管理，Server 以 <repo>/dist 为 cwd 启动）
+#   exe     : <repo>/dist/Server.exe（qmake DESTDIR=dist；connect.config 构建期经 qrc 内嵌）
+#   config  : Server/connect.config -> filesPath=./filesys（相对 cwd）；未入库的机器本地文件
+#   数据根  : <repo>/dist/filesys
+#   未入库依赖：dist/{Qt5Core,Qt5Gui,Qt5Network,Qt5Sql,Qt5Svg,Qt5Widgets}.dll、dist/libmysql.dll、
+#              dist/sqldrivers/qsqlmysql.dll、dist/platforms/qwindows.dll
+# 脚本自管理 Server 生命周期（taskkill + Popen, cwd=<repo>/dist）。
 import hashlib, os, socket, struct, subprocess, sys, time
 
 MYSQL = r"C:/Program Files/MySQL/MySQL Server 5.7/bin/mysql.exe"
@@ -12,8 +20,10 @@ def sql(q):
     r = subprocess.run([MYSQL] + DBQ + [q], capture_output=True, text=True)
     return r.stdout.strip()
 
-BASE = os.environ.get("SEC001_BASE", r"E:/qt/xiangmu")
-SBX = os.path.join(BASE, "Server", "filesys")
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+DIST = os.path.join(REPO, "dist")
+EXE = os.path.join(DIST, "Server.exe")
+SBX = os.path.join(DIST, "filesys")
 HOST, PORT = "127.0.0.1", 5000
 HDR = 76
 T_REG, T_REG_R, T_LOGIN, T_LOGIN_R = 1, 2, 3, 4
@@ -84,6 +94,22 @@ class Conn:
         except OSError:
             pass
 
+def start_server():
+    os.environ["PATH"] = r"C:/Qt/5.14.2/mingw73_64/bin;C:/Qt/Tools/mingw730_64/bin;" + os.environ["PATH"]
+    subprocess.run(["taskkill", "/F", "/IM", "Server.exe"], capture_output=True)
+    time.sleep(1.0)
+    subprocess.Popen([EXE], cwd=DIST, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    dl = time.time() + 25
+    while time.time() < dl:
+        try:
+            socket.create_connection((HOST, PORT), timeout=1).close(); return True
+        except OSError: time.sleep(0.4)
+    return False
+
+def stop_server():
+    subprocess.run(["taskkill", "/F", "/IM", "Server.exe"], capture_output=True)
+    time.sleep(1.0)
+
 results = []
 def check(sid, desc, cond, detail):
     results.append((sid, desc, bool(cond)))
@@ -118,6 +144,8 @@ def ensure_user(name):
     sys.exit(2)
 
 print("=== 0. DB 清场（F-2 修复：他树/上轮残留不得以清场豁免冒充 PASS） ===")
+if not start_server():
+    print("FATAL: Server 启动失败"); sys.exit(2)
 for u in (A, B, R, V):
     sql(f"DELETE FROM user_file WHERE owner_name='{u}';")
     sql(f"DELETE FROM upload_session WHERE owner_name='{u}';")
@@ -128,6 +156,10 @@ sql("DELETE fo FROM file_object fo LEFT JOIN user_file uf ON uf.object_id=fo.obj
 
 for u in (A, B, R, V):
     ensure_user(u)
+# 夹具：服务端用户根只在"首次注册"时创建；账号在多轮运行后已在 DB 中，故显式预建（运行环境事实，
+# 与 entry_ops/fastupload/dedup 同式）。R 的根由注销用例删除、V 的根由 X3c 校验存在。
+for u in (A, B, R, V):
+    os.makedirs(os.path.join(SBX, u), exist_ok=True)
 
 import shutil
 
@@ -339,6 +371,7 @@ stolen = os.path.exists(os.path.join(SBX, A, "secret.txt"))
 check("K2d", "B-1：自我登记他人源→自我同意链被拒且无复制", r and r[0][0] == T_FINISH and not bf(r[0][1]) and not stolen, f"ret={bf(r[0][1]) if r else 'NORESP'} stolen={stolen}")
 
 ca.close(); c2.close()
+stop_server()
 fails = [x for x in results if not x[2]]
 print(f"\n==== 汇总: {len(results)-len(fails)}/{len(results)} PASS ====")
 for f in fails:

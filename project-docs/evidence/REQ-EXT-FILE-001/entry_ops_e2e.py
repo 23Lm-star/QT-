@@ -1,7 +1,16 @@
 # REQ-EXT-FILE-001 验收4/5 + 条目操作 e2e（证据归档，仿 SEC-001 verify.py 模式）。
 # 覆盖：启动存量迁移(T6)/幂等重跑/同名不同内容(1)安置/skipped_name_conflict/旧文件零删除(验收5)、
 # MKDIR目录条目、rename/move/sharefile 条目优先+物理回退(D5)、伪造大小拒绝+跨用户拒绝(验收4)。
-# 脚本自管理 Server.exe 生命周期（taskkill+Popen, cwd=Server/）；断言走 DB/磁盘/响应字节。
+# 脚本自管理 Server.exe 生命周期（taskkill+Popen, cwd=<repo>/dist）；断言走 DB/磁盘/响应字节。
+#
+# ---- 统一 e2e 运行形态（五套件一致，见 project-docs/evidence/E2E-RUNFORM.md）----
+# 运行：py -3.13 project-docs/evidence/REQ-EXT-FILE-001/entry_ops_e2e.py
+#   cwd     : 任意（脚本自管理，Server 以 <repo>/dist 为 cwd 启动）
+#   exe     : <repo>/dist/Server.exe（qmake DESTDIR=dist；connect.config 构建期经 qrc 内嵌）
+#   config  : Server/connect.config -> filesPath=./filesys（相对 cwd）；未入库的机器本地文件
+#   数据根  : <repo>/dist/filesys
+#   未入库依赖：dist/{Qt5Core,Qt5Gui,Qt5Network,Qt5Sql,Qt5Svg,Qt5Widgets}.dll、dist/libmysql.dll、
+#              dist/sqldrivers/qsqlmysql.dll、dist/platforms/qwindows.dll
 import hashlib, os, shutil, socket, struct, subprocess, sys, time
 
 HOST, PORT = "127.0.0.1", 5000
@@ -16,9 +25,11 @@ T_MOVE, T_MOVE_R = 38, 39
 MAGIC = 0x5253554d
 MYSQL = r"C:/Program Files/MySQL/MySQL Server 5.7/bin/mysql.exe"
 DB = ["-h", "localhost", "-u", "root", "-p123456", "mydb", "-N", "-B", "-e"]
-EXE = os.path.abspath("build/build-Server/release/Server.exe")
-SRV = os.path.abspath("Server")
-FS = os.path.join(SRV, "filesys")
+REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+DIST = os.path.join(REPO, "dist")
+EXE = os.path.join(DIST, "Server.exe")
+SRV = DIST
+FS = os.path.join(DIST, "filesys")
 OP, RC = "e2eop1", "e2eop2"
 C1 = b"LEGACY-CONTENT-ONE" * 20
 C2 = b"UPLOADED-CONTENT-TWO" * 20
