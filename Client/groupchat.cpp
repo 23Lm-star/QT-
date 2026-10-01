@@ -157,7 +157,10 @@ void GroupChat::onItemDoubleClicked(QListWidgetItem *item)
 
 void GroupChat::loadOlder()
 {
-    const quint64 cursor = m_firstSeq > 0 ? m_firstSeq : m_groupLastSeq;
+    // 91 mode=1 语义为 seq<=cursor（含边界）：必须以「已渲染最小 seq-1」请求，
+    // 否则最早一条会被重复回传（92 渲染侧亦有 seq 去重兜底）。
+    quint64 cursor = m_groupLastSeq;
+    if (m_firstSeq > 0) cursor = m_firstSeq - 1;
     if (cursor == 0) return;
     requestPull(1, cursor, 50);
 }
@@ -311,9 +314,10 @@ void GroupChat::handleResponse(PDU *pdu)
         m_groupLastSeq = groupLastSeq;
         m_unread = unread;
         if (mode == 1) {
-            // 后向翻页：响应按 seq 升序；逐条前插到列表头部
+            // 后向翻页：响应按 seq 升序；逐条前插到列表头部（已渲染 seq 跳过兜底）
             for (int i = records.size() - 1; i >= 0; --i) {
                 const Record &record = records.at(i);
+                if (m_renderedSeqs.contains(record.seq)) continue;
                 const QString time = QDateTime::fromMSecsSinceEpoch(qint64(record.createdAtMs))
                         .toString(QStringLiteral("HH:mm:ss"));
                 QListWidgetItem *item = new QListWidgetItem;

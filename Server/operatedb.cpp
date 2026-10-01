@@ -1618,11 +1618,8 @@ OperateDB::GroupResult OperateDB::handleGroupMessageOperation(const GroupRequest
         q.addBindValue(limit + 1); // 多取一条判定 has_more
         if (!q.exec()) return groupFailure(-2105);
         QList<QByteArray> records;
-        quint64 batchFirst = 0, batchLast = 0;
         while (q.next()) {
             const quint64 recSeq = q.value(0).toULongLong();
-            if (records.isEmpty()) batchFirst = recSeq;
-            batchLast = recSeq;
             QByteArray row;
             groupAppendU64(row, recSeq);
             groupAppendU64(row, q.value(1).toULongLong());
@@ -1634,8 +1631,16 @@ OperateDB::GroupResult OperateDB::handleGroupMessageOperation(const GroupRequest
         }
         bool hasMore = records.size() > limit;
         if (hasMore) { if (mode == 1) records.removeFirst(); else records.removeLast(); }
+        // next_cursor = 本批"实际返回"边界 seq（mode0=最大 / mode1=最小）：
+        // 必须在裁掉多取行之后取，否则前向会跳过边界消息、后向会原地踏步。
         quint64 nextCursor = request.cursorSeq;
-        if (!records.isEmpty()) nextCursor = mode == 0 ? batchLast : batchFirst;
+        if (!records.isEmpty()) {
+            int cursorOffset = 0;
+            quint64 boundary = 0;
+            if (mode == 0) groupReadU64(records.last(), cursorOffset, boundary);
+            else groupReadU64(records.first(), cursorOffset, boundary);
+            nextCursor = boundary;
+        }
         q.prepare("SELECT COUNT(*) FROM group_message WHERE group_id=? AND seq>? AND seq<=?");
         q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
         q.addBindValue(QVariant::fromValue<qulonglong>(lastReadSeq));
