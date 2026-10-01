@@ -1,11 +1,11 @@
-# handoff: REQ-EXT-TRANSFER-001 (audited candidate 520c714, detached worktree build/wt-audit-transfer001, read-only)
+# handoff: REQ-EXT-TRANSFER-001 (audited candidate 119e6d3, detached worktree build/wt-audit-119e6d3, read-only, worktree removed)
 branch: feat/req-ext-transfer-001-parallel-transfer
-head: 520c714
+head: 119e6d3
 tier: LARGE
 node: audit
 audit: pending
-next: repair node (owner, NEW session) -- user ARBITRATED 2026-10-01: accept the audit finding and proceed to repair; F-1 disposition = amend design.md 6.2 T-06 text to 3 streams (D6 unchanged). Fix AUD-1 (97 fastcheck ctx must not consume an upload slot) + AUD-2 (requeue on INIT limit-reject, not Failed), amend the design text, add a CLIENT-LEVEL 3-file concurrent upload case (the raw-socket harness bypasses the 97 handshake and cannot see AUD-1), fix the test report 8 evidence list (EV-1), re-run pipeline, then re-audit the new candidate.
-blockers: AUD-1 BLOCKING (FACT, code trace): the real client sends a 97 fastcheck before every fresh personal 29 (transfertask.cpp:227-291,304, id=allocId>=1); uploadfilefastcheck leaves a counted m_uploads[0] ctx (msghandler.cpp:1303-1305) that nothing removes or reaps, and activeUploadCount()==m_uploads.size() (msghandler.h:54), so only 2 concurrent new personal uploads succeed -- the 3rd 29 gets ret=false (msghandler.cpp:1160,1256) and the client marks it FAILED (transfertask.cpp:451-453) instead of queuing. Violates approved D6 (upload=3) and acceptance 5. This audit FAIL overturns the test node PASS; user arbitrates.
-evidence: build/evidence/claude-req-ext-transfer-001-audit/520c71444f993f7f74b1da84adb0fdb83bd1d92e/audit-report.md (FAIL: 1 blocking AUD-1; AUD-2/3/4 non-blocking; F-1 doc contradiction; EV-1 evidence gap). Frozen headers: 22 ins/0 del, append-only, byte-identical to design 9 (recomputed EQUAL=True). 7 suites + 3 gates + logs reproduced consistent; path boundary clean.
+next: master decides integration vs follow-up repair. Integration is eligible (this audit PASS, no blocking item), BUT before any merge: DOC-1 is NON-BLOCKING (design.md:136-139 repair note still describes the REJECTED LegacySlotGuard/return-before-delete fix, not the shipped fastcheckPlaceholder approach -- would re-introduce AUD-1 if implemented from the text; suggest rewriting 3.1), and AUD-3 / AUD-4 / test-report F-2..F-5 / design 6.3 five GUI items (NEEDS-HUMAN) remain OPEN and must not be read as pass. Cross-CLI independence did NOT hold (Codex CLI unavailable).
+blockers: none blocking. AUD-1 fixed+verified: activeUploadCount() excludes fastcheckPlaceholder; id=0 slot kept for legacy 97->31; independently reproduced at runtime -- unmodified 119e6d3 parallel_e2e = 46/46 (T-19a/b/c PASS), and disabling the exclusion reproduced T-19b [True,True,False] / T-19c lens=[915,1315,0] / 44/46 exactly. Probe reverted, git status clean, HEAD unchanged, zero commits.
+evidence: build/evidence/claude-req-ext-transfer-001-audit/119e6d311812d282208e20cce449be9ce687036a/audit-report.md (PASS: 1 non-blocking DOC-1; AUD-2-N1 observation). F-1 confirmed: design 6.2 T-06 -> 3 streams, D6 and MAX_PARALLEL_DOWNLOADS=3 untouched, protocol.h zero-diff.
 owner: claude-code
 date: 2026-10-01
