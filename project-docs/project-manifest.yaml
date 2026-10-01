@@ -10,6 +10,9 @@ bootstrap:
 frozen_paths:            # enforced by pipeline/audit.ps1 -- hit = escalate to LARGE + user approval
   - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
   - Server/protocol.h
+code_intel:              # advisory only -- never changes the audit verdict (audit.ps1 §4)
+  impact_status: not_applicable   # F2: this repo has no statically-reachable automated tests
+  impact_reason: "0 registered automated tests; regression is carried by e2e socket harnesses under project-docs/evidence/, not statically reachable from the C++ sources"
 directory_contract:      # mirrors .gitignore
   source: Client/, Server/
   artifacts: build*/     # shadow builds go here; never in source dirs
