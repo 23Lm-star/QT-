@@ -16,7 +16,7 @@ ReconnectDialog::ReconnectDialog(QWidget *parent)
     , m_spinnerIdx(0)
 {
     setWindowTitle("与服务器断开");
-    setFixedSize(320, 180);
+    setFixedSize(640, 360);   // REQ-UX-001 A5：面积 4 倍
     setModal(true);   // 模态：弹窗期间禁止操作主窗口，但事件循环仍运行（心跳/重连不阻塞）
 
     m_spinnerLabel = new QLabel("|", this);

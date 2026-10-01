@@ -8,6 +8,18 @@
 #include <QVBoxLayout>
 #include <cstring>
 
+namespace {
+// REQ-UX-001 A3：消息统一排版为「身份/时间行 + 正文行」，长文本由 QListWidget 换行显示；
+// 发送状态只出现在身份行，不再混进正文。
+QString messageHeader(const QString &who, const QString &time, const QString &state)
+{
+    if (state.isEmpty()) {
+        return QStringLiteral("%1  %2").arg(who, time);
+    }
+    return QStringLiteral("%1  %2  ·  %3").arg(who, time, state);
+}
+}
+
 GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
     : QWidget(parent, Qt::Window),
       m_groupId(groupId),
@@ -19,11 +31,16 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
       m_statusLabel(new QLabel(this))
 {
     setWindowTitle(QStringLiteral("群聊 - %1").arg(groupName));
-    resize(560, 480);
+    resize(1120, 960);
+    // REQ-UX-001 A3：长消息必须换行、不横向溢出、不省略
+    m_messageList->setWordWrap(true);
+    m_messageList->setTextElideMode(Qt::ElideNone);
+    m_messageList->setSpacing(6);
+    m_messageList->setUniformItemSizes(false);
     auto *layout = new QVBoxLayout(this);
     layout->addWidget(m_messageList);
     auto *row = new QHBoxLayout;
-    m_input->setPlaceholderText(QStringLiteral("输入消息（<=2000 字节），回车发送"));
+    m_input->setPlaceholderText(QStringLiteral("输入消息，回车发送"));
     row->addWidget(m_input);
     row->addWidget(m_sendButton);
     row->addWidget(m_historyButton);
@@ -101,19 +118,33 @@ QListWidgetItem *GroupChat::insertMessage(quint64 seq, const QString &sender, qu
     QListWidgetItem *item = new QListWidgetItem;
     if (msgType == 1) {
         item->setText(QStringLiteral("—— %1 ——").arg(content));
-        item->setForeground(QColor(120, 120, 120));
+        item->setForeground(QColor(150, 170, 190));
         item->setTextAlignment(Qt::AlignCenter);
         item->setData(ROLE_STATE, 3);
     } else {
-        const QString who = sender == Client::getinstance().m_LoginName
-                ? QStringLiteral("我") : sender;
-        item->setText(QStringLiteral("[%1] %2: %3").arg(time).arg(who).arg(content));
+        const bool mine = (sender == Client::getinstance().m_LoginName);
+        const QString who = mine ? QStringLiteral("我") : sender;
+        item->setText(QStringLiteral("%1\n%2").arg(messageHeader(who, time, QString()), content));
+        item->setTextAlignment(mine ? Qt::AlignRight : Qt::AlignLeft);
         item->setData(ROLE_STATE, 1);
     }
     item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(seq));
     m_messageList->addItem(item);
     markRendered(seq);
     return item;
+}
+
+void GroupChat::renderOwnMessage(QListWidgetItem *item, const QString &state, const QString &content)
+{
+    if (item == nullptr) {
+        return;
+    }
+    QString time = item->data(ROLE_TIME).toString();
+    if (time.isEmpty()) {
+        time = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
+    }
+    item->setText(QStringLiteral("%1\n%2").arg(messageHeader(QStringLiteral("我"), time, state), content));
+    item->setTextAlignment(Qt::AlignRight);
 }
 
 void GroupChat::sendCurrent()
@@ -125,8 +156,11 @@ void GroupChat::sendCurrent()
         return;
     }
     const QString key = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QString time = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
     QListWidgetItem *item = new QListWidgetItem(
-                QStringLiteral("我: %1（发送中…）").arg(content));
+                QStringLiteral("%1\n%2").arg(messageHeader(QStringLiteral("我"), time, QStringLiteral("发送中…")), content));
+    item->setTextAlignment(Qt::AlignRight);
+    item->setData(ROLE_TIME, time);
     item->setData(ROLE_STATE, 0);
     item->setData(ROLE_CLIENT_KEY, key);
     m_messageList->addItem(item);
@@ -145,7 +179,7 @@ void GroupChat::onItemDoubleClicked(QListWidgetItem *item)
     const QString key = item->data(ROLE_CLIENT_KEY).toString();
     for (const PendingSend &pending : m_pending) {
         if (pending.clientMsgId != key) continue;
-        item->setText(QStringLiteral("我: %1（发送中…重试）").arg(pending.content));
+        renderOwnMessage(item, QStringLiteral("发送中…"), pending.content);
         item->setData(ROLE_STATE, 0);
         QByteArray body;
         groupAppendString(body, key.toUtf8());
@@ -167,8 +201,9 @@ void GroupChat::loadOlder()
 
 void GroupChat::updateStatus()
 {
-    m_statusLabel->setText(QStringLiteral("群水位 %1 · 服务端已读 %2 · 本地未读 %3")
-                           .arg(m_groupLastSeq).arg(m_confirmedSeq).arg(m_unread));
+    // REQ-UX-001 A3：不再向用户暴露"水位/已读游标"等协议术语
+    m_statusLabel->setText(QStringLiteral("本群消息共 %1 条 · 未读 %2 条")
+                           .arg(m_groupLastSeq).arg(m_unread));
 }
 
 void GroupChat::applyUnreadSummary(quint64 lastSeq, quint64 lastReadSeq, quint64 unread)
@@ -217,7 +252,7 @@ void GroupChat::handleMessageEvent(PDU *pdu)
             if (pending.item != nullptr && pending.item->data(ROLE_STATE).toInt() == 0) {
                 markRendered(seq);
                 pending.item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(seq));
-                pending.item->setText(QStringLiteral("我: %1（已送达）").arg(text));
+                renderOwnMessage(pending.item, QStringLiteral("已送达"), text);
                 pending.item->setData(ROLE_STATE, 1);
                 updateStatus();
                 return;
@@ -255,8 +290,7 @@ void GroupChat::handleResponse(PDU *pdu)
             if (hasKey) {
                 for (const PendingSend &pending : m_pending) {
                     if (pending.clientMsgId == QString::fromUtf8(key) && pending.item != nullptr) {
-                        pending.item->setText(QStringLiteral("我: %1（发送失败，双击重试）")
-                                              .arg(pending.content));
+                        renderOwnMessage(pending.item, QStringLiteral("发送失败（双击重试）"), pending.content);
                         pending.item->setData(ROLE_STATE, 2);
                         break;
                     }
@@ -275,11 +309,11 @@ void GroupChat::handleResponse(PDU *pdu)
             if (state == 0) {
                 // 89 先于 90 到达：渲染并入已渲染集合；90 到达时按 seq 去重不再重复
                 pending.item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(seq));
-                pending.item->setText(QStringLiteral("我: %1（已发送）").arg(pending.content));
+                renderOwnMessage(pending.item, QStringLiteral("已发送"), pending.content);
                 pending.item->setData(ROLE_STATE, 1);
                 markRendered(seq);
             } else if (state == 1) {
-                pending.item->setText(QStringLiteral("我: %1（已发送）").arg(pending.content));
+                renderOwnMessage(pending.item, QStringLiteral("已发送"), pending.content);
             }
             break;
         }
@@ -323,14 +357,15 @@ void GroupChat::handleResponse(PDU *pdu)
                 QListWidgetItem *item = new QListWidgetItem;
                 if (record.msgType == 1) {
                     item->setText(QStringLiteral("—— %1 ——").arg(QString::fromUtf8(record.content)));
-                    item->setForeground(QColor(120, 120, 120));
+                    item->setForeground(QColor(150, 170, 190));
                     item->setTextAlignment(Qt::AlignCenter);
                 } else {
-                    const QString who = QString::fromUtf8(record.sender)
-                            == Client::getinstance().m_LoginName ? QStringLiteral("我")
-                                                                 : QString::fromUtf8(record.sender);
-                    item->setText(QStringLiteral("[%1] %2: %3").arg(time).arg(who)
-                                  .arg(QString::fromUtf8(record.content)));
+                    const bool mine = (QString::fromUtf8(record.sender)
+                            == Client::getinstance().m_LoginName);
+                    const QString who = mine ? QStringLiteral("我") : QString::fromUtf8(record.sender);
+                    item->setText(QStringLiteral("%1\n%2")
+                                  .arg(messageHeader(who, time, QString()), QString::fromUtf8(record.content)));
+                    item->setTextAlignment(mine ? Qt::AlignRight : Qt::AlignLeft);
                 }
                 item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(record.seq));
                 item->setData(ROLE_STATE, 1);

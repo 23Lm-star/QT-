@@ -45,7 +45,7 @@ GroupFile::GroupFile(quint64 groupId, const QString &groupName, QWidget *parent)
       m_statusLabel(new QLabel(this))
 {
     setWindowTitle(QStringLiteral("群文件 - %1").arg(groupName));
-    if (parent == nullptr) resize(620, 420);
+    if (parent == nullptr) resize(1240, 840);   // REQ-UX-001 A5：面积 4 倍
 
     auto *layout = new QVBoxLayout(this);
     auto *toolbar = new QHBoxLayout;

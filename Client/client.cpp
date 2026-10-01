@@ -19,6 +19,7 @@
 #include <QDateTime>
 #include <QInputDialog>
 #include <QSettings>
+#include <QScreen>
 #include <QUuid>
 #include <string>
 
@@ -55,7 +56,7 @@ Client::Client(QWidget *parent)
     , ui(new Ui::Client)
 {
     ui->setupUi(this);
-    setFixedSize(600,420);
+    setFixedSize(scaledWindowSize(600,420));
     this->m_mhptr=new MsgHandler;
     loadconfig();
     // REQ-EXT-SESSION-001：持久化客户端唯一 ID（首启生成 32hex 落盘，之后复用；登录负载附加区携带）
@@ -114,6 +115,18 @@ void Client::loadconfig()
 Client &Client::getinstance(){
     static Client instance;
     return instance;
+}
+
+// REQ-UX-001 A5：基准尺寸 ×2，并收敛到主屏可用区域的 95%，避免大窗口超出显示器
+QSize Client::scaledWindowSize(int baseW, int baseH)
+{
+    QSize s(baseW * 2, baseH * 2);
+    if(QScreen *scr = QApplication::primaryScreen()){
+        const QRect avail = scr->availableGeometry();
+        s.setWidth(qMin(s.width(), int(avail.width() * 0.95)));
+        s.setHeight(qMin(s.height(), int(avail.height() * 0.95)));
+    }
+    return s;
 }
 
 void Client::flus()

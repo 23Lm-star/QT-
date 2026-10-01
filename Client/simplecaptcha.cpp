@@ -13,11 +13,11 @@ SimpleCaptcha::SimpleCaptcha(QWidget *parent)
     m_label->setStyleSheet(
         "QLabel {"
         "   font-family: 'Consolas', monospace;"
-        "   font-size: 18px;"
+        "   font-size: 28px;"
         "   font-weight: bold;"
         "}"
     );
-    m_label->setFixedSize(120, 40);
+    m_label->setFixedSize(240, 80);   // REQ-UX-001 A5：面积 4 倍
 
     // 初始化随机种子（可选）
     static bool seeded = false;
