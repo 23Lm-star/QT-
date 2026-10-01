@@ -16,6 +16,7 @@ Group::Group(QWidget *parent)
     : QWidget(parent),
       m_createButton(new QPushButton(QStringLiteral("建群"), this)),
       m_refreshButton(new QPushButton(QStringLiteral("刷新群聊"), this)),
+      m_fileButton(new QPushButton(QStringLiteral("群文件"), this)),
       m_invitationButton(new QPushButton(QStringLiteral("待处理邀请"), this)),
       m_groupList(new QListWidget(this)),
       m_invitationList(new QListWidget(this)),
@@ -29,6 +30,7 @@ Group::Group(QWidget *parent)
     auto *toolbar = new QHBoxLayout;
     toolbar->addWidget(m_createButton);
     toolbar->addWidget(m_refreshButton);
+    toolbar->addWidget(m_fileButton);
     toolbar->addWidget(m_invitationButton);
     layout->addLayout(toolbar);
     auto *actionBar = new QHBoxLayout;
@@ -60,6 +62,8 @@ Group::Group(QWidget *parent)
     connect(m_createButton, &QPushButton::clicked, this, &Group::createGroup);
     connect(m_refreshButton, &QPushButton::clicked, this, &Group::refreshGroups);
     connect(m_invitationButton, &QPushButton::clicked, this, &Group::refreshInvitations);
+    // REQ-EXT-GROUP-003：打开选中群的群文件目录窗口
+    connect(m_fileButton, &QPushButton::clicked, this, &Group::openSelectedFiles);
     // REQ-EXT-GROUP-002：双击群条目打开群聊窗口
     connect(m_groupList, &QListWidget::itemDoubleClicked, this, &Group::openSelectedChat);
     m_statusLabel->setText(QStringLiteral("群聊按需加载"));
@@ -371,4 +375,38 @@ void Group::handleMessageEvent(PDU *pdu)
     // 未打开窗口：不渲染，只刷新未读徽标并提示（离线补偿拉取兜底）
     requestUnreadSummary();
     m_statusLabel->setText(QStringLiteral("群 %1 有新消息").arg(groupId));
+}
+
+// REQ-EXT-GROUP-003：打开选中群的群文件目录窗口
+void Group::openSelectedFiles()
+{
+    const QListWidgetItem *item = m_groupList->currentItem();
+    if (item == nullptr) {
+        m_statusLabel->setText(QStringLiteral("请先选择一个群"));
+        return;
+    }
+    const quint64 groupId = item->data(Qt::UserRole).toULongLong();
+    if (groupId == 0) return;
+    const QString groupName = item->data(Qt::UserRole + 1).toString();
+    GroupFile *win = m_fileWindows.value(groupId, nullptr);
+    if (win == nullptr) {
+        win = new GroupFile(groupId, groupName, nullptr);
+        m_fileWindows.insert(groupId, win);
+    }
+    win->show();
+    win->raise();
+    win->activateWindow();
+}
+
+// REQ-EXT-GROUP-003：100/102/104 按信封 group_id 路由到群文件窗口
+void Group::handleFileResponse(PDU *pdu)
+{
+    const quint64 groupId = envelopeGroupId(pdu);
+    if (groupId == 0) return;
+    GroupFile *win = m_fileWindows.value(groupId, nullptr);
+    if (win != nullptr) {
+        win->handleResponse(pdu);
+        return;
+    }
+    m_statusLabel->setText(QStringLiteral("群 %1 的文件响应到达（窗口未打开）").arg(groupId));
 }

@@ -3,6 +3,7 @@
 
 #include "protocol.h"
 #include "groupchat.h"
+#include "groupfile.h"
 #include <QComboBox>
 #include <QHash>
 #include <QLineEdit>
@@ -24,6 +25,8 @@ public:
     void handleMessageResponse(PDU *pdu);
     // REQ-EXT-GROUP-002：90 在线消息事件按 group_id 路由
     void handleMessageEvent(PDU *pdu);
+    // REQ-EXT-GROUP-003：100/102/104 群文件响应按 group_id 路由到群文件窗口
+    void handleFileResponse(PDU *pdu);
 
 protected:
     void showEvent(QShowEvent *event) override;
@@ -42,6 +45,7 @@ private slots:
     void transferOwner();
     void dissolveGroup();
     void openSelectedChat();
+    void openSelectedFiles();
 
 private:
     void sendRequest(uint type, quint64 groupId = 0, const QByteArray &body = QByteArray());
@@ -54,6 +58,7 @@ private:
     static quint64 envelopeGroupId(PDU *pdu);
     QPushButton *m_createButton;
     QPushButton *m_refreshButton;
+    QPushButton *m_fileButton;      // REQ-EXT-GROUP-003：打开选中群的群文件窗口
     QPushButton *m_invitationButton;
     QListWidget *m_groupList;
     QListWidget *m_invitationList;
@@ -63,6 +68,7 @@ private:
     quint64 m_requestId;
     bool m_loaded;
     QHash<quint64, GroupChat*> m_chatWindows;   // group_id → 窗口（应用生命周期内保留）
+    QHash<quint64, GroupFile*> m_fileWindows;   // group_id → 群文件窗口
     QHash<quint64, quint64> m_unreadByGroup;    // group_id → 未读数（96 回带）
 };
 

@@ -915,3 +915,214 @@ bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& 
     if (!ok) db.rollback();
     return ok;
 }
+
+// ===== REQ-EXT-GROUP-003：群文件引用（对象层）=====
+// D3 口径：refcount 语义扩展为 "user_file(active) ∪ group_file(active)" 的活跃逻辑引用数；
+// 群引用 +1 / -1 与个人条目共用同一计数器，归零 → pending_reclaim，绝不物理删。
+FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
+        const QString& owner, quint64 groupId, const QString& wantedName,
+        qint64 objectId, qint64 sizeBytes, bool createUserEntry, qint64 existingFileId)
+{
+    GroupAttachResult r;
+    r.groupDisplayName = wantedName;
+    if (owner.isEmpty() || groupId == 0 || objectId < 0 || wantedName.isEmpty()) {
+        r.error = "参数为空或非法";
+        return r;
+    }
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) { r.error = "数据库不可达"; return r; }
+    QSqlDatabase db = conn.database();
+    if (!db.transaction()) { r.error = "事务开启失败"; return r; }
+
+    bool done = false;
+    do {
+        QSqlQuery q(db);
+        // 0) 对象存在且大小相符（FOR UPDATE，与 commitUpload / attachExistingObject 同源口径）
+        q.prepare("SELECT size_bytes FROM file_object WHERE object_id=? FOR UPDATE");
+        q.addBindValue(objectId);
+        if (!q.exec() || !q.next()) { r.error = "对象不存在"; break; }
+        const qint64 objSize = q.value(0).toLongLong();
+        const qint64 size = sizeBytes >= 0 ? sizeBytes : objSize;
+        if (objSize != size) { r.error = "对象大小与声明不符"; break; }
+
+        // 1) 上传者个人根逻辑条目（可选）：群文件与个人根命名空间解耦，仅为逻辑文件标识。
+        qint64 fileId = existingFileId;
+        if (createUserEntry) {
+            const QString parent = normalizeParent(owner, QStringLiteral("/"));
+            if (parent.isEmpty()) { r.error = "个人根归一失败"; break; }
+            QString pName = clampUtf8(wantedName, kMaxNameBytes);
+            bool pSuffix = false;
+            q.prepare("SELECT object_id,status FROM user_file "
+                      "WHERE owner_name=? AND parent_path=? AND display_name=?");
+            q.addBindValue(owner);
+            q.addBindValue(parent);
+            q.addBindValue(pName);
+            if (q.exec() && q.next() && q.value(1).toString() == "active") {
+                const QVariant o = q.value(0);
+                if (!(o.isValid() && !o.isNull() && o.toLongLong() == objectId)) pSuffix = true;
+            }
+            if (pSuffix) {
+                QString base, ext;
+                splitName(pName, base, ext);
+                bool freed = false;
+                for (int n = 1; n <= kNameSuffixCap; ++n) {
+                    const QString cand = makeSuffixed(base, ext, n);
+                    if (!nameTaken(owner, parent, cand, db)) { pName = cand; freed = true; break; }
+                }
+                if (!freed) { r.error = "个人根同名候选耗尽"; break; }
+            }
+            q.prepare("SELECT file_id,object_id,status FROM user_file "
+                      "WHERE owner_name=? AND parent_path=? AND display_name=? FOR UPDATE");
+            q.addBindValue(owner);
+            q.addBindValue(parent);
+            q.addBindValue(pName);
+            if (!q.exec()) { r.error = q.lastError().text(); break; }
+            bool newRef = true;
+            if (q.next()) {
+                const qint64 rowId = q.value(0).toLongLong();
+                const qint64 rowObj = q.value(1).isNull() ? -1 : q.value(1).toLongLong();
+                const QString st = q.value(2).toString();
+                if (st == "active") {
+                    if (rowObj != objectId) { r.error = "个人根并发同名冲突"; break; }
+                    fileId = rowId;
+                    newRef = false;                       // 幂等：同(位置,对象)已存在，不重复计数
+                } else {
+                    q.prepare("UPDATE user_file SET object_id=?,is_dir=0,status='active' WHERE file_id=?");
+                    q.addBindValue(objectId);
+                    q.addBindValue(rowId);
+                    if (!q.exec()) { r.error = q.lastError().text(); break; }
+                    fileId = rowId;
+                }
+            } else {
+                q.prepare("INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+                          "VALUES (?,?,?,0,?,'active')");
+                q.addBindValue(owner);
+                q.addBindValue(parent);
+                q.addBindValue(pName);
+                q.addBindValue(objectId);
+                if (!q.exec()) { r.error = q.lastError().text(); break; }
+                fileId = q.lastInsertId().toLongLong();
+            }
+            if (newRef) {
+                q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+                q.addBindValue(objectId);
+                if (!q.exec()) { r.error = q.lastError().text(); break; }
+            }
+        }
+        r.fileId = fileId;
+
+        // 2) 群目录条目：群内同名按 uk_group_file_name 去重，同名同对象幂等
+        QString gName = clampUtf8(wantedName, kMaxNameBytes);
+        bool gSuffix = false;
+        q.prepare("SELECT object_id,status FROM group_file WHERE group_id=? AND display_name=?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        q.addBindValue(gName);
+        if (q.exec() && q.next() && q.value(1).toString() == "active") {
+            const QVariant o = q.value(0);
+            if (!(o.isValid() && !o.isNull() && o.toLongLong() == objectId)) gSuffix = true;
+        }
+        if (gSuffix) {
+            QString base, ext;
+            splitName(gName, base, ext);
+            bool freed = false;
+            for (int n = 1; n <= kNameSuffixCap; ++n) {
+                const QString cand = makeSuffixed(base, ext, n);
+                QSqlQuery t(db);
+                t.prepare("SELECT 1 FROM group_file WHERE group_id=? AND display_name=? AND status='active' LIMIT 1");
+                t.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+                t.addBindValue(cand);
+                if (!(t.exec() && t.next())) { gName = cand; freed = true; break; }
+            }
+            if (!freed) { r.error = "群目录同名候选耗尽"; break; }
+        }
+        r.groupDisplayName = gName;
+
+        q.prepare("SELECT group_file_id,object_id,status FROM group_file "
+                  "WHERE group_id=? AND display_name=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        q.addBindValue(gName);
+        if (!q.exec()) { r.error = q.lastError().text(); break; }
+        if (q.next()) {
+            const qint64 gfId = q.value(0).toLongLong();
+            const qint64 gfObj = q.value(1).isNull() ? -1 : q.value(1).toLongLong();
+            const QString st = q.value(2).toString();
+            if (st == "active") {
+                if (gfObj != objectId) { r.error = "群内并发同名冲突"; break; }
+                r.groupFileId = gfId;                     // 幂等命中：零写入返回既有引用
+                done = true;
+                break;
+            }
+            q.prepare("UPDATE group_file SET object_id=?,file_id=?,uploader_name=?,size_bytes=?,status='active' "
+                      "WHERE group_file_id=?");
+            q.addBindValue(objectId);
+            q.addBindValue(fileId >= 0 ? QVariant::fromValue<qint64>(fileId) : QVariant());
+            q.addBindValue(owner);
+            q.addBindValue(size);
+            q.addBindValue(gfId);
+            if (!q.exec()) { r.error = q.lastError().text(); break; }
+            r.groupFileId = gfId;
+        } else {
+            q.prepare("INSERT INTO group_file (group_id,file_id,object_id,uploader_name,display_name,size_bytes,status) "
+                      "VALUES (?,?,?,?,?,?,'active')");
+            q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+            q.addBindValue(fileId >= 0 ? QVariant::fromValue<qint64>(fileId) : QVariant());
+            q.addBindValue(objectId);
+            q.addBindValue(owner);
+            q.addBindValue(gName);
+            q.addBindValue(size);
+            if (!q.exec()) { r.error = q.lastError().text(); break; }
+            r.groupFileId = q.lastInsertId().toLongLong();
+        }
+        // 3) 群引用 +1
+        q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+        q.addBindValue(objectId);
+        if (!q.exec()) { r.error = q.lastError().text(); break; }
+        done = true;
+    } while (false);
+
+    if (!done) { db.rollback(); return r; }
+    if (!db.commit()) { db.rollback(); r.error = db.lastError().text(); return r; }
+    r.ok = true;
+    return r;
+}
+
+bool FileObjectStore::releaseGroupFile(qint64 groupFileId, quint64 groupId,
+                                       const QString& actor, bool actorIsOwner, QString& err)
+{
+    err.clear();
+    if (groupFileId < 0 || groupId == 0 || actor.isEmpty()) { err = "参数为空"; return false; }
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) { err = "数据库不可达"; return false; }
+    QSqlDatabase db = conn.database();
+    if (!db.transaction()) { err = "事务开启失败"; return false; }
+
+    bool ok = false;
+    do {
+        QSqlQuery q(db);
+        // 归属谓词：group_file_id 必须与信封 group_id 同群（不泄露他群存在性）
+        q.prepare("SELECT object_id,uploader_name,status FROM group_file "
+                  "WHERE group_file_id=? AND group_id=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qint64>(groupFileId));
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        if (!q.exec() || !q.next() || q.value(2).toString() != "active") { err = "群文件不存在"; break; }
+        if (!actorIsOwner && q.value(1).toString() != actor) { err = "无权删除他人群文件"; break; }
+        const QVariant obj = q.value(0);
+
+        q.prepare("UPDATE group_file SET status='removed' WHERE group_file_id=?");
+        q.addBindValue(QVariant::fromValue<qint64>(groupFileId));
+        if (!q.exec()) { err = q.lastError().text(); break; }
+
+        if (!obj.isNull()) {
+            q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
+                      "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+            q.addBindValue(obj.toLongLong());
+            if (!q.exec()) { err = q.lastError().text(); break; }
+        }
+        ok = db.commit();
+    } while (false);
+    if (!ok) {
+        db.rollback();
+        qCWarning(lcFs) << "[releaseGroupFile] 失败 groupFileId" << groupFileId << "err" << err;
+    }
+    return ok;
+}

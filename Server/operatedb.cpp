@@ -86,7 +86,7 @@ bool OperateDB::checkSchemaVersion()
         qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
                          << q.lastError().text()
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql 与 migrate_ext_file_002.sql";
+                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql 与 migrate_ext_group_003.sql";
         return false;
     }
     int version = 0;
@@ -95,11 +95,12 @@ bool OperateDB::checkSchemaVersion()
     }
     const int required = qMax(kFileAssetSchemaVersion,
                               qMax(kGroupSchemaVersion,
-                                   qMax(kGroupMessageSchemaVersion, kFastUploadSchemaVersion)));
+                                   qMax(kGroupMessageSchemaVersion,
+                                        qMax(kFastUploadSchemaVersion, kGroupFileSchemaVersion))));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql 与 migrate_ext_file_002.sql";
+                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql 与 migrate_ext_group_003.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -1823,4 +1824,144 @@ OperateDB::GroupResult OperateDB::handleGroupMessageOperation(const GroupRequest
     }
 
     return groupFailure(-2000);
+}
+
+// ===== REQ-EXT-GROUP-003：群文件目录与访问控制 =====
+// 判定点（全部服务端、每请求即时执行；与 GROUP-001/002 同源）：
+//   P0 actor 有效 → P1 群存在 → P2 成员门(active) → P3 解散门(写操作) → P4 归属/存在性
+//   → P5 删除授权(owner 或 上传者本人) → P6 名称(调用方预校验) → P7 对象存在性。
+// 失败码：-1001 未认证 / -1002 库不可达 / -2101 非成员 / -2102 群不存在或已解散 /
+//        -2103 归属或权限非法 / -2105 对象缺失或安置失败。不泄露他群存在性。
+OperateDB::GroupFileResult OperateDB::handleGroupFileOperation(GroupFileRequest &request,
+                                                              const QString &actor)
+{
+    GroupFileResult result;
+    if (actor.isEmpty()) { result.code = -1001; return result; }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) { result.code = -1002; return result; }
+    QSqlDatabase db = connection.database();
+    QSqlQuery q(db);
+
+    // P1：群存在（取状态）
+    q.prepare("SELECT status FROM group_info WHERE group_id=?");
+    q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+    if (!q.exec() || !q.next()) { result.code = -2102; return result; }
+    const QString groupStatus = q.value(0).toString();
+
+    // P2：成员门（status='active'；left/removed/无行一律拒绝——退出/被移除即时失权）
+    const QString role = groupRole(db, request.groupId, actor);
+    if (role.isEmpty()) { result.code = -2101; return result; }
+
+    // P3：解散门——写操作（上传/删除）要求群 active；读操作（列表/下载）成员可只读历史
+    const bool writeOp = (request.operation == GroupFileUploadInit
+                          || request.operation == GroupFileDelete);
+    if (writeOp && groupStatus != "active") { result.code = -2102; return result; }
+
+    if (request.operation == GroupFileList) {
+        q.prepare("SELECT COUNT(*) FROM group_file WHERE group_id=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        if (!q.exec() || !q.next()) { result.code = -2105; return result; }
+        const quint32 total = q.value(0).toUInt();
+
+        q.prepare("SELECT group_file_id,size_bytes,UNIX_TIMESTAMP(created_at)*1000,"
+                  "uploader_name,display_name FROM group_file "
+                  "WHERE group_id=? AND status='active' ORDER BY group_file_id LIMIT ? OFFSET ?");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        q.addBindValue(int(request.limit));
+        q.addBindValue(int(request.offset));
+        if (!q.exec()) { result.code = -2105; return result; }
+        QList<QByteArray> records;
+        while (q.next()) {
+            QByteArray row;
+            // 元数据四元：名称、大小、上传者、时间（不含任何物理路径）
+            groupAppendU64(row, q.value(0).toULongLong());
+            groupAppendU64(row, q.value(1).toULongLong());
+            groupAppendU64(row, q.value(2).toULongLong());
+            groupAppendString(row, q.value(3).toString().toUtf8());
+            groupAppendString(row, q.value(4).toString().toUtf8());
+            records.append(row);
+        }
+        QByteArray body;
+        groupAppendU32(body, quint32(records.size()));
+        groupAppendU32(body, total);
+        for (const QByteArray &row : records) body.append(row);
+        result.code = 0;
+        result.responseBody = body;
+        return result;
+    }
+
+    if (request.operation == GroupFileUploadInit) {
+        if (request.fileSize < 0 || request.shaHex.isEmpty() || request.displayName.isEmpty()) {
+            result.code = -2103;
+            return result;
+        }
+        // P7 去重预检查：同 sha256+size 的既有物理对象（FOR UPDATE 防并发双建）
+        q.prepare("SELECT object_id FROM file_object WHERE sha256=? AND size_bytes=? FOR UPDATE");
+        q.addBindValue(request.shaHex);
+        q.addBindValue(request.fileSize);
+        qint64 objectId = -1;
+        if (q.exec() && q.next()) objectId = q.value(0).toLongLong();
+
+        if (objectId >= 0) {
+            // 秒传命中：个人条目 + 群条目 + 引用计数同事务；零正文传输
+            const FileObjectStore::GroupAttachResult ar = FileObjectStore::instance().attachGroupFile(
+                        actor, request.groupId, request.displayName, objectId, request.fileSize,
+                        /*createUserEntry=*/true);
+            if (!ar.ok) {
+                qCWarning(lcDb) << "[GroupFile] 秒传安置失败 group=" << request.groupId
+                                << "原因=" << ar.error;
+                result.code = -2105;
+                return result;
+            }
+            result.code = 0;
+            result.hit = true;
+            result.groupFileId = quint64(ar.groupFileId);
+            request.hostFileId = ar.fileId;
+            request.objectId = objectId;
+            request.displayName = ar.groupDisplayName;
+            return result;
+        }
+        // 未命中：不建对象/条目，由调用方建立暂存会话（staging + upload_session）走既有分块
+        result.code = 0;
+        result.hit = false;
+        return result;
+    }
+
+    if (request.operation == GroupFileDelete) {
+        // P5 授权在 releaseGroupFile 内与 P4 归属同事务判定：owner 可删任意，上传者可删己
+        const bool isOwner = (role == "owner");
+        QString err;
+        if (!FileObjectStore::instance().releaseGroupFile(qint64(request.groupFileId),
+                                                          request.groupId, actor, isOwner, err)) {
+            qCWarning(lcDb) << "[GroupFile] 删除拒绝 group=" << request.groupId
+                            << " gf=" << request.groupFileId << "原因=" << err;
+            result.code = -2103;
+            return result;
+        }
+        result.code = 0;
+        return result;
+    }
+
+    if (request.operation == GroupFileDownload) {
+        // P4 归属：group_file_id 必须与信封 group_id 同群且 active（不泄露他群存在性）
+        q.prepare("SELECT object_id,size_bytes,display_name FROM group_file "
+                  "WHERE group_file_id=? AND group_id=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupFileId));
+        q.addBindValue(QVariant::fromValue<qulonglong>(request.groupId));
+        if (!q.exec() || !q.next()) { result.code = -2103; return result; }
+        const qint64 objectId = q.value(0).toLongLong();
+        request.objectId = objectId;
+        request.sizeBytes = q.value(1).toLongLong();
+        request.displayName = q.value(2).toString();
+
+        // P7 对象存在性（物理绝对路径由服务端解析，绝不接受客户端路径）
+        q.prepare("SELECT storage_path FROM file_object WHERE object_id=?");
+        q.addBindValue(objectId);
+        if (!q.exec() || !q.next()) { result.code = -2105; return result; }
+        result.code = 0;
+        return result;
+    }
+
+    result.code = -2103;
+    return result;
 }

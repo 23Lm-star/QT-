@@ -245,7 +245,13 @@ void Client::handlMsg(PDU *&pdu)
         break;
     }
     case ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND:{
-        m_mhptr->uploadfiledata();
+        // REQ-EXT-GROUP-003：群上传进行中时，32 确认路由到群文件窗口的 Uploader
+        GroupFile *gf = GroupFile::uploadingInstance();
+        if (gf != nullptr) {
+            gf->acknowledgeUploadChunk(pdu);
+        } else {
+            m_mhptr->uploadfiledata();
+        }
         break;
     }
     case ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND:{
@@ -324,6 +330,16 @@ void Client::handlMsg(PDU *&pdu)
         break;
     case ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT:
         Index::getinstance().getGroup()->handleMessageEvent(pdu);
+        break;
+    // REQ-EXT-GROUP-003：群文件响应。100/102/104 按 group_id 路由到群文件窗口；
+    // 106 元数据由客户端 MsgHandler 统一准备落盘，正文随后走既有 42/43。
+    case ENUM_MSG_TYPE_GROUP_FILE_LIST_RESPOND:
+    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND:
+    case ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND:
+        Index::getinstance().getGroup()->handleFileResponse(pdu);
+        break;
+    case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND:
+        m_mhptr->handleGroupFileDownloadRespond(pdu);
         break;
     default:
         break;

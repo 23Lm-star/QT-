@@ -462,6 +462,87 @@ void MsgHandler::downloadfile()
     handleDownloadRespond();
 }
 
+// 为流式下载创建落盘文件：客户目录/yyyy-MM/ 下按 (N) 递推去重。
+// 个人下载与群下载共用同一接收文件槽（连接内下载串行，会话态不冲突）。
+bool MsgHandler::beginReceiving(const QString& fileName)
+{
+    QString safeName = fileName.isEmpty() ? QStringLiteral("download.bin") : fileName;
+    QString monthDirPath=QString("%1/%2")
+            .arg(Index::getinstance().getFile()->m_strUserPath)
+            .arg(QDate::currentDate().toString("yyyy-MM"));
+    QDir dir;
+    if(!dir.mkpath(monthDirPath)){
+        QMessageBox::information(&Index::getinstance(),"提示","创建下载目录失败");
+        return false;
+    }
+
+    QString savePath=QDir(monthDirPath).filePath(safeName);
+    QFileInfo saveInfo(savePath);
+    QString baseName=saveInfo.completeBaseName();
+    QString suffix=saveInfo.suffix();
+    int index=1;
+    while(QFileInfo::exists(savePath)){
+        QString candidate=suffix.isEmpty()
+                ? QString("%1(%2)").arg(baseName).arg(index)
+                : QString("%1(%2).%3").arg(baseName).arg(index).arg(suffix);
+        savePath=QDir(monthDirPath).filePath(candidate);
+        index++;
+    }
+
+    if(m_recvFile){
+        m_recvFile->close();
+        delete m_recvFile;
+        m_recvFile=nullptr;
+    }
+    m_recvFile=new QFile(savePath);
+    if(!m_recvFile->open(QIODevice::WriteOnly)){
+        QMessageBox::information(&Index::getinstance(),"提示","无法创建下载文件");
+        delete m_recvFile;
+        m_recvFile=nullptr;
+        return false;
+    }
+    m_recvFilePath=savePath;
+    m_recvFileName=safeName;
+    return true;
+}
+
+// REQ-EXT-GROUP-003：106 元数据（信封20 + code + size_bytes(u64) + name_len(u32) + name）。
+// 成功后正文经既有 42/43 到达，由 handleDownloadData/handleDownloadFinish 落盘。
+void MsgHandler::handleGroupFileDownloadRespond(PDU* pdu)
+{
+    if(pdu==nullptr || pdu->uiMsgLen < 36){
+        return;
+    }
+    const QByteArray payload(pdu->caMsg, int(pdu->uiMsgLen));
+    int offset=0;
+    quint16 version=0, length=0;
+    quint64 requestId=0, groupId=0;
+    quint32 code=0;
+    if(!groupReadU16(payload,offset,version) || !groupReadU16(payload,offset,length)
+            || !groupReadU64(payload,offset,requestId) || !groupReadU64(payload,offset,groupId)
+            || !groupReadU32(payload,offset,code)
+            || version!=GROUP_PROTOCOL_VERSION || length!=GROUP_ENVELOPE_LENGTH){
+        return;
+    }
+    Q_UNUSED(requestId);
+    Q_UNUSED(groupId);
+    if(code!=0){
+        QMessageBox::information(&Index::getinstance(),"提示",
+            QString("群文件下载失败：%1").arg(qint32(code)));
+        return;
+    }
+    quint64 sizeBytes=0;
+    quint32 nameLen=0;
+    QByteArray nameBytes;
+    if(!groupReadU64(payload,offset,sizeBytes) || !groupReadU32(payload,offset,nameLen)
+            || !groupReadString(payload,offset,nameBytes)){
+        return;
+    }
+    Q_UNUSED(nameLen);
+    Q_UNUSED(sizeBytes);
+    beginReceiving(QString::fromUtf8(nameBytes));
+}
+
 void MsgHandler::handleDownloadRespond()
 {
     bool ret=false;
@@ -479,44 +560,11 @@ void MsgHandler::handleDownloadRespond()
         return;
     }
 
-    QString monthDirPath=QString("%1/%2")
-            .arg(Index::getinstance().getFile()->m_strUserPath)
-            .arg(QDate::currentDate().toString("yyyy-MM"));
-    QDir dir;
-    if(!dir.mkpath(monthDirPath)){
-        QMessageBox::information(&Index::getinstance(),"提示","创建下载目录失败");
+    // 落盘准备（与群文件下载共用同一接收槽）
+    if(!beginReceiving(fileName)){
         return;
     }
-
-    QString savePath=QDir(monthDirPath).filePath(fileName);
-    QFileInfo saveInfo(savePath);
-    QString baseName=saveInfo.completeBaseName();
-    QString suffix=saveInfo.suffix();
-    int index=1;
-    while(QFileInfo::exists(savePath)){
-        QString candidate=suffix.isEmpty()
-                ? QString("%1(%2)").arg(baseName).arg(index)
-                : QString("%1(%2).%3").arg(baseName).arg(index).arg(suffix);
-        savePath=QDir(monthDirPath).filePath(candidate);
-        index++;
-    }
-
-    //清理已有的接收文件
-    if(m_recvFile){
-        m_recvFile->close();
-        delete m_recvFile;
-        m_recvFile=nullptr;
-    }
-
-    m_recvFile=new QFile(savePath);
-    if(!m_recvFile->open(QIODevice::WriteOnly)){
-        QMessageBox::information(&Index::getinstance(),"提示","无法创建下载文件");
-        delete m_recvFile;
-        m_recvFile=nullptr;
-        return;
-    }
-    m_recvFilePath=savePath;
-    qCDebug(lcCli)<<"下载准备就绪:"<<savePath<<"预期大小:"<<fileSize;
+    qCDebug(lcCli)<<"下载准备就绪:"<<m_recvFilePath<<"预期大小:"<<fileSize;
 }
 
 void MsgHandler::handleDownloadData()
