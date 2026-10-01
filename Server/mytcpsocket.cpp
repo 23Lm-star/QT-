@@ -255,6 +255,25 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST:
         respdu=m_MsgHandler->groupRequest(pdu->uiType);
         break;
+    // REQ-EXT-GROUP-003：群文件请求（99/101/103，均经 actor 门）
+    case ENUM_MSG_TYPE_GROUP_FILE_LIST_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_FILE_DELETE_REQUEST:
+        respdu=m_MsgHandler->groupFileRequest(pdu->uiType);
+        break;
+    // 105 群文件下载：先回 106 元数据，再走既有 42/43 分块流（源路径由服务端解析）
+    case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST:{
+        respdu=m_MsgHandler->groupFileRequest(pdu->uiType);
+        if(respdu){
+            const QString src=m_MsgHandler->m_downloadCanonicalPath;
+            sendAndRelease(respdu);
+            respdu=nullptr;
+            if(!src.isEmpty()){
+                startDownloadStream(src);
+            }
+        }
+        return nullptr;
+    }
     case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
     case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
     case ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT:
@@ -692,6 +711,15 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return groupReject(ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND);
     case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST:
         return groupReject(ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND);
+    // REQ-EXT-GROUP-003：群文件请求的未认证拒绝
+    case ENUM_MSG_TYPE_GROUP_FILE_LIST_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_FILE_LIST_RESPOND);
+    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND);
+    case ENUM_MSG_TYPE_GROUP_FILE_DELETE_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND);
+    case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND);
     case ENUM_MSG_TYPE_CHAT_REQUEST:
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
         return nullptr; // 无响应语义的投递型请求，拒绝仅落审计日志

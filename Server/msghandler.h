@@ -50,6 +50,9 @@ public:
     PDU* logoff(bool& revoked);//注销账户（REQ-EXT-SEC-001：授权依据为连接级身份，revoked 供会话撤销）
     // REQ-EXT-GROUP-001：统一解析、校验并处理 60-87 群协议请求。
     PDU* groupRequest(uint requestType);
+    // REQ-EXT-GROUP-003：统一解析、校验并处理群文件协议请求（99/101/103/105）。
+    // 权限判定全部落在 OperateDB::handleGroupFileOperation（服务端即时判定）。
+    PDU* groupFileRequest(uint requestType);
 
     // ===== REQ-EXT-SEC-001：连接级 actor_context（仅服务端登录成功时写入，客户端 PDU 字段不作为授权依据） =====
     QString m_actorName;   // 服务端派生的操作者用户名
@@ -95,6 +98,11 @@ public:
     // REQ-EXT-FILE-002 D2：当前上传声明的 SHA-256（= upload_session.client_sha256），
     // 只作命中判定与复算对照，永不作为转正依据。
     QString m_uploadExpectedSha;
+    // ===== REQ-EXT-GROUP-003：当前分块上传的群作用域（非 0 = 群文件上传）=====
+    // 由 101 未命中路径写入；上传完成（finalizeUploadOnComplete）时建群引用后清空。
+    quint64 m_groupUploadGroupId = 0;
+    QString m_groupUploadDisplayName;
+    quint64 m_lastGroupFileId = 0;   // 最近一次群上传落定的 group_file_id（0=无）
     // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
     // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。
     // 返回转正结果（调用方可忽略）；失败时 CommitResult.ok=false。

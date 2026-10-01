@@ -41,6 +41,15 @@ public:
         QString error;
     };
 
+    // REQ-EXT-GROUP-003：群文件引用安置结果（与对象/个人条目/群条目/引用计数同事务）
+    struct GroupAttachResult {
+        bool ok = false;
+        qint64 groupFileId = -1;     // group_file.group_file_id
+        qint64 fileId = -1;          // 上传者 user_file.file_id（个人根逻辑条目）
+        QString groupDisplayName;    // 群目录最终展示名（含 (N) 去重）
+        QString error;
+    };
+
     static FileObjectStore& instance();
 
     // 服务端复算 staging 的 SHA-256 与大小（流式，1MiB 缓冲）
@@ -69,6 +78,21 @@ public:
 
     // 删除条目（软删）并释放引用；对象引用归零 → pending_reclaim。
     bool releaseEntry(qint64 fileId, const QString& owner);
+
+    // REQ-EXT-GROUP-003：群文件引用安置（对象存在性 + 个人根条目 + 群目录条目 + 引用计数，
+    // 同一事务）。createUserEntry=true：在 owner 个人根建/复活条目（秒传命中路径）；
+    // false：复用 existingFileId（分块上传完成路径，条目已由 commitUpload 建好）。
+    // 群内同名同对象 active → 幂等返回既有 group_file_id，不重复计数；同名不同对象走 (N) 递推。
+    GroupAttachResult attachGroupFile(const QString& owner, quint64 groupId,
+                                      const QString& wantedName, qint64 objectId,
+                                      qint64 sizeBytes, bool createUserEntry,
+                                      qint64 existingFileId = -1);
+
+    // REQ-EXT-GROUP-003：软删群文件引用并减引用计数（归零 → pending_reclaim，绝不物理删）。
+    // refcount 语义已含 user_file(active) ∪ group_file(active)，故 refcount<=0 即两表均无活跃引用。
+    // actorIsOwner=true 允许删除他人上传；否则仅允许 uploader_name==actor（普通成员不能删他人文件）。
+    bool releaseGroupFile(qint64 groupFileId, quint64 groupId,
+                          const QString& actor, bool actorIsOwner, QString& err);
 
     // 新建引用（分享=同对象新条目，+1 引用，物理零复制）。
     bool refObject(qint64 objectId);

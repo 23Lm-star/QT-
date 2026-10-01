@@ -24,6 +24,8 @@ public:
     // 取独立版本号：与 GROUP-002 的 2026100101 同名会让"未执行 FILE-002 迁移"的库通过启动检查，
     // fail-fast 失效（见 development 节点实测记录）。
     static const int kFastUploadSchemaVersion = 2026100102;
+    // REQ-EXT-GROUP-003：群文件迁移版本（group_file 表）。
+    static const int kGroupFileSchemaVersion = 2026100103;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
@@ -75,6 +77,33 @@ public:
     GroupResult handleGroupOperation(const GroupRequest &request, const QString &actor);
     // REQ-EXT-GROUP-002：群消息操作（发送/拉取/已读确认/未读摘要）；actor 来自连接认证上下文。
     GroupResult handleGroupMessageOperation(const GroupRequest &request, const QString &actor);
+
+    // ===== REQ-EXT-GROUP-003：群文件目录与访问控制 =====
+    // 权限事实源与 GROUP-001/002 同源：group_info.status + group_member.status='active'。
+    // 全部判定在服务端、每请求即时执行（退出/被移除即时失权），客户端不自报身份、不缓存授权。
+    enum GroupFileOperation { GroupFileList = 1, GroupFileUploadInit, GroupFileDelete, GroupFileDownload };
+    struct GroupFileRequest {
+        GroupFileOperation operation = GroupFileList;
+        quint64 groupId = 0;         // 信封 group_id（目标群）
+        quint64 groupFileId = 0;     // Delete/Download 的群文件引用
+        quint32 offset = 0;          // List 分页起点
+        quint16 limit = 50;          // List 每页条数（调用方已钳 1-200）
+        qint64 fileSize = 0;         // UploadInit 声明大小
+        QString shaHex;              // UploadInit 摘要（严格 64 小写 hex，调用方已校验）
+        QString displayName;         // UploadInit 请求名；出参=服务端最终群展示名
+        // 出参
+        qint64 hostFileId = -1;      // UploadInit 命中：上传者 user_file.file_id
+        qint64 objectId = -1;        // 命中/Download：物理对象
+        qint64 sizeBytes = -1;       // Download：文件大小
+    };
+    struct GroupFileResult {
+        int code = -2000;            // 0 成功，负数为业务错误
+        QByteArray responseBody;     // List/Download 的业务体（不含信封与 code）
+        bool hit = false;            // UploadInit：true=秒传命中（零正文）
+        quint64 groupFileId = 0;     // UploadInit 命中时的群文件引用
+    };
+    // P0-P7 判定点在同一事务/同一入口内按序执行；失败码段 -2xxx 与群消息同源。
+    GroupFileResult handleGroupFileOperation(GroupFileRequest &request, const QString &actor);
     //REQ-EXT-FILE-001 T6：存量文件启动自动迁移（幂等：file_migration_map 已有记录即跳过；
     //失败记 failed 继续其余，绝不删除旧文件——验收5）。main 在版本检查通过后调用一次。
     void migrateLegacyFiles();

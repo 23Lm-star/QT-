@@ -1155,6 +1155,9 @@ PDU *MsgHandler::uploadfileinit()
     // REQ-FS-003①/SEC-001：所在目录须在 actor 本人用户根内；父路径规范化后作逻辑条目键。
     ResumableUploadSession::BeginResult result = {false, 0, false};
     m_uploadSessionId = -1;
+    // REQ-EXT-GROUP-003：个人上传路径清空群作用域，避免上一次群上传上下文泄漏
+    m_groupUploadGroupId = 0;
+    m_groupUploadDisplayName.clear();
     const QString parentPath = FileObjectStore::normalizeParent(m_actorName, dirPath);
     if (pathInActorRoot(dirPath) && !m_actorName.isEmpty()) {
         result = m_uploadSession.beginStaged(m_actorName, parentPath, fileName, fileSize, resumeEnabled);
@@ -1197,6 +1200,9 @@ PDU *MsgHandler::uploadfileinit()
 // 不读客户端物理路径、不复制物理文件；拒绝路径只记长度与类型，不落内容/路径明文（lcFs）。
 PDU *MsgHandler::uploadfilefastcheck()
 {
+    // REQ-EXT-GROUP-003：个人秒传路径清空群作用域
+    m_groupUploadGroupId = 0;
+    m_groupUploadDisplayName.clear();
     bool ret = false;
     bool hit = false;
     qint64 fileId = -1;
@@ -1459,6 +1465,30 @@ FileObjectStore::CommitResult MsgHandler::finalizeUploadOnComplete()
     OperateDB::instance().finishUploadSession(m_uploadSessionId, "verifying");
     r = FileObjectStore::instance().commitUpload(owner, parent, display, expected, staging,
                                                 /*copyOnly=*/false, m_uploadExpectedSha);
+    // REQ-EXT-GROUP-003：群作用域上传在个人条目落定后，同规则建群目录引用（+1 引用计数）。
+    // 群引用建立失败则撤销个人条目（releaseEntry 减引用）并整体判失败，绝不留下半成品。
+    const quint64 groupId = m_groupUploadGroupId;
+    const QString groupName = m_groupUploadDisplayName;
+    m_groupUploadGroupId = 0;
+    m_groupUploadDisplayName.clear();
+    m_lastGroupFileId = 0;
+    if (r.ok && groupId != 0) {
+        const FileObjectStore::GroupAttachResult ga = FileObjectStore::instance().attachGroupFile(
+                    owner, groupId, groupName.isEmpty() ? r.displayName : groupName,
+                    r.objectId, expected, /*createUserEntry=*/false, r.fileId);
+        if (ga.ok) {
+            m_lastGroupFileId = quint64(ga.groupFileId);
+            qCDebug(lcFs) << "[finalizeUpload] 群引用落定 group=" << groupId
+                          << " gf=" << ga.groupFileId << " 群名=" << ga.groupDisplayName;
+        } else {
+            QString relErr;
+            FileObjectStore::instance().releaseEntry(r.fileId, owner);   // 撤销个人条目，保持一致性
+            r.ok = false;
+            r.error = "群引用建立失败：" + ga.error;
+            qCCritical(lcFs) << "[finalizeUpload] 群引用失败，已撤销个人条目 conn=" << m_connId
+                             << " group=" << groupId << " 原因=" << ga.error;
+        }
+    }
     if (r.ok) {
         // 同写 file_id：使"已完成会话"能被请求级幂等短路直接命中（§2 步骤3）
         OperateDB::instance().finishUploadSession(m_uploadSessionId, "done", r.fileId);
@@ -1915,4 +1945,197 @@ PDU* MsgHandler::groupRequest(uint requestType)
         return response(result.code, retryBody, requestId, request.groupId == 0 ? groupId : request.groupId);
     }
     return response(result.code, result.responseBody, requestId, result.groupId == 0 ? groupId : result.groupId);
+}
+
+namespace {
+uint groupFileRespondType(uint requestType)
+{
+    switch (requestType) {
+    case ENUM_MSG_TYPE_GROUP_FILE_LIST_REQUEST: return ENUM_MSG_TYPE_GROUP_FILE_LIST_RESPOND;
+    case ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST: return ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND;
+    case ENUM_MSG_TYPE_GROUP_FILE_DELETE_REQUEST: return ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND;
+    case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST: return ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND;
+    default: return ENUM_MSG_TYPE_MAX;
+    }
+}
+}
+
+// ===== REQ-EXT-GROUP-003：群文件请求（99/101/103/105）=====
+// 客户端不自报身份、不给出任何物理路径；载荷只有 offset/limit、size/sha/name、group_file_id。
+// 信封与边界先验（version/envelope_length/长度域/尾随字节），越界一律拒绝且不落明文。
+// 授权判定全部在 OperateDB::handleGroupFileOperation（服务端每请求即时判定）。
+PDU* MsgHandler::groupFileRequest(uint requestType)
+{
+    const uint responseType = groupFileRespondType(requestType);
+    if (responseType == ENUM_MSG_TYPE_MAX) return nullptr;
+    m_downloadCanonicalPath.clear();
+
+    const QByteArray payload(pdu->caMsg, int(pdu->uiMsgLen));
+    int offset = 0;
+    quint16 version = 0, envelopeLength = 0;
+    quint64 requestId = 0, groupId = 0;
+    auto response = [&](int code, const QByteArray &body) {
+        QByteArray encoded;
+        groupAppendU16(encoded, GROUP_PROTOCOL_VERSION);
+        groupAppendU16(encoded, GROUP_ENVELOPE_LENGTH);
+        groupAppendU64(encoded, requestId);
+        groupAppendU64(encoded, groupId);
+        groupAppendU32(encoded, quint32(code));
+        encoded.append(body);
+        PDU *out = mkPDU(uint(encoded.size()));
+        out->uiType = responseType;
+        memcpy(out->caMsg, encoded.constData(), size_t(encoded.size()));
+        return out;
+    };
+    if (!groupReadU16(payload, offset, version) || !groupReadU16(payload, offset, envelopeLength)
+            || !groupReadU64(payload, offset, requestId) || !groupReadU64(payload, offset, groupId)
+            || envelopeLength != GROUP_ENVELOPE_LENGTH || version != GROUP_PROTOCOL_VERSION
+            || payload.size() < envelopeLength) {
+        qCWarning(lcNet) << "[GROUPFILE] 拒绝非法信封 type=" << requestType << " conn=" << m_connId;
+        return response(-2001, QByteArray());
+    }
+
+    OperateDB::GroupFileRequest request;
+    request.groupId = groupId;
+    QByteArray value;
+    bool parsed = true;
+    if (requestType == ENUM_MSG_TYPE_GROUP_FILE_LIST_REQUEST) {
+        request.operation = OperateDB::GroupFileList;
+        parsed = groupReadU32(payload, offset, request.offset)
+                && groupReadU16(payload, offset, request.limit);
+        if (parsed && (request.limit < 1 || request.limit > uint(GROUP_FILE_MAX_LIST_LIMIT))) parsed = false;
+    } else if (requestType == ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST) {
+        request.operation = OperateDB::GroupFileUploadInit;
+        quint64 fileSize = 0;
+        parsed = groupReadU64(payload, offset, fileSize);
+        request.fileSize = qint64(fileSize);
+        if (parsed && !groupReadString(payload, offset, value)) parsed = false;
+        else if (parsed) request.shaHex = QString::fromLatin1(value);
+        if (parsed && !groupReadString(payload, offset, value)) parsed = false;
+        else if (parsed) request.displayName = QString::fromUtf8(value);
+        if (parsed) {
+            // 摘要严格 [0-9a-f]{64}（客户端 toHex 产出小写）
+            if (request.shaHex.size() != 64) parsed = false;
+            for (int i = 0; parsed && i < request.shaHex.size(); ++i) {
+                const QChar c = request.shaHex.at(i);
+                if (!((c >= QLatin1Char('0') && c <= QLatin1Char('9'))
+                      || (c >= QLatin1Char('a') && c <= QLatin1Char('f')))) parsed = false;
+            }
+            // P6 名称合法性：非空、≤255B、无 '/' '\\' NUL
+            const QByteArray nb = request.displayName.toUtf8();
+            if (parsed && (request.displayName.isEmpty() || nb.size() > 255
+                           || request.displayName.contains(QLatin1Char('/'))
+                           || request.displayName.contains(QLatin1Char('\\'))
+                           || request.displayName.contains(QChar('\0')))) parsed = false;
+        }
+    } else if (requestType == ENUM_MSG_TYPE_GROUP_FILE_DELETE_REQUEST) {
+        request.operation = OperateDB::GroupFileDelete;
+        quint64 gfid = 0;
+        parsed = groupReadU64(payload, offset, gfid);
+        request.groupFileId = gfid;
+    } else {
+        request.operation = OperateDB::GroupFileDownload;
+        quint64 gfid = 0;
+        parsed = groupReadU64(payload, offset, gfid);
+        request.groupFileId = gfid;
+    }
+    if (!parsed || offset != payload.size() || request.groupId == 0) {
+        qCWarning(lcNet) << "[GROUPFILE] 拒绝越界载荷 type=" << requestType << " conn=" << m_connId;
+        return response(-2002, QByteArray());
+    }
+
+    const OperateDB::GroupFileResult result =
+            OperateDB::instance().handleGroupFileOperation(request, m_actorName);
+    int code = result.code;
+
+    if (request.operation == OperateDB::GroupFileList) {
+        return response(code, code == 0 ? result.responseBody : QByteArray());
+    }
+    if (request.operation == OperateDB::GroupFileDelete) {
+        QByteArray body;
+        groupAppendU64(body, request.groupFileId);
+        return response(code, body);
+    }
+    if (request.operation == OperateDB::GroupFileDownload) {
+        QByteArray body;
+        if (code == 0) {
+            // 服务端解析物理路径（group_file.object_id → file_object.storage_path），
+            // 绝不接受客户端路径；后续正文走既有 42/43 分块（MyTcpSocket 触发）。
+            const QString absPath = FileObjectStore::instance().objectAbsPath(request.objectId);
+            if (absPath.isEmpty() || !QFileInfo(absPath).isFile()) {
+                code = -2105;
+            } else {
+                m_downloadCanonicalPath = absPath;
+                const QByteArray nameBytes = request.displayName.toUtf8();
+                groupAppendU64(body, quint64(request.sizeBytes < 0 ? 0 : request.sizeBytes));
+                groupAppendU32(body, quint32(nameBytes.size()));
+                body.append(nameBytes);
+            }
+        }
+        if (code != 0) body.clear();
+        return response(code, body);
+    }
+
+    // UPLOAD_INIT（101）：命中=零正文；未命中=建立暂存会话（staging + upload_session）后走既有分块
+    bool hit = result.hit;
+    qint64 fileId = -1, sessionId = -1, nextOffset = 0;
+    quint64 groupFileIdOut = 0;
+    QString finalName = request.displayName;
+    m_groupUploadGroupId = 0;
+    m_groupUploadDisplayName.clear();
+    if (code == 0) {
+        if (hit) {
+            fileId = request.hostFileId;
+            groupFileIdOut = result.groupFileId;
+            nextOffset = request.fileSize;   // 命中零正文：续传起点=文件尾
+        } else {
+            const QString parent = QStringLiteral("/");
+            const ResumableUploadSession::BeginResult br = m_uploadSession.beginStaged(
+                        m_actorName, parent, request.displayName, request.fileSize, true);
+            if (!br.ok) {
+                code = -2105;
+                qCWarning(lcFs) << "[GROUPFILE] 暂存会话建立失败 conn=" << m_connId
+                                << " group=" << request.groupId;
+            } else {
+                sessionId = OperateDB::instance().createUploadSession(
+                            m_actorName, parent, request.displayName, request.fileSize,
+                            request.shaHex, m_uploadSession.stagingFilePath(), br.offset, 3600);
+                if (sessionId < 0) {
+                    code = -2105;
+                    qCWarning(lcFs) << "[GROUPFILE] 上传会话登记失败 conn=" << m_connId;
+                } else {
+                    m_uploadSessionId = sessionId;
+                    m_uploadExpectedSha = request.shaHex;
+                    m_groupUploadGroupId = request.groupId;
+                    m_groupUploadDisplayName = request.displayName;
+                    nextOffset = br.offset;
+                    if (br.complete) {
+                        // 0 字节或断点已在尾部：立即落定（服务端复算 + 群引用，同个人路径）
+                        const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
+                        if (cr.ok) {
+                            hit = true;
+                            fileId = cr.fileId;
+                            groupFileIdOut = m_lastGroupFileId;
+                            nextOffset = request.fileSize;
+                        } else {
+                            code = -2105;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    QByteArray body;
+    if (code == 0) {
+        const QByteArray nameBytes = finalName.toUtf8();
+        body.append(char(hit ? 1 : 0));
+        body.append(char(0)); body.append(char(0)); body.append(char(0));   // reserved 3B
+        groupAppendU64(body, quint64(fileId < 0 ? 0 : fileId));
+        groupAppendU64(body, groupFileIdOut);
+        groupAppendU64(body, quint64(sessionId < 0 ? 0 : sessionId));
+        groupAppendU64(body, quint64(nextOffset < 0 ? 0 : nextOffset));
+        groupAppendU32(body, quint32(nameBytes.size()));
+        body.append(nameBytes);
+    }
+    return response(code, body);
 }

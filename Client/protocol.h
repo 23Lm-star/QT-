@@ -127,6 +127,16 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_REQUEST = 97,   // 秒传预检查请求
     ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND = 98,   // 秒传预检查响应
 
+    // ===== REQ-EXT-GROUP-003：群文件目录与访问控制（仅追加，旧编号 1-98 不变） =====
+    ENUM_MSG_TYPE_GROUP_FILE_LIST_REQUEST = 99,          // 群文件列表请求
+    ENUM_MSG_TYPE_GROUP_FILE_LIST_RESPOND = 100,         // 群文件列表响应
+    ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST = 101,  // 群文件上传初始化（含秒传预检查）
+    ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND = 102,  // 命中/续传起点
+    ENUM_MSG_TYPE_GROUP_FILE_DELETE_REQUEST = 103,       // 删除群文件引用请求
+    ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND = 104,       // 删除群文件引用响应
+    ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST = 105,     // 群文件下载请求
+    ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND = 106,     // 群文件下载元数据响应（正文走既有 42/43）
+
     ENUM_MSG_TYPE_MAX = 99999,
 };
 
@@ -154,6 +164,31 @@ static const int FASTCHECK_RESP_FILE_ID_OFFSET    = 8;   // qint64
 static const int FASTCHECK_RESP_SESSION_ID_OFFSET = 16;  // qint64
 static const int FASTCHECK_RESP_NEXT_OFFSET       = 24;  // qint64，miss 时续传起点
 static const int FASTCHECK_RESP_NAME_LEN_OFFSET   = 32;  // u32
+
+// ===== REQ-EXT-GROUP-003：群文件 PDU 布局常量（两端逐字节一致，只追加） =====
+// 全部载荷以 GROUP-001/002 的 20B 群信封开头（version|envelope_length|request_id|group_id），
+// 其后为 code(u32) 与业务字段；偏移相对完整载荷（caMsg 起始）。
+static const int GROUP_FILE_LIST_OFFSET_OFFSET   = 20;  // u32 分页起点（0 起）
+static const int GROUP_FILE_LIST_LIMIT_OFFSET    = 24;  // u16 1-200
+static const int GROUP_FILE_LIST_RESP_COUNT_OFFSET   = 24;  // u32 本页记录数
+static const int GROUP_FILE_LIST_RESP_TOTAL_OFFSET   = 28;  // u32 群内 active 总数
+static const int GROUP_FILE_LIST_RESP_RECORDS_OFFSET = 32;  // records[] 起始
+static const int GROUP_FILE_INIT_SIZE_OFFSET     = 20;  // u64 文件大小
+static const int GROUP_FILE_INIT_RESP_HIT_OFFSET       = 24;  // u8 1=秒传命中/0=需分块
+static const int GROUP_FILE_INIT_RESP_FILE_ID_OFFSET   = 28;  // qint64 上传者 user_file.file_id
+static const int GROUP_FILE_INIT_RESP_GFID_OFFSET      = 36;  // qint64 group_file_id（hit 非 0）
+static const int GROUP_FILE_INIT_RESP_SESSION_OFFSET   = 44;  // qint64 upload_session.session_id
+static const int GROUP_FILE_INIT_RESP_NEXT_OFFSET      = 52;  // qint64 续传起点（hit=file_size）
+static const int GROUP_FILE_INIT_RESP_NAME_LEN_OFFSET  = 60;  // u32 服务端最终展示名长度
+static const int GROUP_FILE_INIT_RESP_NAME_OFFSET      = 64;  // 最终展示名 UTF-8
+static const int GROUP_FILE_DELETE_ID_OFFSET     = 20;  // u64 group_file_id
+static const int GROUP_FILE_DELETE_RESP_ID_OFFSET    = 24;  // u64 回带 group_file_id
+static const int GROUP_FILE_DOWNLOAD_ID_OFFSET   = 20;  // u64 group_file_id
+static const int GROUP_FILE_DOWNLOAD_RESP_SIZE_OFFSET     = 24;  // u64 文件大小
+static const int GROUP_FILE_DOWNLOAD_RESP_NAME_LEN_OFFSET = 32;  // u32 展示名长度
+static const int GROUP_FILE_DOWNLOAD_RESP_NAME_OFFSET     = 36;  // 展示名 UTF-8
+static const int GROUP_FILE_MAX_NAME_BYTES       = 70;  // group_file.display_name 列宽（UTF-8 字节）
+static const int GROUP_FILE_MAX_LIST_LIMIT       = 200; // 单页上限
 
 struct PDU{//协议数据单元
     uint uiTotalLen;    //总长度
