@@ -1,5 +1,15 @@
 # REQ-EXT-GROUP-002 证据索引
 
+## independent audit 节点（2026-10-01，候选 03dc01d）
+
+目录 `audit/`：`report.md`（**结论 PASS**：0 条阻塞缺陷；冻结路径仅追加 88–96 复证、三门与证据对账、
+`FINDING-PRE1` 属基线既有之独立验证、CodeGraph 影响闭包）、`independent-verification.log`（复证命令与原始输出）、
+`branch.diff`（审计基线差异）、`audit-run-fresh.txt` / `audit-run-with-evidence.txt`（`pipeline/audit.ps1`
+两次运行：干净工作树 RED=证据未运输 → 运输 test 日志后 `PASS (03dc01d)`）、`impact-check{.json,-denied.txt}`、
+`manifest/manifest.txt`（record-evidence 盖章；其 `commit:` 为**归档时主工作树 HEAD**，运行绑定哈希见
+test 工作树内 manifest 与文件名）。
+运输副本（供 owner 侧 state.ps1 发现）：`build/evidence/codex-req-ext-group-002-group-messaging/03dc01d86a3…/audit-report.md`。
+
 ## independent test 节点（2026-10-01，候选 03dc01d）
 
 目录 `independent-test/`：`report.md`（结论/矩阵/FINDING-PRE1）、自研 harness
