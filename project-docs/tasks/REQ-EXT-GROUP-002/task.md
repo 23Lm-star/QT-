@@ -60,3 +60,14 @@
 - **2026-10-01 待批准 D2**：协议编号表将 GROUP-001 预留的 88–95 扩至 **88–96**（未读摘要需独立请求/响应对，95 单槽不足），只追加不重排。两份 `protocol.h` 属 frozen_paths，须主人一次性批准后方可进入 development。审批卡见 design.md §14。
 - **2026-10-01 本会话只做设计**：主人指示「开发阶段先不用做，先做好设计阶段」，故 development 不在本会话开启，等 D2 批准后另开会话。
 - **2026-10-01 D2 已批准**：主人批准协议编号表 88–96（只追加、不重排 1–87）。两份 `protocol.h` 的 frozen_paths 变更已获授权，可进入 development。
+
+## development 节点收口（2026-10-01）
+
+- **实现提交**：`e9b099f`（T1–T7 全量：迁移 SQL、OperateDB 消息接口、PDU 88–96 两 `protocol.h`、msghandler/socket 接线、有界广播队列、客户端群聊窗口与路由）；后续修复 `03dc01d`（分页游标边界，见下）。候选终态 = `03dc01d`。
+- **T7 harness 抓出真实缺陷（P6 分页探针）**：`next_cursor` 在裁掉 has_more 探测行**之前**取值——前向翻页（mode0）返回未显示边界行 seq，续页跳过边界消息（实测 20 页后 793/800 缺 7 条）；后向翻页（mode1）返回最大 seq，续翻原地踏步。同轮暴露客户端 mode1 续翻传 `m_firstSeq`（语义含边界）导致最早一条重复。
+- **修复**：`Server/operatedb.cpp` 改为裁行后从 `records.first()/last()` 解码取实际返回边界 seq；`Client/groupchat.cpp` loadOlder 改传 `m_firstSeq-1`，并给 mode1 渲染加 `m_renderedSeqs` 去重兜底。提交 `03dc01d`。
+- **修复后终证据**：`pipeline/build.ps1` GREEN（`03dc01d`, 2026-10-01 10:27）；`pipeline/test.ps1` 诚实-0（仓库自动化测试注册数为 0）；T7 harness 三轮迭代后 **38/38 PASS**（含 P6 分页 800/800、P7 慢连接丢 462 条实时投递但拉取补齐 800/800 且快连接无影响、P8 一对一/发布链接/GROUP-001 回归 15/15）。
+- **证据归档**：`project-docs/evidence/REQ-EXT-GROUP-002/`（verify.py、verify-output.log、evidence.json、server-console.log、pipeline-build 日志、record-evidence.py manifest，全部锚定 `03dc01d`）。工作副本在 `build/group002/`（gitignored）。
+- **环境前提（移交独立测试）**：数据库须先执行 `Server/migrate_ext_group_002.sql`（幂等；本地 mydb 已执行，schema_version=2026100101）；harness 依赖 pymysql（Python313 解释器）；服务端需 `QT_ASSUME_STDERR_HAS_CONSOLE=1 QT_FORCE_STDERR_LOGGING=1` 重定向方能捕获 QDebug 日志。
+- **下一节点**：independent test（新会话、干净分离工作树、只读源码），候选 `03dc01d`。开发会话不再改生产源码。
+- **实现文档缺口（遗留）**：`project-docs/architecture.md`/`modules.md`/`interfaces.md` 尚无群模块内容（GROUP-001 合并时亦未更新）。按 `path-ownership.yaml` 属 project_architect 维护范围，development 节点不越权修改，记为架构师侧 follow-up。
