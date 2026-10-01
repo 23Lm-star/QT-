@@ -1,4 +1,4 @@
-# handoff: REQ-EXT-TRANSFER-001 repair follow-up (owner 会话，候选 35dfce7)
+﻿# handoff: REQ-EXT-TRANSFER-001 repair follow-up (owner 会话，候选 35dfce7)
 branch: feat/req-ext-transfer-001-parallel-transfer
 head: 35dfce7
 tier: LARGE
