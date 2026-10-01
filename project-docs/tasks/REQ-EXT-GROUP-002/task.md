@@ -81,3 +81,21 @@
 - **冻结路径复核**：两份 `protocol.h` 相对 `master` 仅追加 88–96，旧编号 1–87 未动，符合 D2 批准范围。
 - **未执行**：GUI 冒烟（无法自动化，未尝试）；DB 故障注入（只读节点不做源码注入，以负路径观测等价替代）。
 - **下一节点**：independent audit（新会话、不同代理、detached worktree 只读）。
+
+## independent audit 节点收口（2026-10-01）
+
+- **候选**：`03dc01d`；审计工作树 `build/wt-audit-group002`（detached、只读、用完已删）；本节点零提交、零生产源码改动。
+- **结论**：**PASS**（候选范围内 0 条阻塞缺陷，可进 integration）。独立复证：两份 `protocol.h` 枚举 `name→value` 全表比对（1–87 逐一相同，仅追加 88–96）；`getChatMsg` 函数体与 `master` 逐字节一致（`690cbe79…`）复现 test 哈希。
+- **证据**：`project-docs/evidence/REQ-EXT-GROUP-002/audit/`（report.md、independent-verification.log、branch.diff、audit-run-*.txt、impact-check.json、manifest/）。
+- **观察（非阻塞，归档时择机处理）**：① `pipeline/audit.ps1` 冻结检查是"最后一次提交"级（`HEAD~1..HEAD`），看不见分支级 frozen 变更——须另开 SMALL 管线任务修正；② 设计 §11 未逐字列 `Client/group.{h,cpp}`，建议 task/design 追认一句；③ 归档 manifest 的 `commit:` 字段是归档时主树 HEAD，易误读，INDEX.md 已补说明；④ `-2101/-2102` 错误码存在性侧信道属既有模式，architect 侧措辞修正。
+- **下一节点**：integration（三事实行）。
+
+## integration / merged 节点收口（2026-10-01）
+
+- **三事实行核验**（原始输出 `project-docs/evidence/REQ-EXT-GROUP-002/integration/merge-facts.txt`）：
+  1. **审计报告存在且被接受** — `audit/report.md` PASS@`03dc01d`，与 dev/test 结论无冲突，无需主人裁决。
+  2. **frozen-path diff 为空** — `git diff 03dc01d..ffaaacf -- Client/protocol.h Server/protocol.h` 为空（合并结果与受审候选冻结面零差异）；分支级 frozen 变更恰为 D2 批准的 88–96 追加。
+  3. **合并结果 pipeline** — `build.ps1` **GREEN**(`ffaaacf`)、`test.ps1` honest-0；`audit.ps1` 报 `RED: frozen:*` —— 该命中是 `HEAD~1..HEAD` 在 --no-ff 合并上取整段特性差异所致，即 D2 已批准（主人 2026-10-01）的 PDU 追加，与 GROUP-001 合并时记录的情形同源，非未授权变更、非缺失事实。
+- **合并**：`git checkout master && git merge --no-ff codex/req-ext-group-002-group-messaging` → `ffaaacf`（trunk 为分支纯祖先，无冲突）。分支不删除（与 GROUP-001 收口惯例一致，保留可追溯）；本需求测试工作树 `build/wt-test-group002` 已移除。
+- **交付**：可靠群文本消息 PDU 88–96（T1–T7）；验证面 = development harness 38/38 + independent test 107/108 + GROUP-001 回归 15/15；唯一 FAIL = `FINDING-PRE1`（基线既有）。
+- **遗留（交下一节点/架构师）**：FINDING-PRE1 另开 SMALL 分支修复；`pipeline/audit.ps1` 冻结检查区间修正（SMALL 管线任务）；architecture/modules/interfaces 群模块文档更新（project_architect 范围）；GUI 冒烟维持 NEEDS-HUMAN。

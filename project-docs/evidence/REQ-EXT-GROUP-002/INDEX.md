@@ -1,5 +1,15 @@
 # REQ-EXT-GROUP-002 证据索引
 
+> 备注（manifest `commit:` 字段易误读）：下各节点 `manifest/manifest.txt` 的 `commit:` 记的是**归档动作发生时主工作树 HEAD**，
+> 不是被测候选；运行级绑定哈希见候选工作树内的 manifest（`commit: 03dc01d…, dirty: no`）与日志文件名。
+
+## integration / merged 节点（2026-10-01，合并结果 ffaaacf）
+
+目录 `integration/`：`merge-facts.txt`（三事实行原始输出：审计报告 PASS/接受、`git diff 03dc01d..ffaaacf` 冻结面零差异、
+合并结果三门）、`audit-merged.txt`（`pipeline/audit.ps1` 在 `ffaaacf` 报 `RED: frozen:*` = D2 批准追加随 --no-ff 合并的预期命中，
+非缺失事实）、`build-ffaaacf-*.log` / `test-ffaaacf-*.log` + 对应 `manifest-*`。
+合并：`master` ← no-ff `codex/req-ext-group-002-group-messaging`，`ffaaacf`。
+
 ## independent audit 节点（2026-10-01，候选 03dc01d）
 
 目录 `audit/`：`report.md`（**结论 PASS**：0 条阻塞缺陷；冻结路径仅追加 88–96 复证、三门与证据对账、
