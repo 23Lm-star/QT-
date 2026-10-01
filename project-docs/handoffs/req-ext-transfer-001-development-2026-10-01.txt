@@ -1,0 +1,11 @@
+# handoff: REQ-EXT-TRANSFER-001 development — T1-T8 完成，候选 520c714，六套件 + 新套件全绿
+branch: feat/req-ext-transfer-001-parallel-transfer
+head: 520c714
+tier: LARGE
+node: development
+audit: none
+next: 新会话开 independent test——独立干净工作树 checkout 520c714，跑 pipeline/{build,test,audit} + 七套 e2e（六套既有 + parallel_e2e.py 43 例）；纯客户端行为按 design §6.3 人工清单，脚本不可断言的项不得记为通过
+blockers: 无。audit.ps1 为 RED=预期冻结面命中（本任务即冻结面变更）；冻结面自检 git diff master...HEAD -- 两端 protocol.h = 22 insertions/0 deletions，与 §9 逐字一致
+evidence: project-docs/evidence/REQ-EXT-TRANSFER-001/{development/report.md,parallel_e2e.py,development/*.log}；design.md §9 逐字批准稿
+owner: claude-code
+date: 2026-10-01
