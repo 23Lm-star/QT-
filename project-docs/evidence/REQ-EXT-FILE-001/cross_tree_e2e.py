@@ -237,10 +237,15 @@ cb1.close(); cb2.close()
 stop_server()
 LEG = "E:/legacy/roottree/filesys"
 LEG2 = "E:/legacy/roottree-B/filesys"
-sql(f"DELETE FROM user_file WHERE owner_name='{X1}' AND display_name IN ('oldfile.txt','dupf.txt','slashdir');")
+sql(f"DELETE FROM user_file WHERE owner_name='{X1}' AND display_name IN ('oldfile.txt','dupf.txt','slashdir','fsdir');")
 sql(f"DELETE FROM file_migration_map WHERE old_path LIKE '{LEG}/%' OR old_path LIKE '{LEG2}/%';")
 # F-5 夹具：同 triple 撞键对（两他树绝对键、同 owner+名+对象、均 active）+ 无盘符 "/filesys/…" 探针
+# T3 夹具：首段=filesys 且 '/' 结尾（旧 SQL 谓词误判 canonical，实际 normalizeParent 会转换）
 ins = (f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
+       f"VALUES ('{X1}','/filesys/{X1}/sub/','fsdir',1,NULL,'active'); "
+       f"INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,staging_path,status,expires_at) "
+       f"VALUES ('{X1}','/filesys/{X1}/sub/','usd.txt',10,'x','failed',NOW()); "
+       f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
        f"SELECT '{X1}','{LEG}/{X1}','oldfile.txt',0,fo.object_id,'active' "
        f"FROM file_object fo WHERE fo.sha256='{SH(PC)}'; "
        f"INSERT INTO user_file (owner_name,parent_path,display_name,is_dir,object_id,status) "
@@ -275,6 +280,15 @@ check("CVXC", "dupf loser 保留旧键未被改写（无 1062 路径）",
 check("CVXD", "无盘符 '/filesys/<user>' 探针 → '/'",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='slashdir' "
           f"AND parent_path='/' AND is_dir=1") == "1")
+# T3/FINDING-DEV-3：判别与 isLogicKeyForm 对齐——旧形状谓词误判为 canonical 的形态必须转换
+check("CVXG", "首段=filesys 且 '/' 结尾（旧谓词误判 canonical）→ '/sub/'",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='fsdir' "
+          f"AND parent_path='/sub/' AND is_dir=1") == "1")
+check("CVXH", "user_file 零 '/filesys/...' 残留",
+      sql("SELECT COUNT(*) FROM user_file WHERE parent_path LIKE '/filesys/%'") == "0")
+check("CVXJ", "upload_session 同判别：'/filesys/...' → '/sub/'",
+      sql(f"SELECT COUNT(*) FROM upload_session WHERE owner_name='{X1}' AND display_name='usd.txt' "
+          f"AND parent_path='/sub/'") == "1")
 check("CV4", "active 行零残留非逻辑键（deleted 保留旧键属预期）",
       sql("SELECT COUNT(*) FROM user_file WHERE status='active' AND parent_path NOT LIKE '/%'") == "0")
 cc, ret = login_conn(X1)
@@ -298,6 +312,10 @@ check("CVXF", "重放幂等：dupf 1 active + 1 deleted 不变",
           f"AND status='active'") == "1"
       and sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='dupf.txt' "
               f"AND status='deleted'") == "1")
+check("CVXK", "重放幂等：fsdir 1 行 '/sub/' 不变、'/filesys/...' 仍零残留",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{X1}' AND display_name='fsdir' "
+          f"AND parent_path='/sub/'") == "1"
+      and sql("SELECT COUNT(*) FROM user_file WHERE parent_path LIKE '/filesys/%'") == "0")
 
 # ---------- 5. 收尾清场（不污染后续套件） ----------
 stop_server()
