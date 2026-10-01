@@ -118,7 +118,8 @@ void MsgHandler::handlonlineuser(){
           if(strcmp(userName,Client::getinstance().m_LoginName.toStdString().c_str())==0){
               continue;
           }
-          userNamelist.append(QString("%1.%2").arg(i+1).arg(userName));//将编号还有用户名都统一加进去
+          // REQ-UX-001：列表项直接展示用户名（旧实现加 "<序号>." 前缀，消费端按首个 '.' 解析，用户名含 '.' 会解析错）
+          userNamelist.append(QString::fromUtf8(userName));
       }
       Index::getinstance().getFriend()->m_onlineUser->updateOnlineUser(userNamelist);
 }
@@ -128,14 +129,21 @@ void MsgHandler::handlAddFriend()
     int ret=0;
     memcpy(&ret,pdu->caData,sizeof (ret));
     qCDebug(lcCli)<<"AddFriend ans ret"<<ret<<endl;
+    // REQ-UX-001 A1：任何结果都必须有可见反馈并更新在线用户窗口提示条
+    OnlineUser *ou=Index::getinstance().getFriend()->m_onlineUser;
     if(ret==1){
+        // ret=1 来自对方的"同意"回执：双向好友关系已建立
         Index::getinstance().getFriend()->flushfriend();
+        if(ou){ ou->setHint(QStringLiteral("好友添加成功")); }
+        QMessageBox::information(ou,"提示","好友添加成功");
     }
     else if(ret==-2){
-        QMessageBox::information(Index::getinstance().getFriend()->m_onlineUser,"提示","该用户不在线");
+        if(ou){ ou->setHint(QStringLiteral("该用户不在线")); }
+        QMessageBox::information(ou,"提示","该用户不在线");
     }
     else {
-        QMessageBox::information(Index::getinstance().getFriend()->m_onlineUser,"提示","添加失败");
+        if(ou){ ou->setHint(QStringLiteral("添加失败：对方不在线或已是好友")); }
+        QMessageBox::information(ou,"提示","添加失败：对方不在线或已是好友");
     }
 }
 //同意添加好友

@@ -3,34 +3,36 @@
    基调：半透明黑灰 + 蓝色发光边框 + 圆角
    ============================================ */
 
-/* --- 全局基础 --- */
+/* --- 全局基础（REQ-UX-001：白色文字 + 放大字号）--- */
 QWidget {
-    color: #e0e8f0;
+    color: #ffffff;
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
-    font-size: 14px;
+    font-size: 20px;
 }
 
-/* --- 主窗口背景 --- */
-QWidget#Client {
+/* --- 窗口背景统一为登录页背景（REQ-UX-001 A4）---
+   此前只有 #Client/#Index 设了背景，其余顶层窗口落到 Qt 默认浅色底，
+   与全局浅色字叠加成"浅底浅字"不可读。此处按类名统一覆盖所有窗口。 */
+QWidget#Client,
+QWidget#Index,
+OnlineUser, GroupChat, GroupFile, Chat, Friend, File, Group,
+ShareFile, ShareLinkDialog, FolderSelectDialog, UserInformation,
+ReconnectDialog, SimpleCaptcha, TransferTaskPanel {
     background-color: #0d1b2a;
     background-image: url(:/bg_main.jpg);
     background-position: center;
-}
-QWidget#Index {
-    background-color: #081220;
-    background-image: url(:/bg_index.jpg);
-    background-position: center;
+    color: #ffffff;
 }
 
 /* --- 标签（亮色文字）--- */
 QLabel {
-    color: #c8d8f0;
+    color: #ffffff;
     background: transparent;
-    font-size: 14px;
+    font-size: 20px;
 }
 QLabel#titleLabel {
     color: #ffffff;
-    font-size: 24px;
+    font-size: 34px;
     font-weight: bold;
 }
 
@@ -40,8 +42,8 @@ QLineEdit {
     border-radius: 10px;
     padding: 10px 14px;
     background: rgba(15, 25, 45, 200);
-    color: #d4e8f0;
-    font-size: 15px;
+    color: #ffffff;
+    font-size: 21px;
     selection-background-color: #1e6fa0;
     selection-color: #ffffff;
 }
@@ -59,8 +61,8 @@ QTextEdit {
     border-radius: 10px;
     padding: 8px;
     background: rgba(10, 20, 35, 210);
-    color: #d0e0f0;
-    font-size: 14px;
+    color: #ffffff;
+    font-size: 20px;
     selection-background-color: #1e6fa0;
 }
 QTextEdit:focus {
@@ -75,8 +77,8 @@ QPushButton {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
         stop:0 rgba(30, 60, 100, 220),
         stop:1 rgba(15, 35, 60, 220));
-    color: #b8d8f8;
-    font-size: 15px;
+    color: #ffffff;
+    font-size: 21px;
     font-weight: bold;
     min-height: 20px;
 }
@@ -152,8 +154,8 @@ QPushButton#friend_PB, QPushButton#file_PB {
     border-radius: 8px;
     padding: 16px 8px;
     background: rgba(10, 25, 45, 180);
-    color: #a0c8f0;
-    font-size: 20px;
+    color: #ffffff;
+    font-size: 28px;
     font-family: "Agency FB", "Microsoft YaHei";
 }
 QPushButton#friend_PB:hover, QPushButton#file_PB:hover {
@@ -173,8 +175,8 @@ QListWidget {
     border-radius: 10px;
     padding: 4px;
     background: rgba(8, 18, 35, 210);
-    color: #c0d8f0;
-    font-size: 14px;
+    color: #ffffff;
+    font-size: 20px;
     outline: none;
     alternate-background-color: rgba(15, 28, 48, 180);
 }
@@ -203,7 +205,7 @@ QStackedWidget {
 QLabel#loadingLabel {
     background: rgba(8, 18, 35, 220);
     color: #ffcc00;
-    font-size: 22px;
+    font-size: 30px;
     font-weight: bold;
     border-radius: 10px;
 }
@@ -252,6 +254,6 @@ QToolTip {
     border-radius: 6px;
     padding: 4px 8px;
     background: rgba(15, 30, 50, 230);
-    color: #c8d8f0;
-    font-size: 13px;
+    color: #ffffff;
+    font-size: 18px;
 }

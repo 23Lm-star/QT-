@@ -318,6 +318,16 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
     if(ret==1){//记录已登录的用户名
         strname=username;
         authOk=true;
+        // REQ-UX-001 A2：登录即幂等确保 actor 个人目录存在。
+        // 目录此前只在注册成功时创建（rigist()），存量账号随部署更换 filesPath 后目录缺失；
+        // 而沙箱校验要求路径物理存在（isPathInSandbox 取 canonicalFilePath，空即拒），
+        // 于是自身根目录被判越权 → 列目录/建目录/上传全被拒、且用户无法自助恢复。
+        const QString fsRoot = Server::getinstance().filesPath;
+        if(!fsRoot.isEmpty()){
+            QDir dir;
+            dir.mkpath(fsRoot);
+            dir.mkpath(QString("%1/%2").arg(fsRoot).arg(username));
+        }
     }else{
         loginVersion=0;
     }

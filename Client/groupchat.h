@@ -43,6 +43,8 @@ private:
     QListWidgetItem *insertMessage(quint64 seq, const QString &sender, quint8 msgType,
                                    quint64 createdAtMs, const QString &content);
     void markRendered(quint64 seq);
+    // REQ-UX-001 A3：自己的消息统一"身份/时间行 + 正文行"右对齐重绘
+    void renderOwnMessage(QListWidgetItem *item, const QString &state, const QString &content);
 
     quint64 m_groupId;
     QString m_groupName;
@@ -69,6 +71,7 @@ private:
     static const int ROLE_SEQ = Qt::UserRole;          // quint64 seq
     static const int ROLE_STATE = Qt::UserRole + 1;    // 0 发送中 / 1 已发送 / 2 发送失败 / 3 系统
     static const int ROLE_CLIENT_KEY = Qt::UserRole + 2;
+    static const int ROLE_TIME = Qt::UserRole + 3;     // 本地乐观条目的时间戳显示
 };
 
 #endif // GROUPCHAT_H

@@ -8,7 +8,8 @@ Index::Index(QWidget *parent) :
     ui(new Ui::Index)
 {
     ui->setupUi(this);
-    setFixedSize(1000,650);
+    // REQ-UX-001 A5：2 倍放大并收敛到屏幕可用区
+    setFixedSize(Client::scaledWindowSize(1000,650));
 }
 Index &Index::getinstance()
 {

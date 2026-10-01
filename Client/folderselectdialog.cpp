@@ -11,8 +11,8 @@ FolderSelectDialog::FolderSelectDialog(QWidget *parent)
     : QDialog(parent)
 {
     setWindowTitle("选择目标文件夹");
-    setMinimumWidth(420);
-    resize(420, 360);
+    setMinimumWidth(840);
+    resize(840, 720);   // REQ-UX-001 A5：面积 4 倍
 
     m_pathLabel = new QLabel("当前目录：根目录", this);
 

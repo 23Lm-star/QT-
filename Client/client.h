@@ -37,6 +37,8 @@ public:
     void loadconfig();
     //架构函数 静态 调用 构建唯一实例
     static Client& getinstance();
+    // REQ-UX-001 A5：按 2 倍基准放大窗口尺寸，并收敛到可用屏幕内（避免窗口超出显示器）
+    static QSize scaledWindowSize(int baseW, int baseH);
     //进行验证码刷新的函数
     void flus();
     QString generateCaptcha(int length = 6);
