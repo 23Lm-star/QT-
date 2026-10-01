@@ -71,3 +71,13 @@
 - **环境前提（移交独立测试）**：数据库须先执行 `Server/migrate_ext_group_002.sql`（幂等；本地 mydb 已执行，schema_version=2026100101）；harness 依赖 pymysql（Python313 解释器）；服务端需 `QT_ASSUME_STDERR_HAS_CONSOLE=1 QT_FORCE_STDERR_LOGGING=1` 重定向方能捕获 QDebug 日志。
 - **下一节点**：independent test（新会话、干净分离工作树、只读源码），候选 `03dc01d`。开发会话不再改生产源码。
 - **实现文档缺口（遗留）**：`project-docs/architecture.md`/`modules.md`/`interfaces.md` 尚无群模块内容（GROUP-001 合并时亦未更新）。按 `path-ownership.yaml` 属 project_architect 维护范围，development 节点不越权修改，记为架构师侧 follow-up。
+
+## independent test 节点收口（2026-10-01）
+
+- **候选**：`03dc01d`；分离工作树 `build/wt-test-group002`（只读，零生产源码改动）；本工作树独立构建 GREEN，被测二进制 sha256 `4a5aca0f…`。
+- **结论**：**PASS**（0 条归因候选的缺陷，可交 independent audit）。自研 harness（断言自候选源码推导，未采信 development 的 `verify.py`）：part1 58/58、part2 36/37、part3 13/13、GROUP-001 回归 15/15。
+- **FINDING-PRE1（基线既有，非候选引入）**：一对一离线消息每次 `GETCHATMSG` 重复下发且 `message_info.issuccess` 恒为 0。证据：`getchatMsg` 不在本分支 diff 内，且与 `master` 函数体 sha256 完全一致（`690cbe79…`）；最小复现 `independent-test/probe_chatmsg.py`。建议另开 SMALL 分支修复，不阻断本需求。
+- **观察（非缺陷）**：`mode1` 为 `seq <= cursor` 含边界语义，调用方须传 `next_cursor - 1`（客户端 `groupchat.cpp:163` 已如此）；建议 design.md §7 补调用约定一句。
+- **冻结路径复核**：两份 `protocol.h` 相对 `master` 仅追加 88–96，旧编号 1–87 未动，符合 D2 批准范围。
+- **未执行**：GUI 冒烟（无法自动化，未尝试）；DB 故障注入（只读节点不做源码注入，以负路径观测等价替代）。
+- **下一节点**：independent audit（新会话、不同代理、detached worktree 只读）。

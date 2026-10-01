@@ -1,4 +1,15 @@
-# REQ-EXT-GROUP-002 证据索引（development 节点）
+# REQ-EXT-GROUP-002 证据索引
+
+## independent test 节点（2026-10-01，候选 03dc01d）
+
+目录 `independent-test/`：`report.md`（结论/矩阵/FINDING-PRE1）、自研 harness
+（`itest_group002.py` part1、`itest_part2.py` part2、`itest_part3.py` part3、`wire.py` 共享线协议、
+`probe_chatmsg.py` 既有缺陷最小复现）、运行日志 `part{1,2,3}-run.log`、`group001-regress.log`、
+机器可读 `itest_results_part{1,2,3}.json`、服务端控制台 `server-console.log`、pipeline 构建/测试日志。
+结果：part1 **58/58**、part2 **36/37**、part3 **13/13**、GROUP-001 回归 **15/15**；
+唯一 FAIL = 基线既有缺陷 FINDING-PRE1（`getchatMsg` 与 master 字节一致，非本候选引入）。
+
+## development 节点（2026-10-01，候选 03dc01d）
 
 | 文件 | 节点 | 结论/内容 | 锚定哈希 |
 |---|---|---|---|
