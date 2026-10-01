@@ -23,10 +23,20 @@ $changed = @(git diff --name-only "$base..HEAD" 2>$null)
 #    even when the branch tip is a docs commit. Source of truth:
 #    project-docs/project-manifest.yaml `frozen_paths:`; hardcoded fallback if unreadable.
 $frozen = @()
+$impactStatus = $null; $impactReason = $null
 $manifest = Join-Path $repo "project-docs\project-manifest.yaml"
 if (Test-Path $manifest) {
+    # Explicit UTF-8 decode. PS5.1 Get-Content defaults to the ANSI code page (ACP936 here):
+    # on the LF manifest a line ending in a full-width ')' (U+FF09 = EF BC 89) makes byte 0x89
+    # a lead byte that swallows the following 0x0A, merging two frozen_paths lines into one and
+    # silently dropping Server/protocol.h (F1, REQ-EXT-FILE-002 audit, 2026-10-01).
+    $mText = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8
+    foreach ($line in ($mText -split "\r?\n")) {
+        if ($line -match '^\s*impact_status:\s*"?([^"\s#]+)"?') { $impactStatus = $matches[1] }
+        elseif ($line -match '^\s*impact_reason:\s*"?([^"\r\n#]+)"?') { $impactReason = $matches[1].Trim() }
+    }
     $inFrozen = $false
-    foreach ($line in Get-Content -LiteralPath $manifest) {
+    foreach ($line in ($mText -split "\r?\n")) {
         if ($line -match '^frozen_paths:\s*(#.*)?$') { $inFrozen = $true; continue }
         if (-not $inFrozen) { continue }
         if ($line -match '^\s+-\s+([^\s#]+)') { $frozen += $matches[1] }
@@ -63,6 +73,14 @@ if (-not $hasLog) { Write-Output "NO test evidence for $evHash (run pipeline/tes
 #    references/pipeline.md: "codegraph sync + impact face via impact-check.py". The script lives
 #    outside the repo (skill checkout), so absence on another machine is expected and non-fatal.
 $impact = "skipped: impact-check unavailable"
+if ($impactStatus -eq "not_applicable") {
+    # Manifest-declared: this repo has no statically-reachable automated test suite, so the
+    # affected-test face is meaningless here (F2). Declared, not silently skipped -- a fake
+    # PASS from an empty glob would be worse than a named non-result.
+    $impact = "NOT_APPLICABLE"
+    if ($impactReason) { $impact = "NOT_APPLICABLE ($impactReason)" }
+}
+if ($impactStatus -ne "not_applicable") {
 try {
     $skillScripts = @("$env:USERPROFILE\.claude\skills\development-os-v1-7\scripts", "$env:USERPROFILE\.codex\skills\development-os-v1-7\scripts") |
         Where-Object { Test-Path $_ } | Select-Object -First 1
@@ -98,6 +116,7 @@ try {
         }
     }
 } catch { $impact = "skipped: $($_.Exception.Message)" }
+}
 Write-Output "impact-check: $impact"
 
 if ($fail.Count -gt 0) { Write-Output "audit RED: $($fail -join ', ')"; exit 1 }
