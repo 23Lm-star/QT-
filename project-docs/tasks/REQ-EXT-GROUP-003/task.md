@@ -65,3 +65,26 @@ independent test（新会话、异代理）：在 `0b83aab` 的干净 detached w
 - **环境**：DB `mydb` 已含 `schema_version=2026100103`，表 `group_file` 在位；统一 e2e 运行形态（cwd=dist / `dist/Server.exe` / `filesPath=./filesys` 相对 / CRLF 配置）；解释器 `py -3.13`。群生命周期 harness 不自管 Server，由外部预置 Qt PATH 启动后运行。
 - **未执行**：GUI 冒烟（无法自动化）；冻结面深度复核与 CodeGraph 影响闭包（属 independent audit 节点，不采信本轮结论）。
 - **下一节点**：independent audit（新会话、不同代理、detached worktree 只读 `0b83aab`）。
+
+## independent audit 节点收口（2026-10-01）
+- **审计对象**：`0b83aab`；detached worktree 只读，**零提交、零生产源码改动**，报告落盘后删除。
+- **结论**：**PASS** —— 0 条阻塞缺陷；**6 条非阻塞观察**（归档待后续，不进 repair，不阻断 integration）：
+  ① 权限门 P1–P5 非事务/非行锁（退出与被移除的竞态窗口不可由客户端操纵，顺序撤销验收不受影响）；
+  ② 群下载失败静默（客户端先判 `<36B`，失败响应仅 24B，无提示）；③ 102 展示名语义偏差（未命中回请求名，影响为零）；
+  ④ 全局内容去重可"无实体入群"（既有内容寻址模型属性，非本候选引入）；⑤ 名称钳制按 70 字节而非 70 字符（保守无碍）；
+  ⑥ 客户端上传单例假设（既有模式）。既有基线 `FINDING-PRE1` 不在本回归面。
+- **独立性**：审计者 claude-code（新会话、只读），与 development owner 同名——**跨代理未满足**，报告如实记录；
+  经主人裁决接受（`audit: accepted by user, 2026-10-01`）。
+- **独立复证**：两端 `protocol.h` 99–106 仅追加、两端常量块逐字节一致；候选之上零代码提交（`0b83aab..9129900` 仅 `project-docs/`）。
+
+## integration / merge 节点收口（2026-10-01）· LARGE 收尾
+- **三事实行**（原始核验 `project-docs/evidence/REQ-EXT-GROUP-003/integration/merge-facts.txt`）：
+  ① 独立审计报告**已存在且被接受**（主人 2026-10-01 接受报告与同代理独立性）；
+  ② **冻结面零越批准改动**：`git diff 0b83aab..495e552 --stat -- Client/protocol.h Server/protocol.h` 为空；
+  ③ **合并结果 pipeline GREEN**：build GREEN、test GREEN-WARN(honest-0)、audit PASS（`495e552`）。
+- **合并**：`codex/req-ext-group-003-group-files@9129900` → `master`，**no-ff**，合并提交 `495e552`（父 `285b4b0`+`9129900`），文件集无交集、零冲突。
+- **冻结命中层级**：分支层 `independent-test/pipeline-audit.log` = `audit RED: frozen:Client/protocol.h, frozen:Server/protocol.h`（设计信号，已批准）；合并后 trunk `audit PASS`（冻结检查按分支范围，合并增量属历史）。
+- **本次发布**：群文件目录与访问控制——群文件协议 99–106（只追加）、`group_file` 表 + `schema_version=2026100103`、`FileObjectStore::attachGroupFile/releaseGroupFile`（refcount 联合语义）、`OperateDB::handleGroupFileOperation` P0–P7 每请求即时判定、客户端群文件窗口。
+- **审计发现**：0 阻塞；6 条非阻塞观察（见上，归档待后续）。
+- **回归面**：`groupfile_e2e.py` 45/45；既有 13/43/37/48/46；群生命周期 15/15。**新增回归测试**：无独立注册用例入库（仓库 0 注册自动化测试，回归由 e2e socket harness 承担，与既有口径一致）；GUI 冒烟维持 NEEDS-HUMAN。
+- **收尾**：审计 + 集成证据归档 `project-docs/evidence/REQ-EXT-GROUP-003/`；worktree 释放、分支保留待清。
