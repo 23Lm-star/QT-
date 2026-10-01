@@ -1,0 +1,56 @@
+# REQ-EXT-GROUP-003 群文件目录与访问控制 — 任务记录（goal 节点，2026-10-01）
+
+## 档位
+- **LARGE**（goal 定档 2026-10-01）。理由（风险面，非行数）：
+  1. **冻结面命中**：需向 `Client/protocol.h` 与 `Server/protocol.h`（manifest `frozen_paths`）追加群文件 PDU → v1.7 自动升 LARGE，且改动须主人批准。
+  2. **公共契约变更**：新增群文件协议段（PDU 99–106）+ 新表 `group_file` + `schema_version` 提升（新增独立版本号）。
+  3. **跨会话**：客户端（群文件目录/上传/下载/删除 UI + 新分派）+ 服务端（新入口 `groupFileRequest` / 权限判定 / 对象仓挂接）+ DB 迁移，单会话放不下。
+  4. **权限与路径安全热路径**：复用文件资产层（`file_object`/`user_file`/`FileObjectStore`）与上传下载链路，验收覆盖越权（退出/被移除即时失权）、解散写拒绝、路径负向面——回归面覆盖 GROUP-001/002、FILE-001/002 与一对一聊天。
+  5. 需求文档 `project-docs/requirements/REQ-EXT-GROUP-003.md` 自声明 LARGE；本记录与之一致，不再改档。
+- 流程版本：Development OS v1.7。分支：`codex/req-ext-group-003-group-files`，基线 `master@60a5fc9`。
+- 节点计划：goal（本记录 + `design.md`，本会话，不动生产源码）→ **主人批准契约变更** → development → independent test（新会话）→ repair（如需）→ independent audit（新会话、不同代理、只读）→ integration（三事实行）→ merge no-ff。
+- `owner_agent: claude-code`（分支名沿用需求文档给定前缀 `codex/`，owner 以本行为准）。
+
+## 依赖核查（2026-10-01 goal 节点实测，逐条以代码/DB 事实确认，非文档转述）
+| 依赖 | 实测事实（本树 / 本库） | 结论 |
+|---|---|---|
+| REQ-EXT-SEC-001 连接级 actor | `MyTcpSocket::handlMsg` 以 `isPublicRequestType` 白名单门控，未认证走 `authRejectPdu`（`mytcpsocket.cpp:53/60`）；群请求类型不在白名单即自动要求 `m_actorAuthenticated`，handler 用 `m_actorName` 覆盖自称字段 | ✅ 可用 |
+| REQ-EXT-GROUP-001 成员事实源 | `group_member` 存活事实：主键 `(group_id,user_name)`、`role('owner'/'admin'/'member')`、`status('active'/'left'/'removed')`、`last_read_seq`、索引 `idx_group_member_user_group(user_name,group_id)`、`idx_group_member_status(group_id,status)`（DB `SHOW COLUMNS` 实测一致）；`group_info.status('active'/'dissolved')` | ✅ 可用 |
+| GROUP-001 D5 解散语义 | `handleGroupOperation`：解散 = `UPDATE group_info SET status='dissolved'`（operatedb.cpp:1577）；群消息门判定 `gi.status='active'`（operatedb.cpp:1655，非 active 回 -2102）——**写操作拒绝已成型，本需求照此对群文件上传/删除生效；只读历史仍放行** | ✅ 语义可复用 |
+| REQ-EXT-GROUP-002 群消息 PDU 88–96 | `Server/protocol.h:116-124` 88–96 已在位；群信封 `GROUP_PROTOCOL_VERSION=1`/`GROUP_ENVELOPE_LENGTH=20`、`groupAppendU16/U32/U64/String`、`groupRead*` 就位（`groupRequest` msghandler.cpp:1786）；事件伪造拒绝（mytcpsocket.cpp:258-264） | ✅ 复用信封 |
+| REQ-EXT-FILE-001 文件资产层 | 四表实测在位：`file_object(uk_sha256,refcount,status ready/pending_reclaim)`、`user_file(uk_loc,is_dir,object_id FK,status active/deleted)`、`upload_session`、`file_migration_map`；`FileObjectStore`（`hashStaging`/`commitUpload`/`attachEntry`/`attachExistingObject`/`releaseEntry`/`normalizeParent`/`logicPathInActorRoot`）；`schema_version` 表在位 | ✅ 可用 |
+| REQ-EXT-FILE-002 PDU 97/98 秒传 | `Server/protocol.h:127-128` 97/98 在位；`upload_session` 加列实测：`client_request_id VARCHAR(64) NULL`、`file_id BIGINT NULL`、唯一键 `uk_req(owner_name,client_request_id)` | ✅ 可用（本需求对群上传**不复用** 97/98，见 design §1.3） |
+| `schema_version` 现值 | DB 实测：`2026092901`(FILE-001)、`2026093001`(GROUP-001)、`2026100101`(GROUP-002)、`2026100102`(FILE-002)；`checkSchemaVersion()` 取 `MAX(version)` 比对四常量 `qMax`（operatedb.cpp:96） | ✅ 新版本号须独立且更大 |
+| PDU 编号水位 | `Server/protocol.h` 最大业务枚举 = **98**，`ENUM_MSG_TYPE_MAX=99999`；群生命周期 60–87、群消息 88–96、文件 97–98 | ✅ 群文件从 **99** 起追加 |
+| master 基线整合面 | 实测**不存在** `small/normalize-logic-keys-predicate` 分支（`git branch -a` 无此名；`git log --all` 无对应提交）；当前唯一 master 头 `60a5fc9`，工作区 clean | ✅ 基线无在飞冲突；集成前仍会将 master 合入本分支吸收任何新到的 SMALL |
+
+**结论：依赖全部满足。开发启动条件 = 主人批准契约变更（本文档"契约影响"批准卡）+ 从 master 切分支（已完成）。**
+
+## 契约影响（须主人批准 · 业务语言批准卡见文末）
+| 面 | 变更 | 性质 |
+|---|---|---|
+| `Client/protocol.h` + `Server/protocol.h`（frozen） | 追加群文件 PDU **99–106**（`GROUP_FILE_LIST/ UPLOAD_INIT/ DELETE/ DOWNLOAD` 四对，**只追加不重编号**）+ 群文件偏移常量块（两端逐字节一致） | 冻结面变更 |
+| 新表 `group_file` | 群文件逻辑关联（群、逻辑文件、上传者、展示名/大小快照、状态、时间）+ 唯一键与索引 | 附加式（新增表，不动旧表） |
+| `schema_version` | 新增独立版本号 **`2026100103`** 并入 `required` 计算 | 低版本启动 fail-fast |
+| 数据面传输 | 群上传复用既有分块 `UPLOADFILE_DATA`(31/32)；群下载复用既有分块 `DOWNLOADFILE_DATA/FINISH`(42/43)，源由服务端 `group_file→object_id→storage_path` 解析 | **既有分块语义零改动** |
+| 既有 PDU 编号 / 既有语义 / 既有表 | **零改动**（97/98 秒传、29–32 上传、40–43 下载、群 60–96 全部保留原样） | 回归面零破坏 |
+
+> 批准前**不得写实现代码**。
+
+## 数据模型（详见 `design.md` §3）
+- `group_file`：`group_file_id` 主键；`group_id`；`file_id`（→`user_file.file_id`，**逻辑文件标识**，可空）；`object_id`（→`file_object.object_id`，物理对象，下载/去重/引用计数入口）；`uploader_name`；`display_name`（群目录展示名**快照**，与上传者个人根解耦）；`size_bytes`（快照）；`status('active'/'removed')`；`created_at`/`updated_at`。唯一键 `uk_group_file_name(group_id, display_name)`；索引 `(group_id,status)`、`(group_id,uploader_name)`。
+- **引用计数扩展**：`file_object.refcount` 语义扩展为"`user_file`(active) ∪ `group_file`(active) 的活跃逻辑引用数"；建群文件引用 +1、删群引用 −1；归零转 `pending_reclaim`（D3：绝不物理删）。**删除一个群引用不影响其他用户/群的同一物理对象**（验收 4）。
+
+## 不做的事 / 停止条件
+- **不做**（需求 §5 明文排除）：协作编辑、文件锁、版本管理、批量打包下载、群文件消息卡片、复杂 `owner/editor/viewer` 权限；群目录**子目录**（首版扁平群根，需求允许"受控相对路径"，扁平即可满足验收）；新外部依赖；`Server/filesys/` 入库；改动既有 PDU 编号或既有分块协议语义。
+- **停止条件**（需求 §5）：① 退出/踢出后的访问撤销**不是服务端即时判定**（若靠客户端或缓存）→ 停止合并且回 goal；② 群文件**仍依赖裸客户端路径拼接**（非 `group_file_id→object_id→服务端 storage_path`）→ 停止合并且回 goal；③ 协议新旧版本无法明确拒绝未知类型 → 停止；④ 基线出现与本盘点冲突的事实 → 回 goal 重估，不在开发节点即兴扩面。
+
+## 允许路径
+`Client/protocol.h`、新增 `Client/groupfile.{h,cpp}`（或扩展 `Client/group.{h,cpp}`）、`Client/msghandler.{h,cpp}`、`Client/client.{h,cpp}`、`Client/index.{h,cpp,.ui}`、`Client/Client.pro`、`Server/protocol.h`、`Server/msghandler.{h,cpp}`、`Server/mytcpsocket.{h,cpp}`（入口门 case + 事件拒绝）、`Server/operatedb.{h,cpp}`、`Server/fileobjectstore.{h,cpp}`、`Server/server.{h,cpp}`（版本检查文案）、`Server/main.cpp`（迁移挂钩点）、`Server/Server.pro`、`Server/migrate_ext_group_003.sql`、`Server/migrate_ext_group_003_rollback.sql`、`project-docs/tasks|evidence/REQ-EXT-GROUP-003/`、handoff。
+**禁止**：改既有枚举编号/删字段；改既有 PDU 语义；写 `user_file`/`file_object` 既有语义分支（仅经 `FileObjectStore` 窄接口扩展）；新外部依赖；`Server/filesys/` 入库；群文件之外的功能扩面（群公告/消息卡片等）。
+
+## 门次与事件（append-only）
+- 2026-10-01 **goal**：定档 LARGE。依赖 8 项逐条以代码/DB 实测通过（见上表）。产出 `task.md` + `design.md`（协议 99–106 逐字段/偏移、`group_file` DDL、权限判定点、路径负向面、验收 1–6 验证手段、允许路径）。契约变更批准卡已提交主人，**待批准**。本会话不写实现代码、不开 development 节点。
+
+## 下一节点
+主人批准契约变更（PDU 99–106 追加 + `group_file` 新表 + `schema_version=2026100103`）→ 开 development 节点（新会话，从本分支施工）。
