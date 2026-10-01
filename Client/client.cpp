@@ -308,7 +308,17 @@ void Client::handlMsg(PDU *&pdu)
     case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND:
     case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
     case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
+    case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND:
         Index::getinstance().getGroup()->handleResponse(pdu);
+        break;
+    // REQ-EXT-GROUP-002：消息类响应按信封 group_id 路由到对应群窗口
+    case ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_RESPOND:
+    case ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_RESPOND:
+    case ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND:
+        Index::getinstance().getGroup()->handleMessageResponse(pdu);
+        break;
+    case ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT:
+        Index::getinstance().getGroup()->handleMessageEvent(pdu);
         break;
     default:
         break;

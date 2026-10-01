@@ -1528,6 +1528,11 @@ uint groupRespondType(uint requestType)
     case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST: return ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND;
     case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST: return ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND;
     case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST: return ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND;
+    // REQ-EXT-GROUP-002：群消息
+    case ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_REQUEST: return ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_RESPOND;
+    case ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST: return ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_RESPOND;
+    case ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST: return ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND;
+    case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST: return ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND;
     default: return ENUM_MSG_TYPE_MAX;
     }
 }
@@ -1548,6 +1553,11 @@ OperateDB::GroupOperation groupOperation(uint requestType)
     case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST: return OperateDB::GroupListMembers;
     case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST: return OperateDB::GroupQueryInvitations;
     case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST: return OperateDB::GroupSummary;
+    // REQ-EXT-GROUP-002：群消息
+    case ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_REQUEST: return OperateDB::GroupSendMessage;
+    case ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST: return OperateDB::GroupPullMessages;
+    case ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST: return OperateDB::GroupReadConfirm;
+    case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST: return OperateDB::GroupUnreadSummary;
     default: return OperateDB::GroupList;
     }
 }
@@ -1608,15 +1618,60 @@ PDU* MsgHandler::groupRequest(uint requestType)
         parsed = readText(request.targetName); break;
     case OperateDB::GroupSetRole:
         parsed = readText(request.targetName) && readText(request.role); break;
+    // REQ-EXT-GROUP-002：群消息（发送方身份一律取 actor，载荷无 sender 字段）
+    case OperateDB::GroupSendMessage:
+        parsed = readText(request.clientMsgId) && readText(request.content);
+        if (parsed && request.clientMsgId.toUtf8().size() > 64) parsed = false;
+        if (parsed && request.content.toUtf8().size() > 2000) parsed = false;
+        break;
+    case OperateDB::GroupPullMessages: {
+        if (offset + 1 > payload.size()) { parsed = false; break; }
+        request.pullMode = quint8(payload.at(offset++));
+        parsed = (request.pullMode <= 1)
+                && groupReadU64(payload, offset, request.cursorSeq)
+                && groupReadU16(payload, offset, request.limit);
+        if (parsed && (request.limit < 1 || request.limit > 100)) parsed = false; // 越界载荷拒绝（客户端同值钳制）
+        break;
+    }
+    case OperateDB::GroupReadConfirm:
+        parsed = groupReadU64(payload, offset, request.readSeq); break;
+    case OperateDB::GroupUnreadSummary:
+        break;
     default:
         break;
     }
     if (!parsed || offset != payload.size()) {
         qCWarning(lcNet) << "[GROUP] 拒绝越界载荷 type=" << requestType << "conn=" << m_connId;
-        return response(-2002, QByteArray(), requestId, groupId);
+        // REQ-EXT-GROUP-002：发送请求解析失败也回带幂等键（可解析到时），客户端据此同键重试
+        QByteArray rejectBody;
+        if (request.operation == OperateDB::GroupSendMessage && !request.clientMsgId.isEmpty()) {
+            groupAppendString(rejectBody, request.clientMsgId.toUtf8());
+        }
+        return response(-2002, rejectBody, requestId, groupId);
     }
 
     const OperateDB::GroupResult result = OperateDB::instance().handleGroupOperation(request, m_actorName);
+    // REQ-EXT-GROUP-002 T3/T5：先提交后广播——仅在 DB 提交成功（code==0 且 broadcastMessage）
+    // 后触发；89=已持久化，90=在线送达，语义分离。幂等重放不重复广播。
+    if (result.code == 0 && result.broadcastMessage && !result.notifyUsers.isEmpty()) {
+        QByteArray msgBody;
+        groupAppendU16(msgBody, GROUP_PROTOCOL_VERSION);
+        groupAppendU16(msgBody, GROUP_ENVELOPE_LENGTH);
+        groupAppendU64(msgBody, 0);
+        groupAppendU64(msgBody, result.groupId);
+        groupAppendU32(msgBody, 0);
+        groupAppendU64(msgBody, result.groupId);
+        groupAppendU64(msgBody, result.message.seq);
+        groupAppendU64(msgBody, result.message.msgId);
+        groupAppendString(msgBody, result.message.sender.toUtf8());
+        msgBody.append(char(result.message.msgType));
+        groupAppendU64(msgBody, result.message.createdAtMs);
+        groupAppendString(msgBody, result.message.content.toUtf8());
+        PDU *msgEvent = mkPDU(uint(msgBody.size()));
+        msgEvent->uiType = ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT;
+        memcpy(msgEvent->caMsg, msgBody.constData(), size_t(msgBody.size()));
+        MyTcpServer::getinstance().broadcastGroupMessage(result.notifyUsers, msgEvent);
+    }
     if (!result.notifyUsers.isEmpty() && result.eventType != 0) {
         QByteArray eventBody;
         groupAppendU16(eventBody, GROUP_PROTOCOL_VERSION);
@@ -1631,6 +1686,13 @@ PDU* MsgHandler::groupRequest(uint requestType)
                                               : ENUM_MSG_TYPE_GROUP_MEMBER_EVENT;
         memcpy(event->caMsg, eventBody.constData(), size_t(eventBody.size()));
         MyTcpServer::getinstance().sendGroupEvent(result.notifyUsers, event);
+    }
+    if (request.operation == OperateDB::GroupSendMessage && result.code != 0
+            && result.responseBody.isEmpty() && !request.clientMsgId.isEmpty()) {
+        // 失败体回带幂等键：客户端据此把对应 pending 项标为「发送失败，双击重试」
+        QByteArray retryBody;
+        groupAppendString(retryBody, request.clientMsgId.toUtf8());
+        return response(result.code, retryBody, requestId, request.groupId == 0 ? groupId : request.groupId);
     }
     return response(result.code, result.responseBody, requestId, result.groupId == 0 ? groupId : result.groupId);
 }

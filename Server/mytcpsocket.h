@@ -54,13 +54,25 @@ public:
     // - 返回非空 PDU → 由 recvmsg() 调用 seedMsg() 写入并释放
     // - 返回 nullptr   → PDU 已由 handlMsg() 内部发送并释放（如下载流），或无需响应
     // 禁止同一 PDU 既返回又通过 sendAndRelease/seedMsg 发送
+    // REQ-EXT-GROUP-002 T3：每连接有界发送队列（群消息广播用）。返回 false=队列满、
+    // 该连接实时投递被丢弃（由拉取兜底），不影响其他成员。
+    bool enqueueOutbound(const QByteArray &pdu);
+    static const int OUTBOUND_QUEUE_MAX_MSGS = 256;
+    static constexpr qint64 OUTBOUND_QUEUE_MAX_BYTES = 256 * 1024;
+    static constexpr qint64 OUTBOUND_FLUSH_HIGH_WATER = 256 * 1024;
 private:
     /// 发送 PDU 并释放其内存（所有权转移到此方法）
     /// pdu 为 nullptr 时安全空操作
     void sendAndRelease(PDU* pdu);
+    // REQ-EXT-GROUP-002 T3：队列冲刷（事件循环内一次性调度）
+    QList<QByteArray> m_outboundQueue;
+    qint64 m_outboundQueueBytes = 0;
+    bool m_outboundPumpScheduled = false;
+    quint64 m_outboundDropCount = 0;
 private slots:
     void sendNextChunk();
     void onBytesWritten(qint64 bytes);
+    void pumpOutboundQueue();
 public slots:
     void handleUploadWriteFinished(qint64 offset, qint64 length, bool success);
     void recvmsg();//接收信息引起的槽函数

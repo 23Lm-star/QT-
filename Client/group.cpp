@@ -60,6 +60,8 @@ Group::Group(QWidget *parent)
     connect(m_createButton, &QPushButton::clicked, this, &Group::createGroup);
     connect(m_refreshButton, &QPushButton::clicked, this, &Group::refreshGroups);
     connect(m_invitationButton, &QPushButton::clicked, this, &Group::refreshInvitations);
+    // REQ-EXT-GROUP-002：双击群条目打开群聊窗口
+    connect(m_groupList, &QListWidget::itemDoubleClicked, this, &Group::openSelectedChat);
     m_statusLabel->setText(QStringLiteral("群聊按需加载"));
     m_invitationList->setMaximumHeight(100);
 }
@@ -120,6 +122,13 @@ void Group::createGroup()
 void Group::refreshGroups()
 {
     sendRequest(ENUM_MSG_TYPE_LIST_GROUPS_REQUEST);
+    requestUnreadSummary();
+}
+
+// REQ-EXT-GROUP-002：95 无业务字段，按 actor 汇总全部 active 群；96 回带未读徽标
+void Group::requestUnreadSummary()
+{
+    sendRequest(ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST);
 }
 
 void Group::refreshInvitations()
@@ -232,6 +241,9 @@ void Group::handleResponse(PDU *pdu)
                                              .arg(QString::fromUtf8(name)).arg(QString::fromUtf8(role))
                                              .arg(QString::fromUtf8(status)).arg(id), m_groupList);
             item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(id));
+            item->setData(Qt::UserRole + 1, QString::fromUtf8(name));   // 群名 → 聊天窗口标题
+            item->setData(Qt::UserRole + 2, item->text());              // 基础文案（徽标在其上追加）
+            refreshUnreadBadge(id, m_unreadByGroup.value(id, 0));
         }
         m_statusLabel->setText(QStringLiteral("我的群聊：%1 个").arg(count));
     } else if (pdu->uiType == ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND) {
@@ -267,5 +279,96 @@ void Group::handleResponse(PDU *pdu)
     } else if (pdu->uiType == ENUM_MSG_TYPE_CREATE_GROUP_RESPOND) {
         m_statusLabel->setText(QStringLiteral("建群成功"));
         refreshGroups();
+    } else if (pdu->uiType == ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND) {
+        // REQ-EXT-GROUP-002：96 = count + N×{group_id,last_seq,last_read_seq,unread}
+        quint32 count = 0;
+        if (!groupReadU32(payload, offset, count)) return;
+        quint64 totalUnread = 0;
+        for (quint32 i = 0; i < count; ++i) {
+            quint64 summaryGroupId = 0, lastSeq = 0, lastReadSeq = 0, unread = 0;
+            if (!groupReadU64(payload, offset, summaryGroupId) || !groupReadU64(payload, offset, lastSeq)
+                    || !groupReadU64(payload, offset, lastReadSeq) || !groupReadU64(payload, offset, unread)) return;
+            totalUnread += unread;
+            m_unreadByGroup.insert(summaryGroupId, unread);
+            refreshUnreadBadge(summaryGroupId, unread);
+            // 已打开窗口：同步游标与未读数
+            if (m_chatWindows.contains(summaryGroupId)) {
+                m_chatWindows.value(summaryGroupId)->applyUnreadSummary(lastSeq, lastReadSeq, unread);
+            }
+        }
+        m_statusLabel->setText(QStringLiteral("我的群聊：%1 个 · 未读合计 %2")
+                               .arg(m_groupList->count()).arg(totalUnread));
     }
+}
+
+// REQ-EXT-GROUP-002：群条目文案追加未读徽标（0 不显示）
+void Group::refreshUnreadBadge(quint64 groupId, quint64 unread)
+{
+    for (int i = 0; i < m_groupList->count(); ++i) {
+        QListWidgetItem *item = m_groupList->item(i);
+        if (item->data(Qt::UserRole).toULongLong() != groupId) continue;
+        QString text = item->data(Qt::UserRole + 2).toString();
+        if (text.isEmpty()) text = item->text();
+        if (unread > 0) text += QStringLiteral(" · 未读 %1").arg(unread);
+        item->setText(text);
+        return;
+    }
+}
+
+void Group::openSelectedChat()
+{
+    const QListWidgetItem *item = m_groupList->currentItem();
+    if (item == nullptr) return;
+    const quint64 groupId = item->data(Qt::UserRole).toULongLong();
+    if (groupId == 0) return;
+    const QString groupName = item->data(Qt::UserRole + 1).toString();
+    GroupChat *chat = m_chatWindows.value(groupId, nullptr);
+    if (chat == nullptr) {
+        chat = new GroupChat(groupId, groupName, nullptr);
+        m_chatWindows.insert(groupId, chat);
+    }
+    chat->show();
+    chat->raise();
+    chat->activateWindow();
+}
+
+// 信封首 20B：版本(2)+长度(2)+request_id(8)+group_id(8)
+quint64 Group::envelopeGroupId(PDU *pdu)
+{
+    if (pdu == nullptr || pdu->uiMsgLen < GROUP_ENVELOPE_LENGTH) return 0;
+    const QByteArray payload(pdu->caMsg, GROUP_ENVELOPE_LENGTH);
+    int offset = 0;
+    quint16 version = 0, length = 0;
+    quint64 requestId = 0, groupId = 0;
+    if (!groupReadU16(payload, offset, version) || !groupReadU16(payload, offset, length)
+            || !groupReadU64(payload, offset, requestId) || !groupReadU64(payload, offset, groupId)) return 0;
+    Q_UNUSED(version);
+    Q_UNUSED(length);
+    Q_UNUSED(requestId);
+    return groupId;
+}
+
+void Group::handleMessageResponse(PDU *pdu)
+{
+    const quint64 groupId = envelopeGroupId(pdu);
+    if (groupId == 0) return;
+    if (m_chatWindows.contains(groupId)) {
+        m_chatWindows.value(groupId)->handleResponse(pdu);
+        return;
+    }
+    m_statusLabel->setText(QStringLiteral("群 %1 的消息响应到达（窗口未打开）").arg(groupId));
+}
+
+void Group::handleMessageEvent(PDU *pdu)
+{
+    const quint64 groupId = envelopeGroupId(pdu);
+    if (groupId == 0) return;
+    GroupChat *chat = m_chatWindows.value(groupId, nullptr);
+    if (chat != nullptr) {
+        chat->handleMessageEvent(pdu);
+        return;
+    }
+    // 未打开窗口：不渲染，只刷新未读徽标并提示（离线补偿拉取兜底）
+    requestUnreadSummary();
+    m_statusLabel->setText(QStringLiteral("群 %1 有新消息").arg(groupId));
 }

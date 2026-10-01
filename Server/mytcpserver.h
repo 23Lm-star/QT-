@@ -29,6 +29,9 @@ public:
     void reseed(char*tarname,PDU*pdu);
     // REQ-EXT-GROUP-001：向当前在线群成员广播已提交的成员/邀请事件。
     void sendGroupEvent(const QStringList& users, PDU* pdu);
+    // REQ-EXT-GROUP-002 T3：群消息在线广播——锁内仅收集目标连接快照，锁外逐连接入
+    // 每连接有界发送队列；队列满只丢该连接实时投递（拉取兜底），不阻塞事务与其他成员。
+    void broadcastGroupMessage(const QStringList& users, PDU* pdu);
     // REQ-EXT-SEC-001 M-1: 分享握手登记表——分享人发出邀请时登记 (接收者, 服务端 canonical 源路径)，
     // 接收者同意移动时仅放行有登记的条目并在成功后消费。仅事件循环主线程（socket 处理器）访问，无需加锁。
     void addPendingShare(const QString& receiver, const QString& canonicalSource);

@@ -149,6 +149,37 @@ void MyTcpServer::sendGroupEvent(const QStringList& users, PDU *pdu)
     memfree(pdu);
 }
 
+// REQ-EXT-GROUP-002 T3：群消息在线广播——持 m_tcpsocketlistMutex 仅收集目标连接
+// 指针快照，随即释放锁；锁外逐连接写入其每连接有界发送队列（绝不持全局锁写 socket）。
+void MyTcpServer::broadcastGroupMessage(const QStringList& users, PDU *pdu)
+{
+    if (pdu == nullptr) return;
+    if (users.isEmpty()) { memfree(pdu); return; }
+    QSet<QString> targets;
+    for (const QString& user : users) {
+        if (!user.isEmpty()) targets.insert(user);
+    }
+    QList<MyTcpSocket*> snapshot;
+    {
+        QMutexLocker locker(&m_tcpsocketlistMutex);
+        snapshot = tcpsocketlist;
+    }
+    const QByteArray payload(reinterpret_cast<const char*>(pdu), int(pdu->uiTotalLen));
+    memfree(pdu);
+    int dropped = 0;
+    for (MyTcpSocket* socket : snapshot) {
+        if (socket == nullptr || !socket->m_actorAuthenticated
+                || !targets.contains(socket->m_strLoginName)) {
+            continue;
+        }
+        if (!socket->enqueueOutbound(payload)) ++dropped;
+    }
+    if (dropped > 0) {
+        qCWarning(lcNet) << "[GROUP] 群消息广播队列满：丢弃实时投递连接数=" << dropped
+                         << "目标成员数=" << users.size();
+    }
+}
+
 // REQ-EXT-SEC-001 M-1：分享握手登记（仅主线程访问）
 void MyTcpServer::addPendingShare(const QString& receiver, const QString& canonicalSource)
 {

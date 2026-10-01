@@ -244,10 +244,16 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     case ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_REQUEST:
     case ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST:
     case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST:
+    // REQ-EXT-GROUP-002：群消息请求（88/91/93/95，均经 actor 门）
+    case ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST:
+    case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST:
         respdu=m_MsgHandler->groupRequest(pdu->uiType);
         break;
     case ENUM_MSG_TYPE_GROUP_MEMBER_EVENT:
     case ENUM_MSG_TYPE_GROUP_INVITATION_EVENT:
+    case ENUM_MSG_TYPE_GROUP_MESSAGE_EVENT:
         // 事件只能由服务端生成，客户端发入的同名类型一律丢弃并记审计日志。
         qCWarning(lcNet) << "[GROUP] 拒绝客户端伪造事件 type=" << pdu->uiType
                          << "conn=" << m_connectionId;
@@ -353,6 +359,46 @@ void MyTcpSocket::onBytesWritten(qint64)
 {
     if(m_downloadActive && bytesToWrite()<DOWNLOAD_WRITE_HIGH_WATER){
         scheduleNextDownloadChunk();
+    }
+    // REQ-EXT-GROUP-002 T3：出站队列随 socket 缓冲回落继续冲刷
+    if(!m_outboundQueue.isEmpty() && bytesToWrite()<OUTBOUND_FLUSH_HIGH_WATER){
+        pumpOutboundQueue();
+    }
+}
+
+// REQ-EXT-GROUP-002 T3：入队一条待发送 PDU（广播路径调用，锁外、非阻塞）。
+// 队列满（条数或字节先到者）返回 false：该连接实时投递被丢弃并计数，
+// 由下次进入群聊/重连的游标拉取兜底；不影响其他成员。
+bool MyTcpSocket::enqueueOutbound(const QByteArray &pdu)
+{
+    if(pdu.isEmpty()){
+        return true;
+    }
+    if(m_outboundQueue.size()>=OUTBOUND_QUEUE_MAX_MSGS
+            || m_outboundQueueBytes+pdu.size()>OUTBOUND_QUEUE_MAX_BYTES){
+        ++m_outboundDropCount;
+        qCWarning(lcNet)<<"[GROUP] 广播队列满，丢弃该连接实时投递 conn="<<m_connectionId
+                        <<" user="<<m_strLoginName<<" drops="<<m_outboundDropCount;
+        return false;
+    }
+    m_outboundQueue.append(pdu);
+    m_outboundQueueBytes+=pdu.size();
+    if(!m_outboundPumpScheduled && bytesToWrite()<OUTBOUND_FLUSH_HIGH_WATER){
+        m_outboundPumpScheduled=true;
+        QTimer::singleShot(0,this,&MyTcpSocket::pumpOutboundQueue);
+    }
+    return true;
+}
+
+// REQ-EXT-GROUP-002 T3：事件循环内冲刷队列——仅在 socket 缓冲低于高水位时写入，
+// 使单连接总排队量有界；连接断开时由 clientOffLine 清空。
+void MyTcpSocket::pumpOutboundQueue()
+{
+    m_outboundPumpScheduled=false;
+    while(!m_outboundQueue.isEmpty() && bytesToWrite()<OUTBOUND_FLUSH_HIGH_WATER){
+        const QByteArray next=m_outboundQueue.takeFirst();
+        m_outboundQueueBytes-=next.size();
+        write(next.constData(),next.size());
     }
 }
 
@@ -493,6 +539,10 @@ void MyTcpSocket::clientOffLine(){
         m_downloadFile=nullptr;
     }
     m_downloadActive=false;
+    // REQ-EXT-GROUP-002 T3：断线清空出站队列（实时投递丢弃由拉取兜底）
+    m_outboundQueue.clear();
+    m_outboundQueueBytes=0;
+    m_outboundPumpScheduled=false;
     // REQ-EXT-SESSION-001 D6：权威判定——版本不匹配=被踢旧连接，不得清在线状态、不得动登记表，
     // 否则旧连接死亡会误清新会话的在线态（验收 §6.5 竞态断言）
     bool authoritative=true;
@@ -627,6 +677,15 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return groupReject(ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND);
     case ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_REQUEST:
         return groupReject(ENUM_MSG_TYPE_QUERY_GROUP_SUMMARY_RESPOND);
+    // REQ-EXT-GROUP-002：群消息请求的未认证拒绝
+    case ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_RESPOND);
+    case ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_RESPOND);
+    case ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND);
+    case ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST:
+        return groupReject(ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_RESPOND);
     case ENUM_MSG_TYPE_CHAT_REQUEST:
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
         return nullptr; // 无响应语义的投递型请求，拒绝仅落审计日志
