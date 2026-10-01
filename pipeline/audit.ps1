@@ -87,7 +87,7 @@ try {
                 if ($out -match '(?m)^verdict\s*:\s*(\S+)') {
                     $v = $matches[1]
                     if ($v -eq "PASS") { $impact = "PASS" }
-                    elseif ($out -match '(?ms)^notes\s*:\s*\r?\n\s+-\s+(.+)$') { $impact = "$v ($($matches[1].Trim()))" }
+                    elseif ($out -match '(?m)^notes\s*:\s*\r?\n\s+-\s+([^\r\n]+)') { $impact = "$v ($($matches[1].Trim()))" }
                     else { $impact = $v }
                 } else { $impact = "skipped: unparseable output" }
             } else {
