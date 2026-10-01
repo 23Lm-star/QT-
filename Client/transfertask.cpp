@@ -449,7 +449,22 @@ void TransferManager::onUploadInitRespond(PDU* pdu)
         memcpy(&resumeOffset, pdu->caData + UPLOAD_RESUME_OFFSET, sizeof(resumeOffset));
     }
     if (!ret) {
-        finishTask(*t, Failed, QStringLiteral("服务端拒绝上传初始化（并发上限或已存在）"));
+        // AUD-2 修复（design §3.3 / 验收 5）：INIT 被拒 = 合法的"继续排队"信号，不是失败。
+        if (t->state != Running) return;   // 迟到响应（任务已被暂停/取消）：忽略，名额此前已归还
+        if (m_activeUploads > 0) --m_activeUploads;   // 归还本任务在 startTask 计入的名额
+        if (m_activeUploads > 0) {
+            // 仍有在途上传：其结束事件（finishTask→pump）驱动本任务重试；此处不立即重发，避免自旋。
+            // 摘要已由首次 97 判为未命中，重试直接走 29（与 resume() 同语义）。
+            t->state = Queued;
+            t->needFastcheck = false;
+            t->failReason.clear();
+            m_uploadQueue.append(t->key);
+            emit tasksChanged();
+            return;
+        }
+        // 无在途上传可释放名额：该拒绝不会自愈，收口为失败（避免无限静默排队）
+        t->state = Queued;   // 名额已归还，避免 finishTask 二次扣减
+        finishTask(*t, Failed, QStringLiteral("服务端拒绝上传初始化"));
         return;
     }
     t->uploader = new Uploader(id, t->localPath, resumeOffset, this);

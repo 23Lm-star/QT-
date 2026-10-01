@@ -1155,6 +1155,7 @@ PDU *MsgHandler::uploadfileinit()
     bool ret = false;
     bool complete = false;
     qint64 resumeOffset = 0;
+    bool adoptedFastcheck = false;   // AUD-1：本次 29 消费了前序 97 的暂存 → 随后释放 id=0 占位
 
     // D7 硬上限 / T-17 重复 id：未通过则不建任何状态（P7：不回退到 id=0）
     if (acquireUploadSlot(tid)) {
@@ -1183,6 +1184,7 @@ PDU *MsgHandler::uploadfileinit()
                 if (adopt) {
                     ctx.sessionId = m_pendingFastcheck.sessionId;
                     ctx.expectedSha = m_pendingFastcheck.shaHex;
+                    adoptedFastcheck = true;
                 } else {
                     // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
                     ctx.sessionId = OperateDB::instance().createUploadSession(
@@ -1206,10 +1208,15 @@ PDU *MsgHandler::uploadfileinit()
         m_pendingFastcheck.active = false;   // 一次 29 之后失效（无论是否采纳）
         if (!ret) {
             m_uploads.remove(tid);   // 未成功不保留空上下文
+        } else if (adoptedFastcheck) {
+            // AUD-1：97 的暂存已被本次 29 采纳（会话/摘要已转入本槽），id=0 占位不再需要——
+            // 释放以免残留条目长期滞留、并与真实槽重复引用同一 upload_session 行。
+            // 注：此处 ctx 引用不再使用，remove 可能引起 QHash 重排，故放在最后。
+            m_uploads.remove(TRANSFER_ID_LEGACY);
         }
     } else {
         qCWarning(lcFs) << "uploadfileinit 拒绝：并发上限或 id 冲突 conn=" << m_connId
-                        << " id=" << tid << " active=" << m_uploads.size();
+                        << " id=" << tid << " active=" << activeUploadCount();
     }
 
     qCDebug(lcFs)<<"uploadfileinit file"<<fileName
@@ -1303,6 +1310,13 @@ PDU *MsgHandler::uploadfilefastcheck()
     // 97 无 transfer_id（P2：客户端预检查保持单飞）→ 始终落在旧单流槽（id=0）
     m_uploads.remove(TRANSFER_ID_LEGACY);
     UploadCtx& ctx = currentUpload();
+    // AUD-1 修复：97 是**预检查/暂存登记**，不是一次上传，其 id=0 槽不得占用上传并发名额
+    // （activeUploadCount() 按此标记排除）。否则并行客户端"每文件先 97 再 29"会为每个文件留下
+    // 一个被计入的占位，使同一连接第 3 路新个人上传的 INIT 被上限误拒（违背 D6 上传=3 / 验收 5）。
+    // 注意：不得在此清掉该槽——旧客户端（REQ-EXT-FILE-002 形态）未命中后直接发 31 分块（无 29），
+    // 正是靠这个 id=0 上下文接收正文；该槽在 31 推进时转为普通活跃上下文（见 handleUploadWriteFinished），
+    // 或在被随后的 29 采纳后由 uploadfileinit 释放。
+    ctx.fastcheckPlaceholder = true;
     bool ret = false;
     bool hit = false;
     qint64 fileId = -1;
@@ -2231,7 +2245,7 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
             // D7 硬上限 / T-17 重复 id：拒绝且不建状态（P7：不回退到 id=0）
             code = -2106;
             qCWarning(lcFs) << "[GROUPFILE] 拒绝：并发上限或 id 冲突 conn=" << m_connId
-                            << " id=" << m_currentTransferId << " active=" << m_uploads.size();
+                            << " id=" << m_currentTransferId << " active=" << activeUploadCount();
         } else {
             const quint64 tid = m_currentTransferId;
             UploadCtx& ctx = m_uploads[tid];

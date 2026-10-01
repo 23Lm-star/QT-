@@ -93,7 +93,12 @@ design §6.3 的 5 条纯客户端行为本节点**未执行**（需 GUI 人工�
 
 ## 8. 证据清单（本目录）
 
-`test-report.md`（本文件）、`environment.txt`、`static-independent.log`、`frozen-content.log`、`readonly-confirm.log`、`pipeline-audit.log`、`build-520c714-*.log`、`test-520c714-*.log`、`manifest-build-*`、`manifest-test-*`、七套件日志 `entry_ops/dedup/cross_tree/sec001/fastupload/groupfile/parallel_e2e(.log)`、复跑 `parallel_e2e-rerun.log`。
+`test-report.md`（本文件）、`environment.txt`、`static-independent.log`、`frozen-content.log`、`readonly-confirm.log`、`pipeline-audit.log`、`build-520c714-*.log`、`test-520c714-*.log`、七套件日志 `entry_ops/dedup/cross_tree/sec001/fastupload/groupfile/parallel_e2e(.log)`、复跑 `parallel_e2e-rerun.log`。
+
+> **repair 更正（EV-1）**：本清单原列有 `manifest-build-*` / `manifest-test-*`，本目录内**不存在**该文件。
+> 证据 manifest 由 `pipeline/build.ps1` / `test.ps1` 的 `Stamp-Evidence` 写入 **`build/evidence/current/`**
+> （gitignored 的传输区），不经本目录归档；此处删除该两项。原文为清单过度声明（evidence missing），
+> 三门日志本身真实自洽，结论不受影响。
 
 ## 9. 交下一节点
 

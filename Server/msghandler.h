@@ -30,6 +30,9 @@ public:
         QString  groupDisplayName;       // 既有 m_groupUploadDisplayName
         bool     writeInFlight = false;  // 既有 m_uploadWriteInFlight（逐 transfer 化）
         qint64   lastProgressMs = 0;     // 空闲回收用
+        // AUD-1：97 秒传预检查借 id=0 槽做暂存登记，这不是一次上传，**不占用上传并发名额**。
+        // 首次收到该槽的 31 正文（或该槽被随后的 29 采纳）时本标记失效。
+        bool     fastcheckPlaceholder = false;
     };
     QHash<quint64, UploadCtx> m_uploads;   // key 0 = 旧单流路径
     // handlMsg 按 PDU 落位写入的当前传输 id（29/31/40/101/105/107）；非传输族 = 0
@@ -51,7 +54,17 @@ public:
     bool acquireUploadSlot(quint64 id);
     void abortUpload(quint64 id);          // 释放槽位：upload_session 置 expired，staging 保留
     void reapIdleUploads(qint64 nowMs, int idleSec);   // 空闲回收（返回被回收条目数）
-    int  activeUploadCount() const { return int(m_uploads.size()); }
+    // AUD-1：上传并发名额计数**排除** 97 预检查占位（id=0 纯暂存槽），其余条目照旧计入
+    int  activeUploadCount() const {
+        int n = 0;
+        for (QHash<quint64, UploadCtx>::const_iterator it = m_uploads.constBegin();
+             it != m_uploads.constEnd(); ++it) {
+            if (!it->fastcheckPlaceholder) {
+                ++n;
+            }
+        }
+        return n;
+    }
     //各种处理函数，进行各种类型请求的处理
     PDU* rigist();//注册
     PDU* login(QString& strname, bool& authOk, quint64& loginVersion);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context；REQ-EXT-SESSION-001：loginVersion 供连接绑定用户域版本）

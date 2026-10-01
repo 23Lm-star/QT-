@@ -3,10 +3,13 @@
 # 断言口径：本套件为裸 socket 驱动，覆盖 per-transfer 状态表、独占上限、公平调度、107/108、
 # 空闲回收、断线清理、id=0 旧语义与冻结面 §9 逐字一致。纯客户端行为（多选 UI / 队列不发起
 # 第 4 个 29 / 暂停继续取消按钮 / 大文件摘要不卡 UI）属 design §6.3 人工清单，见文件末尾 NOTE。
+# 例外：T-19 逐字节复现真实客户端的并行上传握手序列（97→98→29→30→31/32）——裸 29 看不见
+# "97 秒传占位吞掉上传名额"（AUD-1 回归锚点）。
 #
-# 与 design §6.2 的两处实测差异（已记录，交 independent test / audit 复核）：
-#   D-a T-06：design 写"8MB×1 + 64KB×3"共 4 条下载流，与主人裁定的 D6（下载上限 3）冲突；
-#       本套件按 1 大 + 2 小（共 3 条）断言同一公平性性质（小文件的 43 早于大文件的 43）。
+# 与 design §6.2 的历史差异（已收口）：
+#   D-a T-06：原 design 写"8MB×1 + 64KB×3"共 4 条下载流，与主人裁定的 D6（下载上限 3）冲突；
+#       主人 2026-10-01 仲裁后 repair 节点已把 design §6.2 T-06 文本修订为 3 条流（512KB×1 +
+#       1KB×2），与本套件一致。本套件仍按 1 大 + 2 小断言同一公平性性质。
 import hashlib, os, re, shutil, socket, struct, subprocess, sys, time
 
 HOST, PORT = "127.0.0.1", 5000
@@ -14,6 +17,7 @@ HDR = 76
 T_REG, T_CAP, T_CAP_R, T_LOGIN, T_LOGIN_R, T_PING, T_PONG = 1, 44, 45, 3, 4, 50, 51
 T_MKDIR, T_MKDIR_R, T_FLUSH = 19, 20, 23
 T_UPINIT, T_UPDATA, T_UPINIT_R, T_UPDATA_R = 29, 31, 30, 32
+T_FC, T_FC_R = 97, 98   # 秒传预检查（仅 T-19 用：复现真实客户端握手）
 T_DOWN, T_DOWN_R, T_DATA, T_FINISH = 40, 41, 42, 43
 T_ABORT, T_ABORT_R = 107, 108
 T_GCREATE, T_GCREATE_R = 60, 61
@@ -268,6 +272,54 @@ check("T-01c", "3 条 entry 内容与源逐字节一致",
       all(got[i]["finish"] and SHA(got[i]["data"]) == SHA(payloads[j])
           for i, j in zip((21, 22, 23), (11, 12, 13))),
       f"lens={[len(got[i]['data']) for i in (21,22,23)]}")
+
+# ================= T-19：客户端握手保真（97→98→29→30→31/32；AUD-1 回归锚点） =================
+# T-01/T-03 直发裸 29，绕过真实客户端的 97 秒传预检查，因此看不见 AUD-1（97 在 m_uploads[0]
+# 留下的占位被 activeUploadCount() 计入 → 第 3 路新个人上传 INIT 被误拒）。本用例按
+# transfertask.cpp/file.cpp 的真实序列交错发送：97#1,29#1, 97#2,29#2, 97#3,29#3。
+print("=== T-19 ===")
+FASTCHECK_MAGIC = 0x4643484b
+
+def fastcheck(c, sha, name, dirPath, size, reqId):
+    c.send(pdu(T_FC, msg=sha.encode() + name.encode() + dirPath.encode() + reqId.encode(),
+               dat=u32(1) + u32(FASTCHECK_MAGIC) + i64(size) + u32(64)
+                   + u32(len(name.encode())) + u32(len(dirPath.encode())) + u32(len(reqId.encode()))))
+    return c.wait(T_FC_R, 10)
+
+c19, _ = login_conn(U)
+t19 = [(901, "t19_a.bin", NONCE + b"T19" + b"A" * 900),
+       (902, "t19_b.bin", NONCE + b"T19" + b"B" * 1300),
+       (903, "t19_c.bin", NONCE + b"T19" + b"C" * 500)]
+fc_ret, init_ret = [], []
+for i, n, pl in t19:
+    r = fastcheck(c19, SHA(pl), n, DST, len(pl), f"{int(time.time_ns()) % 10**16:016x}{i:016x}")
+    fc_ret.append(r is not None and r[1][0] != 0 and r[1][1] == 0)   # ret=true 且未命中
+    r2 = up_init(c19, i, DST, n, len(pl))
+    init_ret.append(r2 is not None and r2[1][0] != 0)
+check("T-19a", "3 路 97→98 均 ret=true 且未命中（hit=false）", all(fc_ret), f"{fc_ret}")
+check("T-19b", "3 路 29→30 均 ret=true（AUD-1 回归：97 占位不得吞上传名额）",
+      init_ret == [True, True, True], f"{init_ret}")
+pl19 = {i: pl for i, _, pl in t19}
+off19 = {i: 0 for i, _, _ in t19}
+done19 = {i: False for i, _, _ in t19}
+ok19 = True
+while not all(done19.values()):
+    for i, _, _ in t19:
+        if done19[i]: continue
+        ch = pl19[i][off19[i]:off19[i] + 300]
+        a = up_chunk(c19, i, off19[i], ch)
+        if a is None or a[1][0] == 0 or eid(a[1]) != i:
+            ok19 = False; done19[i] = True; break
+        off19[i] += len(ch)
+        if a[1][16] != 0: done19[i] = True
+for i, n, _ in t19:
+    dl_req(c19, i + 100, f"{DST}/{n}", n)
+got19 = collect(c19, [1001, 1002, 1003])
+check("T-19c", "3 条 entry 内容与源逐字节一致（握手保真下无串扰）",
+      ok19 and all(got19[i + 100]["finish"] and SHA(got19[i + 100]["data"]) == SHA(pl19[i])
+                   for i, _, _ in t19),
+      f"lens={[len(got19[i + 100]['data']) for i, _, _ in t19]}")
+c19.close()
 
 # ================= T-03：上传硬上限 + 释放后补位（D7/P4） =================
 print("=== T-03 ===")
@@ -527,6 +579,7 @@ for sid, desc, cc in results:
     if not cc: print(f"  FAIL -> {sid} {desc}")
 print(f"{okn}/{len(results)} passed")
 print("NOTE: 纯客户端行为（多选选择器/任务列表/暂停继续取消按钮/客户端队列不发起第 4 个 29/"
-      "大文件摘要不卡 UI）属 design §6.3 人工清单，非本套件可断言范围。")
+      "大文件摘要不卡 UI）属 design §6.3 人工清单，非本套件可断言范围；"
+      "wire 级握手保真（T-19：97→98→29→30→31/32）已由本套件覆盖。")
 stop_server()
 sys.exit(0 if okn == len(results) else 1)

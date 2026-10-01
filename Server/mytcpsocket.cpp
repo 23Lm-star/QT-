@@ -375,6 +375,8 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
         m_MsgHandler->m_currentTransferId=transferId;
         m_MsgHandler->finalizeUploadOnComplete();
     }else if(success){
+        // AUD-1：该槽已开始承载正文（旧客户端 97→31 直传路径），不再是 97 纯暂存占位 → 重新计入名额
+        cp->fastcheckPlaceholder=false;
         cp->lastProgressMs=QDateTime::currentMSecsSinceEpoch();   // 推进空闲回收计时
     }
     sendUploadAck(transferId,success,ackOffset,complete);
