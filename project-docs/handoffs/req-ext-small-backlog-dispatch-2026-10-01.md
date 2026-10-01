@@ -48,3 +48,6 @@
 ## 会话预算
 - 软上限 60 请求/会话。四项预计吃满：**T1（F1 解析修复 + 双向证据）与 T2 优先**；若余量不足，先交回 handoff，把 T3/T4 留给下一个会话——**不要为赶进度压缩验证**。
 - 若某任务判定为「不该修」，直接记 `WONT_FIX` + 理由收口，比勉强改动更符合治理。
+
+## 执行台账（append-only）
+- 2026-10-01 T1 `small/pipeline-audit-frozen-parse` → 合并 `master@488f964`（no-ff）：F1 **FIXED**（清单改按 raw UTF-8 读；主工作树 LF 解析 1→2；临时双冻结分支报 2 个 HIT，分支已删未合并）；F2 **NOT_APPLICABLE**（仓库 0 静态可达自动化测试，manifest 显式声明，不配置 glob 以免空结果被误判 PASS）。build GREEN / test GREEN-WARN(0) / audit PASS。handoff `handoffs/small-pipeline-audit-frozen-parse-2026-10-01.txt`。
