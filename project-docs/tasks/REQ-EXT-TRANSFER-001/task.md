@@ -51,5 +51,7 @@
 
 - 2026-10-01 independent audit：新会话 + **不同模型**（Codex CLI 本机不可用，跨 CLI 未执行，已披露残余限制）、detached 只读工作树 `build/wt-audit-transfer001` @ `520c714`。**结论 FAIL —— 1 条阻塞缺陷 AUD-1**，推翻 test 节点 PASS。AUD-1（FACT，源码级推演并经节点复核）：真实客户端每个新个人上传先发 97，`uploadfilefastcheck` 在 `m_uploads[0]` 留下**不回收**的上下文并被 `activeUploadCount()` 计入，致并发新个人上传**只能 2 个**，第 3 个 INIT 被拒且客户端标记**失败**（违背批准 D6 上传=3 与验收 5）；test 裸 socket 绕过 97 故不可见。非阻塞 AUD-2（上限拒绝应回队而非失败）/AUD-3（迟到 98 误归属）/AUD-4（107 与在途写并发）；F-1 归类为 design 文档自相矛盾（需 design owner 处置，audit 不放宽 D6）；EV-1 证据缺口（test 报告 §8 所列 `manifest-*` 不存在）。冻结面 22 ins/0 del、逐字节合 §9，路径边界与七套件证据复核自洽。报告 `build/evidence/claude-req-ext-transfer-001-audit/520c714.../audit-report.md`。
 
+- 2026-10-01 仲裁（AskUserQuestion 两项）：audit FAIL 与 test PASS 冲突 → 主人裁决**接受审计结论、进入修复**；**F-1 处置 = 修订 `design.md` §6.2 T-06 文本为 3 条流**（不改已批准的 D6）。两项裁决已记录；修复须在 owner **新会话**执行（audit 会话只读，不得改生产源码/验收条件）。
+
 ## 下一节点
-**repair**（owner、**新会话**）：修 AUD-1（97 暂存不得占上传名额）+ AUD-2（INIT 上限拒绝→回队重试），重跑 pipeline，并补**客户端级 3 文件并发上传**用例（裸 socket 套件看不见 AUD-1）；随后 re-audit。**F-1 需 design owner 先出处置**（改 §6.2 文本为 3 流，或提请主人改 D6）。**audit FAIL 与 test PASS 冲突 → 由主人裁决**后 repair 方可开工。integration 三事实行暂不成立。
+**repair**（owner、**新会话**，主人已批准开工）：(1) 修 AUD-1——97 秒传暂存不得占用上传名额（建议把暂存移出 `m_uploads`，或采纳后立即移除 id=0 槽，或在 `activeUploadCount()` 排除 fastcheck 占位）；(2) 修 AUD-2——`onUploadInitRespond` 对"上限拒绝"应回队重试而非标记失败；(3) 按裁决修订 `design.md` §6.2 T-06 文本为 3 条流；(4) 补**客户端级 3 文件并发上传**用例（裸 socket 套件看不见 AUD-1，须走真实 97→29→31/32）；(5) 重跑 pipeline + 七套件；(6) 更正 test 报告 §8 证据清单（EV-1）。完成后归档审计报告到 `project-docs/evidence/`、置 `audit: resolved`，新候选 hash 需 re-audit。integration 三事实行暂不成立。
