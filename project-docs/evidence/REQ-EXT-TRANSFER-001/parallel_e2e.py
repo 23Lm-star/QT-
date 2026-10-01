@@ -4,7 +4,8 @@
 # 空闲回收、断线清理、id=0 旧语义与冻结面 §9 逐字一致。纯客户端行为（多选 UI / 队列不发起
 # 第 4 个 29 / 暂停继续取消按钮 / 大文件摘要不卡 UI）属 design §6.3 人工清单，见文件末尾 NOTE。
 # 例外：T-19 逐字节复现真实客户端的并行上传握手序列（97→98→29→30→31/32）——裸 29 看不见
-# "97 秒传占位吞掉上传名额"（AUD-1 回归锚点）。
+# "97 秒传占位吞掉上传名额"（AUD-1 回归锚点）；T-20 为空闲/写盘竞态不变量（AUD-4 回归锚点）；
+# T-21 为 98 回带请求标识契约（AUD-3 服务端锚点）；T-22 为客户端队列静态契约（AUD-2/F-3）。
 #
 # 与 design §6.2 的历史差异（已收口）：
 #   D-a T-06：原 design 写"8MB×1 + 64KB×3"共 4 条下载流，与主人裁定的 D6（下载上限 3）冲突；
@@ -572,14 +573,108 @@ check("T-13c", "被回收会话置 expired", int(st) >= 3, f"expired={st}")
 abort(c9, 704)
 c9.close()
 
+# ================= T-20：107 × 在途写竞态（AUD-4 回归锚点） =================
+# 断言不变量：任意时刻 staging 文件大小 == upload_session.confirmed_offset（= 服务端已确认字节）。
+# 触发窗口：31 发出后**不等 32 ack** 立刻发 107，使 107 可能落在 UploadWriteTask 写盘在途期间。
+# 无 AUD-4 修复时该不变量必失败（confirmed_offset 停留 INIT 值、暂存被在途写越尾）。
+print("=== T-20 ===")
+c20, _ = login_conn(U)
+t20_hits, t20_db_ok, t20_resume_ok = 0, [], []
+for k in range(6):
+    nm = f"t20_{k}.bin"
+    rid = 860 + k
+    total = 120000
+    up_init(c20, rid, DST, nm, total)
+    up_chunk(c20, rid, 0, b"P" * 1000)                     # 先落一块并等 ack（receivedSize=1000）
+    # 在途写 + 立即 107：大块（60KB）拉长写盘时间，107 紧随其后无等待
+    c20.send(pdu(T_UPDATA, msg=b"Q" * 60000,
+                 dat=i64(1000) + b"\0" * 32 + u32(MAGIC) + b"\0" * 4 + u64(rid)))
+    c20.send(pdu(T_ABORT, dat=b"\0" * ID_OFF + u64(rid)))
+    r = c20.wait(T_ABORT_R, 10)
+    t20_hits += 1 if (r is not None and r[1][0] != 0) else 0
+    time.sleep(0.6)                                        # 等在途写落定 + 延迟释放收尾
+    row = sql(f"SELECT confirmed_offset, staging_path FROM upload_session WHERE owner_name='{U}' "
+              f"AND display_name='{nm}' ORDER BY session_id DESC LIMIT 1")
+    if "\t" in row:
+        off_s, sp = row.split("\t", 1)
+        size = os.path.getsize(sp) if os.path.exists(sp) else -1
+        t20_db_ok.append(int(off_s) == size and size >= 0)
+    else:
+        t20_db_ok.append(False)
+    # 续传起点（30 回带）必须等于暂存大小——服务端 beginStaged 与暂存一致
+    r2 = up_init(c20, rid + 100, DST, nm, total)
+    roff = i64at(r2[1], 32) if r2 else -1
+    sz2 = os.path.getsize(sp) if "\t" in row and os.path.exists(sp) else -1
+    t20_resume_ok.append(r2 is not None and r2[1][0] != 0 and roff == sz2)
+    abort(c20, rid + 100)
+check("T-20a", "107 在途写竞态×6：108 均 ret=true", t20_hits == 6, f"hits={t20_hits}")
+check("T-20b", "107 后 upload_session.confirmed_offset == 暂存物理大小（AUD-4 不变量）",
+      all(t20_db_ok) and len(t20_db_ok) == 6, f"{t20_db_ok}")
+check("T-20c", "续传 30 回带的 resumeOffset == 暂存物理大小", all(t20_resume_ok), f"{t20_resume_ok}")
+c20.close()
+
+# ================= T-21：98 回带请求标识（AUD-3 服务端契约锚点） =================
+# 客户端按 98 回带的标识归属迟到响应；服务端必须逐字节回带 97 的 reqId，且不改变既有
+# nameLen/名字段（msg[:nameLen] 仍是服务端最终文件名；回带标识追加在其后）。
+print("=== T-21 ===")
+c21, _ = login_conn(U)
+def fc_raw(c, sha, name, dirPath, size, reqId):
+    c.send(pdu(T_FC, msg=sha.encode() + name.encode() + dirPath.encode() + reqId.encode(),
+               dat=u32(1) + u32(FASTCHECK_MAGIC) + i64(size) + u32(64)
+                   + u32(len(name.encode())) + u32(len(dirPath.encode())) + u32(len(reqId.encode()))))
+    return c.wait(T_FC_R, 10)
+def fc_tail(r, rid_hex):
+    """返回 (标识逐字节相符, 名字段是否被标识污染)"""
+    nl = u32at(r[1], 32)
+    if len(r[2]) < nl:
+        return False, True
+    return r[2][nl:].decode("latin-1") == rid_hex, (len(r[2]) != nl + len(rid_hex))
+# (1) 未命中路径：98 无名字（nameLen=0），标识占满 caMsg
+t21_miss = []
+for n, p, rh in ((901, b"W" * 700, "a1" * 16), (902, b"W" * 900, "b2" * 16)):
+    r = fc_raw(c21, SHA(p), f"t21_{n}.bin", DST, len(p), rh)
+    ok, dirty = fc_tail(r, rh) if r else (False, True)
+    t21_miss.append(r is not None and r[1][0] != 0 and r[1][1] == 0 and ok and not dirty)
+check("T-21a", "未命中 98：回带标识逐字节相符且不污染既有字段", all(t21_miss), f"{t21_miss}")
+# (2) 命中路径：先整文件上传落定，再用同 sha 发 97 → hit=true，名字段仍是落定名，标识追加其后
+pl21 = NONCE + b"T21HIT" + b"H" * 800
+nm21 = "t21_hit.bin"
+up21 = upload(c21, 905, DST, nm21, pl21, chunk=400)
+r = fc_raw(c21, SHA(pl21), nm21, DST, len(pl21), "c3" * 16)
+if r:
+    nl = u32at(r[1], 32)
+    nm_ok = r[2][:nl].decode("utf-8", "replace") == nm21
+    tok_ok = r[2][nl:].decode("latin-1") == "c3" * 16
+else:
+    nm_ok = tok_ok = False
+check("T-21b", "命中 98：nameLen/名字段语义不变，回带标识紧随其后（附加上限=不破坏旧读法）",
+      up21 and r is not None and r[1][0] != 0 and r[1][1] != 0 and nm_ok and tok_ok,
+      f"upload={up21} nameLen={u32at(r[1], 32) if r else -1}")
+c21.close()
+
+# ================= T-22：客户端本地队列契约（静态；AUD-2/F-3） =================
+# 本仓无客户端测试宿主（pipeline/test.ps1 注册 0 单测；Client 为 GUI 进程无 headless 入口），
+# 故客户端队列只能做**静态契约**断言——动态"第 4 个不发 29"仍需 §6.3 人工项。
+# 服务端等价面由 T-03（上限拒绝 + 释放后补位）与 T-19（真实握手）覆盖。
+print("=== T-22 ===")
+_tt = os.path.join(REPO, "Client", "transfertask.cpp")
+src = open(_tt, encoding="utf-8").read() if os.path.exists(_tt) else ""
+gate = re.search(r"while \(m_activeUploads < int\(MAX_PARALLEL_UPLOADS\) && !m_uploadQueue\.isEmpty\(\)\)", src)
+requeue = re.search(r"t->state = Queued;\s*\n\s*t->needFastcheck = false;\s*\n\s*t->failReason\.clear\(\);\s*\n\s*m_uploadQueue\.append\(t->key\);", src)
+nofail_immediate = "服务端拒绝上传初始化" in src and "m_activeUploads > 0" in src
+check("T-22a", "pump() 以 MAX_PARALLEL_UPLOADS 为闸且只启动 Queued（静态）", gate is not None, "")
+check("T-22b", "INIT 被拒 → 回队（needFastcheck=false，事件驱动重试，非 Failed）（静态）",
+      requeue is not None and nofail_immediate, "")
+
 # ================= 汇总 =================
 print("\n=== 汇总 ===")
 okn = sum(1 for _, _, cc in results if cc)
 for sid, desc, cc in results:
     if not cc: print(f"  FAIL -> {sid} {desc}")
 print(f"{okn}/{len(results)} passed")
-print("NOTE: 纯客户端行为（多选选择器/任务列表/暂停继续取消按钮/客户端队列不发起第 4 个 29/"
+print("NOTE: 纯客户端行为（多选选择器/任务列表/暂停继续取消按钮/**客户端队列不发起第 4 个 29**/"
       "大文件摘要不卡 UI）属 design §6.3 人工清单，非本套件可断言范围；"
-      "wire 级握手保真（T-19：97→98→29→30→31/32）已由本套件覆盖。")
+      "wire 级握手保真（T-19：97→98→29→30→31/32）与客户端队列的**静态契约**（T-22）已由本套件覆盖，"
+      "但客户端队列的**动态**断言（第 4 个 29 确实未发出）仍需人工项——本仓无客户端测试宿主。")
 stop_server()
 sys.exit(0 if okn == len(results) else 1)

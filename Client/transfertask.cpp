@@ -18,6 +18,7 @@
 #include <QFutureWatcher>
 #include <QPushButton>
 #include <QTableWidget>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
@@ -232,6 +233,11 @@ void TransferManager::pumpFastcheck()
         Task* t = taskByKey(key);
         if (t == nullptr || t->state != Hashing) continue;
         m_fastcheckInFlight = key;
+        // AUD-3：每次 97 携带唯一请求标识，由服务端 98 回带；客户端据此按标识归属，
+        // 98 与在途标识不符（迟到响应）即丢弃，避免误算到当前任务头上。
+        m_fastcheckInFlightToken = QString::fromLatin1(
+                    QUuid::createUuid().toRfc4122().toHex());
+        t->fastcheckToken = m_fastcheckInFlightToken;
         emit fastcheckDue(key);
         return;
     }
@@ -252,15 +258,36 @@ void TransferManager::failTask(quint64 key, const QString& reason)
     Task* t = taskByKey(key);
     if (t == nullptr) return;
     m_fastcheckQueue.removeOne(key);
-    if (m_fastcheckInFlight == key) m_fastcheckInFlight = 0;
+    if (m_fastcheckInFlight == key) {
+        m_fastcheckInFlight = 0;
+        m_fastcheckInFlightToken.clear();
+    }
     finishTask(*t, Failed, reason);
 }
 
 // 97 → 98 → 29（服务端采纳 97 建立的暂存会话）→ 30 → 31/32
 void TransferManager::onFastcheckRespond(PDU* pdu)
 {
+    // AUD-3：无在途 97 → 迟到/孤儿 98，丢弃（不推进任何任务状态，也不释放单飞槽）。
+    if (m_fastcheckInFlight == 0) {
+        return;
+    }
+    // 服务端回带的请求标识（98 caMsg = 名字 || 标识，nameLen 只算名字）；无回带则不校验（兼容拒绝路径）。
+    QString echoed;
+    if (pdu->caMsg != nullptr && pdu->uiMsgLen > 0) {
+        uint nameLen = 0;
+        memcpy(&nameLen, pdu->caData + FASTCHECK_RESP_NAME_LEN_OFFSET, sizeof(nameLen));
+        if (nameLen < uint(pdu->uiMsgLen)) {
+            echoed = QString::fromLatin1(pdu->caMsg + nameLen, int(pdu->uiMsgLen) - int(nameLen));
+        }
+    }
+    // 有回带但不等于在途标识 → 这是更早一次 97 的迟到响应：丢弃，保留在途槽等待真正响应。
+    if (!echoed.isEmpty() && echoed != m_fastcheckInFlightToken) {
+        return;
+    }
     const quint64 key = m_fastcheckInFlight;
     m_fastcheckInFlight = 0;
+    m_fastcheckInFlightToken.clear();
     Task* t = taskByKey(key);
     if (t == nullptr) {
         pumpFastcheck();
@@ -686,6 +713,7 @@ void TransferManager::pause(quint64 key)
         m_fastcheckQueue.removeOne(key);
         if (m_fastcheckInFlight == key) {
             m_fastcheckInFlight = 0;   // 98 到达时视为无归属，丢弃
+            m_fastcheckInFlightToken.clear();
             pumpFastcheck();
         }
         if (t->state == Hashing && m_activeUploads > 0) --m_activeUploads;
@@ -744,6 +772,7 @@ void TransferManager::cancel(quint64 key)
     m_fastcheckQueue.removeOne(key);
     if (m_fastcheckInFlight == key) {
         m_fastcheckInFlight = 0;   // 98 到达时视为无归属，丢弃
+        m_fastcheckInFlightToken.clear();
     }
     m_idToKey.remove(t->id);
     m_tasks.remove(key);

@@ -1273,7 +1273,19 @@ void MsgHandler::abortUpload(quint64 id)
     if (!cp) {
         return;
     }
+    // AUD-4：释放前把暂存对齐到"已确认偏移"——在途写若失败会留下尾部字节，会让暂存物理大小
+    // 越过 upload_session.confirmed_offset，续传起点（beginStaged 按文件大小派生）与 DB 记录不一致。
+    const QString staging = cp->session.stagingFilePath();
+    const qint64 confirmed = cp->session.receivedSize();
+    if (!staging.isEmpty()) {
+        QFile f(staging);
+        if (f.open(QIODevice::ReadWrite) && f.size() > confirmed) {
+            f.resize(confirmed);
+        }
+        if (f.isOpen()) f.close();
+    }
     if (cp->sessionId >= 0) {
+        OperateDB::instance().updateUploadOffset(cp->sessionId, confirmed);
         OperateDB::instance().finishUploadSession(cp->sessionId, "expired");
     }
     cp->session.reset();
@@ -1324,12 +1336,25 @@ PDU *MsgHandler::uploadfilefastcheck()
     qint64 nextOffset = 0;
     QByteArray finalName;
     // 拒绝响应也带协议版本：客户端据此区分"版本不匹配"与"服务端拒绝"
+    // AUD-3：同时尽力回带请求标识（97 的 reqId），使客户端能把迟到 98 归还到发起它的任务。
+    // 拒绝路径下长度字段可能已非法，故按"caMsg 末尾 reqIdLen 字节"取；仍越界则不回带（客户端按无匹配丢弃）。
     auto rejectResponse = [&]() {
-        PDU* r = mkPDU();
+        QByteArray echo;
+        if (pdu->caMsg != nullptr && pdu->uiMsgLen > 0) {
+            uint rl = 0;
+            memcpy(&rl, pdu->caData + FASTCHECK_REQID_LEN_OFFSET, sizeof(rl));
+            if (rl >= 8 && rl <= 96 && pdu->uiMsgLen > 0 && rl <= uint(pdu->uiMsgLen)) {
+                echo = QByteArray(pdu->caMsg + (pdu->uiMsgLen - int(rl)), int(rl));
+            }
+        }
+        PDU* r = mkPDU(uint(echo.size()));
         const uint respVersion = FASTCHECK_VERSION;
         r->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
         memcpy(r->caData + FASTCHECK_RESP_RET_OFFSET, &ret, sizeof(ret));
         memcpy(r->caData + FASTCHECK_RESP_VERSION_OFFSET, &respVersion, sizeof(respVersion));
+        if (!echo.isEmpty()) {
+            memcpy(r->caMsg, echo.constData(), size_t(echo.size()));   // nameLen=0，客户端从 caMsg[0..] 读标识
+        }
         return r;
     };
 
@@ -1517,7 +1542,9 @@ PDU *MsgHandler::uploadfilefastcheck()
                   << " fileId=" << fileId << " sessionId=" << sessionId
                   << " nextOffset=" << nextOffset << " nameLen=" << finalName.size();
 
-    PDU* respdu = mkPDU(uint(finalName.size()));
+    // AUD-3：98 回带 97 的请求标识（追加在名字之后，nameLen 不含它）——客户端据此按标识归属，
+    // 丢弃无匹配的迟到 98。旧读法 msg[:nameLen] 不受影响（附加字段只增不减）。
+    PDU* respdu = mkPDU(uint(finalName.size()) + uint(reqIdBytes.size()));
     respdu->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
     const uint respVersion = FASTCHECK_VERSION;
     const uint nameLenOut = uint(finalName.size());
@@ -1530,6 +1557,9 @@ PDU *MsgHandler::uploadfilefastcheck()
     memcpy(respdu->caData + FASTCHECK_RESP_NAME_LEN_OFFSET, &nameLenOut, sizeof(nameLenOut));
     if (!finalName.isEmpty()) {
         memcpy(respdu->caMsg, finalName.constData(), size_t(finalName.size()));
+    }
+    if (!reqIdBytes.isEmpty()) {
+        memcpy(respdu->caMsg + finalName.size(), reqIdBytes.constData(), size_t(reqIdBytes.size()));
     }
     return respdu;
 }

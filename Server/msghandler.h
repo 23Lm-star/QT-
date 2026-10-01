@@ -33,6 +33,9 @@ public:
         // AUD-1：97 秒传预检查借 id=0 槽做暂存登记，这不是一次上传，**不占用上传并发名额**。
         // 首次收到该槽的 31 正文（或该槽被随后的 29 采纳）时本标记失效。
         bool     fastcheckPlaceholder = false;
+        // AUD-4：107 在写盘在途时到达 → 延迟释放。立即 abort 会让在途写落在 ctx 消失之后，
+        // 使暂存物理大小越过 upload_session.confirmed_offset。置位后由 handleUploadWriteFinished 收尾。
+        bool     pendingAbort = false;
     };
     QHash<quint64, UploadCtx> m_uploads;   // key 0 = 旧单流路径
     // handlMsg 按 PDU 落位写入的当前传输 id（29/31/40/101/105/107）；非传输族 = 0

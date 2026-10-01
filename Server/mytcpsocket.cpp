@@ -368,6 +368,12 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
     if(success){
         success=cp->session.acceptWrittenChunk(offset,length);
     }
+    // AUD-4：107 曾因写盘在途而延迟——现在写已落定（成功则已计入 receivedSize），收尾释放。
+    // abortUpload 会把暂存对齐到 receivedSize 并落 DB confirmed_offset；此处不再回 32（客户端已发 107）。
+    if(cp->pendingAbort){
+        m_MsgHandler->abortUpload(transferId);
+        return;
+    }
     const bool complete = success && cp->session.isComplete();
     const qint64 ackOffset = cp->session.receivedSize();
     if(complete){
@@ -388,8 +394,17 @@ PDU* MyTcpSocket::handleUploadAbort(PDU* pdu)
     quint64 transferId=TRANSFER_ID_LEGACY;
     memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
     bool ret=false;
-    if(transferId!=TRANSFER_ID_LEGACY && m_MsgHandler->findUpload(transferId)!=nullptr){
-        m_MsgHandler->abortUpload(transferId);
+    MsgHandler::UploadCtx* cp=(transferId!=TRANSFER_ID_LEGACY)
+            ? m_MsgHandler->findUpload(transferId) : nullptr;
+    if(cp!=nullptr){
+        // AUD-4：写盘在途时不得立即释放——否则在途写会落在 ctx 消失之后（回调落空），暂存物理大小
+        // 越过 upload_session.confirmed_offset。标记延迟释放，由 handleUploadWriteFinished 收尾；
+        // 108 仍即时回 ret=true（客户端不再向该 id 发正文，槽位语义不受影响）。
+        if(cp->writeInFlight){
+            cp->pendingAbort=true;
+        }else{
+            m_MsgHandler->abortUpload(transferId);
+        }
         ret=true;
     }
     PDU* resp=mkPDU();

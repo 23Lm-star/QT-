@@ -137,7 +137,8 @@ void File::onFastcheckDue(quint64 key)
     const QByteArray nameBytes = t->displayName.toUtf8();
     const QByteArray dirBytes = t->dirPath.toUtf8();
     const qint64 fileSize = t->totalBytes;
-    const QByteArray reqId = QUuid::createUuid().toRfc4122().toHex();
+    // AUD-3：请求标识由 TransferManager 在派出 97 时生成并留存，98 回带该标识后按标识归属
+    const QByteArray reqId = t->fastcheckToken.toLatin1();
 
     QByteArray msg;
     msg.append(shaHex);

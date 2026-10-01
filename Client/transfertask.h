@@ -44,6 +44,7 @@ public:
         QString savePath;
         Uploader* uploader = nullptr;
         bool    needFastcheck = true;   // 个人上传首次走 97 预检查；续传跳过（S3）
+        QString fastcheckToken;         // AUD-3：本次 97 的请求标识（服务端 98 回带，用于按标识归属）
         bool isUpload() const { return kind == PersonalUpload || kind == GroupUpload; }
     };
 
@@ -120,6 +121,7 @@ private:
     QWidget* m_panel = nullptr;
     QList<quint64> m_fastcheckQueue;      // 已算出摘要、待发 97 的任务键
     quint64 m_fastcheckInFlight = 0;      // 正在等待 98 的任务键（0 = 无）
+    QString m_fastcheckInFlightToken;     // AUD-3：在途 97 的请求标识（与 98 回带比对；不匹配 = 迟到，丢弃）
 };
 
 // 文件级任务列表窗口（§5.5；M6：并发时不再用逐文件 QMessageBox）
