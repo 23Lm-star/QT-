@@ -4,8 +4,8 @@ head: 8cf7e3b
 tier: MEDIUM
 node: merged
 audit: none
-next: 人工目视验收 5 项（1 在线用户单击有提示、双击弹确认框并在成功/失败时弹结果；2 文件页能列出用户根且能新建目录/上传；3 群聊自己能与他人分清、长文本换行、无"水位/已读"术语；4 各窗口背景与登录页一致且白字清晰；5 窗口明显变大、字号变大）。通过即结束；需回滚用 git revert -m 1 8cf7e3b
-blockers: none。MEDIUM 无强制独立审计；三门 GREEN + 五套 e2e 195/195 + A2 定向探针 5/5。仅人工目视 5 项未做（本会话无法目视 GUI）；cross_tree 套件（41 用例）未跑（需先建 build/xtree-file001 NTFS junction 指向 dist/filesys）；本分支基线为 master，不含未合并的 REQ-EXT-TRANSFER-001
+next: 两件待办（新会话）：(a) 决定是否部署到 dist —— 现 dist 跑的是 transfer-001 分支构建，部署命令 cp build/wt-fix-ux001/dist/{Client,Server}.exe dist/ 会让运行时不含并行传输；(b) 人工目视 5 项（1 在线用户单击有提示、双击弹确认并在成功/失败时弹结果；2 文件页能列出并能新建/上传；3 群聊自己/他人分清、长文本换行、无"水位/已读"术语；4 各窗口背景与登录一致且白字清晰；5 窗口明显变大）。回滚：git revert -m 1 8cf7e3b
+blockers: none。MEDIUM 无强制独立审计；三门 GREEN + 五套 e2e 195/195 + A2 定向探针 5/5。GUI 目视 5 项未做（本会话无法目视）；cross_tree 套件（41 用例）未跑（需先建 build/xtree-file001 NTFS junction 指向 dist/filesys）；本分支基线为 master，不含未合并的 REQ-EXT-TRANSFER-001；残留 worktree build/wt-fix-ux001（现检出 master，含已构建 exe，勿删以免丢失 dist 源）
 evidence: project-docs/evidence/REQ-UX-001/（e2e-1dea6c3.log 五套件 195/195 + ux001_probe.py A2 5/5）；build/evidence/current/ build GREEN 8cf7e3b + test GREEN-WARN(0 注册项) + audit PASS（worktree build/wt-fix-ux001）
 owner: claude-code
 date: 2026-10-01
