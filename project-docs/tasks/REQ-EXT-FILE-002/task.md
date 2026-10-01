@@ -52,6 +52,14 @@
 ## 门次与事件（append-only）
 - 2026-10-01 goal：定档 LARGE，依赖四项实测通过，FILE-001 遗留 L1/L2 纳入本分支，契约变更批准卡提交主人。
 - 2026-10-01 **主人批准**（原话"同意（推荐）"）：批准范围为设计 §1 的协议追加（`protocol.h` 两端新增 `UPLOADFILE_FASTCHECK_REQUEST=97` / `_RESPOND=98`，只追加不重编号 + 新偏移/magic 常量）与 §3 的 `upload_session` 加三列（`client_request_id`、`file_id`、`uk_req`）+ `schema_version` 提升至 `2026100101`。批准即签核 design（`design.md`）。**不含**：改动既有 PDU 编号、既有分块协议语义、新增外部依赖。
+- 2026-10-01 development：代码提交 `c452eb3`（主工作树，唯一活动开发区）。交付见 `project-docs/evidence/REQ-EXT-FILE-002/development-report.md`。证据：新建 `fastupload_e2e.py` 46/46（dist 形态 + Server-cwd 形态各一次，重跑稳定）；FILE-001 四套件 13/43/37/48 全绿（旧 INIT 路径零破坏）；build GREEN；`audit.ps1` RED 项为预期冻结签名（判读口径见报告 §4.2）。
+- 2026-10-01 development 偏差与发现（待测试/审计复核，报告 §4）：
+  - **DEV-1（偏差，需主人知悉）**：`schema_version` 取 `2026100102`——`2026100101` 已被 GROUP-002 占用，同名会让 fail-fast 失效（库缺列仍通过启动检查）。仍属"新增版本号并入 required"的批准范围；`design.md:87`、本记录 2026-10-01 批准行的数值应更正为 `2026100102`。
+  - **FINDING-DEV-1**：`pipeline/audit.ps1` 以 PS5.1 默认编码读 UTF-8 manifest，中文注释被破坏后只解析出**第一个**冻结路径（`Server/protocol.h` 未纳入冻结检查）。pipeline 脚本属仓库契约，本分支不改，另开 SMALL 任务修。
+  - **FINDING-DEV-2**：FILE-001 四套回归依赖部署前运行形态（`filesPath=./filesys` + `cwd=Server` + exe 在 `build/build-Server/release/`），与现行绝对路径配置冲突；本次以临时相对配置复现原形态跑绿并已还原，建议另开 SMALL 任务统一运行形态。
+  - **FINDING-DEV-3**：L1/L2 本分支只收口"判别"面（`isLogicKeyForm`）；`normalizeLogicKeys` 的 SQL 选择谓词仍把 `/filesys/<owner>/…` 视为 canonical，存量该形态行不会被转换（数据面未收口；当前库实测无此类行）。如需补谓词，另开 SMALL 任务并降级处理。
+  - **FINDING-DEV-4**：验收 5 的"过期临时会话清理"在代码库本无调度器（FILE-001 亦无）；本节点不新增清理器，改为验证不变式（清理后对象/条目零影响）。
+  - **FINDING-DEV-5**：`MKDIR` 非幂等（目录已存在回 `ret=0`）；用户根仅首次注册时创建——既有行为，仅记录。
 
 ## 下一节点
-development（owner 会话）：dev worktree 从本分支切出 → 按 design §1–§4 落地 → pipeline 三门 → handoff。契约变更已批准，无待决门。
+独立测试（新会话、建议不同 agent）：干净 detached worktree @ `c452eb3`，独立重跑 `fastupload_e2e.py` + FILE-001 四套件 + pipeline 三门，并复核上述 DEV-1/FINDING-DEV-1..5。按 L6 沿用 `node: test`。

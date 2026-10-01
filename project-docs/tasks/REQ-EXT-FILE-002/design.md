@@ -84,10 +84,14 @@ caMsg: 服务端最终展示名（hit 时非空）；miss 时为空
 ALTER TABLE upload_session ADD COLUMN client_request_id VARCHAR(64) NULL;
 ALTER TABLE upload_session ADD COLUMN file_id BIGINT NULL;
 ALTER TABLE upload_session ADD UNIQUE KEY uk_req (owner_name, client_request_id);
-INSERT IGNORE INTO schema_version (version) VALUES (2026100101);
+INSERT IGNORE INTO schema_version (version) VALUES (2026100102);
 ```
 - 键长校验：`(32+64)*3 = 288B` < 767B（Antelope+COMPACT 上限）✓；既有行 `client_request_id` 为 NULL，MySQL 唯一键允许多 NULL，**历史行不冲突**。
-- `OperateDB` 增 `kFastUploadSchemaVersion = 2026100101` 并入 `qMax(...)` 的 `required` 计算（`Server/operatedb.cpp:96`）；低版本启动 fail-fast，错误文案补上 `migrate_ext_file_002.sql`。
+- `OperateDB` 增 `kFastUploadSchemaVersion` 并入 `qMax(...)` 的 `required` 计算（`Server/operatedb.cpp:96`）；低版本启动 fail-fast，错误文案补上 `migrate_ext_file_002.sql`。
+- **2026-10-01 development 更正**：本文件原写的版本号 `2026100101` 与 REQ-EXT-GROUP-002 的
+  `kGroupMessageSchemaVersion = 2026100101` 重名，会让"只跑过 GROUP-002 迁移"的库通过启动检查
+  （缺列仍启动）。实际实现取 **`2026100102`**（独立版本号），其余不变；理由与验证见
+  `project-docs/evidence/REQ-EXT-FILE-002/development-report.md` §4.1。
 - 回滚：`Server/migrate_ext_file_002_rollback.sql`（DROP KEY `uk_req` + DROP 两列；表内容零改动）。
 
 ## 4. 客户端改动（D4）
