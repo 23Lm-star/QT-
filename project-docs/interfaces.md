@@ -39,7 +39,7 @@ struct Msg {
 };
 ```
 
-### 1.3 消息类型枚举（基础段 1–55；扩展段见 §8 群 60–96、§9 文件 97–98）
+### 1.3 消息类型枚举（基础段 1–55；扩展段见 §8 群 60–96、§9 文件 97–98、§10 传输 107–108）
 
 | 枚举值 | 常量 | 方向 | 说明 |
 |--------|------|------|------|
@@ -112,7 +112,7 @@ struct Msg {
 | 聊天 | 发送者 | 接收者 | — | `Msg` 结构体 |
 | 上传 INIT | 文件名 | 文件总大小(`qint64`) | 魔数 `0x5253554D` | 目标目录路径 |
 | 上传 DATA | 块偏移量(`qint64`) | — | 魔数校验 | 文件数据块 |
-| 上传 INIT 响应 | — | — | — | 已接收偏移量（字符串） |
+| 上传 INIT 响应 | 是否成功（4B） | 续传起点(`qint64`) | 魔数 `0x5253554D` | — |
 | 创建目录 | 目录名 | — | — | — |
 | 切换目录 | 新路径 | — | — | — |
 | 刷新文件 | — | — | — | 当前目录路径 |
@@ -127,6 +127,10 @@ struct Msg {
 | 解析应用内链接响应 | 是否成功（4B） | 文件名（32B） | 文件大小（qint64） | 仅允许展示所需元数据；随后走原下载流 |
 | 注销/删除账号 | `ENUM_MSG_TYPE_LOGOFF_REQUEST` | 用户名（32B）+ 密码（32B） | — | — |
 | | `ENUM_MSG_TYPE_LOGOFF_RESPOND` | 是否成功（4B） | — | — |
+| 传输族 29/30/31/32/40/42/43/101/102/105/106/107/108 | 见 §10.2 落位表 | — | — | — |
+
+> REQ-EXT-TRANSFER-001：上表"传输族"各行在 `caData[48..55]` 追加 u64 `transfer_id`（41 例外，见 §10.2）；
+> `0` = 旧单流路径，旧字段偏移与语义零改动。
 
 ### 1.5 `mkPDU` 接口
 
@@ -495,3 +499,89 @@ bool checkSchemaVersion();           // 四版本 qMax 达标检查
 ```
 
 
+
+---
+
+## 10. 传输接口（REQ-EXT-TRANSFER-001）
+
+### 10.1 新增消息类型（107–108，仅追加，旧编号 1–106 不变）
+
+| 枚举值 | 常量 | 方向 | 说明 |
+|---|---|---|---|
+| 107 | `ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST` | C→S | 上传任务释放请求（暂停/取消共用） |
+| 108 | `ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND` | S→C | 上传任务释放响应（`ret` + 回带 id） |
+
+### 10.2 `transfer_id` 落位表（两端逐字节一致，`Client/protocol.h` ≡ `Server/protocol.h`）
+
+| PDU | 落位 | 备注 |
+|---|---|---|
+| 29/30/31/32/40/42/43/101/102/105/106/107/108 | `caData[48..55]`（`TRANSFER_ID_OFFSET`） | u64，本机小端 `memcpy` |
+| 41 `DOWNLOADFILE_RESPOND` | `caData[16..23]`（`DOWNLOAD_RESP_TRANSFER_ID_OFFSET`） | 其 [32..62] 被既有文件名字段占用 |
+
+常量（两端逐字一致）：
+
+```cpp
+static const int TRANSFER_ID_OFFSET = 48;
+static const int DOWNLOAD_RESP_TRANSFER_ID_OFFSET = 16;
+static const quint64 TRANSFER_ID_LEGACY = 0;      // 旧协议单流路径
+static const quint32 MAX_PARALLEL_UPLOADS = 3;    // 单连接并发上传上限（个人+群共享）
+static const quint32 MAX_PARALLEL_DOWNLOADS = 3;  // 单连接并发下载上限（个人+群共享）
+```
+
+### 10.3 107/108 形态
+
+```
+107 UPLOADFILE_ABORT_REQUEST   caData[0..47]=0, caData[48..55]=transfer_id, caMsg 长度=0
+108 UPLOADFILE_ABORT_RESPOND   caData[0]=ret(bool), caData[48..55]=transfer_id 回带, caMsg 长度=0
+```
+
+- 处置：查得上下文 → 释放（`upload_session.status='expired'`、清在途位、移出并发计数与下载环）→ `ret=true`；
+  未登记 id → `ret=false`，不建状态，连接存活（幂等）。
+- 下载不可 abort（非目标）：对下载 id 发 107 得 `ret=false`。
+
+### 10.4 服务端与客户端接口
+
+```cpp
+// Server/msghandler.h —— per-transfer 上传上下文（D8：id=0 旧单流槽落入同一容器）
+struct UploadCtx { quint64 id; ResumableUploadSession session; qint64 sessionId; QString expectedSha;
+                   quint64 groupId; QString groupDisplayName; bool writeInFlight; qint64 lastProgressMs; };
+QHash<quint64, UploadCtx> m_uploads;      UploadCtx* findUpload(quint64);
+bool acquireUploadSlot(quint64);          // 上限(D7) + 重复 id(T-17)；id=0 每次重置
+void abortUpload(quint64);                // Active→Aborted：会话 expired，staging 保留
+void reapIdleUploads(qint64 nowMs, int idleSec);   // D5 空闲回收
+
+// Server/mytcpsocket.h —— 下载环（§4.1）
+struct DownloadStream { quint64 id; QFile* file; qint64 totalSize, sentSize; };
+QHash<quint64, DownloadStream> m_downloads;   QList<quint64> m_downloadRing;   int m_rrCursor;
+void startDownloadStream(const QString&, quint64 id);   void removeDownloadStream(quint64);
+PDU* handleUploadAbort(PDU*);     static const int UPLOAD_IDLE_REAP_SEC = 60;
+
+// Server/uploadwritetask.h —— 写盘任务回带 transfer_id（回调按 id 归属）
+UploadWriteTask(quint64 connectionId, quint64 transferId, const QString& filePath, qint64 offset, const QByteArray& data);
+
+// Client/transfertask.h —— 任务管理与调度（新增组件）
+class TransferManager {   // 单例；两方向各 3 名额（D6），队首自动补位
+    quint64 allocId();    static quint64 transferIdOf(const PDU*);   // 41 读 [16..23]，其余 [48..55]
+    quint64 enqueuePersonalUpload / enqueueGroupUpload / enqueuePersonalDownload / enqueueGroupDownload(...);
+    void onFastcheckRespond / onUploadInitRespond / onUploadDataRespond(PDU*);      // 98/30/32
+    void onGroupUploadInitRespond / onDownloadRespond / onDownloadData / onDownloadFinish / onGroupDownloadRespond / onAbortRespond(PDU*);
+    void pause/resume/cancel/retry(quint64 key);
+signals:
+    void hashDue(quint64 key, const QString& localPath);   // M5：SHA-256 交后台线程
+    void fastcheckDue(quint64 key);                        // 97 预检查单飞轮转
+};
+class TransferTaskPanel : public QWidget;   // 文件级任务列表（M6）
+```
+
+- 客户端上传入口（`Client/file.cpp`）仍是 SHA-256（1MiB 流式，P4）+ 97 预检查（P5）；
+  未命中后由 `TransferManager` 发 29（个人）/101（群）建槽，服务端采纳 97 建立的暂存会话（不重复建会话、保留摘要对照）。
+- 个人上传恢复（暂停后继续）以**新 id** 跳过 97 直接走 29（S3），服务端由确定性 staging 路径回带续传起点。
+
+### 10.5 业务错误码（新增）
+
+| 码 | 含义 |
+|---|---|
+| `-2106` | 群文件上传初始化被拒（并发上传超限或 id 冲突，D7/T-17） |
+| `-2107` | 群文件下载被拒（并发下载超限，D7） |
+
+（上传方向超限在个人路径体现为 30 的 `ret=false`，不引入负码。）

@@ -8,12 +8,13 @@
 class UploadWriteTask : public QRunnable
 {
 public:
-    UploadWriteTask(quint64 connectionId, const QString &filePath,
+    UploadWriteTask(quint64 connectionId, quint64 transferId, const QString &filePath,
                     qint64 offset, const QByteArray &data);
     void run() override;
 
 private:
     quint64 m_connectionId;
+    quint64 m_transferId;
     QString m_filePath;
     qint64 m_offset;
     QByteArray m_data;

@@ -9,7 +9,7 @@
 #include "sharelinkdialog.h"
 #include "folderselectdialog.h"
 
-class Uploader;
+class QPushButton;
 
 namespace Ui {
 class File;
@@ -22,13 +22,10 @@ class File : public QWidget
 public:
     QString m_strUserPath;//用户路径
     QString m_strCurPath;//当前路径
-    QString m_strUploadPath;//上传文件路径
     QString m_strShareFileName;//分享文件名
     QList<FileInfo*>m_fileInfoList;//当前路径文件信息
     ShareFile* m_shareFile;
     void flushfile();//刷新当前文件->引导刷新
-    void uploadfile(qint64 resumeOffset=0);//上传文件数据->上传m_strUploadPath文件
-    void acknowledgeUploadChunk(bool success, qint64 nextOffset, bool complete);
     void updateCurrfile(QList<FileInfo*>qFileinfolist);//利用文件信息列表刷新文件信息
     void flushCurrLE();
     void onGetShareLink();
@@ -74,6 +71,13 @@ private slots:
     // 新增：右键菜单
     void onFileListContextMenu(const QPoint &pos);
 
+    // REQ-EXT-TRANSFER-001：打开文件级任务列表
+    void onTasks_PB_clicked();
+    // REQ-EXT-TRANSFER-001：TransferManager 请求在后台计算 SHA-256（M5）
+    void onHashDue(quint64 key, const QString& localPath);
+    // REQ-EXT-TRANSFER-001：轮到此任务发送 97 秒传预检查（连接级单飞）
+    void onFastcheckDue(quint64 key);
+
 
 private:
     Ui::File *ui;
@@ -83,7 +87,7 @@ private:
     void scheduleUiRefresh();//合并排队：最多排入一个 UI 刷新回调
     QString selectedFileRelativePath(QListWidgetItem *item);//计算选中文件相对用户根目录的路径
     FolderSelectDialog* m_moveDlg = nullptr;               // 移动文件时的目标目录选择弹窗
-    Uploader* m_uploader = nullptr;
+    QPushButton* m_tasksBtn = nullptr;                     // 传输任务列表入口
 };
 
 #endif // FILE_H

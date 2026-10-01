@@ -9,6 +9,7 @@
 #include <QDateTime>
 #include <QPair>
 #include <QMap>
+#include <QHash>
 
 //用于作为 服务器处理客户端请求 的类
 class MsgHandler
@@ -17,9 +18,56 @@ public:
     MsgHandler();
     //记录客户端发送的请求DPU
     PDU* pdu;
-    QString ClientName; 
-    //记录要上传的文件对象还有已上传的大小和总大小
-    ResumableUploadSession m_uploadSession;
+    QString ClientName;
+
+    // ===== REQ-EXT-TRANSFER-001：每连接 per-transfer 上传上下文（D8：id=0 旧单流路径落入同一容器） =====
+    struct UploadCtx {
+        quint64  id = 0;                 // 0 = 旧单流槽
+        ResumableUploadSession session;  // 既有类型，原样复用
+        qint64   sessionId = -1;         // upload_session.session_id
+        QString  expectedSha;            // 既有 m_uploadExpectedSha
+        quint64  groupId = 0;            // 既有 m_groupUploadGroupId
+        QString  groupDisplayName;       // 既有 m_groupUploadDisplayName
+        bool     writeInFlight = false;  // 既有 m_uploadWriteInFlight（逐 transfer 化）
+        qint64   lastProgressMs = 0;     // 空闲回收用
+        // AUD-1：97 秒传预检查借 id=0 槽做暂存登记，这不是一次上传，**不占用上传并发名额**。
+        // 首次收到该槽的 31 正文（或该槽被随后的 29 采纳）时本标记失效。
+        bool     fastcheckPlaceholder = false;
+        // AUD-4：107 在写盘在途时到达 → 延迟释放。立即 abort 会让在途写落在 ctx 消失之后，
+        // 使暂存物理大小越过 upload_session.confirmed_offset。置位后由 handleUploadWriteFinished 收尾。
+        bool     pendingAbort = false;
+    };
+    QHash<quint64, UploadCtx> m_uploads;   // key 0 = 旧单流路径
+    // handlMsg 按 PDU 落位写入的当前传输 id（29/31/40/101/105/107）；非传输族 = 0
+    quint64 m_currentTransferId = 0;
+    // 97 未命中建立的会话暂存：随后的 29 INIT（同 parent/display/size）直接采纳，
+    // 避免重复建会话，并保留客户端摘要的服务端复算对照（FILE-002 D2）。
+    struct PendingFastcheck {
+        bool    active = false;
+        qint64  sessionId = -1;
+        QString shaHex;
+        QString parent;
+        QString display;
+        qint64  size = 0;
+    };
+    PendingFastcheck m_pendingFastcheck;
+    UploadCtx* findUpload(quint64 id);
+    UploadCtx& currentUpload();            // 不存在则新建（调用方须先过 acquireUploadSlot）
+    // 上限（D7）与重复 id（T-17）判定；true = 可占用该槽（id=0 每次重置旧槽）
+    bool acquireUploadSlot(quint64 id);
+    void abortUpload(quint64 id);          // 释放槽位：upload_session 置 expired，staging 保留
+    void reapIdleUploads(qint64 nowMs, int idleSec);   // 空闲回收（返回被回收条目数）
+    // AUD-1：上传并发名额计数**排除** 97 预检查占位（id=0 纯暂存槽），其余条目照旧计入
+    int  activeUploadCount() const {
+        int n = 0;
+        for (QHash<quint64, UploadCtx>::const_iterator it = m_uploads.constBegin();
+             it != m_uploads.constEnd(); ++it) {
+            if (!it->fastcheckPlaceholder) {
+                ++n;
+            }
+        }
+        return n;
+    }
     //各种处理函数，进行各种类型请求的处理
     PDU* rigist();//注册
     PDU* login(QString& strname, bool& authOk, quint64& loginVersion);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context；REQ-EXT-SESSION-001：loginVersion 供连接绑定用户域版本）
@@ -92,16 +140,13 @@ public:
 
     //下载文件时存储通过验证的规范路径
     QString m_downloadCanonicalPath;
+    // REQ-EXT-TRANSFER-001 D7：下载方向并发名额是否可用（由 MyTcpSocket 在本连接会话前写入；
+    // 超上限时 40 → ret=false、105 → code=-2107，且不建流）
+    bool m_downloadSlotAvailable = true;
 
     // ===== REQ-EXT-FILE-001 T3/T4：内容寻址上传落定 =====
-    qint64 m_uploadSessionId = -1;   // 当前暂存会话 upload_session.session_id
-    // REQ-EXT-FILE-002 D2：当前上传声明的 SHA-256（= upload_session.client_sha256），
+    // REQ-EXT-FILE-002 D2：上传声明的 SHA-256（= upload_session.client_sha256）现落在 UploadCtx.expectedSha，
     // 只作命中判定与复算对照，永不作为转正依据。
-    QString m_uploadExpectedSha;
-    // ===== REQ-EXT-GROUP-003：当前分块上传的群作用域（非 0 = 群文件上传）=====
-    // 由 101 未命中路径写入；上传完成（finalizeUploadOnComplete）时建群引用后清空。
-    quint64 m_groupUploadGroupId = 0;
-    QString m_groupUploadDisplayName;
     quint64 m_lastGroupFileId = 0;   // 最近一次群上传落定的 group_file_id（0=无）
     // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
     // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。

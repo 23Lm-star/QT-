@@ -1,9 +1,8 @@
 #include "groupfile.h"
 
 #include "client.h"
-#include "uploader.h"
+#include "transfertask.h"
 
-#include <QCryptographicHash>
 #include <QDateTime>
 #include <QFile>
 #include <QFileDialog>
@@ -12,8 +11,6 @@
 #include <QMessageBox>
 #include <QVBoxLayout>
 #include <cstring>
-
-GroupFile *GroupFile::s_uploading = nullptr;
 
 namespace {
 QString humanSize(quint64 bytes)
@@ -65,11 +62,6 @@ GroupFile::GroupFile(quint64 groupId, const QString &groupName, QWidget *parent)
     setStatus(QStringLiteral("双击文件可直接下载"));
 }
 
-GroupFile *GroupFile::uploadingInstance()
-{
-    return s_uploading;
-}
-
 QByteArray GroupFile::envelope(const QByteArray &body)
 {
     QByteArray payload;
@@ -109,40 +101,29 @@ void GroupFile::refresh()
     sendRequest(ENUM_MSG_TYPE_GROUP_FILE_LIST_REQUEST, body);
 }
 
+// REQ-EXT-TRANSFER-001 §5.5/§5.6：多选上传；SHA-256 移出 UI 线程（M5），完成后交任务列表排队
 void GroupFile::uploadFile()
 {
-    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("选择要上传的文件"));
-    if (path.isEmpty()) return;
-    const QString name = QFileInfo(path).fileName();
-    if (name.isEmpty() || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\'))) {
-        QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("文件名不合法"));
-        return;
-    }
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("无法读取所选文件"));
-        return;
-    }
-    QCryptographicHash hasher(QCryptographicHash::Sha256);
-    while (!f.atEnd()) {
-        const QByteArray chunk = f.read(1024 * 1024);
-        if (chunk.isEmpty() && f.error() != QFile::NoError) {
-            QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("读取文件失败"));
-            return;
+    const QStringList paths = QFileDialog::getOpenFileNames(this, QStringLiteral("选择要上传的文件"));
+    if (paths.isEmpty()) return;
+    int enqueued = 0;
+    for (const QString &path : paths) {
+        const QString name = QFileInfo(path).fileName();
+        if (name.isEmpty() || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\'))
+                || name.toUtf8().size() > 255) {
+            QMessageBox::information(this, QStringLiteral("提示"),
+                                     QStringLiteral("文件名不合法：%1").arg(name));
+            continue;
         }
-        hasher.addData(chunk);
+        const quint64 rowKey = TransferManager::instance().enqueueGroupUpload(
+                    m_groupId, path, name, QByteArray());   // sha 由任务在后台计算
+        TransferManager::instance().showPanel();
+        Q_UNUSED(rowKey);
+        ++enqueued;
     }
-    const qint64 size = f.size();
-    f.close();
-    const QByteArray shaHex = hasher.result().toHex();
-    m_uploadPath = path;
-
-    QByteArray body;
-    groupAppendU64(body, quint64(size));
-    groupAppendString(body, shaHex);
-    groupAppendString(body, name.toUtf8());
-    setStatus(QStringLiteral("上传预检查：%1").arg(name));
-    sendRequest(ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_REQUEST, body);
+    if (enqueued > 0) {
+        setStatus(QStringLiteral("已加入传输任务 %1 个").arg(enqueued));
+    }
 }
 
 void GroupFile::downloadSelected()
@@ -152,10 +133,11 @@ void GroupFile::downloadSelected()
         QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("请选择要下载的文件"));
         return;
     }
-    m_downloadingRow = m_fileList->currentRow();
-    QByteArray body;
-    groupAppendU64(body, groupFileId);
-    sendRequest(ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST, body);
+    const QListWidgetItem *item = m_fileList->currentItem();
+    const QString display = (item != nullptr)
+            ? item->data(Qt::UserRole + 1).toString() : QStringLiteral("download.bin");
+    TransferManager::instance().enqueueGroupDownload(m_groupId, groupFileId, display);
+    TransferManager::instance().showPanel();
 }
 
 void GroupFile::deleteSelected()
@@ -223,76 +205,10 @@ void GroupFile::handleResponse(PDU *pdu)
             item->setData(Qt::UserRole + 1, display);
         }
         setStatus(QStringLiteral("群文件：共 %1 项（本页 %2）").arg(total).arg(count));
-    } else if (pdu->uiType == ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND) {
-        if (payload.size() < GROUP_FILE_INIT_RESP_NAME_OFFSET) return;
-        auto readU64At = [&](int at) -> quint64 {
-            quint64 v = 0;
-            for (int i = 0; i < 8; ++i) v |= quint64(quint8(payload.at(at + i))) << (8 * i);
-            return v;
-        };
-        auto readU32At = [&](int at) -> quint32 {
-            quint32 v = 0;
-            for (int i = 0; i < 4; ++i) v |= quint32(quint8(payload.at(at + i))) << (8 * i);
-            return v;
-        };
-        const bool hit = (quint8(payload.at(GROUP_FILE_INIT_RESP_HIT_OFFSET)) != 0);
-        const qint64 nextOffset = qint64(readU64At(GROUP_FILE_INIT_RESP_NEXT_OFFSET));
-        const quint32 nameLen = readU32At(GROUP_FILE_INIT_RESP_NAME_LEN_OFFSET);
-        const QByteArray name = payload.mid(GROUP_FILE_INIT_RESP_NAME_OFFSET, int(nameLen));
-
-        if (hit) {
-            setStatus(QStringLiteral("秒传成功：%1").arg(QString::fromUtf8(name)));
-            refresh();
-            return;
-        }
-        // 未命中：走既有分块上传（31/32），续传起点由服务端给定
-        if (m_uploader != nullptr) {
-            setStatus(QStringLiteral("已有上传进行中"));
-            return;
-        }
-        s_uploading = this;
-        m_uploader = new Uploader(m_uploadPath, nextOffset, this);
-        connect(m_uploader, &Uploader::seedMsg, &Client::getinstance(), &Client::seedMsg);
-        connect(m_uploader, &Uploader::errnoMsg, this, [this](const QString &msg) {
-            setStatus(QStringLiteral("上传失败：%1").arg(msg));
-        });
-        connect(m_uploader, &Uploader::finished, this, &GroupFile::onUploadFinished);
-        setStatus(QStringLiteral("上传中：%1").arg(QString::fromUtf8(name)));
-        m_uploader->start();
     } else if (pdu->uiType == ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND) {
         setStatus(QStringLiteral("已删除，正在刷新"));
         refresh();
     }
-    // 106 下载元数据由客户端 MsgHandler 统一处理（落盘准备），此处不重复处理
-}
-
-void GroupFile::acknowledgeUploadChunk(PDU *pdu)
-{
-    if (m_uploader == nullptr || pdu == nullptr) return;
-    bool ret = true;
-    qint64 nextOffset = 0;
-    bool complete = false;
-    uint resumeMagic = 0;
-    memcpy(&resumeMagic, pdu->caData + UPLOAD_RESUME_MAGIC_OFFSET, sizeof(resumeMagic));
-    if (resumeMagic == UPLOAD_RESUME_MAGIC) {
-        memcpy(&ret, pdu->caData, sizeof(ret));
-        memcpy(&nextOffset, pdu->caData + UPLOAD_ACK_NEXT_OFFSET, sizeof(nextOffset));
-        memcpy(&complete, pdu->caData + UPLOAD_ACK_COMPLETE_OFFSET, sizeof(complete));
-    }
-    m_uploader->acknowledge(ret, nextOffset, complete);
-}
-
-void GroupFile::onUploadFinished(bool success)
-{
-    if (s_uploading == this) s_uploading = nullptr;
-    if (m_uploader != nullptr) {
-        m_uploader->deleteLater();
-        m_uploader = nullptr;
-    }
-    if (success) {
-        setStatus(QStringLiteral("上传完成"));
-        refresh();
-    } else {
-        setStatus(QStringLiteral("上传失败"));
-    }
+    // REQ-EXT-TRANSFER-001：102 上传初始化响应改由 TransferManager 按 id 路由（本窗口不再处理），
+    // 106 下载元数据同理；31/32 与 42/43 的分块收发均由 TransferManager 承载。
 }

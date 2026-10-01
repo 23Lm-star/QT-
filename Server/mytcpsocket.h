@@ -4,6 +4,8 @@
 #include <QObject>
 #include <QFile>
 #include <QTimer>
+#include <QHash>
+#include <QList>
 #include <protocol.h>
 #include "msghandler.h"
 //进行一个客户端连接的类
@@ -34,19 +36,32 @@ public:
     PDU* handlMsg(PDU* pdu);
     void seedMsg(PDU* respdu);
 
-    //流式分块下载状态
+    // ===== REQ-EXT-TRANSFER-001：per-transfer 流式分块下载（单调度环 + 单定时器，§4.1） =====
     static const int DOWNLOAD_CHUNK_SIZE = 65536; // 64KB
-    QFile* m_downloadFile;
-    qint64 m_downloadTotalSize;
-    qint64 m_downloadSentSize;
-    bool m_downloadActive;
+    struct DownloadStream {
+        quint64 id = 0;
+        QFile*  file = nullptr;
+        qint64  totalSize = 0;
+        qint64  sentSize = 0;
+        qint64  remaining() const { return totalSize - sentSize; }
+    };
+    QHash<quint64, DownloadStream> m_downloads;   // key 0 = 旧单流路径
+    QList<quint64> m_downloadRing;                // round-robin 环（活跃顺序）
+    int m_rrCursor = 0;
     bool m_downloadNextChunkScheduled;
-    bool m_uploadWriteInFlight;
     static constexpr qint64 DOWNLOAD_WRITE_HIGH_WATER = 256 * 1024;
-    void startDownloadStream(const QString& filePath);
+    void startDownloadStream(const QString& filePath, quint64 transferId);
     void scheduleNextDownloadChunk();
+    void removeDownloadStream(quint64 id);
+    void seedDownloadFinish(quint64 id, bool success);
     void handleUploadData(PDU* pdu);
-    void sendUploadAck(bool success, qint64 nextOffset, bool complete);
+    void sendUploadAck(quint64 transferId, bool success, qint64 nextOffset, bool complete);
+    // 107/108：上传任务释放（暂停/取消共用）
+    PDU* handleUploadAbort(PDU* pdu);
+    // D5：上传上下文空闲回收（连接级定时器，间隔 15s）
+    static const int UPLOAD_IDLE_REAP_SEC = 60;
+    QTimer* m_reapTimer;
+    void onReapTimeout();
     // REQ-EXT-SEC-001：统一入口门——公开类型白名单 + 未认证拒绝响应
     static bool isPublicRequestType(uint uiType);
     PDU* authRejectPdu(uint uiType);
@@ -74,7 +89,7 @@ private slots:
     void onBytesWritten(qint64 bytes);
     void pumpOutboundQueue();
 public slots:
-    void handleUploadWriteFinished(qint64 offset, qint64 length, bool success);
+    void handleUploadWriteFinished(quint64 transferId, qint64 offset, qint64 length, bool success);
     void recvmsg();//接收信息引起的槽函数
     void clientOffLine();//客户端登录下线断开连接的槽函数
 

@@ -26,11 +26,7 @@ public:
     void renamedir();
     void sharefileagree();
     void sharefilefinsh();
-    void uploadfileinit();
-    void uploadfilefastcheck();//REQ-EXT-FILE-002：秒传预检查响应（命中提示+刷新，未命中续传）
-    void uploadfiledata();
     void flushfile();
-    void downloadfile();
     void handleCaptcha();
     void handlMoveFile();
     void handlUserInformation();
@@ -38,20 +34,8 @@ public:
     void handleQueryFilePublishLink(PDU* pdu);
     void handleCreatePublishLink(PDU* pdu);
     void handleResolvePublishLink(PDU* pdu);
-    void handleDownloadRespond();
-    // REQ-EXT-GROUP-003：106 群文件下载元数据响应（正文复用既有 42/43 接收流）
-    void handleGroupFileDownloadRespond(PDU* pdu);
-
-    //流式下载接收状态
-    void handleDownloadData();
-    void handleDownloadFinish();
-
-private:
-    // 为流式下载创建落盘文件（同名 (N) 递推）；成功返回 true 并置 m_recvFile/m_recvFilePath
-    bool beginReceiving(const QString& fileName);
-    QFile* m_recvFile;        //下载接收文件
-    QString m_recvFilePath;   //保存路径
-    QString m_recvFileName;   //文件名
+    // REQ-EXT-TRANSFER-001：30/32/41/42/43/102/106/108 已改由 TransferManager 按 transfer_id 路由，
+    // 本类原有的单槽上传/下载接收状态已删除。
 };
 
 #endif // MSGHANDLER_H

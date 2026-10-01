@@ -46,8 +46,8 @@ public:
     // 现值取单调登记表，并发下自含式正确：低版本登录者也会把自己关掉）
     void closeStaleSockets(const QString& user);
 public slots:
-    void handleUploadWriteFinished(quint64 connectionId, qint64 offset,
-                                   qint64 length, bool success);
+    void handleUploadWriteFinished(quint64 connectionId, quint64 transferId,
+                                   qint64 offset, qint64 length, bool success);
 private:
     MyTcpServer();
     //记录所有已经建立连接的 socket对象 链表

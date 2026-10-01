@@ -1161,41 +1161,80 @@ PDU *MsgHandler::uploadfileinit()
     const bool resumeEnabled = (resumeMagic == UPLOAD_RESUME_MAGIC);
     const QString dirPath = QString::fromUtf8(pdu->caMsg);
     const QString fileName = fixedString(strname, 32);
-    // REQ-EXT-FILE-001 T4：内容寻址暂存——写进 .staging 而非最终目录，完成时 commitUpload 转正。
-    // REQ-FS-003①/SEC-001：所在目录须在 actor 本人用户根内；父路径规范化后作逻辑条目键。
-    ResumableUploadSession::BeginResult result = {false, 0, false};
-    m_uploadSessionId = -1;
-    // REQ-EXT-GROUP-003：个人上传路径清空群作用域，避免上一次群上传上下文泄漏
-    m_groupUploadGroupId = 0;
-    m_groupUploadDisplayName.clear();
-    const QString parentPath = FileObjectStore::normalizeParent(m_actorName, dirPath);
-    if (pathInActorRoot(dirPath) && !m_actorName.isEmpty()) {
-        result = m_uploadSession.beginStaged(m_actorName, parentPath, fileName, fileSize, resumeEnabled);
-        if (result.ok) {
-            // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
-            m_uploadSessionId = OperateDB::instance().createUploadSession(
-                m_actorName, parentPath, fileName, fileSize,
-                QString(), m_uploadSession.stagingFilePath(), result.offset, 3600);
-            if (m_uploadSessionId < 0) {
-                qCWarning(lcFs) << "uploadfileinit 会话登记失败 conn=" << m_connId;
+    const quint64 tid = m_currentTransferId;
+    bool ret = false;
+    bool complete = false;
+    qint64 resumeOffset = 0;
+    bool adoptedFastcheck = false;   // AUD-1：本次 29 消费了前序 97 的暂存 → 随后释放 id=0 占位
+
+    // D7 硬上限 / T-17 重复 id：未通过则不建任何状态（P7：不回退到 id=0）
+    if (acquireUploadSlot(tid)) {
+        UploadCtx& ctx = m_uploads[tid];
+        ctx.id = tid;
+        ctx.sessionId = -1;
+        ctx.expectedSha.clear();
+        ctx.groupId = 0;
+        ctx.groupDisplayName.clear();
+        ctx.writeInFlight = false;
+        ctx.lastProgressMs = QDateTime::currentMSecsSinceEpoch();
+
+        // REQ-EXT-FILE-001 T4：内容寻址暂存——写进 .staging 而非最终目录，完成时 commitUpload 转正。
+        // REQ-FS-003①/SEC-001：所在目录须在 actor 本人用户根内；父路径规范化后作逻辑条目键。
+        const QString parentPath = FileObjectStore::normalizeParent(m_actorName, dirPath);
+        // 采纳前序 97 预检查建立的会话（同 parent/display/size）：不重复建会话，保留摘要对照
+        const bool adopt = (tid != TRANSFER_ID_LEGACY) && m_pendingFastcheck.active
+                && !m_actorName.isEmpty()
+                && m_pendingFastcheck.parent == parentPath
+                && m_pendingFastcheck.display == fileName
+                && m_pendingFastcheck.size == fileSize;
+        if (pathInActorRoot(dirPath) && !m_actorName.isEmpty()) {
+            const ResumableUploadSession::BeginResult result =
+                    ctx.session.beginStaged(m_actorName, parentPath, fileName, fileSize, resumeEnabled);
+            if (result.ok) {
+                if (adopt) {
+                    ctx.sessionId = m_pendingFastcheck.sessionId;
+                    ctx.expectedSha = m_pendingFastcheck.shaHex;
+                    adoptedFastcheck = true;
+                } else {
+                    // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
+                    ctx.sessionId = OperateDB::instance().createUploadSession(
+                        m_actorName, parentPath, fileName, fileSize,
+                        QString(), ctx.session.stagingFilePath(), result.offset, 3600);
+                    if (ctx.sessionId < 0) {
+                        qCWarning(lcFs) << "uploadfileinit 会话登记失败 conn=" << m_connId;
+                    }
+                }
+                ret = true;
+                resumeOffset = result.offset;
+                complete = result.complete;
+                if (result.complete) {
+                    // 0 字节或断点已到尾部：立即落定（仍走服务端复算，验收4）
+                    finalizeUploadOnComplete();
+                }
             }
-            if (result.complete) {
-                // 0 字节或断点已到尾部：立即落定（仍走服务端复算，验收4）
-                finalizeUploadOnComplete();
-            }
+        } else {
+            qCWarning(lcFs) << "uploadfileinit 拒绝越权目录 conn=" << m_connId << ":" << dirPath;
+        }
+        m_pendingFastcheck.active = false;   // 一次 29 之后失效（无论是否采纳）
+        if (!ret) {
+            m_uploads.remove(tid);   // 未成功不保留空上下文
+        } else if (adoptedFastcheck) {
+            // AUD-1：97 的暂存已被本次 29 采纳（会话/摘要已转入本槽），id=0 占位不再需要——
+            // 释放以免残留条目长期滞留、并与真实槽重复引用同一 upload_session 行。
+            // 注：此处 ctx 引用不再使用，remove 可能引起 QHash 重排，故放在最后。
+            m_uploads.remove(TRANSFER_ID_LEGACY);
         }
     } else {
-        qCWarning(lcFs) << "uploadfileinit 拒绝越权目录 conn=" << m_connId << ":" << dirPath;
+        qCWarning(lcFs) << "uploadfileinit 拒绝：并发上限或 id 冲突 conn=" << m_connId
+                        << " id=" << tid << " active=" << activeUploadCount();
     }
 
-    bool ret=result.ok;
-    qint64 resumeOffset=result.offset;
     qCDebug(lcFs)<<"uploadfileinit file"<<fileName
             <<"size"<<fileSize
             <<"resume"<<resumeEnabled
             <<"offset"<<resumeOffset
-            <<"complete"<<result.complete
-            <<"ret"<<ret<<endl;
+            <<"complete"<<complete
+            <<"ret"<<ret<<"id"<<tid<<endl;
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND;
     memcpy(respdu->caData,&ret,sizeof (ret));
@@ -1203,16 +1242,113 @@ PDU *MsgHandler::uploadfileinit()
     if(resumeEnabled){
         memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
     }
+    memcpy(respdu->caData+TRANSFER_ID_OFFSET,&tid,sizeof(tid));   // R3：响应回带 id
     return respdu;
+}
+
+// ===== REQ-EXT-TRANSFER-001：per-transfer 上传上下文访问 =====
+MsgHandler::UploadCtx* MsgHandler::findUpload(quint64 id)
+{
+    QHash<quint64, UploadCtx>::iterator it = m_uploads.find(id);
+    return it == m_uploads.end() ? nullptr : &it.value();
+}
+
+MsgHandler::UploadCtx& MsgHandler::currentUpload()
+{
+    UploadCtx& ctx = m_uploads[m_currentTransferId];
+    ctx.id = m_currentTransferId;
+    return ctx;
+}
+
+// id=0 为旧单流槽，每次 INIT 重置；非 0 遵循 D7 上限与 T-17 重复 id 拒绝。
+bool MsgHandler::acquireUploadSlot(quint64 id)
+{
+    if (id == TRANSFER_ID_LEGACY) {
+        m_uploads.remove(TRANSFER_ID_LEGACY);
+        return true;
+    }
+    if (m_uploads.contains(id)) {
+        return false;
+    }
+    if (activeUploadCount() >= int(MAX_PARALLEL_UPLOADS)) {
+        return false;
+    }
+    return true;
+}
+
+// Active→Aborted：会话置 expired，staging 保留（与暂停同处置，区别在客户端）
+void MsgHandler::abortUpload(quint64 id)
+{
+    UploadCtx* cp = findUpload(id);
+    if (!cp) {
+        return;
+    }
+    // AUD-4：释放前把暂存对齐到"已确认偏移"——在途写若失败会留下尾部字节，会让暂存物理大小
+    // 越过 upload_session.confirmed_offset，续传起点（beginStaged 按文件大小派生）与 DB 记录不一致。
+    const QString staging = cp->session.stagingFilePath();
+    const qint64 confirmed = cp->session.receivedSize();
+    if (!staging.isEmpty()) {
+        QFile f(staging);
+        if (f.open(QIODevice::ReadWrite) && f.size() > confirmed) {
+            f.resize(confirmed);
+        }
+        if (f.isOpen()) f.close();
+    }
+    if (cp->sessionId >= 0) {
+        OperateDB::instance().updateUploadOffset(cp->sessionId, confirmed);
+        OperateDB::instance().finishUploadSession(cp->sessionId, "expired");
+    }
+    // N-1 连带：97 占位被空闲回收时，其"待 29 采纳"的登记（m_pendingFastcheck）必须一并失效——
+    // 否则 60s 后到达的 29 会采纳一条已 expired 的 upload_session 行。按 sessionId 精确匹配，
+    // 只影响被回收的正是该挂起会话的场合。
+    if (m_pendingFastcheck.active && m_pendingFastcheck.sessionId == cp->sessionId) {
+        m_pendingFastcheck.active = false;
+    }
+    cp->session.reset();
+    m_uploads.remove(id);
+    qCWarning(lcFs) << "[transfer] 释放上传槽 id=" << id << " conn=" << m_connId
+                    << " 剩余=" << m_uploads.size();
+}
+
+// D5：上传上下文 60s 无进展回收（写盘在途不回收）
+void MsgHandler::reapIdleUploads(qint64 nowMs, int idleSec)
+{
+    if (m_uploads.isEmpty()) {
+        return;
+    }
+    const qint64 idleMs = qint64(idleSec) * 1000;
+    QList<quint64> victims;
+    for (QHash<quint64, UploadCtx>::const_iterator it = m_uploads.constBegin();
+         it != m_uploads.constEnd(); ++it) {
+        if (!it->writeInFlight && it->lastProgressMs > 0
+                && nowMs - it->lastProgressMs > idleMs) {
+            victims.append(it.key());
+        }
+    }
+    for (quint64 id : victims) {
+        qCWarning(lcFs) << "[transfer] 空闲回收上传槽 id=" << id << " conn=" << m_connId;
+        abortUpload(id);
+    }
 }
 // REQ-EXT-FILE-002 D2：秒传预检查（新 PDU 97/98）。
 // 三段顺序：请求级幂等短路 → 摘要预检查（命中零正文） → 未命中登记暂存会话交回原顺序上传状态机。
 // 不读客户端物理路径、不复制物理文件；拒绝路径只记长度与类型，不落内容/路径明文（lcFs）。
 PDU *MsgHandler::uploadfilefastcheck()
 {
-    // REQ-EXT-GROUP-003：个人秒传路径清空群作用域
-    m_groupUploadGroupId = 0;
-    m_groupUploadDisplayName.clear();
+    // 97 无 transfer_id（P2：客户端预检查保持单飞）→ 始终落在旧单流槽（id=0）
+    m_uploads.remove(TRANSFER_ID_LEGACY);
+    UploadCtx& ctx = currentUpload();
+    // N-1：97 纯占位此前从不置 lastProgressMs，永不满足 D5 的空闲回收条件（要求 lastProgressMs > 0），
+    // 残留的 id=0 暂存槽与 upload_session 行只能等 3600s TTL 或下一次 97 覆盖。建槽即起空闲计时，
+    // 使其纳入既有回收口径（60s 无进展即 Active→Aborted，会话 expired、staging 保留）。
+    ctx.lastProgressMs = QDateTime::currentMSecsSinceEpoch();
+    // AUD-1 修复：97 是**预检查/暂存登记**，不是一次上传，其 id=0 槽不得占用上传并发名额
+    // （activeUploadCount() 按此标记排除）。否则并行客户端"每文件先 97 再 29"会为每个文件留下
+    // 一个被计入的占位，使同一连接第 3 路新个人上传的 INIT 被上限误拒（违背 D6 上传=3 / 验收 5）。
+    // 注意：不得在此清掉该槽——旧客户端（REQ-EXT-FILE-002 形态）未命中后直接发 31 分块（无 29），
+    // 正是靠这个 id=0 上下文接收正文；该槽在 31 推进时转为普通活跃上下文（见 handleUploadWriteFinished），
+    // 或在被随后的 29 采纳后由 uploadfileinit 释放。
+    ctx.fastcheckPlaceholder = true;
     bool ret = false;
     bool hit = false;
     qint64 fileId = -1;
@@ -1220,12 +1356,25 @@ PDU *MsgHandler::uploadfilefastcheck()
     qint64 nextOffset = 0;
     QByteArray finalName;
     // 拒绝响应也带协议版本：客户端据此区分"版本不匹配"与"服务端拒绝"
+    // AUD-3：同时尽力回带请求标识（97 的 reqId），使客户端能把迟到 98 归还到发起它的任务。
+    // 拒绝路径下长度字段可能已非法，故按"caMsg 末尾 reqIdLen 字节"取；仍越界则不回带（客户端按无匹配丢弃）。
     auto rejectResponse = [&]() {
-        PDU* r = mkPDU();
+        QByteArray echo;
+        if (pdu->caMsg != nullptr && pdu->uiMsgLen > 0) {
+            uint rl = 0;
+            memcpy(&rl, pdu->caData + FASTCHECK_REQID_LEN_OFFSET, sizeof(rl));
+            if (rl >= 8 && rl <= 96 && pdu->uiMsgLen > 0 && rl <= uint(pdu->uiMsgLen)) {
+                echo = QByteArray(pdu->caMsg + (pdu->uiMsgLen - int(rl)), int(rl));
+            }
+        }
+        PDU* r = mkPDU(uint(echo.size()));
         const uint respVersion = FASTCHECK_VERSION;
         r->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
         memcpy(r->caData + FASTCHECK_RESP_RET_OFFSET, &ret, sizeof(ret));
         memcpy(r->caData + FASTCHECK_RESP_VERSION_OFFSET, &respVersion, sizeof(respVersion));
+        if (!echo.isEmpty()) {
+            memcpy(r->caMsg, echo.constData(), size_t(echo.size()));   // nameLen=0，客户端从 caMsg[0..] 读标识
+        }
         return r;
     };
 
@@ -1291,7 +1440,7 @@ PDU *MsgHandler::uploadfilefastcheck()
     // 本地：以本次请求的 parent/display/size 建立暂存会话（未命中与"失败重试"共用）。
     // retrySessionId >= 0 = 复用既有会话行（uk_req 下不可再插一行，只能原地重置）。
     auto beginStagedSession = [&](qint64 retrySessionId) {
-        const ResumableUploadSession::BeginResult br = m_uploadSession.beginStaged(
+        const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
                     m_actorName, parent, displayName, fileSize, true);
         if (!br.ok) {
             qCWarning(lcFs) << "[fastcheck] 暂存会话建立失败 conn=" << m_connId;
@@ -1300,16 +1449,16 @@ PDU *MsgHandler::uploadfilefastcheck()
         if (retrySessionId >= 0) {
             if (!OperateDB::instance().restartUploadSession(
                         retrySessionId, parent, displayName, fileSize, shaHex,
-                        m_uploadSession.stagingFilePath(), br.offset, 3600)) {
+                        ctx.session.stagingFilePath(), br.offset, 3600)) {
                 qCWarning(lcFs) << "[fastcheck] 会话重置失败 conn=" << m_connId;
                 return;
             }
-            m_uploadSessionId = retrySessionId;
+            ctx.sessionId = retrySessionId;
         } else {
-            m_uploadSessionId = OperateDB::instance().createUploadSession(
+            ctx.sessionId = OperateDB::instance().createUploadSession(
                         m_actorName, parent, displayName, fileSize, shaHex,
-                        m_uploadSession.stagingFilePath(), br.offset, 3600, reqId);
-            if (m_uploadSessionId < 0) {
+                        ctx.session.stagingFilePath(), br.offset, 3600, reqId);
+            if (ctx.sessionId < 0) {
                 // 同请求键并发插入冲突：回读既有行复用（幂等重放不返回空会话）
                 const OperateDB::UploadSessionLookup ex =
                         OperateDB::instance().lookupUploadSessionByRequestId(m_actorName, reqId);
@@ -1317,13 +1466,13 @@ PDU *MsgHandler::uploadfilefastcheck()
                     qCWarning(lcFs) << "[fastcheck] 会话登记失败 conn=" << m_connId;
                     return;
                 }
-                m_uploadSessionId = ex.sessionId;
+                ctx.sessionId = ex.sessionId;
             }
         }
-        m_uploadExpectedSha = shaHex;
-        ret = true; sessionId = m_uploadSessionId; nextOffset = br.offset;
+        ctx.expectedSha = shaHex;
+        ret = true; sessionId = ctx.sessionId; nextOffset = br.offset;
         if (br.complete) {
-            const qint64 pending = m_uploadSessionId;
+            const qint64 pending = ctx.sessionId;
             const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
             if (cr.ok) {
                 hit = true; fileId = cr.fileId; sessionId = pending;
@@ -1344,14 +1493,14 @@ PDU *MsgHandler::uploadfilefastcheck()
         handled = true;
     } else if (prior.found && prior.status == "uploading") {
         // 断点续传：用会话行（而非本次请求）的 parent/display/size 复原同一 staging 令牌
-        const ResumableUploadSession::BeginResult br = m_uploadSession.beginStaged(
+        const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
                     m_actorName, prior.parentPath, prior.displayName, prior.expectedSize, true);
         if (br.ok) {
-            m_uploadSessionId = prior.sessionId;
-            m_uploadExpectedSha = prior.clientSha256;
+            ctx.sessionId = prior.sessionId;
+            ctx.expectedSha = prior.clientSha256;
             ret = true; sessionId = prior.sessionId; nextOffset = br.offset;
             if (br.complete) {
-                const qint64 pending = m_uploadSessionId;
+                const qint64 pending = ctx.sessionId;
                 const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
                 if (cr.ok) { hit = true; fileId = cr.fileId; sessionId = pending; finalName = cr.displayName.toUtf8(); }
                 else { ret = false; }
@@ -1391,17 +1540,31 @@ PDU *MsgHandler::uploadfilefastcheck()
             }
         } else {
             // 未命中：不建对象、不建条目，只登记暂存会话（后续走既有分块 PDU，零改动）
-            m_uploadSessionId = -1;
-            m_uploadExpectedSha.clear();
+            ctx.sessionId = -1;
+            ctx.expectedSha.clear();
             beginStagedSession(-1);
         }
+    }
+
+    // 未命中且会话可续：暂存供随后的 29 INIT 采纳（个人并行上传握手 = 97 → 29 → 31/32）
+    m_pendingFastcheck.active = false;
+    if (ret && !hit) {
+        UploadCtx& pc = currentUpload();
+        m_pendingFastcheck.active = true;
+        m_pendingFastcheck.sessionId = pc.sessionId;
+        m_pendingFastcheck.shaHex = pc.expectedSha;
+        m_pendingFastcheck.parent = pc.session.parentPath();
+        m_pendingFastcheck.display = pc.session.displayName();
+        m_pendingFastcheck.size = pc.session.totalSize();
     }
 
     qCDebug(lcFs) << "[fastcheck] conn=" << m_connId << " ret=" << ret << " hit=" << hit
                   << " fileId=" << fileId << " sessionId=" << sessionId
                   << " nextOffset=" << nextOffset << " nameLen=" << finalName.size();
 
-    PDU* respdu = mkPDU(uint(finalName.size()));
+    // AUD-3：98 回带 97 的请求标识（追加在名字之后，nameLen 不含它）——客户端据此按标识归属，
+    // 丢弃无匹配的迟到 98。旧读法 msg[:nameLen] 不受影响（附加字段只增不减）。
+    PDU* respdu = mkPDU(uint(finalName.size()) + uint(reqIdBytes.size()));
     respdu->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
     const uint respVersion = FASTCHECK_VERSION;
     const uint nameLenOut = uint(finalName.size());
@@ -1415,18 +1578,22 @@ PDU *MsgHandler::uploadfilefastcheck()
     if (!finalName.isEmpty()) {
         memcpy(respdu->caMsg, finalName.constData(), size_t(finalName.size()));
     }
+    if (!reqIdBytes.isEmpty()) {
+        memcpy(respdu->caMsg + finalName.size(), reqIdBytes.constData(), size_t(reqIdBytes.size()));
+    }
     return respdu;
 }
 
-//上传文件数据
+//上传文件数据（此路径实际由 MyTcpSocket::handleUploadData 派发；保留按 id 取上下文）
 PDU *MsgHandler::uploadfiledata()
 {
+    UploadCtx* cp = findUpload(m_currentTransferId);
     uint resumeMagic=0;
     qint64 chunkOffset=0;
     memcpy(&resumeMagic,pdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,sizeof(uint));
-    if(resumeMagic == UPLOAD_RESUME_MAGIC){
+    if(resumeMagic == UPLOAD_RESUME_MAGIC && cp){
         memcpy(&chunkOffset,pdu->caData+UPLOAD_CHUNK_OFFSET,sizeof(qint64));
-        if(chunkOffset != m_uploadSession.receivedSize()){
+        if(chunkOffset != cp->session.receivedSize()){
             bool ret=false;
             PDU* respdu=mkPDU();
             respdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND;
@@ -1438,10 +1605,10 @@ PDU *MsgHandler::uploadfiledata()
 
     bool ret=false; // Upload writes are dispatched by MyTcpSocket to UploadWriteTask.
     qCDebug(lcFs)<<"uploadfiledata len"<<pdu->uiMsgLen
-            <<"received"<<m_uploadSession.receivedSize()
-            <<"total"<<m_uploadSession.totalSize()
+            <<"received"<<(cp?cp->session.receivedSize():-1)
+            <<"total"<<(cp?cp->session.totalSize():-1)
             <<"ret"<<ret<<endl;
-    if(ret && !m_uploadSession.isComplete()){
+    if(ret && cp && !cp->session.isComplete()){
         return nullptr;
     }
     PDU* respdu=mkPDU();
@@ -1458,29 +1625,36 @@ PDU *MsgHandler::uploadfiledata()
 FileObjectStore::CommitResult MsgHandler::finalizeUploadOnComplete()
 {
     FileObjectStore::CommitResult r;
+    UploadCtx* cp = findUpload(m_currentTransferId);
+    if (!cp) {
+        r.error = "会话上下文缺失";
+        qCWarning(lcFs) << "[finalizeUpload] 无上下文，拒绝转正 conn=" << m_connId
+                        << " id=" << m_currentTransferId;
+        return r;
+    }
+    const quint64 tid = cp->id;
     const QString owner = m_actorName;
-    const QString parent = m_uploadSession.parentPath();
-    const QString display = m_uploadSession.displayName();
-    const qint64 expected = m_uploadSession.totalSize();
-    const QString staging = m_uploadSession.stagingFilePath();
+    const QString parent = cp->session.parentPath();
+    const QString display = cp->session.displayName();
+    const qint64 expected = cp->session.totalSize();
+    const QString staging = cp->session.stagingFilePath();
+    const qint64 sessionId = cp->sessionId;
+    const QString expectedSha = cp->expectedSha;
+    const quint64 groupId = cp->groupId;
+    const QString groupName = cp->groupDisplayName;
     if (owner.isEmpty() || parent.isEmpty() || display.isEmpty() || staging.isEmpty()) {
         r.error = "会话上下文缺失";
         qCWarning(lcFs) << "[finalizeUpload] 会话上下文缺失，拒绝转正 conn=" << m_connId;
-        m_uploadSession.reset();
-        m_uploadSessionId = -1;
-        m_uploadExpectedSha.clear();
+        m_uploads.remove(tid);
         return r;
     }
-    qCDebug(lcFs) << "[finalizeUpload] verifying conn=" << m_connId << " owner=" << owner << " display=" << display;
-    OperateDB::instance().finishUploadSession(m_uploadSessionId, "verifying");
+    qCDebug(lcFs) << "[finalizeUpload] verifying conn=" << m_connId << " id=" << tid
+                  << " owner=" << owner << " display=" << display;
+    OperateDB::instance().finishUploadSession(sessionId, "verifying");
     r = FileObjectStore::instance().commitUpload(owner, parent, display, expected, staging,
-                                                /*copyOnly=*/false, m_uploadExpectedSha);
+                                                /*copyOnly=*/false, expectedSha);
     // REQ-EXT-GROUP-003：群作用域上传在个人条目落定后，同规则建群目录引用（+1 引用计数）。
     // 群引用建立失败则撤销个人条目（releaseEntry 减引用）并整体判失败，绝不留下半成品。
-    const quint64 groupId = m_groupUploadGroupId;
-    const QString groupName = m_groupUploadDisplayName;
-    m_groupUploadGroupId = 0;
-    m_groupUploadDisplayName.clear();
     m_lastGroupFileId = 0;
     if (r.ok && groupId != 0) {
         const FileObjectStore::GroupAttachResult ga = FileObjectStore::instance().attachGroupFile(
@@ -1501,16 +1675,14 @@ FileObjectStore::CommitResult MsgHandler::finalizeUploadOnComplete()
     }
     if (r.ok) {
         // 同写 file_id：使"已完成会话"能被请求级幂等短路直接命中（§2 步骤3）
-        OperateDB::instance().finishUploadSession(m_uploadSessionId, "done", r.fileId);
+        OperateDB::instance().finishUploadSession(sessionId, "done", r.fileId);
         qCDebug(lcFs) << "[finalizeUpload] 落定 fileId=" << r.fileId << " objId=" << r.objectId
                       << " dedup=" << r.dedupHit << " 定名=" << r.displayName;
     } else {
-        OperateDB::instance().finishUploadSession(m_uploadSessionId, "failed");
+        OperateDB::instance().finishUploadSession(sessionId, "failed");
         qCWarning(lcFs) << "[finalizeUpload] 拒绝转正 conn=" << m_connId << " 原因=" << r.error;
     }
-    m_uploadSession.reset();
-    m_uploadSessionId = -1;
-    m_uploadExpectedSha.clear();
+    m_uploads.remove(tid);   // 上下文释放（Committed → [无]）
     return r;
 }
 
@@ -1526,6 +1698,17 @@ PDU *MsgHandler::downloadfile()
     bool ret=false;
     qint64 fileSize=0;
     m_downloadCanonicalPath.clear();
+    if (!m_downloadSlotAvailable) {
+        // D7 硬兜底：本连接并发下载已达上限（客户端正常排队时不触发）
+        qCWarning(lcFs) << "[downloadfile] 拒绝：下载并发上限 conn=" << m_connId
+                        << " id=" << m_currentTransferId;
+        PDU* respdu=mkPDU();
+        respdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND;
+        memcpy(respdu->caData,&ret,sizeof(ret));
+        memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
+        memcpy(respdu->caData+DOWNLOAD_RESP_TRANSFER_ID_OFFSET,&m_currentTransferId,sizeof(m_currentTransferId));
+        return respdu;
+    }
 
     // REQ-EXT-SEC-001: 下载范围收敛为 actor 本人用户根，他人文件不可下载
     // REQ-EXT-FILE-001 D5：对象文件不物理落用户路径，改为校验所在目录在 actor 根内
@@ -1555,6 +1738,8 @@ PDU *MsgHandler::downloadfile()
     respdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND;
     memcpy(respdu->caData,&ret,sizeof(ret));
     memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
+    // 41 的 [32..62] 被文件名字段占用 → id 落在独立的 [16..23]（D2）
+    memcpy(respdu->caData+DOWNLOAD_RESP_TRANSFER_ID_OFFSET,&m_currentTransferId,sizeof(m_currentTransferId));
     QByteArray fileNameBytes=fileName.toUtf8();
     memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
     qCDebug(lcFs)<<"downloadfile validate path"<<filePath<<"ret"<<ret<<"size"<<fileSize;
@@ -1994,6 +2179,11 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
         encoded.append(body);
         PDU *out = mkPDU(uint(encoded.size()));
         out->uiType = responseType;
+        // 102/106 回带 transfer_id（R3）；其余群文件响应 caData 保持全零
+        if (responseType == ENUM_MSG_TYPE_GROUP_FILE_UPLOAD_INIT_RESPOND
+                || responseType == ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND) {
+            memcpy(out->caData + TRANSFER_ID_OFFSET, &m_currentTransferId, sizeof(m_currentTransferId));
+        }
         memcpy(out->caMsg, encoded.constData(), size_t(encoded.size()));
         return out;
     };
@@ -2068,6 +2258,11 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
     }
     if (request.operation == OperateDB::GroupFileDownload) {
         QByteArray body;
+        if (code == 0 && !m_downloadSlotAvailable) {
+            code = -2107;   // D7：本连接并发下载已达上限
+            qCWarning(lcFs) << "[GROUPFILE] 拒绝：下载并发上限 conn=" << m_connId
+                            << " id=" << m_currentTransferId;
+        }
         if (code == 0) {
             // 服务端解析物理路径（group_file.object_id → file_object.storage_path），
             // 绝不接受客户端路径；后续正文走既有 42/43 分块（MyTcpSocket 触发）。
@@ -2091,33 +2286,48 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
     qint64 fileId = -1, sessionId = -1, nextOffset = 0;
     quint64 groupFileIdOut = 0;
     QString finalName = request.displayName;
-    m_groupUploadGroupId = 0;
-    m_groupUploadDisplayName.clear();
     if (code == 0) {
         if (hit) {
             fileId = request.hostFileId;
             groupFileIdOut = result.groupFileId;
             nextOffset = request.fileSize;   // 命中零正文：续传起点=文件尾
+        } else if (!acquireUploadSlot(m_currentTransferId)) {
+            // D7 硬上限 / T-17 重复 id：拒绝且不建状态（P7：不回退到 id=0）
+            code = -2106;
+            qCWarning(lcFs) << "[GROUPFILE] 拒绝：并发上限或 id 冲突 conn=" << m_connId
+                            << " id=" << m_currentTransferId << " active=" << activeUploadCount();
         } else {
+            const quint64 tid = m_currentTransferId;
+            UploadCtx& ctx = m_uploads[tid];
+            ctx.id = tid;
+            ctx.sessionId = -1;
+            ctx.expectedSha.clear();
+            ctx.groupId = 0;
+            ctx.groupDisplayName.clear();
+            ctx.writeInFlight = false;
+            ctx.lastProgressMs = QDateTime::currentMSecsSinceEpoch();
+
             const QString parent = QStringLiteral("/");
-            const ResumableUploadSession::BeginResult br = m_uploadSession.beginStaged(
+            const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
                         m_actorName, parent, request.displayName, request.fileSize, true);
             if (!br.ok) {
                 code = -2105;
+                m_uploads.remove(tid);
                 qCWarning(lcFs) << "[GROUPFILE] 暂存会话建立失败 conn=" << m_connId
                                 << " group=" << request.groupId;
             } else {
                 sessionId = OperateDB::instance().createUploadSession(
                             m_actorName, parent, request.displayName, request.fileSize,
-                            request.shaHex, m_uploadSession.stagingFilePath(), br.offset, 3600);
+                            request.shaHex, ctx.session.stagingFilePath(), br.offset, 3600);
                 if (sessionId < 0) {
                     code = -2105;
+                    m_uploads.remove(tid);
                     qCWarning(lcFs) << "[GROUPFILE] 上传会话登记失败 conn=" << m_connId;
                 } else {
-                    m_uploadSessionId = sessionId;
-                    m_uploadExpectedSha = request.shaHex;
-                    m_groupUploadGroupId = request.groupId;
-                    m_groupUploadDisplayName = request.displayName;
+                    ctx.sessionId = sessionId;
+                    ctx.expectedSha = request.shaHex;
+                    ctx.groupId = request.groupId;
+                    ctx.groupDisplayName = request.displayName;
                     nextOffset = br.offset;
                     if (br.complete) {
                         // 0 字节或断点已在尾部：立即落定（服务端复算 + 群引用，同个人路径）

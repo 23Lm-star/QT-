@@ -19,7 +19,8 @@
 | **Chat** | `chat.{h,cpp}`, `chat.ui` | 聊天界面：消息发送/展示；一对一即时通讯 |
 | **OnlineUser** | `onlineuser.{h,cpp}`, `onlineuser.ui` | 在线用户列表界面 |
 | **ShareFile** | `sharefile.{h,cpp}`, `sharefile.ui` | 文件分享：选择目标好友的界面 |
-| **Uploader** | `uploader.{h,cpp}` | 文件上传工作线程：`moveToThread` 独立线程，分块(4096B)发送 |
+| **Uploader** | `uploader.{h,cpp}` | 单文件分块(4096B)发送；携带 `transferId`（31 的 `caData[48..55]`），单块在途等 32 再发下一块 |
+| **TransferManager / TransferTaskPanel** | `transfertask.{h,cpp}` | REQ-EXT-TRANSFER-001：文件级任务管理与调度（两方向各 3 名额）、按 `transfer_id` 路由 30/32/41/42/43/98/102/106/108、上传暂停/继续/取消（107）、SHA-256 后台线程（M5）、任务列表 UI（M6） |
 | **UserInformation** | `userinformation.{h,cpp}`, `userinformation.ui` | 用户信息展示弹出窗口 |
 | **SimpleCaptcha** | `simplecaptcha.{h,cpp}` | 验证码显示组件（本地绘制） |
 | **ClientHeartbeat** | `clientheartbeat.{h,cpp}`（规划） | 唯一客户端心跳调度器：登录后发 PING、接收 PONG、3 次超时上报连接不健康；不依赖业务页面。 |
@@ -42,10 +43,18 @@ Index (单例)
  ├── Chat
  └── sharefile (通过 File 触发)
 
-Uploader (独立线程)
+Uploader
  ├── protocol.h (构造 PDU)
  └── QTcpSocket (通过信号回主线程发送)
+
+TransferManager (单例，Client 持有)
+ ├── Uploader (每个活跃上传一个实例)
+ ├── File / GroupFile (入队、hashDue/fastcheckDue 信号)
+ └── Client::seedMsg (发送 29/31/40/101/105/107)
 ```
+
+> REQ-EXT-TRANSFER-001：上传/下载的**会话状态已从单例搬入任务**——`File`/`GroupFile` 不再各持
+> 一个 `m_uploader`，`GroupFile::s_uploading` 静态单例已删除；`Client/MsgHandler` 不再持有下载接收单槽。
 
 ---
 
@@ -57,13 +66,14 @@ Uploader (独立线程)
 |------|------|------|
 | **Server** | `server.{h,cpp}` | 服务端入口窗口：加载配置、启动 TCP 监听 |
 | **MyTcpServer** | `mytcpserver.{h,cpp}` | TCP 监听器（单例）：管理连接列表、消息转发 |
-| **MyTcpSocket** | `mytcpsocket.{h,cpp}` | 单客户端连接：PDU 粘包/半包处理、消息分发 |
+| **MyTcpSocket** | `mytcpsocket.{h,cpp}` | 单客户端连接：PDU 粘包/半包处理、消息分发；REQ-EXT-TRANSFER-001 起持有 per-transfer 下载环（`m_downloads` + round-robin）与上传空闲回收定时器 |
 | **ClientTask** | `clienttask.{h,cpp}` | 线程池任务包装：`QObject + QRunnable` |
 | **MsgHandler** | `msghandler.{h,cpp}` | 请求处理：注册/登录/好友/聊天/文件/验证码 |
 | **OperateDB** | `operatedb.{h,cpp}` | 数据库访问（单例）：全部 SQL 操作集中在此；仅追加分享链接持久化窄接口 |
 | **ShareLinkService** | `sharelinkservice.{h,cpp}`（规划） | 生成、哈希、解析和校验应用内分享 token；只依赖 OperateDB 窄接口和文件根目录校验，不依赖好友分享链路。 |
 | **DatabaseConnectionPool** | `databaseconnectionpool.{h,cpp}` | 数据库连接池（单例）：RAII 管理，按线程隔离 |
-| **ResumableUploadSession** | `resumableuploadsession.{h,cpp}` | 断点续传会话管理：写入文件、偏移量连续性校验 |
+| **ResumableUploadSession** | `resumableuploadsession.{h,cpp}` | 断点续传会话管理：写入文件、偏移量连续性校验；REQ-EXT-TRANSFER-001 起由 `MsgHandler::UploadCtx` 按 `transfer_id` 持有 |
+| **UploadWriteTask** | `uploadwritetask.{h,cpp}` | 分块写盘任务（QThreadPool）；回带 `transfer_id` 使回调按 id 归属 |
 | **Protocol** | `protocol.{h,cpp}` | PDU 协议定义 + 构造：`memalloc/memfree` 版本 |
 | **Config** | `connect.config`, `config.qrc` | 监听配置（IP/端口/文件路径），嵌入 Qt 资源文件 |
 
@@ -230,3 +240,45 @@ Server  MyTcpSocket（actor 门）
                       └── DatabaseConnectionPool（RAII、线程隔离）
 ```
 
+
+---
+
+## 7. 多文件并行传输子系统（REQ-EXT-TRANSFER-001）
+
+### 7.1 客户端
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **TransferManager** | `transfertask.{h,cpp}`（新增） | 单例任务表：`QHash<key,Task>` + `id→key` 映射；两方向独立名额（上传 3 / 下载 3，D6），`pump()` 在槽位释放时启动同方向队首；按 `transfer_id` 路由 30/32/41/42/43/98/102/106/108；`pause/resume/cancel/retry`（仅上传）；97 预检查连接级单飞（`pumpFastcheck`，因 97 不带 id 且服务端旧槽单份） |
+| **TransferTaskPanel** | `transfertask.{h,cpp}`（新增） | 文件级任务列表（`QTableWidget`：文件名/方向/进度/状态/失败原因 + 暂停/继续/取消/重试），替代并发下互相打架的逐文件 `QMessageBox`（M6） |
+| **File** | `file.{h,cpp}` | 多选 `getOpenFileNames`；**保留**流式 SHA-256（1MiB）与 97 预检查（P4/P5）——任务入队后由 `hashDue`/`fastcheckDue` 信号驱动本窗口计算并发送；下载支持多选并发；新增"传输列表"入口（程序化按钮，不改 .ui） |
+| **GroupFile** | `groupfile.{h,cpp}` | 多选上传（SHA 由 `TransferManager` 在后台线程算，M5）与下载；删除 `m_uploader` 与静态 `s_uploading` 单例；102/106 交由 `TransferManager` 路由 |
+| **MsgHandler (Client)** | `msghandler.{h,cpp}` | 移除下载接收单槽与旧上传响应处理（30/32/41/42/43/98/102/106 已改由 `TransferManager` 承载） |
+| **Uploader** | `uploader.{h,cpp}` | 构造时接收 `transferId`，31 的 `caData[48..55]` 写入；`acknowledge()` 只接受本 id 的响应（由 `TransferManager` 保证） |
+
+### 7.2 服务端
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **MsgHandler** | `msghandler.{h,cpp}` | `UploadCtx` 表（`QHash<quint64,UploadCtx>`，id=0 = 旧单流槽）：29/101 建槽（`acquireUploadSlot` 判上限 D7 与重复 id T-17）、31 校验逐 transfer 化、`abortUpload`（107 处置：会话 `expired`、staging 保留）、`reapIdleUploads`（D5 60s 回收）、`finalizeUploadOnComplete` 释放上下文；97 未命中暂存会话供随后 29 采纳（`m_pendingFastcheck`）；下载上限经 `m_downloadSlotAvailable` 在 40/105 拒绝 |
+| **MyTcpSocket** | `mytcpsocket.{h,cpp}` | 落位读取请求 id（29/31/40/101/105/107）；`handleUploadData`/`handleUploadWriteFinished` 按 id 取上下文（未知 id 拒绝不回退）；`handleUploadAbort` 107→108；**下载环**：`m_downloads` + `m_downloadRing` + `m_rrCursor`，每 tick 一块 round-robin，与 256KB 高水位联动；连接级 15s 回收定时器；`clientOffLine` 清空两表不写 DB |
+| **UploadWriteTask** | `uploadwritetask.{h,cpp}` | 增加 `transferId`，经 `MyTcpServer` 回调按 id 归属 |
+| **MyTcpServer** | `mytcpserver.{h,cpp}` | `handleUploadWriteFinished` 增加 `transferId` 形参并透传 |
+
+### 7.3 依赖关系
+
+```
+Client  File/GroupFile ──enqueue──> TransferManager ──29/31/40/101/105/107──> Client::seedMsg
+                ↑ hashDue/fastcheckDue        ↑ 30/32/41/42/43/98/102/106/108（Client::handlMsg 按 id 分发）
+        Uploader（每活跃上传一个，带 transferId）
+
+Server  MyTcpSocket（落位读 id；下载环；107/108；15s 回收）
+          └── MsgHandler::UploadCtx 表（29/31/101/107/回收）
+                └── UploadWriteTask ──(connectionId, transferId)──> MyTcpServer ──> MyTcpSocket
+```
+
+### 7.4 不变式与缺口
+
+- id=0 走同一容器但字节与语义与旧实现逐字节等价（D8/I1/I3）；旧 e2e 直接打 id=0 全流程。
+- 每 transfer 保持单块在途 + 顺序 offset，不引入乱序分片。
+- 已知缺口：**下载不可 abort**（非目标）——客户端放弃某下载后服务端仍发完，有界且断线即止（design §10 R1）。

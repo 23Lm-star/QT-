@@ -8,8 +8,6 @@
 #include <QPushButton>
 #include <QWidget>
 
-class Uploader;
-
 // REQ-EXT-GROUP-003：单群文件目录窗口。
 // 目录经 99/100 分页列出（名称/大小/上传者/时间，无物理路径）；
 // 上传先发 101 做秒传预检查：命中零正文，未命中回 session_id/nextOffset 走既有 31 分块；
@@ -23,20 +21,15 @@ public:
     quint64 groupId() const { return m_groupId; }
     QString groupName() const { return m_groupName; }
 
-    // 100/102/104 响应路由（按信封 group_id 匹配）
+    // 100/104 响应路由（按信封 group_id 匹配）
+    // REQ-EXT-TRANSFER-001：102/106 已改由 TransferManager 按 transfer_id 路由
     void handleResponse(PDU *pdu);
-    // 32 上传数据响应路由（仅当本窗口有进行中的群上传）
-    void acknowledgeUploadChunk(PDU *pdu);
-    // 当前有进行中群上传的窗口（无则 nullptr）；供 Client 分发 32 响应
-    static GroupFile *uploadingInstance();
-    // 42/43 下载流前置：106 元数据已由客户端 MsgHandler 处理（复用既有接收文件）
 
 private slots:
     void refresh();
     void uploadFile();
     void downloadSelected();
     void deleteSelected();
-    void onUploadFinished(bool success);
     void onItemDoubleClicked(QListWidgetItem *item);
 
 private:
@@ -54,12 +47,6 @@ private:
     QPushButton *m_downloadButton;
     QPushButton *m_deleteButton;
     QLabel *m_statusLabel;
-    int m_downloadingRow = -1;   // 正在下载的行（用于完成提示与去重）
-
-    // 群上传（秒传未命中时的分块路径）
-    Uploader *m_uploader = nullptr;
-    QString m_uploadPath;
-    static GroupFile *s_uploading;
 };
 
 #endif // GROUPFILE_H

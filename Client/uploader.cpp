@@ -4,10 +4,11 @@
 #include <QTimer>
 #include <cstring>
 
-Uploader::Uploader(const QString &strUploadPath, qint64 resumeOffset, QObject *parent)
+Uploader::Uploader(quint64 transferId, const QString &strUploadPath, qint64 resumeOffset, QObject *parent)
     : QObject(parent),
       strUploadPath(strUploadPath),
       m_resumeOffset(resumeOffset),
+      m_transferId(transferId),
       m_nextOffset(0),
       m_waitingAck(false),
       m_active(false),
@@ -79,6 +80,7 @@ void Uploader::sendNextChunk()
     const uint resumeMagic = UPLOAD_RESUME_MAGIC;
     memcpy(pdu->caData + UPLOAD_CHUNK_OFFSET, &m_nextOffset, sizeof(m_nextOffset));
     memcpy(pdu->caData + UPLOAD_RESUME_MAGIC_OFFSET, &resumeMagic, sizeof(resumeMagic));
+    memcpy(pdu->caData + TRANSFER_ID_OFFSET, &m_transferId, sizeof(m_transferId));   // REQ-EXT-TRANSFER-001
     memcpy(pdu->caMsg, chunk.constData(), chunk.size());
     m_waitingAck = true;
     emit seedMsg(pdu);

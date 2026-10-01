@@ -13,8 +13,9 @@ public:
     QString strUploadPath;
     qint64 m_resumeOffset;
 
-    Uploader(const QString& strUploadPath, qint64 resumeOffset=0, QObject* parent=nullptr);
+    Uploader(quint64 transferId, const QString& strUploadPath, qint64 resumeOffset=0, QObject* parent=nullptr);
     void start();
+    quint64 transferId() const { return m_transferId; }
 public slots:
     void acknowledge(bool success, qint64 nextOffset, bool complete);
 signals:
@@ -26,6 +27,7 @@ private:
     void sendNextChunk();
     void finish(bool success);
 
+    quint64 m_transferId;
     QFile m_file;
     qint64 m_nextOffset;
     bool m_waitingAck;
