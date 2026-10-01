@@ -932,26 +932,60 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName)
         return ret;
     }
     QSqlDatabase db = connection.database();
-    QSqlQuery q(db);
 
-    q.prepare("select msg,seed_time from message_info where seed_name = ? and rev_name = ? and issuccess = 0");
+    // 单次事务内完成"读取未送达 + 标记已送达"：并发拉取不会重复读到同一批行。
+    if(!db.transaction()){
+        qCWarning(lcDb)<<"getchatMsg begin transaction failed:"<<db.lastError().text();
+        return ret;
+    }
+
+    // FOR UPDATE：锁定本次将返回的行，使并发拉取在读到相同行之前被串行化。
+    QSqlQuery q(db);
+    q.prepare("select id,msg,seed_time from message_info "
+              "where seed_name = ? and rev_name = ? and issuccess = 0 for update");
     q.addBindValue(QString::fromUtf8(seedName));
     q.addBindValue(QString::fromUtf8(revName));
     qCDebug(lcDb)<<"getchatMsg for:"<<QString::fromUtf8(seedName)<<"->"<<QString::fromUtf8(revName);
     if(!q.exec()){
+        qCWarning(lcDb)<<"getchatMsg select failed:"<<q.lastError().text();
+        db.rollback();
         return ret;
     }
+    QVector<qlonglong> ids;
     while(q.next()){
-        QString retItem1(q.value(0).toString());
-        QString retItem2(q.value(1).toString());
-        ret.append(retItem1);
-        ret.append(retItem2);
+        ids.append(q.value(0).toLongLong());
+        ret.append(q.value(1).toString());   // msg
+        ret.append(q.value(2).toString());   // seed_time
+    }
+    q.finish();   // 结束迭代，避免结果集状态影响后续语句
+
+    if(!ids.isEmpty()){
+        QStringList placeholders;
+        for(int i=0;i<ids.size();++i){
+            placeholders.append(QStringLiteral("?"));
+        }
+        // 独立 QSqlQuery，仅按本次返回的主键更新，并保留 issuccess=0 条件：
+        // 只标记"确实已返回"的行，事务提交前并发到达的新行不会被误标。
+        QSqlQuery upd(db);
+        upd.prepare(QStringLiteral("update message_info set issuccess = 1 "
+                                   "where id in (%1) and issuccess = 0")
+                        .arg(placeholders.join(QLatin1Char(','))));
+        for(int i=0;i<ids.size();++i){
+            upd.addBindValue(ids.at(i));
+        }
+        if(!upd.exec()){
+            qCWarning(lcDb)<<"getchatMsg update issuccess=1 failed:"<<upd.lastError().text();
+            db.rollback();
+            return QStringList();   // 未能标记已送达则不返回，宁可下次重投也不重复下发
+        }
+        qCDebug(lcDb)<<"getchatMsg update issuccess=1 rows:"<<upd.numRowsAffected();
     }
 
-    q.prepare("update message_info set issuccess = 1 where seed_name = ? and rev_name = ?");
-    q.addBindValue(QString::fromUtf8(seedName));
-    q.addBindValue(QString::fromUtf8(revName));
-    qCDebug(lcDb)<<"update msg issuccess=1 ret:"<<q.exec();
+    if(!db.commit()){
+        qCWarning(lcDb)<<"getchatMsg commit failed:"<<db.lastError().text();
+        db.rollback();
+        return QStringList();
+    }
     return ret;
 }
 
