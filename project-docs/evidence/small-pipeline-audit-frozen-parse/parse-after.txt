@@ -1,3 +1,0 @@
-AFTER (raw UTF-8 read) frozen count = 2
-  - Client/protocol.h
-  - Server/protocol.h

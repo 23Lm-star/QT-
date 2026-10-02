@@ -1,2 +1,0 @@
-xmu.db | DB-WARNING
-xmu.net | NET-CRITICAL

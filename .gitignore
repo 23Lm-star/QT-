@@ -53,6 +53,12 @@ Desktop.ini
 /.planning/
 /.ui_headers_backup_*/
 
+# AI development workflow (Development OS) — local only, not shipped with the app
+/project-docs/
+/pipeline/
+/AGENTS.md
+/CLAUDE.md
+
 # Local documentation and resume tooling
 /findings.md
 /progress.md

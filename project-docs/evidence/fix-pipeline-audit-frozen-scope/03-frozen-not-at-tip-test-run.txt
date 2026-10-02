@@ -1,2 +1,0 @@
-test GREEN-WARN: 0 automated tests registered (fill TESTS in pipeline/test.ps1)
-  any GREEN claim must cite a named probe or human-verified evidence, not this gate
