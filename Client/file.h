@@ -58,6 +58,9 @@ private slots:
     // 新增：上传槽函数
     void on_upload_PB_clicked();
 
+    // 购物车上传：分多次把文件加入待传清单，点「上传文件」统一入队
+    void onAddPendingUpload_clicked();
+
     void on_download_PB_clicked();
 
     void on_share_PB_clicked();
@@ -88,6 +91,8 @@ private:
     QString selectedFileRelativePath(QListWidgetItem *item);//计算选中文件相对用户根目录的路径
     FolderSelectDialog* m_moveDlg = nullptr;               // 移动文件时的目标目录选择弹窗
     QPushButton* m_tasksBtn = nullptr;                     // 传输任务列表入口
+    QPushButton* m_addUploadBtn = nullptr;                 // 添加待传（购物车上传入口）
+    QStringList m_pendingUploads;                          // 待传清单（本地路径）
 };
 
 #endif // FILE_H

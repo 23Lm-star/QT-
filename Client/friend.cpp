@@ -9,6 +9,7 @@ Friend::Friend(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::Friend)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
     m_onlineUser=new OnlineUser;
     m_chat=new Chat;

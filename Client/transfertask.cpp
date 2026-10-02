@@ -12,11 +12,15 @@
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMessageBox>
 #include <QCryptographicHash>
 #include <QFutureWatcher>
 #include <QPushButton>
+#include <QStandardPaths>
 #include <QTableWidget>
 #include <QUuid>
 #include <QVBoxLayout>
@@ -39,6 +43,112 @@ TransferManager::TransferManager()
 quint64 TransferManager::allocId()
 {
     return m_nextId++;
+}
+
+// ===================== 会话间持久化（transfers_<user>.json） =====================
+// 设计：快照只在状态跃迁点写入（入队/完成/暂停/恢复/取消/重试），进度字节不落盘——
+// 续传点由协议决定（个人上传 97/30 回带 offset；下载整文件重传），落盘进度只会误导。
+
+QString TransferManager::snapshotPath() const
+{
+    QString safe;
+    for (const QChar &ch : m_currentUser) {
+        const ushort u = ch.unicode();
+        safe += ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9')
+                 || u >= 0x4E00) ? ch : QChar('_');   // 中文/字母数字保留，其余转 _（防路径注入）
+    }
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    return QDir(base).filePath(QStringLiteral("transfers_%1.json").arg(safe));
+}
+
+void TransferManager::saveSnapshot()
+{
+    if (m_currentUser.isEmpty()) return;
+    QJsonArray arr;
+    for (auto it = m_tasks.constBegin(); it != m_tasks.constEnd(); ++it) {
+        const Task &t = it.value();
+        if (t.state == Done || t.state == Cancelled) continue;   // 终态不入快照
+        QJsonObject o;
+        o[QStringLiteral("kind")] = int(t.kind);
+        o[QStringLiteral("localPath")] = t.localPath;
+        o[QStringLiteral("displayName")] = t.displayName;
+        o[QStringLiteral("dirPath")] = t.dirPath;
+        o[QStringLiteral("serverPath")] = t.serverPath;
+        o[QStringLiteral("groupId")] = double(t.groupId);
+        o[QStringLiteral("groupFileId")] = double(t.groupFileId);
+        o[QStringLiteral("totalBytes")] = double(t.totalBytes);
+        arr.append(o);
+    }
+    const QString path = snapshotPath();
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+void TransferManager::restoreSavedTasks()
+{
+    if (m_currentUser.isEmpty()) return;
+    if (m_restoredUser == m_currentUser) return;   // 断线重连不重复恢复（内存为准）
+    m_restoredUser = m_currentUser;
+    m_restoredCount = 0;
+    QFile f(snapshotPath());
+    if (!f.open(QIODevice::ReadOnly)) return;
+    const QJsonArray arr = QJsonDocument::fromJson(f.readAll()).array();
+    for (const QJsonValue &v : arr) {
+        const QJsonObject o = v.toObject();
+        const Kind kind = Kind(o[QStringLiteral("kind")].toInt());
+        Task t;
+        t.kind = kind;
+        t.localPath = o[QStringLiteral("localPath")].toString();
+        t.displayName = o[QStringLiteral("displayName")].toString();
+        t.dirPath = o[QStringLiteral("dirPath")].toString();
+        t.serverPath = o[QStringLiteral("serverPath")].toString();
+        t.groupId = quint64(o[QStringLiteral("groupId")].toDouble());
+        t.groupFileId = quint64(o[QStringLiteral("groupFileId")].toDouble());
+        t.key = m_nextKey++;
+        t.id = allocId();   // Paused 任务无 wire 活动；resume 时会重新分配
+        if (t.isUpload()) {
+            t.totalBytes = QFileInfo(t.localPath).size();
+            if (t.localPath.isEmpty() || !QFileInfo::exists(t.localPath)) {
+                // 本地文件已删：恢复为 Failed 让用户看见，而不是无声丢弃
+                t.state = Failed;
+                t.failReason = QStringLiteral("本地文件不存在，无法续传");
+            } else {
+                t.state = Paused;
+                t.wasRestored = true;
+                ++m_restoredCount;
+            }
+        } else {
+            t.totalBytes = qint64(o[QStringLiteral("totalBytes")].toDouble());
+            t.state = Paused;
+            ++m_restoredCount;
+        }
+        m_tasks.insert(t.key, t);
+    }
+    if (m_restoredCount > 0) emit tasksChanged();
+}
+
+void TransferManager::setCurrentUser(const QString& name)
+{
+    if (name.isEmpty() || name == m_currentUser) return;
+    if (!m_currentUser.isEmpty()) saveSnapshot();   // 切用户：上一个用户的内存任务落盘
+    m_tasks.clear();
+    m_idToKey.clear();
+    m_uploadQueue.clear();
+    m_downloadQueue.clear();
+    m_fastcheckQueue.clear();
+    m_fastcheckInFlight = 0;
+    m_fastcheckInFlightToken.clear();
+    m_activeUploads = 0;
+    m_activeDownloads = 0;
+    m_currentUser = name;
+    restoreSavedTasks();
+}
+
+void TransferManager::saveSnapshotNow()
+{
+    saveSnapshot();
 }
 
 QString TransferManager::stateText(State s)
@@ -92,6 +202,7 @@ quint64 TransferManager::enqueuePersonalUpload(const QString& localPath, const Q
     m_tasks.insert(t.key, t);
     m_idToKey.insert(t.id, t.key);
     m_uploadQueue.append(t.key);
+    saveSnapshot();
     emit tasksChanged();
     pump();
     return t.key;
@@ -113,6 +224,7 @@ quint64 TransferManager::enqueueGroupUpload(quint64 groupId, const QString& loca
     m_tasks.insert(t.key, t);
     m_idToKey.insert(t.id, t.key);
     m_uploadQueue.append(t.key);
+    saveSnapshot();
     emit tasksChanged();
     pump();
     return t.key;
@@ -130,6 +242,7 @@ quint64 TransferManager::enqueuePersonalDownload(const QString& serverPath, cons
     m_tasks.insert(t.key, t);
     m_idToKey.insert(t.id, t.key);
     m_downloadQueue.append(t.key);
+    saveSnapshot();
     emit tasksChanged();
     pump();
     return t.key;
@@ -148,6 +261,7 @@ quint64 TransferManager::enqueueGroupDownload(quint64 groupId, quint64 groupFile
     m_tasks.insert(t.key, t);
     m_idToKey.insert(t.id, t.key);
     m_downloadQueue.append(t.key);
+    saveSnapshot();
     emit tasksChanged();
     pump();
     return t.key;
@@ -404,6 +518,7 @@ void TransferManager::finishTask(Task& t, State s, const QString& reason)
     }
     t.state = s;
     if (!reason.isEmpty()) t.failReason = reason;
+    saveSnapshot();
     emit tasksChanged();
     pump();
 }
@@ -718,6 +833,7 @@ void TransferManager::pause(quint64 key)
         }
         if (t->state == Hashing && m_activeUploads > 0) --m_activeUploads;
         t->state = Paused;
+        saveSnapshot();
         emit tasksChanged();
         return;
     }
@@ -734,10 +850,24 @@ void TransferManager::pause(quint64 key)
     pump();
 }
 
+// 恢复任务：上传走 29 INIT 续传（服务端按 staging 续），下载重发 41/105
 void TransferManager::resume(quint64 key)
 {
     Task* t = taskByKey(key);
-    if (t == nullptr || !t->isUpload()) return;
+    if (t == nullptr) return;
+    if (!t->isUpload()) {
+        // 下载任务同样可"继续"（传输面板的继续按钮对下载条目原先无效）
+        if (t->state != Paused && t->state != Failed) return;
+        t->id = allocId();
+        m_idToKey.insert(t->id, key);
+        t->failReason.clear();
+        t->state = Queued;
+        m_downloadQueue.append(key);
+        saveSnapshot();
+        emit tasksChanged();
+        pump();
+        return;
+    }
     if (t->state != Paused && t->state != Failed) return;
     // S3：以新 id 重走 INIT，服务端由 (owner|parent|display|size) 派生同一 staging → 续传
     t->id = allocId();
@@ -745,9 +875,16 @@ void TransferManager::resume(quint64 key)
     t->failReason.clear();
     t->state = Queued;
     if (t->kind == PersonalUpload) {
-        t->needFastcheck = false;   // 续传不再做秒传预检查（staging 已在服务端）
+        if (t->wasRestored) {
+            // 快照恢复的任务：首次继续仍走 97 预检查（服务端 staging 可能已清空，
+            // 直接 29 会被拒并陷入 AUD-2 重试循环；97 能拿到真实状态），走完即归位 S3 快路径
+            t->wasRestored = false;
+        } else {
+            t->needFastcheck = false;   // S3：续传不再做秒传预检查（staging 已在服务端）
+        }
     }
     m_uploadQueue.append(key);
+    saveSnapshot();
     emit tasksChanged();
     pump();
 }
@@ -755,7 +892,22 @@ void TransferManager::resume(quint64 key)
 void TransferManager::cancel(quint64 key)
 {
     Task* t = taskByKey(key);
-    if (t == nullptr || !t->isUpload()) return;
+    if (t == nullptr) return;
+    if (!t->isUpload()) {
+        // 下载任务取消：Running 归还名额并关收盘文件；排队中移出队列
+        if (t->state == Running) {
+            if (m_activeDownloads > 0) --m_activeDownloads;
+            closeRecv(*t);
+        } else if (t->state == Queued) {
+            m_downloadQueue.removeOne(key);
+        }
+        m_idToKey.remove(t->id);
+        m_tasks.remove(key);
+        saveSnapshot();
+        emit tasksChanged();
+        pump();
+        return;
+    }
     if (t->state == Running) {
         sendAbortIfActive(*t);
         if (t->uploader) {
@@ -776,6 +928,7 @@ void TransferManager::cancel(quint64 key)
     }
     m_idToKey.remove(t->id);
     m_tasks.remove(key);
+    saveSnapshot();
     emit tasksChanged();
     pumpFastcheck();
     pump();
@@ -795,6 +948,7 @@ void TransferManager::retry(quint64 key)
     t->failReason.clear();
     t->state = Queued;
     m_downloadQueue.append(key);
+    saveSnapshot();
     emit tasksChanged();
     pump();
 }
@@ -868,6 +1022,10 @@ void TransferTaskPanel::refresh()
     TransferManager& mgr = TransferManager::instance();
     const QList<quint64> keys = mgr.taskKeys();
     m_table->setRowCount(int(keys.size()));
+    if (mgr.restoredCount() > 0) {
+        m_hint->setText(QStringLiteral("已恢复 %1 个未完成传输（暂停状态，选中后点\"继续\"）。下载的继续对本条目同样生效。")
+                        .arg(mgr.restoredCount()));
+    }
     int row = 0;
     for (quint64 key : keys) {
         TransferManager::Task* t = mgr.taskByKey(key);

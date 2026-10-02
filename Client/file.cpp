@@ -66,6 +66,7 @@ File::File(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::File)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
     m_strUserPath=QString("%1/%2").arg(Client::getinstance().m_strRootPath).arg(Client::getinstance().m_LoginName);
     m_strCurPath=m_strUserPath;
@@ -89,6 +90,14 @@ File::File(QWidget *parent) :
         ui->upload_PB->parentWidget()->layout()->addWidget(m_tasksBtn);
     }
     connect(m_tasksBtn, &QPushButton::clicked, this, &File::onTasks_PB_clicked);
+
+    // 购物车上传入口：分多次添加文件进待传清单，「上传文件」统一入队（主人要求的批量模式）
+    m_addUploadBtn = new QPushButton(QStringLiteral("添加待传"), this);
+    m_addUploadBtn->setToolTip(QStringLiteral("把文件加入待传清单（可分多次添加），再点「上传文件」一起进入上传队列"));
+    if (ui->upload_PB->parentWidget() && ui->upload_PB->parentWidget()->layout()) {
+        ui->upload_PB->parentWidget()->layout()->addWidget(m_addUploadBtn);
+    }
+    connect(m_addUploadBtn, &QPushButton::clicked, this, &File::onAddPendingUpload_clicked);
 
     // REQ-EXT-TRANSFER-001：上传任务的摘要计算与 97 预检查由本窗口承担（P4/P5：客户端入口发 FASTCHECK）
     connect(&TransferManager::instance(), &TransferManager::hashDue, this, &File::onHashDue);
@@ -456,8 +465,29 @@ void File::on_inputPath_PB_clicked(){
 }
 // REQ-EXT-TRANSFER-001 §5.5：多选选择器 → 每个文件建一个任务，交 TransferManager 队列（上限 3）
 // 摘要由任务在后台线程计算（M5），随后单飞发 97 预检查（file.cpp 为客户端上传入口，P4/P5）。
+// 购物车模式：待传清单非空时「上传文件」把清单统一入队；为空时走原多选对话框（一次可勾多个）。
 void File::on_upload_PB_clicked()
 {
+    if (!m_pendingUploads.isEmpty()) {
+        int enqueued=0;
+        for(const QString& path:m_pendingUploads){
+            const QString uploadName=QFileInfo(path).fileName();
+            if(!isValidFileName(uploadName)){
+                QMessageBox::information(this,"提示",QString("文件名不合法：%1").arg(uploadName));
+                continue;
+            }
+            TransferManager::instance().enqueuePersonalUpload(path,m_strCurPath,uploadName);
+            ++enqueued;
+        }
+        m_pendingUploads.clear();
+        if(m_addUploadBtn!=nullptr){
+            m_addUploadBtn->setText(QStringLiteral("添加待传"));
+        }
+        if(enqueued>0){
+            TransferManager::instance().showPanel();
+        }
+        return;
+    }
     const QStringList paths=QFileDialog::getOpenFileNames(this,"选择要上传的文件");
     if(paths.isEmpty()){
         return;
@@ -475,6 +505,27 @@ void File::on_upload_PB_clicked()
     if(enqueued>0){
         TransferManager::instance().showPanel();
     }
+}
+
+// 把选中的文件加入待传清单（不开始传输）；可连续多次操作，攒够后点「上传文件」统一入队
+void File::onAddPendingUpload_clicked()
+{
+    const QStringList paths=QFileDialog::getOpenFileNames(this,"选择要加入待传清单的文件（可多选）");
+    if(paths.isEmpty()){
+        return;
+    }
+    int added=0;
+    for(const QString& path:paths){
+        if(!m_pendingUploads.contains(path)){
+            m_pendingUploads.append(path);
+            ++added;
+        }
+    }
+    if(m_addUploadBtn!=nullptr){
+        m_addUploadBtn->setText(QStringLiteral("添加待传(%1)").arg(m_pendingUploads.size()));
+    }
+    QMessageBox::information(this,"待传清单",
+        QString("本次新增 %1 个，清单共 %2 个。\n点「上传文件」统一进入上传队列。").arg(added).arg(m_pendingUploads.size()));
 }
 
 // REQ-EXT-TRANSFER-001 §5.5：下载支持多选并发（仅普通文件；目录跳过）

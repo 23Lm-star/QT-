@@ -30,6 +30,7 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
       m_historyButton(new QPushButton(QStringLiteral("加载更早"), this)),
       m_statusLabel(new QLabel(this))
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     setWindowTitle(QStringLiteral("群聊 - %1").arg(groupName));
     resize(1120, 960);
     // REQ-UX-001 A3：长消息必须换行、不横向溢出、不省略

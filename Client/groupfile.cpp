@@ -39,8 +39,10 @@ GroupFile::GroupFile(quint64 groupId, const QString &groupName, QWidget *parent)
       m_uploadButton(new QPushButton(QStringLiteral("上传"), this)),
       m_downloadButton(new QPushButton(QStringLiteral("下载"), this)),
       m_deleteButton(new QPushButton(QStringLiteral("删除"), this)),
+      m_tasksButton(new QPushButton(QStringLiteral("传输列表"), this)),
       m_statusLabel(new QLabel(this))
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     setWindowTitle(QStringLiteral("群文件 - %1").arg(groupName));
     if (parent == nullptr) resize(1240, 840);   // REQ-UX-001 A5：面积 4 倍
 
@@ -50,16 +52,26 @@ GroupFile::GroupFile(quint64 groupId, const QString &groupName, QWidget *parent)
     toolbar->addWidget(m_uploadButton);
     toolbar->addWidget(m_downloadButton);
     toolbar->addWidget(m_deleteButton);
+    toolbar->addWidget(m_tasksButton);
+    // 购物车上传入口：分多次添加文件进待传清单，「上传」统一入队（主人要求的批量模式）
+    m_addQueueButton = new QPushButton(QStringLiteral("添加待传"), this);
+    m_addQueueButton->setToolTip(QStringLiteral("把文件加入待传清单（可分多次添加），再点「上传」一起进入上传队列"));
+    toolbar->addWidget(m_addQueueButton);
     layout->addLayout(toolbar);
     layout->addWidget(m_statusLabel);
     layout->addWidget(m_fileList);
+    m_fileList->setSelectionMode(QAbstractItemView::ExtendedSelection);   // 下载支持多选
 
     connect(m_refreshButton, &QPushButton::clicked, this, &GroupFile::refresh);
     connect(m_uploadButton, &QPushButton::clicked, this, &GroupFile::uploadFile);
+    connect(m_addQueueButton, &QPushButton::clicked, this, &GroupFile::addPendingUploads);
     connect(m_downloadButton, &QPushButton::clicked, this, &GroupFile::downloadSelected);
     connect(m_deleteButton, &QPushButton::clicked, this, &GroupFile::deleteSelected);
+    connect(m_tasksButton, &QPushButton::clicked, this, [this]() {
+        TransferManager::instance().showPanel();   // 传输队列全局共享（个人+群文件同一队列）
+    });
     connect(m_fileList, &QListWidget::itemDoubleClicked, this, &GroupFile::onItemDoubleClicked);
-    setStatus(QStringLiteral("双击文件可直接下载"));
+    setStatus(QStringLiteral("双击文件可直接下载；下载支持 Ctrl/Shift 多选"));
 }
 
 QByteArray GroupFile::envelope(const QByteArray &body)
@@ -102,8 +114,32 @@ void GroupFile::refresh()
 }
 
 // REQ-EXT-TRANSFER-001 §5.5/§5.6：多选上传；SHA-256 移出 UI 线程（M5），完成后交任务列表排队
+// 购物车模式：待传清单非空时「上传」把清单统一入队；为空时走原多选对话框（一次可勾多个）。
 void GroupFile::uploadFile()
 {
+    if (!m_pendingUploads.isEmpty()) {
+        int enqueued = 0;
+        for (const QString &path : m_pendingUploads) {
+            const QString name = QFileInfo(path).fileName();
+            if (name.isEmpty() || name.contains(QLatin1Char('/')) || name.contains(QLatin1Char('\\'))
+                    || name.toUtf8().size() > 255) {
+                QMessageBox::information(this, QStringLiteral("提示"),
+                                         QStringLiteral("文件名不合法：%1").arg(name));
+                continue;
+            }
+            const quint64 rowKey = TransferManager::instance().enqueueGroupUpload(
+                        m_groupId, path, name, QByteArray());   // sha 由任务在后台计算
+            TransferManager::instance().showPanel();
+            Q_UNUSED(rowKey);
+            ++enqueued;
+        }
+        m_pendingUploads.clear();
+        if (m_addQueueButton != nullptr) {
+            m_addQueueButton->setText(QStringLiteral("添加待传"));
+        }
+        setStatus(QStringLiteral("已加入传输任务 %1 个").arg(enqueued));
+        return;
+    }
     const QStringList paths = QFileDialog::getOpenFileNames(this, QStringLiteral("选择要上传的文件"));
     if (paths.isEmpty()) return;
     int enqueued = 0;
@@ -126,17 +162,48 @@ void GroupFile::uploadFile()
     }
 }
 
+// 把选中的文件加入待传清单（不开始传输）；可连续多次操作，攒够后点「上传」统一入队
+void GroupFile::addPendingUploads()
+{
+    const QStringList paths = QFileDialog::getOpenFileNames(this, QStringLiteral("选择要加入待传清单的文件（可多选）"));
+    if (paths.isEmpty()) return;
+    int added = 0;
+    for (const QString &path : paths) {
+        if (!m_pendingUploads.contains(path)) {
+            m_pendingUploads.append(path);
+            ++added;
+        }
+    }
+    if (m_addQueueButton != nullptr) {
+        m_addQueueButton->setText(QStringLiteral("添加待传(%1)").arg(m_pendingUploads.size()));
+    }
+    QMessageBox::information(this, QStringLiteral("待传清单"),
+        QStringLiteral("本次新增 %1 个，清单共 %2 个。\n点「上传」统一进入上传队列。").arg(added).arg(m_pendingUploads.size()));
+}
+
 void GroupFile::downloadSelected()
 {
-    const quint64 groupFileId = selectedGroupFileId();
-    if (groupFileId == 0) {
+    // 多选下载：遍历全部选中条目（Ctrl/Shift 多选），逐个入队（此前仅支持单选）
+    const QList<QListWidgetItem*> selected = m_fileList->selectedItems();
+    if (selected.isEmpty()) {
         QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("请选择要下载的文件"));
         return;
     }
-    const QListWidgetItem *item = m_fileList->currentItem();
-    const QString display = (item != nullptr)
-            ? item->data(Qt::UserRole + 1).toString() : QStringLiteral("download.bin");
-    TransferManager::instance().enqueueGroupDownload(m_groupId, groupFileId, display);
+    int enqueued = 0;
+    for (QListWidgetItem *item : selected) {
+        if (item == nullptr) continue;
+        const quint64 groupFileId = item->data(Qt::UserRole).toULongLong();
+        if (groupFileId == 0) continue;
+        const QString display = item->data(Qt::UserRole + 1).toString();
+        TransferManager::instance().enqueueGroupDownload(m_groupId, groupFileId,
+                    display.isEmpty() ? QStringLiteral("download.bin") : display);
+        ++enqueued;
+    }
+    if (enqueued == 0) {
+        QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("未选中可下载的文件"));
+        return;
+    }
+    setStatus(QStringLiteral("已加入下载任务 %1 个").arg(enqueued));
     TransferManager::instance().showPanel();
 }
 

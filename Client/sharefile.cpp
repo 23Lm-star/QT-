@@ -5,6 +5,7 @@ ShareFile::ShareFile(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::ShareFile)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
 }
 

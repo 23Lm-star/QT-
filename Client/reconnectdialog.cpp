@@ -15,6 +15,7 @@ ReconnectDialog::ReconnectDialog(QWidget *parent)
     : QDialog(parent)
     , m_spinnerIdx(0)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     setWindowTitle("与服务器断开");
     setFixedSize(640, 360);   // REQ-UX-001 A5：面积 4 倍
     setModal(true);   // 模态：弹窗期间禁止操作主窗口，但事件循环仍运行（心跳/重连不阻塞）

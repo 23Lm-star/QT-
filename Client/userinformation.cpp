@@ -58,6 +58,7 @@ UserInformation::UserInformation(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::UserInformation)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
 }
 

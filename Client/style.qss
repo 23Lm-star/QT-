@@ -257,3 +257,64 @@ QToolTip {
     color: #ffffff;
     font-size: 18px;
 }
+
+/* --- 表格（传输任务列表等）---
+   此前未覆盖：表头浅灰底浅灰字、单元格白底白字，全不可读（主人截图实测）。 */
+QTableWidget, QTableView {
+    background: rgba(8, 18, 35, 210);
+    alternate-background-color: rgba(15, 28, 48, 180);
+    color: #ffffff;
+    gridline-color: #24405e;
+    border: 2px solid #2a4a6a;
+    border-radius: 8px;
+    selection-background-color: #1e6fa0;
+    selection-color: #ffffff;
+    font-size: 19px;
+}
+QTableWidget::item, QTableView::item {
+    padding: 4px 8px;
+}
+QTableWidget::item:selected, QTableView::item:selected {
+    background: #1e6fa0;
+    color: #ffffff;
+}
+QHeaderView::section {
+    background: #16283f;
+    color: #ffffff;
+    border: 1px solid #2a4a6a;
+    padding: 6px 8px;
+    font-weight: bold;
+    font-size: 19px;
+}
+QTableCornerButton::section {
+    background: #16283f;
+    border: 1px solid #2a4a6a;
+}
+
+/* --- 系统弹窗深色化（QMessageBox/QInputDialog/QFileDialog）---
+   这些对话框不在窗口类名清单里，落到系统浅灰底，与全局白字叠加不可读。
+   统一为登录页同款深色背景。 */
+QMessageBox, QInputDialog, QFileDialog {
+    background-color: #0d1b2a;
+    background-image: url(:/bg_main.jpg);
+    background-position: center;
+    color: #ffffff;
+}
+QMessageBox QLabel, QInputDialog QLabel {
+    background: transparent;
+    color: #ffffff;
+}
+QComboBox {
+    border: 2px solid #2a4a6a;
+    border-radius: 8px;
+    padding: 6px 10px;
+    background: rgba(15, 25, 45, 200);
+    color: #ffffff;
+    font-size: 20px;
+}
+QComboBox QAbstractItemView {
+    background: #0d1b2a;
+    color: #ffffff;
+    selection-background-color: #1e6fa0;
+    selection-color: #ffffff;
+}

@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>600</width>
+    <width>828</width>
     <height>420</height>
    </rect>
   </property>
@@ -37,11 +37,22 @@
     <number>30</number>
    </property>
    <item>
+    <widget class="QLabel" name="loadingLabel">
+     <property name="text">
+      <string/>
+     </property>
+     <property name="alignment">
+      <set>Qt::AlignCenter</set>
+     </property>
+    </widget>
+   </item>
+   <item>
     <widget class="QLabel" name="titleLabel">
      <property name="font">
       <font>
        <family>Arial</family>
        <pointsize>22</pointsize>
+       <weight>75</weight>
        <bold>true</bold>
       </font>
      </property>
@@ -55,26 +66,6 @@
    </item>
    <item>
     <layout class="QGridLayout" name="gridLayout">
-     <item row="0" column="0">
-      <widget class="QLabel" name="label">
-       <property name="font">
-        <font>
-         <family>Microsoft YaHei</family>
-         <pointsize>14</pointsize>
-        </font>
-       </property>
-       <property name="text">
-        <string>用户名</string>
-       </property>
-      </widget>
-     </item>
-     <item row="0" column="1">
-      <widget class="QLineEdit" name="name_LE">
-       <property name="placeholderText">
-        <string>请输入用户名</string>
-       </property>
-      </widget>
-     </item>
      <item row="1" column="0">
       <widget class="QLabel" name="label_2">
        <property name="font">
@@ -85,16 +76,6 @@
        </property>
        <property name="text">
         <string>密    码</string>
-       </property>
-      </widget>
-     </item>
-     <item row="1" column="1">
-      <widget class="QLineEdit" name="pwd_LE">
-       <property name="echoMode">
-        <enum>QLineEdit::Password</enum>
-       </property>
-       <property name="placeholderText">
-        <string>请输入密码</string>
        </property>
       </widget>
      </item>
@@ -115,9 +96,15 @@
        </item>
        <item>
         <widget class="QLineEdit" name="randcode_LE">
+         <property name="minimumSize">
+          <size>
+           <width>160</width>
+           <height>0</height>
+          </size>
+         </property>
          <property name="maximumSize">
           <size>
-           <width>100</width>
+           <width>160</width>
            <height>16777215</height>
           </size>
          </property>
@@ -140,6 +127,36 @@
         </widget>
        </item>
       </layout>
+     </item>
+     <item row="1" column="1">
+      <widget class="QLineEdit" name="pwd_LE">
+       <property name="echoMode">
+        <enum>QLineEdit::Password</enum>
+       </property>
+       <property name="placeholderText">
+        <string>请输入密码</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="0">
+      <widget class="QLabel" name="label">
+       <property name="font">
+        <font>
+         <family>Microsoft YaHei</family>
+         <pointsize>14</pointsize>
+        </font>
+       </property>
+       <property name="text">
+        <string>用户名</string>
+       </property>
+      </widget>
+     </item>
+     <item row="0" column="1">
+      <widget class="QLineEdit" name="name_LE">
+       <property name="placeholderText">
+        <string>请输入用户名</string>
+       </property>
+      </widget>
      </item>
     </layout>
    </item>
@@ -177,23 +194,6 @@
     </layout>
    </item>
   </layout>
-  <!-- 加载动画覆盖层 -->
-  <widget class="QLabel" name="loadingLabel">
-   <property name="geometry">
-    <rect>
-     <x>0</x>
-     <y>0</y>
-     <width>600</width>
-     <height>420</height>
-    </rect>
-   </property>
-   <property name="text">
-    <string/>
-   </property>
-   <property name="alignment">
-    <set>Qt::AlignCenter</set>
-   </property>
-  </widget>
  </widget>
  <resources>
   <include location="config.qrc"/>

@@ -56,6 +56,7 @@ Client::Client(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Client)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
     setFixedSize(scaledWindowSize(600,420));
     this->m_mhptr=new MsgHandler;
@@ -94,6 +95,7 @@ Client::Client(QWidget *parent)
 }
 
 Client::~Client(){
+    TransferManager::instance().saveSnapshotNow();   // 退出前把未完成传输落盘，下次登录恢复
     delete ui;
 }
 
@@ -191,6 +193,8 @@ void Client::handlMsg(PDU *&pdu)
     }
     case ENUM_MSG_TYPE_LOGIN_RESPOND:{
         m_mhptr->handllogin();
+        // 按用户载入未完成传输快照（切用户会先落盘上一个用户的内存任务）
+        TransferManager::instance().setCurrentUser(m_LoginName);
         m_loggedIn = true;   // 登录过才监控断开，避免登录界面误报
         break;
     }

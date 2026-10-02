@@ -1,6 +1,7 @@
 #include "sharelinkdialog.h"
 
 ShareLinkDialog::ShareLinkDialog(const QString &filePath, QWidget *parent) : QDialog(parent) {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     setWindowTitle("分享文件");
     setMinimumWidth(400);
 

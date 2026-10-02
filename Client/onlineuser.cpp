@@ -17,6 +17,7 @@ OnlineUser::OnlineUser(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::OnlineUser)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
     ui->hintLabel->setText(QStringLiteral("单击选中，双击添加好友"));
 }

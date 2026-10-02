@@ -28,6 +28,7 @@ public:
 private slots:
     void refresh();
     void uploadFile();
+    void addPendingUploads();       // 购物车上传：分多次加入待传清单
     void downloadSelected();
     void deleteSelected();
     void onItemDoubleClicked(QListWidgetItem *item);
@@ -46,6 +47,9 @@ private:
     QPushButton *m_uploadButton;
     QPushButton *m_downloadButton;
     QPushButton *m_deleteButton;
+    QPushButton *m_addQueueButton = nullptr;    // 添加待传（购物车上传入口）
+    QPushButton *m_tasksButton = nullptr;       // 传输列表入口（打开全局传输队列面板）
+    QStringList m_pendingUploads;               // 待传清单（本地路径）
     QLabel *m_statusLabel;
 };
 

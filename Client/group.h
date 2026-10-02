@@ -5,6 +5,7 @@
 #include "groupchat.h"
 #include "groupfile.h"
 #include <QComboBox>
+#include <QDialog>
 #include <QHash>
 #include <QLineEdit>
 #include <QListWidget>
@@ -35,6 +36,7 @@ private slots:
     void createGroup();
     void refreshGroups();
     void refreshInvitations();
+    void showInvitationDialog();    // 待处理邀请弹窗（列表选中条目 → 接受/拒绝）
     void inviteMember();
     void acceptInvitation();
     void rejectInvitation();
@@ -54,6 +56,8 @@ private:
     quint64 selectedInvitationId() const;
     void requestUnreadSummary();
     void refreshUnreadBadge(quint64 groupId, quint64 unread);
+    void ensureInvitationDialog();          // 惰性创建邀请弹窗
+    QString groupErrorText(quint32 code) const;   // 服务端错误码 → 可读中文
     // 信封首 20B 提取 group_id（不满足最小长度返回 0）
     static quint64 envelopeGroupId(PDU *pdu);
     QPushButton *m_createButton;
@@ -61,10 +65,11 @@ private:
     QPushButton *m_fileButton;      // REQ-EXT-GROUP-003：打开选中群的群文件窗口
     QPushButton *m_invitationButton;
     QListWidget *m_groupList;
-    QListWidget *m_invitationList;
+    QListWidget *m_invitationList;  // 挂在邀请弹窗内（不再占主布局）
     QLineEdit *m_targetEdit;
     QComboBox *m_roleBox;
     QLabel *m_statusLabel;
+    QDialog *m_invitationDialog;    // 待处理邀请弹窗（惰性创建）
     quint64 m_requestId;
     bool m_loaded;
     QHash<quint64, GroupChat*> m_chatWindows;   // group_id → 窗口（应用生命周期内保留）

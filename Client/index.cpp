@@ -7,6 +7,7 @@ Index::Index(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::Index)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
     // REQ-UX-001 A5：2 倍放大并收敛到屏幕可用区
     setFixedSize(Client::scaledWindowSize(1000,650));

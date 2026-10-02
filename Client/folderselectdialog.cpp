@@ -10,6 +10,7 @@
 FolderSelectDialog::FolderSelectDialog(QWidget *parent)
     : QDialog(parent)
 {
+    setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     setWindowTitle("选择目标文件夹");
     setMinimumWidth(840);
     resize(840, 720);   // REQ-UX-001 A5：面积 4 倍

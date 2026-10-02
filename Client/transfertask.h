@@ -44,6 +44,7 @@ public:
         QString savePath;
         Uploader* uploader = nullptr;
         bool    needFastcheck = true;   // 个人上传首次走 97 预检查；续传跳过（S3）
+        bool    wasRestored = false;    // 快照恢复的任务：首次继续仍走 97（服务端 staging 可能已变）
         QString fastcheckToken;         // AUD-3：本次 97 的请求标识（服务端 98 回带，用于按标识归属）
         bool isUpload() const { return kind == PersonalUpload || kind == GroupUpload; }
     };
@@ -85,6 +86,16 @@ public:
 
     void showPanel();
 
+    // ===== 会话间持久化：按用户保存未完成任务，二次登录恢复 =====
+    // 登录成功时调用：切换用户（落盘上一个用户的内存任务）并从快照恢复当前用户未完成任务。
+    // 同一用户重复调用（如断线重连）只生效一次；内存中已有任务时不清不重（以内存为准）。
+    void setCurrentUser(const QString& name);
+    // 程序退出前落盘（把内存中非终态任务写进快照）
+    void saveSnapshotNow();
+    // 本次会话恢复出的任务数（面板提示用）
+    int restoredCount() const { return m_restoredCount; }
+    QString currentUser() const { return m_currentUser; }
+
     // 97 预检查为连接级单飞（服务端旧槽）：File 计算完 SHA 后回调提交，按序发送
     void submitFastcheck(quint64 key, const QByteArray& shaHex);
     void failTask(quint64 key, const QString& reason);
@@ -122,6 +133,14 @@ private:
     QList<quint64> m_fastcheckQueue;      // 已算出摘要、待发 97 的任务键
     quint64 m_fastcheckInFlight = 0;      // 正在等待 98 的任务键（0 = 无）
     QString m_fastcheckInFlightToken;     // AUD-3：在途 97 的请求标识（与 98 回带比对；不匹配 = 迟到，丢弃）
+
+    // 持久化（transfers_<user>.json，AppLocalDataLocation）
+    void saveSnapshot();
+    void restoreSavedTasks();
+    QString snapshotPath() const;
+    QString m_currentUser;
+    QString m_restoredUser;               // 已为本用户恢复过快照（防断线重连重复恢复）
+    int m_restoredCount = 0;
 };
 
 // 文件级任务列表窗口（§5.5；M6：并发时不再用逐文件 QMessageBox）
