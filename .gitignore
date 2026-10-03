@@ -91,6 +91,13 @@ Desktop.ini
 /project-docs/evidence/**/*.md
 /project-docs/evidence/**/*.json
 /project-docs/evidence/**/*.png
+/project-docs/evidence/**/*.diff
+/project-docs/evidence/**/*.patch
+/project-docs/evidence/**/*.cpp
+/project-docs/evidence/**/*.out
+/project-docs/evidence/**/*.sql
+/project-docs/evidence/manifest
+/project-docs/evidence/REPORT*
 
 # Local documentation and resume tooling
 /findings.md
