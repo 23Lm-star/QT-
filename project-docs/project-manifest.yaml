@@ -1,0 +1,141 @@
+# project-manifest.yaml -- xiangmu process identity (Development OS v1.7)
+workflow_version: v1.7
+pinned: "2026-09-27"
+trunk: master            # remote set-head done 2026-09-27; origin/main is dead, do not use
+bootstrap:
+  gitignore: done        # 2026-09-13 session + closeout commit e700d22
+  trunk_unified: done
+  pipeline: skeleton     # build filled (Qt 5.14.2 mingw73_64), test = 0 registered, audit = frozen paths active
+  frozen_paths: active
+frozen_paths:            # enforced by pipeline/audit.ps1 -- hit = escalate to LARGE + user approval
+  - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
+  - Server/protocol.h
+code_intel:              # advisory only -- never changes the audit verdict (audit.ps1 §4)
+  impact_status: not_applicable   # this repo has no statically-reachable automated tests
+  impact_reason: "the C++ sources have no in-process unit tests; regression is carried by the socket harnesses under test_gate.suites, which are runtime/harness probes rather than statically-reachable code paths"
+test_gate:                # regression registry -- interpreted by pipeline/test.ps1 via scripts/test-gate.py
+  # All ten suites share ONE server port (5000), ONE database (mydb) and ONE runtime tree
+  # (Server/filesys, from connect.config line 3 = "./filesys", which is cwd-relative and MUST
+  # stay CRLF -- LF makes dist/Server.exe die at startup). They are therefore NOT parallel_safe
+  # and the gate serializes them.
+  #
+  # Known hazard, measured three times: several suites kill the server with
+  # `taskkill /F /IM Server.exe` (by IMAGE NAME), which reaches every other suite's process and
+  # is indistinguishable from a product crash -- it produced three separate "the server died"
+  # findings that were all this. kill_policy below records the intended contract; fixing the
+  # suites themselves to kill by PID is tracked as FINDING-GATE-1.
+  status: waived          # pending -> enforced once the suites are PID-clean and CI-runnable
+  owner: user
+  date: 2026-10-03
+  reason: >
+    Ten socket harnesses (369 declared assertions) carry this project's regression, but they are
+    not yet gate-safe: they share port 5000 / mydb / Server/filesys, several kill the server by
+    image name, and most need a pre-started Server.exe plus a pre-created user root. Declared
+    here so the set is checkable and auditable rather than living as ten unregistered scripts
+    under project-docs/evidence/. Flip to `enforced` after FINDING-GATE-1 (PID-only kills) and
+    FINDING-GATE-2 (self-starting server) are closed.
+  suites:
+    - id: sec001
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SEC-001/verify.py"]
+      cwd: "."
+      asserts: 48
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-SEC-001
+      added: 2026-09-29
+      note: "security baseline. BASE falls back to the literal E:/qt/xiangmu when SEC001_BASE is unset -- see FINDING-GATE-3"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: sec001-regression
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py"]
+      cwd: "."
+      asserts: 48
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-FILE-001
+      added: 2026-09-30
+      note: "D5-adapted copy of sec001. The ORIGINAL verify.py stays byte-identical; only the storage-model assertions were adapted, security assertions untouched"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: entry-ops
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/entry_ops_e2e.py"]
+      cwd: "."
+      asserts: 43
+      timeout_s: 420
+      blocking: true
+      owner: REQ-EXT-FILE-001
+      added: 2026-09-30
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: dedup
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/dedup_e2e.py"]
+      cwd: "."
+      asserts: 13
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-FILE-001
+      added: 2026-09-30
+      note: "FINDING-GATE-1: kills the server with taskkill /IM (image name) at two sites"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: image_name, parallel_safe: false}
+    - id: cross-tree
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/cross_tree_e2e.py"]
+      cwd: "."
+      asserts: 41
+      timeout_s: 420
+      blocking: true
+      owner: REQ-EXT-FILE-001
+      added: 2026-09-30
+      note: "spawns a second tree under build/xtree-file001 with a junction to the shared filesys and the shared mydb -- it is the reason cross-tree idempotency is checkable at all"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: image_name, parallel_safe: false}
+    - id: fastupload
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-002/fastupload_e2e.py"]
+      cwd: "."
+      asserts: 46
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-FILE-002
+      added: 2026-10-01
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: image_name, parallel_safe: false}
+    - id: group-002
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-002/verify.py"]
+      cwd: "."
+      asserts: 15
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-GROUP-002
+      added: 2026-10-01
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: groupfile
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-003/groupfile_e2e.py"]
+      cwd: "."
+      asserts: 45
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-GROUP-003
+      added: 2026-10-01
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: unique-login
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SESSION-001/unique_login_e2e.py"]
+      cwd: "."
+      asserts: 16
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-SESSION-001
+      added: 2026-09-30
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: parallel-transfer
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-001/parallel_e2e.py"]
+      cwd: "."
+      asserts: 54
+      timeout_s: 600
+      blocking: true
+      owner: REQ-EXT-TRANSFER-001
+      added: 2026-10-01
+      note: "needs a debug-capable Server.exe: the N-1 crash was only reproducible with symbols and gdb"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+directory_contract:      # mirrors .gitignore
+  source: Client/, Server/
+  artifacts: build*/     # shadow builds go here; never in source dirs
+  runtime_data: Server/filesys/   # local only, never tracked
+  docs: project-docs/    # root only; Server/project-docs/ is local-only since e700d22
+  third_party: never in git (qtbase purged in e700d22)
+notes:
+  - Anaconda qmake on PATH is NOT the project toolchain; pipeline/build.ps1 pins C:\Qt\5.14.2\mingw73_64 + C:\Qt\Tools\mingw730_64
+  - stale branches pending user decision: origin/main (dead), backup-runnable-2026-07-30 (local+remote)
