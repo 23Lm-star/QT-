@@ -54,10 +54,43 @@ Desktop.ini
 /.ui_headers_backup_*/
 
 # AI development workflow (Development OS) — local only, not shipped with the app
-/project-docs/
+#
+# NOTE the shape of the project-docs rule. It must be `/project-docs/*` (a wildcard over the
+# DIRECTORY'S CHILDREN), never a bare `/project-docs/`: git refuses to descend into an excluded
+# directory, so with the bare form every negation below it is silently inert and the exceptions
+# cannot possibly take effect. Re-excluding the children individually afterwards is what makes the
+# two carve-outs real.
 /pipeline/
 /AGENTS.md
 /CLAUDE.md
+
+# ...but two things under project-docs/ are CODE, not process records, and stay tracked:
+#   - project-docs/project-manifest.yaml  the process identity: frozen_paths AND the test_gate
+#                                        suite registry. Losing it silently disarms every gate.
+#   - project-docs/evidence/**/*.py        the regression harnesses themselves (10 suites /
+#                                        369 assertions). They are the project's only test
+#                                        code; untracked they cannot be reviewed, reverted,
+#                                        shared, or reproduced on another machine.
+#
+# Shape matters twice over here, and both mistakes were made and measured on this repo:
+#  1. `/project-docs/*`, never a bare `/project-docs/`. Git refuses to descend into an excluded
+#     directory, so every negation beneath a bare `/project-docs/` is silently inert.
+#  2. `/project-docs/evidence/*` re-excludes the CHILDREN but then re-admits the directories
+#     (`!/project-docs/evidence/*/`), because `/project-docs/evidence/**` would exclude
+#     `REQ-EXT-FILE-001/` itself -- and git cannot reach `.../REQ-EXT-FILE-001/dedup_e2e.py`
+#     through an excluded directory, so the trailing `!**/*.py` never fires. Hence the
+#     extensions are enumerated instead of using a blanket exclusion.
+# Net effect: harness sources tracked, every log / report / json under evidence still local.
+/project-docs/*
+!/project-docs/project-manifest.yaml
+!/project-docs/evidence/
+/project-docs/evidence/*
+!/project-docs/evidence/*/
+/project-docs/evidence/**/*.log
+/project-docs/evidence/**/*.txt
+/project-docs/evidence/**/*.md
+/project-docs/evidence/**/*.json
+/project-docs/evidence/**/*.png
 
 # Local documentation and resume tooling
 /findings.md
