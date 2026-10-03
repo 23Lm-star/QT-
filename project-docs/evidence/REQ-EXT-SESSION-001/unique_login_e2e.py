@@ -10,11 +10,19 @@ T_FINDU, T_FINDU_R = 5, 6
 T_CAP, T_CAP_R, T_HB, T_HB_R = 44, 45, 50, 51
 MYSQL = r"C:/Program Files/MySQL/MySQL Server 5.7/bin/mysql.exe"
 DB = ["-h", "localhost", "-u", "root", "-p123456", "mydb", "-N", "-B", "-e"]
-EXE = os.path.abspath("build/build-Server/release/Server.exe")
-SRV = os.path.abspath("Server")
-sys.path.insert(0, os.path.join(os.path.dirname(SRV), "project-docs", "evidence", "_harness"))
+
+# FINDING-GATE-2：原来是 build/build-Server/release/Server.exe + cwd=Server/（源码树形态）。
+# 那个路径是 qmake shadow build 的**中间目录**（被 /build/ gitignore，Server.pro 的 DESTDIR
+# 只指向 ../dist），在主工作区根本不存在—— 当年能跑是因为整个测试节点在 detached worktree
+# 内自行构建。改用与另外7 套一致的部署形态：exe 与 cwd 同为 dist/。
+# connect.config 由 qrc 在构建期内嵌进 exe（所以 dist/ 下没有这个文件），因此换cwd 不会
+# 改变 Server 读到的配置；这与 FILE-001 / TRANSFER-001 / GROUP-003 三套的既有做法相同。
+DIST = os.path.abspath("dist")
+EXE = os.path.join(DIST, "Server.exe")
+SRV = DIST
+sys.path.insert(0, os.path.join(os.path.dirname(DIST), "project-docs", "evidence", "_harness"))
 import server_ctl
-_SRV = server_ctl.ServerCtl(EXE, SRV, "127.0.0.1", 5000)
+_SRV = server_ctl.ServerCtl(EXE, SRV, HOST, PORT)
 U1, U2, U3 = "unilog1", "unilog2", "unilog3"
 IDA = b"A1A1" * 8
 IDB = b"B2B2" * 8
