@@ -26,6 +26,8 @@ REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DIST = os.path.join(REPO, "dist")
 EXE = os.path.join(DIST, "Server.exe")
 SBX = os.path.join(DIST, "filesys")
+sys.path.insert(0, os.path.join(REPO, "project-docs", "evidence", "_harness"))
+import server_ctl
 
 def f32(s): return s.encode("utf-8")[:31].ljust(32, b"\0")
 def creds(name, pwd="123456"):
@@ -63,21 +65,20 @@ def sql(q):
     r = subprocess.run([MYSQL] + DB + [q], capture_output=True, text=True)
     return r.stdout.strip()
 
+_SRV = server_ctl.ServerCtl(EXE, DIST, HOST, PORT)
+
 def start_server():
-    os.environ["PATH"] = r"C:/Qt/5.14.2/mingw73_64/bin;C:/Qt/Tools/mingw730_64/bin;" + os.environ["PATH"]
-    subprocess.run(["taskkill", "/F", "/IM", "Server.exe"], capture_output=True)
-    time.sleep(1.0)
-    subprocess.Popen([EXE], cwd=DIST, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    dl = time.time() + 25
-    while time.time() < dl:
-        try:
-            socket.create_connection((HOST, PORT), timeout=1).close(); return True
-        except OSError: time.sleep(0.4)
-    return False
+    # FINDING-GATE-1: 原来是 taskkill /F /IM Server.exe —— 按映像名杀，会打到并行套件的
+    # 进程（实测造成三次"服务端突然消失"的伪缺陷）。现在只按自己启动的 PID 管理；端口被
+    # 别人占用时直接报错，不盲杀。
+    # 契约保持原样：返回 bool。调用点 (start_server() -> if not ...) 不因此改变。
+    if not _SRV.start():
+        print(f"[E] {_SRV.last_error}")
+        return False
+    return True
 
 def stop_server():
-    subprocess.run(["taskkill", "/F", "/IM", "Server.exe"], capture_output=True)
-    time.sleep(1.0)
+    _SRV.stop()
 
 results = []
 def check(sid, desc, cond, detail=""):

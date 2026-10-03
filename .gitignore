@@ -96,6 +96,8 @@ Desktop.ini
 /project-docs/evidence/**/*.cpp
 /project-docs/evidence/**/*.out
 /project-docs/evidence/**/*.sql
+/project-docs/evidence/**/*.sh
+/project-docs/evidence/**/*.ps1
 /project-docs/evidence/manifest
 /project-docs/evidence/REPORT*
 

@@ -19,21 +19,28 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
   # stay CRLF -- LF makes dist/Server.exe die at startup). They are therefore NOT parallel_safe
   # and the gate serializes them.
   #
-  # Known hazard, measured three times: several suites kill the server with
-  # `taskkill /F /IM Server.exe` (by IMAGE NAME), which reaches every other suite's process and
-  # is indistinguishable from a product crash -- it produced three separate "the server died"
-  # findings that were all this. kill_policy below records the intended contract; fixing the
-  # suites themselves to kill by PID is tracked as FINDING-GATE-1.
-  status: waived          # pending -> enforced once the suites are PID-clean and CI-runnable
+  # Known hazard, RESOLVED on 2026-10-03 (FINDING-GATE-1): all suites killed the server with
+  # `taskkill /F /IM Server.exe` -- by IMAGE NAME, which reaches every other suite's process and
+  # is indistinguishable from a product crash. It produced three separate "the server died"
+  # findings, every one of them another suite's kill. They now share
+  # project-docs/evidence/_harness/server_ctl.py, which tracks the PID it started and refuses
+  # to kill anything else; a busy port is reported, not blindly cleared.
+  #
+  # REMAINING blocker for `enforced` -- FINDING-GATE-2: the harnesses still do not own the whole
+  # server lifecycle. unique_login_e2e.py additionally requires a binary at
+  # build/build-Server/release/Server.exe, which does not exist in the main worktree (it was
+  # built inside a detached test worktree). Verified pre-existing, not caused by the PID
+  # cleanup: the unmodified suite fails the same way. Its 16 assertions are therefore counted
+  # as declared, not as green here.
+  status: waived          # pending -> enforced once FINDING-GATE-2 is closed
   owner: user
   date: 2026-10-03
   reason: >
-    Ten socket harnesses (369 declared assertions) carry this project's regression, but they are
-    not yet gate-safe: they share port 5000 / mydb / Server/filesys, several kill the server by
-    image name, and most need a pre-started Server.exe plus a pre-created user root. Declared
-    here so the set is checkable and auditable rather than living as ten unregistered scripts
-    under project-docs/evidence/. Flip to `enforced` after FINDING-GATE-1 (PID-only kills) and
-    FINDING-GATE-2 (self-starting server) are closed.
+    Ten socket harnesses (369 declared assertions) carry this project's regression, but they do
+    not yet own the whole server lifecycle: unique_login_e2e.py needs a binary that the main
+    worktree does not build (FINDING-GATE-2). Declared here so the set is checkable and
+    auditable rather than living as ten unregistered scripts. Flip to `enforced` after
+    FINDING-GATE-2 closes.
   suites:
     - id: sec001
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SEC-001/verify.py"]
@@ -72,8 +79,8 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-FILE-001
       added: 2026-09-30
-      note: "FINDING-GATE-1: kills the server with taskkill /IM (image name) at two sites"
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: image_name, parallel_safe: false}
+      note: "FINDING-GATE-1 fixed 2026-10-03: PID-only via _harness/server_ctl.py"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: cross-tree
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/cross_tree_e2e.py"]
       cwd: "."
@@ -83,7 +90,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       owner: REQ-EXT-FILE-001
       added: 2026-09-30
       note: "spawns a second tree under build/xtree-file001 with a junction to the shared filesys and the shared mydb -- it is the reason cross-tree idempotency is checkable at all"
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: image_name, parallel_safe: false}
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: fastupload
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-002/fastupload_e2e.py"]
       cwd: "."
@@ -92,7 +99,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-FILE-002
       added: 2026-10-01
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: image_name, parallel_safe: false}
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: group-002
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-002/verify.py"]
       cwd: "."
