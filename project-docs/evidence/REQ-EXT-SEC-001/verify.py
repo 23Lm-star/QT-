@@ -1,9 +1,16 @@
 # REQ-EXT-SEC-001 端到端负向/回归 harness（仅会话使用，不入库）
 # 前置：Server.exe 已在 127.0.0.1:5000 运行，CWD=Server/
+#
+# FINDING-GATE-2 补充：本harness 唯一不自启动 Server（历史上靠"前置：已运行，CWD=Server/"），
+# 所以它的**检查路径必须与服务器的实际 cwd 一致**。它通过 PDU 把 "./filesys/..." 字面量发给
+# 服务器，服务器按自己的 cwd 解析落地位置；而本文件用 SBX 去检查落地结果。若两者 cwd 不同
+# （例如统一改用部署形态 dist/），文件会落在 dist/filesys 而本文件仍去 Server/filesys 找，
+# 于是每一条落地断言都误报 FAIL—— 表现为 "L1b MKDIR ret=False" 这类看似产品缺陷的结果。
+# 因此 SBX 改为可由环境变量指定，默认仍是历史的 Server/filesys。
 import hashlib, os, socket, struct, sys, time
 
 BASE = os.environ.get("SEC001_BASE", r"E:/qt/xiangmu")
-SBX = os.path.join(BASE, "Server", "filesys")
+SBX = os.environ.get("SEC001_SBX", os.path.join(BASE, "Server", "filesys"))
 HOST, PORT = "127.0.0.1", 5000
 HDR = 76
 T_REG, T_REG_R, T_LOGIN, T_LOGIN_R = 1, 2, 3, 4
