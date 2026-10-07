@@ -28,6 +28,9 @@ public:
     void handleMessageEvent(PDU *pdu);
     // REQ-EXT-GROUP-003：100/102/104 群文件响应按 group_id 路由到群文件窗口
     void handleFileResponse(PDU *pdu);
+    // REQ-EXT-GROUP-004：会话建立后取回全部群的未读锚点（群水位 + 我的已读游标），
+    // 一次性建立会话级群读状态，使状态就绪与窗口是否打开解耦。
+    void initializeSession();
 
 protected:
     void showEvent(QShowEvent *event) override;

@@ -84,11 +84,17 @@ void MsgHandler::handllogin()
         QTimer::singleShot(1500,[loginName](){
             Client::getinstance().m_LoginName=loginName;
             qCDebug(lcCli)<<"登录账号成功，用户名为:"<<loginName;
+            // REQ-EXT-GROUP-004：新会话丢弃上一会话的群读状态（换账号登录不得继承旧游标）
+            Client::getinstance().resetGroupStates();
             Index::getinstance().show();
             Client::getinstance().hide();
             // 主界面完全构造并显示后，在事件循环下一轮触发初始刷新（仅好友列表）
             QTimer::singleShot(0, [](){
                 Index::getinstance().getFriend()->flushfriend();
+                // REQ-EXT-GROUP-004：这里是全客户端唯一的"会话已建立"时点，一次取回全部群的
+                // 未读锚点（群水位 + 我的已读游标）。不能再早——actor 未建立，摘要必被拒；
+                // 不能再晚——等到第一次打开群聊窗口才取，会让没打开过的群一直空着。
+                Index::getinstance().getGroup()->initializeSession();
                 // 文件列表刷新延迟到用户首次点击"文件"页时
             });
         });

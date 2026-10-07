@@ -94,6 +94,10 @@ Desktop.ini
 /project-docs/evidence/**/*.diff
 /project-docs/evidence/**/*.patch
 /project-docs/evidence/**/*.cpp
+# 例外：REQ-EXT-GROUP-004 的游标探针是**测试代码**，与上面 *.py 套件同等地位。
+# 它直接编译产品头文件 Client/groupchatstate.h（客户端游标逻辑 socket 套件驱动不到），
+# 被 verify.py 调用；不入库则套件在别处无法复现。仍然只放行这一个文件名，不放行 *.cpp。
+!/project-docs/evidence/**/cursor_probe.cpp
 /project-docs/evidence/**/*.out
 /project-docs/evidence/**/*.sql
 /project-docs/evidence/**/*.sh
