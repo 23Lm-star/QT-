@@ -3,6 +3,7 @@
 
 #include <QApplication>
 #include "operatedb.h"
+#include "reclaimscheduler.h"
 int main(int argc, char *argv[])
 {
     QApplication a(argc, argv);
@@ -30,6 +31,17 @@ int main(int argc, char *argv[])
     // REQ-EXT-FILE-001 T6：存量迁移在版本检查通过后、事件循环启动前自动执行一次。
     // 此时尚未处理任何业务请求（a.exec 未开始），且幂等：重跑仅跳过已映射文件。
     OperateDB::instance().migrateLegacyFiles();
+    // REQ-EXT-RECLAIM-001：周期清理调度器（延迟删除的收割者）。
+    // 放在这里而不是更早：它要用 filesPath（initialize 载入）、DB 连接池（connect）
+    // 与迁移后的 schema（checkSchemaVersion 已 fail-fast）。
+    // 它挂在主线程事件循环上、每拍只动有界条数，不阻塞收发；第一次心跳就会先处置
+    // 上一个进程崩溃留下的 reclaiming 行。enabled=0 时它自己拒绝启动。
+    ReclaimScheduler::instance().start();
     s.show();
-    return a.exec();
+    const int rc = a.exec();
+    // 在 QApplication 析构之前停表：调度器是静态单例，它的析构发生在 QApplication
+    // 之后，那时 Qt 已拆掉主线程的 QThread 标识，停一个还活着的定时器会报
+    // "Timers cannot be stopped from another thread"。这里显式收尾，退出保持干净。
+    ReclaimScheduler::instance().stop();
+    return rc;
 }

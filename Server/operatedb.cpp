@@ -86,7 +86,8 @@ bool OperateDB::checkSchemaVersion()
         qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
                          << q.lastError().text()
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql 与 migrate_ext_group_003.sql";
+                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql "
+                            "与 migrate_ext_reclaim_001.sql";
         return false;
     }
     int version = 0;
@@ -96,11 +97,13 @@ bool OperateDB::checkSchemaVersion()
     const int required = qMax(kFileAssetSchemaVersion,
                               qMax(kGroupSchemaVersion,
                                    qMax(kGroupMessageSchemaVersion,
-                                        qMax(kFastUploadSchemaVersion, kGroupFileSchemaVersion))));
+                                        qMax(kFastUploadSchemaVersion,
+                                             qMax(kGroupFileSchemaVersion, kReclaimSchemaVersion)))));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql 与 migrate_ext_group_003.sql";
+                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql "
+                            "与 migrate_ext_reclaim_001.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;

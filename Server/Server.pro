@@ -34,6 +34,7 @@ SOURCES += \
     mytcpsocket.cpp \
     operatedb.cpp \
     protocol.cpp \
+    reclaimscheduler.cpp \
     resumableuploadsession.cpp \
     server.cpp \
     sharelinkservice.cpp \
@@ -53,6 +54,7 @@ HEADERS += \
     mytcpsocket.h \
     operatedb.h \
     protocol.h \
+    reclaimscheduler.h \
     resumableuploadsession.h \
     server.h \
     sharelinkservice.h \
