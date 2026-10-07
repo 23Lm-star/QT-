@@ -1,8 +1,10 @@
 #ifndef CLIENT_H
 #define CLIENT_H
+#include "groupchatstate.h"
 #include "msghandler.h"
 #include "protocol.h"
 #include "reconnectdialog.h"
+#include <QHash>
 #include <QWidget>
 #include <QTcpSocket>
 #include <QTime>
@@ -62,6 +64,11 @@ public:
     static const qint64 SERVER_ALIVE_TIMEOUT_MS;  // 90s = 3×30s 心跳周期
     void onServerLost();
 
+    // REQ-EXT-GROUP-004：群读状态属于账号会话，不属于窗口。
+    // 登录成功时清空重建并取一次锚点；窗口只是读写者，开关窗口不改变语义。
+    GroupChatState &groupState(quint64 groupId) { return m_groupStates[groupId]; }
+    void resetGroupStates() { m_groupStates.clear(); }
+
     ~Client();
 public slots:
     void seedMsg(PDU* pdu);
@@ -87,6 +94,7 @@ private slots:
 
 private:
     Ui::Client *ui;
+    QHash<quint64, GroupChatState> m_groupStates;   // REQ-EXT-GROUP-004：group_id → 群读状态
     QTimer* m_heartbeatTimer;
     // 服务端存活检测相关
     bool m_serverLostShown;     // 重连窗口是否已弹出（去重，避免重复弹）

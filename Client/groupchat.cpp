@@ -4,6 +4,8 @@
 
 #include <QDateTime>
 #include <QHBoxLayout>
+#include <QHideEvent>
+#include <QTimer>
 #include <QUuid>
 #include <QVBoxLayout>
 #include <cstring>
@@ -51,19 +53,32 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
     connect(m_input, &QLineEdit::returnPressed, this, &GroupChat::sendCurrent);
     connect(m_historyButton, &QPushButton::clicked, this, &GroupChat::loadOlder);
     connect(m_messageList, &QListWidget::itemDoubleClicked, this, &GroupChat::onItemDoubleClicked);
+    m_readReportTimer = new QTimer(this);
+    m_readReportTimer->setSingleShot(true);
+    connect(m_readReportTimer, &QTimer::timeout, this, [this]() { flushReadReport(); });
     updateStatus();
 }
 
 void GroupChat::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
-    if (!m_summaryRequested) {
-        m_summaryRequested = true;
-        // 95 无业务字段；96 返回后由 Group 转发本群游标 → 定位补齐起点
-        sendRequest(ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST);
-    } else {
-        confirmRead();
-    }
+    // 每次显示都是一次新的"观看会话"：补齐批次额度重置，按当前锚点补齐隐藏期间落下的消息
+    m_catchupBatches = 0;
+    updateStatus();
+    maybeCatchUp();
+}
+
+// 窗口不可见后游标不再推进，把节流窗口内最后一段推进立即落地（不进网络层排队的部分不丢）
+void GroupChat::hideEvent(QHideEvent *event)
+{
+    QWidget::hideEvent(event);
+    m_readReportTimer->stop();
+    flushReadReport();
+}
+
+void GroupChat::onAnchorUpdated()
+{
+    maybeCatchUp();
 }
 
 QByteArray GroupChat::envelope(const QByteArray &body)
@@ -95,20 +110,84 @@ void GroupChat::requestPull(quint8 mode, quint64 cursor, quint16 limit)
     sendRequest(ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_REQUEST, body);
 }
 
-void GroupChat::confirmRead()
-{
-    if (m_lastSeq == 0 || m_lastSeq <= m_confirmedSeq || !isVisible()) return;
-    QByteArray body;
-    groupAppendU64(body, m_lastSeq);
-    sendRequest(ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST, body);
-}
-
 void GroupChat::markRendered(quint64 seq)
 {
     if (seq == 0) return;
     m_renderedSeqs.insert(seq, true);
     if (m_firstSeq == 0 || seq < m_firstSeq) m_firstSeq = seq;
-    if (seq > m_lastSeq) m_lastSeq = seq;
+}
+
+GroupChatState &GroupChat::groupState()
+{
+    return Client::getinstance().groupState(m_groupId);
+}
+
+// REQ-EXT-GROUP-004：唯一推进入口——90 实时事件、89/90 自己消息、92 拉取记录全走这里。
+// 窗口不可见时只记录水位：消息照渲染，但我没看到，游标绝不动。
+void GroupChat::onMessageArrived(quint64 seq)
+{
+    if (seq == 0) return;
+    if (!isVisible()) {
+        groupState().noteWater(seq);
+        return;
+    }
+    switch (groupState().onArrived(seq)) {
+    case ReadCursorVerdict::Buffered:
+        // 有洞：上面那条已渲染给用户，但游标必须停在洞前；立刻前向拉取补洞
+        maybeCatchUp();
+        break;
+    case ReadCursorVerdict::Advanced:
+        scheduleReadReport(false);
+        break;
+    case ReadCursorVerdict::Ignored:
+        break;
+    }
+    updateStatus();
+}
+
+// 需要且允许时发起前向补洞拉取：锚点未就绪先取摘要；洞已在拉或批次用尽则不重复拉
+void GroupChat::maybeCatchUp()
+{
+    if (!isVisible()) return;
+    if (!groupState().anchored()) {
+        if (!m_summaryRequested) {
+            m_summaryRequested = true;
+            sendRequest(ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST);
+        }
+        return;
+    }
+    if (m_catchupInFlight) return;
+    if (groupState().readCursor() >= groupState().waterSeq()) {
+        scheduleReadReport(false);
+        return;
+    }
+    if (m_catchupBatches >= MAX_CATCHUP_BATCHES) return;
+    ++m_catchupBatches;
+    m_catchupInFlight = true;
+    requestPull(0, groupState().readCursor(), 100);
+}
+
+// 上报节流：固定 400ms 速率的合并器——窗口内的连续推进只发一次，且发的是最新游标，
+// 合并后仍是"前缀末尾"，语义不变。immediate 用于补齐批次结束与关闭前落地。
+void GroupChat::scheduleReadReport(bool immediate)
+{
+    if (!isVisible()) return;
+    if (!groupState().needsReport()) return;
+    if (immediate) {
+        m_readReportTimer->stop();
+        flushReadReport();
+        return;
+    }
+    if (m_readReportTimer->isActive()) return;
+    m_readReportTimer->start(READ_REPORT_THROTTLE_MS);
+}
+
+void GroupChat::flushReadReport()
+{
+    if (!groupState().needsReport()) return;
+    QByteArray body;
+    groupAppendU64(body, groupState().readCursor());
+    sendRequest(ENUM_MSG_TYPE_GROUP_READ_CONFIRM_REQUEST, body);
 }
 
 QListWidgetItem *GroupChat::insertMessage(quint64 seq, const QString &sender, quint8 msgType,
@@ -194,29 +273,18 @@ void GroupChat::loadOlder()
 {
     // 91 mode=1 语义为 seq<=cursor（含边界）：必须以「已渲染最小 seq-1」请求，
     // 否则最早一条会被重复回传（92 渲染侧亦有 seq 去重兜底）。
-    quint64 cursor = m_groupLastSeq;
+    quint64 cursor = groupState().waterSeq();
     if (m_firstSeq > 0) cursor = m_firstSeq - 1;
     if (cursor == 0) return;
-    requestPull(1, cursor, 50);
+    requestPull(1, cursor, 50);   // 上翻历史：seq 全在游标之下，不推进已读、不上报
 }
 
 void GroupChat::updateStatus()
 {
     // REQ-UX-001 A3：不再向用户暴露"水位/已读游标"等协议术语
+    // REQ-EXT-GROUP-004：未读 = 水位 - 连续前缀末尾，与服务器 COUNT 口径等价（序号稠密）
     m_statusLabel->setText(QStringLiteral("本群消息共 %1 条 · 未读 %2 条")
-                           .arg(m_groupLastSeq).arg(m_unread));
-}
-
-void GroupChat::applyUnreadSummary(quint64 lastSeq, quint64 lastReadSeq, quint64 unread)
-{
-    m_groupLastSeq = lastSeq;
-    m_unread = unread;
-    if (!m_initialized) {
-        // 打开窗口：从前向补齐未读开始（游标=服务端 last_read_seq），补到水位即可上翻
-        m_initialized = true;
-        requestPull(0, lastReadSeq, 100);
-    }
-    updateStatus();
+                           .arg(groupState().waterSeq()).arg(groupState().unread()));
 }
 
 void GroupChat::handleMessageEvent(PDU *pdu)
@@ -255,17 +323,15 @@ void GroupChat::handleMessageEvent(PDU *pdu)
                 pending.item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(seq));
                 renderOwnMessage(pending.item, QStringLiteral("已送达"), text);
                 pending.item->setData(ROLE_STATE, 1);
-                updateStatus();
+                onMessageArrived(seq);
                 return;
             }
         }
     }
     QListWidgetItem *item = insertMessage(seq, senderName, msgType, createdAtMs, text);
-    if (item != nullptr) {
-        m_messageList->scrollToBottom();
-        updateStatus();
-    }
-    confirmRead();
+    if (item != nullptr) m_messageList->scrollToBottom();
+    // 渲染去重与游标推进是两件事：即使这条已渲染过，也要喂进推进入口
+    onMessageArrived(seq);
 }
 
 void GroupChat::handleResponse(PDU *pdu)
@@ -313,6 +379,7 @@ void GroupChat::handleResponse(PDU *pdu)
                 renderOwnMessage(pending.item, QStringLiteral("已发送"), pending.content);
                 pending.item->setData(ROLE_STATE, 1);
                 markRendered(seq);
+                onMessageArrived(seq);   // 自己的消息同样占用序号通道，缺的正是它接上前缀
             } else if (state == 1) {
                 renderOwnMessage(pending.item, QStringLiteral("已发送"), pending.content);
             }
@@ -324,6 +391,8 @@ void GroupChat::handleResponse(PDU *pdu)
 
     if (pdu->uiType == ENUM_MSG_TYPE_GROUP_PULL_MESSAGES_RESPOND) {
         if (code != 0) {
+            // 拉取失败：必须解掉"在途"标志，否则本次会话再也补不了洞
+            m_catchupInFlight = false;
             m_statusLabel->setText(QStringLiteral("拉取失败：%1").arg(qint32(code)));
             return;
         }
@@ -346,8 +415,10 @@ void GroupChat::handleResponse(PDU *pdu)
                     || !groupReadString(payload, offset, record.content)) return;
             records.append(record);
         }
-        m_groupLastSeq = groupLastSeq;
-        m_unread = unread;
+        // 水位取 max 收敛。回带的未读数只作交叉校验（测试 S4 钉住它与"水位-游标"等价），
+        // 客户端显示一律由会话状态推导，不引入第二个真相源。
+        groupState().noteWater(groupLastSeq);
+        Q_UNUSED(unread);
         if (mode == 1) {
             // 后向翻页：响应按 seq 升序；逐条前插到列表头部（已渲染 seq 跳过兜底）
             for (int i = records.size() - 1; i >= 0; --i) {
@@ -374,16 +445,22 @@ void GroupChat::handleResponse(PDU *pdu)
                 m_messageList->insertItem(0, item);
             }
         } else {
+            // 前向补齐按 seq 升序返回，逐条喂回同一个推进入口：洞被补齐时游标自然一路推到边界。
+            // 渲染去重（insertMessage 命中已渲染返回 nullptr）与游标推进是两件事——
+            // 窗口隐藏期间已渲染过的消息，同样必须喂进推进函数。
+            // 遍历期间 m_catchupInFlight 保持 true，本轮不会插入第二次拉取。
             for (const Record &record : records) {
                 insertMessage(record.seq, QString::fromUtf8(record.sender), record.msgType,
                               record.createdAtMs, QString::fromUtf8(record.content));
+                onMessageArrived(record.seq);
             }
             m_messageList->scrollToBottom();
             if (hasMore && m_catchupBatches < MAX_CATCHUP_BATCHES) {
                 ++m_catchupBatches;
                 requestPull(0, nextCursor, 100);
             } else {
-                confirmRead();
+                m_catchupInFlight = false;
+                scheduleReadReport(true);   // 批次结束：立即上报，不参与节流
             }
         }
         updateStatus();
@@ -392,8 +469,8 @@ void GroupChat::handleResponse(PDU *pdu)
 
     if (pdu->uiType == ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND) {
         quint64 effective = 0;
-        if (code == 0 && groupReadU64(payload, offset, effective) && effective > m_confirmedSeq) {
-            m_confirmedSeq = effective;
+        if (code == 0 && groupReadU64(payload, offset, effective)) {
+            groupState().markConfirmed(effective);
         }
         updateStatus();
         return;

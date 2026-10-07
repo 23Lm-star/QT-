@@ -147,6 +147,11 @@ void Group::requestUnreadSummary()
     sendRequest(ENUM_MSG_TYPE_GROUP_UNREAD_SUMMARY_REQUEST);
 }
 
+void Group::initializeSession()
+{
+    requestUnreadSummary();
+}
+
 void Group::refreshInvitations()
 {
     sendRequest(ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_REQUEST);
@@ -451,9 +456,12 @@ void Group::handleResponse(PDU *pdu)
             totalUnread += unread;
             m_unreadByGroup.insert(summaryGroupId, unread);
             refreshUnreadBadge(summaryGroupId, unread);
-            // 已打开窗口：同步游标与未读数
+            // REQ-EXT-GROUP-004：锚点落进会话级状态（水位与游标都只增不减）。
+            // 徽标仍用服务端回带的未读数（权威），窗口内的显示由状态推导，两者等价（见需求 §4.5）。
+            Client::getinstance().groupState(summaryGroupId).applyServerAnchor(lastSeq, lastReadSeq);
+            // 已打开窗口：让其按新锚点续补/上报
             if (m_chatWindows.contains(summaryGroupId)) {
-                m_chatWindows.value(summaryGroupId)->applyUnreadSummary(lastSeq, lastReadSeq, unread);
+                m_chatWindows.value(summaryGroupId)->onAnchorUpdated();
             }
         }
         m_statusLabel->setText(QStringLiteral("我的群聊：%1 个 · 未读合计 %2")

@@ -393,6 +393,8 @@ void Client::connectsort(){
 // 以及"未重新鉴权就继续收发文件/聊天"的隐患。
 void Client::forceReLogin() {
     m_loggedIn = false;
+    // REQ-EXT-GROUP-004：旧连接的服务端身份已丢失，群读状态随之作废；重新登录后由新会话重建
+    resetGroupStates();
     // 回到登录界面（Client 在登录成功后曾被 hide，这里重新显示）
     Index::getinstance().hide();
     this->show();

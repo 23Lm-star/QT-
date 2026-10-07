@@ -118,6 +118,16 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       owner: REQ-EXT-GROUP-003
       added: 2026-10-01
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: group004
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-004/verify.py"]
+      cwd: "."
+      asserts: 23
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-GROUP-004
+      added: 2026-10-07
+      note: "自管服务端生命周期（_harness/server_ctl.py）。23 条 = 13 条客户端游标状态机 + 10 条服务端已读契约。其中 13 条由 cursor_probe.cpp 直接编译产品头文件 Client/groupchatstate.h 得出：编译失败时按固定编号全部记 FAIL（断言总数不漂移）。探针需要项目工具链 g++（C:/Qt/Tools/mingw730_64/bin），不需要 Qt5Core 链接与运行期 Qt DLL"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: unique-login
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SESSION-001/unique_login_e2e.py"]
       cwd: "."
