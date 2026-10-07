@@ -7,7 +7,7 @@
 -- 回滚见 migrate_ext_reclaim_001_rollback.sql。
 --
 -- 本迁移是"延迟删除的收割者"能落地的前提。三处改动各自不可省：
---   1) reclaim_at  —— 30 天宽限期必须有一个"最后一次引用消失"的锚点（见下）
+--   1) reclaim_at  —— 宽限期（grace_hours）必须有一个"最后一次引用消失"的锚点（见下）
 --   2) reclaiming  —— 调度器抢删除权用的中间状态，把"删的人 vs 复活的人"的竞争收成
 --                     同一行上的两个条件 UPDATE（见 reclaimscheduler.h 的三条红线）
 --   3) object_id 可空 —— 不这么做，file_object 的行根本删不掉（见下，这是硬阻塞）
@@ -17,7 +17,7 @@
 --    由四个标记点在同一句 UPDATE 里顺带写入：reclaim_at=IF(refcount<=0,NOW(),NULL)
 --    （依赖 MySQL 单表 UPDATE 赋值从左到右求值，本文件里既有代码早已依赖这一点）。
 --    写完之后，抢权(reclaiming)与回退(pending_reclaim)**都不再改它**——否则每次重试都会
---    把 30 天宽限期重新计时，一个 unlink 一直失败的对象就会变成"每 30 天才重试一次"，
+--    把宽限期重新计时，一个 unlink 一直失败的对象就会变成"每过一个宽限期才重试一次"，
 --    永远等不到下一轮。
 --    （这也是不用 updated_at ON UPDATE CURRENT_TIMESTAMP 的原因：那条列会被抢权和
 --      回退自动刷新，正是上面这个毛病。）
@@ -68,7 +68,7 @@ ALTER TABLE group_file MODIFY object_id BIGINT NULL;
 -- ---------------------------------------------------------------------------
 -- 5) 存量待回收行回填：宽限期从**本次迁移时刻**起算，不从 created_at 起算。
 --    created_at 是对象创建时刻，早于真实归零时刻；拿它当锚点会让"刚归零不久"的对象
---    立刻满足 30 天条件而被回收——正好是宽限期要防的那件事。宁可多留 30 天。
+--    立刻满足宽限期条件而被回收——正好是宽限期要防的那件事。宁可多留一个宽限期。
 UPDATE file_object SET reclaim_at = NOW()
 WHERE status = 'pending_reclaim' AND reclaim_at IS NULL;
 
