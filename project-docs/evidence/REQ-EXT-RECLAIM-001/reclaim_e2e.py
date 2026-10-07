@@ -36,13 +36,16 @@ CFG = os.path.join(DIST, "reclaim.cfg")
 
 OWNER = "re2euser"
 OIDS = [999901, 999902, 999903, 999904, 999905]
-# (id, status, reclaim_at 偏移天数, 是否有实体文件, 是否有 active user_file 引用)
+# (id, status, reclaim_at 偏移小时, 是否有实体文件, 是否有 active user_file 引用)
+# 宽限期取 grace_hours=6（见 write_cfg）：40 小时已过宽限，1 小时未过（C 例的判据）。
+# E 必须用 1 小时：崩溃残留的处理顺序是"先退回 pending_reclaim、同一轮再取候选"，
+# 若它已过宽限，退回后当轮就会被正常收走（这是对的），E1/E2 的"保留"就不成立了。
 CASES = [
     (999901, "pending_reclaim", 40, True, False),   # A 到期+无引用 → 行与文件都删
     (999902, "pending_reclaim", 40, True, True),    # B 到期+有活跃引用 → 一条都不许动
     (999903, "pending_reclaim", 1, True, False),    # C 未到宽限期 → 不许动
     (999904, "reclaiming", 40, False, False),       # D 崩溃残留(文件已无) → 补完删记录
-    (999905, "reclaiming", 2, True, False),         # E 崩溃残留(文件仍在) → 退回待回收
+    (999905, "reclaiming", 1, True, False),         # E 崩溃残留(文件仍在) → 退回待回收
 ]
 STG_NEW, STG_OLD, STG_ACTIVE = "re2enew.part", "re2eold.part", "re2eactive.part"
 
@@ -77,7 +80,7 @@ def write_cfg(dry_run):
         f.write("# REQ-EXT-RECLAIM-001 由 reclaim_e2e.py 临时写入；收尾会还原现场\n")
         f.write("enabled=1\ndry_run=%d\n" % (1 if dry_run else 0))
         f.write("tick_ms=1000\ninterval_minutes=60\nper_tick=20\nper_round_limit=500\n")
-        f.write("staging_ttl_days=7\ngrace_days=30\n")
+        f.write("staging_ttl_hours=6\ngrace_hours=6\n")
 
 
 def cleanup():
@@ -103,9 +106,9 @@ def build_fixture():
     cleanup()
 
     rows = ",".join(
-        "(%d,REPEAT('%s',64),5,'objects/zz/%d',0,'%s',NOW(),DATE_SUB(NOW(),INTERVAL %d DAY))"
-        % (oid, "abcdefgh"[i], oid, status, days)
-        for i, (oid, status, days, _f, _r) in enumerate(CASES))
+        "(%d,REPEAT('%s',64),5,'objects/zz/%d',0,'%s',NOW(),DATE_SUB(NOW(),INTERVAL %d HOUR))"
+        % (oid, "abcdefgh"[i], oid, status, hours)
+        for i, (oid, status, hours, _f, _r) in enumerate(CASES))
     sql("INSERT INTO file_object (object_id,sha256,size_bytes,storage_path,refcount,status,"
         "created_at,reclaim_at) VALUES " + rows)
     sql("INSERT INTO user_file (owner_name,parent_path,display_name,object_id,status) "
@@ -118,7 +121,7 @@ def build_fixture():
         "('%s','/','re2eactive.bin',5,'%s','uploading',DATE_ADD(NOW(),INTERVAL 1 HOUR))"
         % (OWNER, win_stg))
 
-    for oid, _s, _d, has_file, _r in CASES:
+    for oid, _s, _h, has_file, _r in CASES:
         p = os.path.join(OBJ, str(oid))
         if has_file:
             with open(p, "wb") as f:
@@ -126,12 +129,13 @@ def build_fixture():
         elif os.path.exists(p):
             os.remove(p)
 
+    # TTL 是 staging_ttl_hours=6：10 小时=过期两例，1 小时=未过期一例。
     now = time.time()
-    for name, age_days in ((STG_OLD, 10), (STG_ACTIVE, 10), (STG_NEW, 1.0 / 24)):
+    for name, age_hours in ((STG_OLD, 10), (STG_ACTIVE, 10), (STG_NEW, 1)):
         p = os.path.join(STG, name)
         with open(p, "wb") as f:
             f.write(b"X")
-        os.utime(p, (now - age_days * 86400, now - age_days * 86400))
+        os.utime(p, (now - age_hours * 3600, now - age_hours * 3600))
 
     got = int(scalar("SELECT COUNT(*) FROM file_object WHERE object_id BETWEEN 999901 AND 999906"))
     if got != 5:

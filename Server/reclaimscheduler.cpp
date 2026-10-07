@@ -37,12 +37,12 @@ ReclaimScheduler::ReclaimScheduler(QObject* parent)
 
 ReclaimScheduler::Config ReclaimScheduler::loadConfig() const
 {
-    Config c;    // 出来就是保守默认：1 小时一轮、每拍 20 条、暂存 7 天、宽限 30 天
+    Config c;    // 出来就是保守默认：1 小时一轮、每拍 20 条、暂存 6 小时、宽限 6 小时
     const QString path = QCoreApplication::applicationDirPath() + "/reclaim.cfg";
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
         qCInfo(lcFs) << "[RECLAIM] 未找到 reclaim.cfg，使用保守默认"
-                     << "(1h/20条/500上限/暂存7天/宽限30天/真删)";
+                     << "(1h/20条/500上限/暂存6小时/宽限6小时/真删)";
         return c;
     }
     const QStringList lines = QString::fromUtf8(f.readAll()).split('\n');
@@ -60,13 +60,13 @@ ReclaimScheduler::Config ReclaimScheduler::loadConfig() const
         if (key == "enabled")                     c.enabled = on;
         else if (key == "dry_run")                c.dryRun = on;
         // 数值一律要求 > 0：这些旋钮全都会放大删除力度，0 或负数不得静默生效。
-        // 尤其 grace_days=0 会删掉复活窗口还开着的对象——那正是宽限期要防的误删。
-        else if (key == "interval_minutes" && ok && n > 0) c.intervalMinutes = n;
-        else if (key == "tick_ms"          && ok && n > 0) c.tickMs = n;
-        else if (key == "per_tick"         && ok && n > 0) c.perTick = n;
-        else if (key == "per_round_limit"  && ok && n > 0) c.perRoundLimit = n;
-        else if (key == "staging_ttl_days" && ok && n > 0) c.stagingTtlDays = n;
-        else if (key == "grace_days"       && ok && n > 0) c.graceDays = n;
+        // 尤其 grace_hours=0 会删掉复活窗口还开着的对象——那正是宽限期要防的误删。
+        else if (key == "interval_minutes"   && ok && n > 0) c.intervalMinutes = n;
+        else if (key == "tick_ms"            && ok && n > 0) c.tickMs = n;
+        else if (key == "per_tick"           && ok && n > 0) c.perTick = n;
+        else if (key == "per_round_limit"    && ok && n > 0) c.perRoundLimit = n;
+        else if (key == "staging_ttl_hours"  && ok && n > 0) c.stagingTtlHours = n;
+        else if (key == "grace_hours"        && ok && n > 0) c.graceHours = n;
         else qCWarning(lcFs) << "[RECLAIM] reclaim.cfg 忽略无法识别的行:" << line;
     }
     return c;
@@ -93,8 +93,8 @@ void ReclaimScheduler::start()
                     << "每拍上限=" << m_cfg.perTick << "条"
                     << "单轮上限=" << m_cfg.perRoundLimit << "条"
                     << "轮次间隔=" << m_cfg.intervalMinutes << "分钟"
-                    << "暂存TTL=" << m_cfg.stagingTtlDays << "天"
-                    << "宽限期=" << m_cfg.graceDays << "天"
+                    << "暂存TTL=" << m_cfg.stagingTtlHours << "小时"
+                    << "宽限期=" << m_cfg.graceHours << "小时"
                     << "dry_run=" << m_cfg.dryRun;
 }
 
@@ -246,13 +246,13 @@ int ReclaimScheduler::harvestReclaimObjects(const Config& cfg, int budget, Stats
     q.prepare("SELECT fo.object_id, fo.storage_path FROM file_object fo "
               "WHERE fo.status='pending_reclaim' AND fo.refcount<=0 "
               "  AND fo.reclaim_at IS NOT NULL "
-              "  AND fo.reclaim_at < DATE_SUB(NOW(), INTERVAL ? DAY) "
+              "  AND fo.reclaim_at < DATE_SUB(NOW(), INTERVAL ? HOUR) "
               "  AND NOT EXISTS (SELECT 1 FROM user_file  uf "
               "                  WHERE uf.object_id=fo.object_id AND uf.status='active') "
               "  AND NOT EXISTS (SELECT 1 FROM group_file gf "
               "                  WHERE gf.object_id=fo.object_id AND gf.status='active') "
               "ORDER BY fo.reclaim_at ASC LIMIT ?");
-    q.addBindValue(cfg.graceDays);
+    q.addBindValue(cfg.graceHours);
     q.addBindValue(budget + m_roundFailedObjects.size());   // 给本轮已知失败项留出位置
     if (!q.exec()) {
         qCWarning(lcFs) << "[RECLAIM] 对象候选查询失败:" << q.lastError().text();
@@ -368,13 +368,13 @@ int ReclaimScheduler::harvestReclaimObjects(const Config& cfg, int budget, Stats
 
 int ReclaimScheduler::harvestStagingFiles(const Config& cfg, int budget, Stats& st)
 {
-    if (budget <= 0 || cfg.stagingTtlDays <= 0) return 0;
+    if (budget <= 0 || cfg.stagingTtlHours <= 0) return 0;
     QDir dir(stagingDir());
     if (!dir.exists()) return 0;
 
     const QSet<QString> active = activeSessionStagingPaths();
     const qint64 cutoffMs = QDateTime::currentMSecsSinceEpoch()
-                            - qint64(cfg.stagingTtlDays) * 86400000LL;
+                            - qint64(cfg.stagingTtlHours) * 3600000LL;
 
     QFileInfoList parts = dir.entryInfoList(QStringList() << "*.part", QDir::Files);
     std::sort(parts.begin(), parts.end(), [](const QFileInfo& a, const QFileInfo& b) {
@@ -390,7 +390,7 @@ int ReclaimScheduler::harvestStagingFiles(const Config& cfg, int budget, Stats& 
         if (m_roundFailedStaging.contains(normKey(abs))) continue;  // 本轮已失败过
         if (cfg.dryRun) {
             qCInfo(lcFs) << "[RECLAIM][dry-run] 待清暂存" << fi.fileName()
-                         << "年龄(天)=" << fi.lastModified().daysTo(QDateTime::currentDateTime());
+                         << "年龄(小时)=" << fi.lastModified().secsTo(QDateTime::currentDateTime()) / 3600.0;
             continue;
         }
         ++st.stagingScanned;
@@ -412,7 +412,7 @@ QSet<QString> ReclaimScheduler::activeSessionStagingPaths() const
     if (!conn.isValid()) return out;
     QSqlQuery q(conn.database());
     // 只有 uploading/verifying 的会话才算"在用"。expired/failed 是**有意保留** .part
-    // 待续传的状态，但这种保留受 TTL 约束：7 天不再来续，就当作废弃。
+    // 待续传的状态，但这种保留受 TTL 约束：过了 staging_ttl_hours 不再来续，就当作废弃。
     // 注：真正在上传的文件 mtime 每一片都在刷新，本来就过不了 TTL 那一关；
     // 这一句是"万一"的兜底，不是主要防线。
     if (q.exec("SELECT staging_path FROM upload_session "
