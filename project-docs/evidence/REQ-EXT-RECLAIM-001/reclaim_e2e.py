@@ -143,7 +143,8 @@ def build_fixture():
 
 
 def prior_parts():
-    """夹具之外既有的 .part 数量——本套件必须一个都不碰。"""
+    """夹具之外既有的 .part 数量。断言 I 比较同一次运行的前后，证明"本轮只动了该动的"；
+    它测不到"本轮开始前就已被别的运行收走"——那不是它的职责（见 INDEX.md）。"""
     return len([n for n in os.listdir(STG)
                 if n.endswith(".part") and not n.startswith("re2e")]) if os.path.isdir(STG) else 0
 
@@ -221,7 +222,7 @@ def main():
               "yes" if exists(os.path.join(STG, STG_NEW)) else "no", "yes")
         check("H", "过期但 uploading 会话在用 → 保留",
               "yes" if exists(os.path.join(STG, STG_ACTIVE)) else "no", "yes")
-        check("I", "既有未过期 .part 一个都没碰", prior_parts(), base)
+        check("I", "夹具之外的既有 .part 同一次运行前后不变", prior_parts(), base)
     finally:
         try:
             cleanup()
