@@ -50,8 +50,8 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-SEC-001
       added: 2026-09-29
-      note: "security baseline. BASE falls back to the literal E:/qt/xiangmu when SEC001_BASE is unset -- see FINDING-GATE-3"
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+      note: "security baseline. BASE falls back to the literal E:/qt/xiangmu when SEC001_BASE is unset -- see FINDING-GATE-3. D5-adapted IN PLACE on 2026-10-03: its four storage-model assertions (K1c/K1f/K1i-or-K2a/K2b) now read the DB fact layer instead of the filesystem, so this file is NO LONGER byte-identical to its original -- the earlier 'original stays byte-identical' position is retired. It gained a mysql CLI dependency (SEC001_MYSQL / SEC001_DB overridable) and still does not self-start the server. Protocol and security assertions are untouched"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false, extra: "mysql CLI at SEC001_MYSQL"}
     - id: sec001-regression
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py"]
       cwd: "."
@@ -60,7 +60,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-FILE-001
       added: 2026-09-30
-      note: "D5-adapted copy of sec001. The ORIGINAL verify.py stays byte-identical; only the storage-model assertions were adapted, security assertions untouched"
+      note: "D5-adapted copy of sec001. Historically this was the ONLY adapted copy while the original kept its assertions; since 2026-10-03 the original was adapted in place too, so the two now carry equivalent storage-model assertions and this suite is redundant-but-retained as the self-starting variant"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: entry-ops
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/entry_ops_e2e.py"]

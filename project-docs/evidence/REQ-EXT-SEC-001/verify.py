@@ -1,15 +1,17 @@
 # REQ-EXT-SEC-001 端到端负向/回归 harness（仅会话使用，不入库）
 # 前置：Server.exe 已在 127.0.0.1:5000 运行，CWD=Server/
 #
-# ★ 历史债（2026-10-03 标注）—— 读到 FAIL 之前先看这里：
-# 本原件的 **K1c / K1f / K1i / K2b 四条**仍断言"内容物理落盘到用户目录"。D5 存储模型
-# 变更（对象内容寻址 + 分享零物理复制）已批准并落地，这四条期望随之过时—— 服务器返回
-# ret=True（协议成功）但不再按旧语义写物理文件，于是它们会误报 FAIL，看起来像产品缺陷。
-# 同一批断言在 D5 适配副本里已替换为"条目归属 + 对象摘要"的等价断言：
-#     project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py   （48/48 全绿）
-# 该副本同时自启动 Server（cwd=dist/），本原件不自启动、且检查路径需SEC001_SBX 与服务器
-# cwd 对齐。原件按 invariant 21 保持断言字节不变，因此此处只加注记，不动断言。
-# 修法见 task #15：把这四条同样适配进原件，或正式声明原件只跑 E0-E6 段。
+# ★ D5 适配（2026-10-03 完成）—— 四条断言已就地适配，与 sec001_regression.py 逐字等价：
+#     K1c: 物理落盘 -> 条目 active + 对象 sha256/size 一致 + 用户树确认无物理写
+#     K1f: isfile(B/A) -> 条目归属（B 有 / A 无，A 的 parent_path='/'）
+#     K2a: exists(up2.bin) -> 无 active 条目
+#     K2b: isfile(up2.bin) -> B 有 active 条目
+#   协议交互（K1a/K1b/K1d/K1g/K1h/K1j/K2c/...）与全部安全断言**一字未动**。
+#   等价副本：project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py （48/48 全绿）
+#
+#   D5 适配的代价：这些断言由"黑盒协议层"变成了"DB 事实层"，因此本 harness 新增了对
+#   mysql CLI 的依赖（MYSQL/DBQ/sql()，与副本同一套）。这是必要的—— D5 之后"落地"根本
+#   不再表现为文件系统事件，协议层无法观测它，只能问数据库。
 #
 # FINDING-GATE-2 补充：本harness 唯一不自启动 Server（历史上靠"前置：已运行，CWD=Server/"），
 # 所以它的**检查路径必须与服务器的实际 cwd 一致**。它通过 PDU 把 "./filesys/..." 字面量发给
@@ -17,11 +19,24 @@
 # （例如统一改用部署形态 dist/），文件会落在 dist/filesys 而本文件仍去 Server/filesys 找，
 # 于是每一条落地断言都误报 FAIL—— 表现为 "L1b MKDIR ret=False" 这类看似产品缺陷的结果。
 # 因此 SBX 改为可由环境变量指定，默认仍是历史的 Server/filesys。
-import hashlib, os, socket, struct, sys, time
+import hashlib, os, socket, struct, subprocess, sys, time
 
 BASE = os.environ.get("SEC001_BASE", r"E:/qt/xiangmu")
 SBX = os.environ.get("SEC001_SBX", os.path.join(BASE, "Server", "filesys"))
 HOST, PORT = "127.0.0.1", 5000
+
+# D5 适配引入的 DB 查询通道（与 sec001_regression.py 同一套，SEC001_DB 可覆盖）。
+# 仅四条落地断言用它；其余断言仍纯协议层。
+MYSQL = os.environ.get(
+    "SEC001_MYSQL", r"C:/Program Files/MySQL/MySQL Server 5.7/bin/mysql.exe")
+DBQ = ["-h", "localhost", "-u", "root", "-p123456", "mydb", "-N", "-B", "-e"]
+
+
+def sql(q):
+    r = subprocess.run([MYSQL] + DBQ + [q], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
 HDR = 76
 T_REG, T_REG_R, T_LOGIN, T_LOGIN_R = 1, 2, 3, 4
 T_FINDU, T_FINDU_R, T_ONLINE, T_ONLINE_R = 5, 6, 7, 8
@@ -124,18 +139,60 @@ def ensure_user(name):
     print(f"FATAL: 用户 {name} 既注册不上也登录不了 ret={ret}")
     sys.exit(2)
 
+# D5 适配（与 sec001_regression.py 的"0. DB 清场"等价）：本原件此前只清文件系统、不清库，
+# 因此**复跑不可靠** —— 上一轮留下的 active 条目会被后续断言当成"已落地"，使 K2a/K2b 之类的
+# 归属断言误报（实测：残留 sec001b/up2.bin 让 K2a 的 landed=True 而非预期的 False）。
+# 断言要可重复执行，前提是每次都从同一初始状态出发。
+# 孤儿 file_object 一并回收：清场后无任何user_file 指向的对象不应留着污染 refcount 断言。
+for u in (A, B, R, V):
+    sql(f"DELETE FROM user_file WHERE owner_name='{u}';")
+    sql(f"DELETE FROM upload_session WHERE owner_name='{u}';")
+    sql(f"DELETE FROM share_link WHERE owner_name='{u}';")
+    sql(f"DELETE FROM file_migration_map WHERE old_path LIKE 'filesys/{u}/%' "
+        f"OR old_path LIKE '%/filesys/{u}/%';")
+sql("DELETE fo FROM file_object fo LEFT JOIN user_file uf ON uf.object_id=fo.object_id "
+    "WHERE uf.file_id IS NULL;")
+
+# 夹具：服务端只在"首次注册"时创建用户根，而上面的 DB 清场已把账号删掉——于是重新注册会
+# 重建根，但注册后立刻登录需要根已经可写。实测缺这一步时，第二次运行会在 ensure_user 的
+# login 步拿到空响应（IndexError: r[0]），整套一条断言都跑不到。
+# 顺序不可调换：预建必须在 ensure_user 之前（与 sec001_regression.py 同式，属运行环境事实）。
+import shutil
+for u in (A, B, R, V):
+    os.makedirs(os.path.join(SBX, u), exist_ok=True)
+
 for u in (A, B, R, V):
     ensure_user(u)
 
-import shutil
 wd = os.path.join(SBX, A, "workdir")
-shutil.rmtree(wd, ignore_errors=True)
+
+
+def rmtree_retry(path):
+    # 服务进程可能瞬态持有目录句柄，裸 rmtree(ignore_errors=True) 会静默留下残留，
+    # 表现为后续断言读到上轮数据（实测会让 K1f/K2b 的归属断言错判）。
+    for _ in range(10):
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.isdir(path):
+            return
+        time.sleep(0.5)
+
+
+def remove_retry(path):
+    for _ in range(10):
+        if not os.path.isfile(path):
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            time.sleep(0.5)
+
+
+rmtree_retry(wd)
 for leftover in (os.path.join(SBX, B, "up.bin"), os.path.join(SBX, B, "up2.bin")):
-    if os.path.isfile(leftover):
-        os.remove(leftover)
+    remove_retry(leftover)
 
 secret = os.path.join(SBX, B, "secret.txt")
-os.makedirs(os.path.join(SBX, B), exist_ok=True)
+os.makedirs(os.path.dirname(secret), exist_ok=True)
 open(secret, "w").write("VICTIM-CONTENT-DO-NOT-TOUCH")
 
 print("=== G1 未认证连接拒绝（验收1/4-群留待GROUP分支 D5） ===")
@@ -253,7 +310,16 @@ for i in range(0, len(payload), 600):
         ok_acks = False
 check("K1b", "上传分块全部 ack 成功", ok_acks, f"chunks={ (len(payload)+599)//600 }")
 uppath = os.path.join(SBX, A, "workdir", "up.bin")
-check("K1c", "落盘内容与长度一致", os.path.isfile(uppath) and open(uppath, "rb").read() == payload, f"size={os.path.getsize(uppath) if os.path.isfile(uppath) else '-'}")
+# D5 适配（2026-10-03，与 sec001_regression.py 的 K1c 逐字等价）：上传以内容寻址对象落盘，
+# 不再物理写用户树。等价断言 = 条目 active + 对象摘要/大小一致 + 用户树确认无物理写。
+# 协议交互（K1a 初始化 / K1b 分块 ack / K1d 下载回读）一字未动，只改"落盘"这一项的判定。
+upsha = hashlib.sha256(payload).hexdigest()
+check("K1c", "条目落盘+对象摘要一致+用户树无物理写(D5适配)",
+      sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
+          f"WHERE uf.owner_name='{A}' AND uf.display_name='up.bin' AND uf.status='active' "
+          f"AND fo.sha256='{upsha}' AND fo.size_bytes={len(payload)}") == "1"
+      and not os.path.isfile(uppath),
+      f"sha={upsha[:8]} physical={os.path.isfile(uppath)}")
 r = ca.ask(pdu(T_DOWN, msg=(updir + "/up.bin").encode(), dat=f32("up.bin")))
 meta = r[0] if r else None
 dl_ok = meta and meta[0] == T_DOWN_R and bf(meta[1])
@@ -276,9 +342,13 @@ check("K1e", "B 收到分享请求且署名=actor(伪造V无效)", sh_ok, f"shar
 if sh_ok:
     r = c2.ask(pdu(T_AGREE_R, msg=ag[0][2], dat=f32(A)))  # B 故意谎报投递目标为 A
     fin = [p for p in ([r[0]] if r else []) if p[0] == T_FINISH]
-    landed_b = os.path.isfile(os.path.join(SBX, B, "up.bin"))
-    landed_a = os.path.isfile(os.path.join(SBX, A, "up.bin"))
-    check("K1f", "接收者谎报目标名：文件仍只落在 B 本人根", fin and bf(fin[0][1]) and landed_b and not landed_a, f"ret={bf(fin[0][1]) if fin else 'NORESP'} inB={landed_b} inA={landed_a}")
+    # D5 适配（与 sec001_regression.py 的 K1f 等价）：改查条目归属而非物理文件。
+    # A 本人根的逻辑键为'/'（owner 相对，跨树确定，F-3/D5 修复）。
+    entry_b = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{B}' AND display_name='up.bin' AND status='active'")
+    entry_a = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{A}' AND parent_path='/' AND display_name='up.bin' AND status='active'")
+    check("K1f", "接收者谎报目标名：条目仍只落 B 本人根(D5适配)",
+          fin and bf(fin[0][1]) and entry_b == "1" and entry_a == "0",
+          f"ret={bf(fin[0][1]) if fin else 'NORESP'} inB={entry_b} inA={entry_a}")
 
 r = ca.ask(pdu(T_MKDIR, msg=(f"./filesys/{A}").encode(), dat=f32("evil\\..\\out")))
 check("K1g", "穿越名段仍被拒（FS-003 回归）", r and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
@@ -292,14 +362,15 @@ check("K1j", "重命名他人文件被拒", r and not bf(r[0][1]) and os.path.is
 print("=== K2 M-1 分享握手登记：伪造/重放同意 ===")
 forged = (f"./filesys/{A}/workdir/up2.bin").encode()
 r = c2.ask(pdu(T_AGREE_R, msg=forged, dat=f32(B)))
-landed_f = os.path.exists(os.path.join(SBX, B, "up2.bin"))
+# D5 适配（与 sec001_regression.py 的 K2a/K2b 等价）：落地改查条目而非物理文件。
+landed_f = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{B}' AND display_name='up2.bin' AND status='active'") != "0"
 check("K2a", "未分享给 B 的源伪造同意被拒且无落地", r and r[0][0] == T_FINISH and not bf(r[0][1]) and not landed_f, f"ret={bf(r[0][1]) if r else 'NORESP'} landed={landed_f}")
 ca.ask(pdu(T_SHARE, msg=f32(B) + forged, dat=f32(A) + struct.pack("<i", 1)))
 fwd = c2.idle(1.5)
 ag = [p for p in fwd if p[0] == T_AGREE]
 r = c2.ask(pdu(T_AGREE_R, msg=ag[0][2], dat=f32(B))) if ag else []
-landed = os.path.isfile(os.path.join(SBX, B, "up2.bin"))
-check("K2b", "握手登记后正常同意成功落地", bool(ag) and r and bf(r[0][1]) and landed, f"agree={bool(ag)} ret={bf(r[0][1]) if r else 'NORESP'}")
+landed = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{B}' AND display_name='up2.bin' AND status='active'") == "1"
+check("K2b", "握手登记后正常同意成功落地(D5适配为条目落地)", bool(ag) and r and bf(r[0][1]) and landed, f"agree={bool(ag)} ret={bf(r[0][1]) if r else 'NORESP'}")
 r = c2.ask(pdu(T_AGREE_R, msg=ag[0][2], dat=f32(B)))
 check("K2c", "登记一次性消费：重放同意被拒", r and r[0][0] == T_FINISH and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
 # B-1：A 把 B 的文件"分享给自己"→ 源不属于分享人：不登记不转发；随后 A 自我同意必须失败
