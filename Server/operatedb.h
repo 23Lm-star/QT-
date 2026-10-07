@@ -26,6 +26,11 @@ public:
     static const int kFastUploadSchemaVersion = 2026100102;
     // REQ-EXT-GROUP-003：群文件迁移版本（group_file 表）。
     static const int kGroupFileSchemaVersion = 2026100103;
+    // REQ-EXT-RECLAIM-001：周期清理调度器迁移版本（file_object.reclaim_at +
+    // status 扩 'reclaiming' + idx_status_reclaim + group_file.object_id 放宽为可空）。
+    // 必须有独立版本号：调度器与 4 处引用归零打标都直接写 reclaim_at，
+    // 未执行本迁移的库若靠旧版本号蒙过启动检查，会在第一次释放文件时 SQL 报错。
+    static const int kReclaimSchemaVersion = 2026100701;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 

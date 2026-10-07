@@ -389,9 +389,13 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
 
         // 4) 引用计数 +1（对象已存在或本事务新建）
         if (!objectCreated) {
-            q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+            q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready',reclaim_at=NULL "
+                      "WHERE object_id=? AND status IN ('ready','pending_reclaim')");
             q.addBindValue(oid);
             if (!q.exec()) { r.error = q.lastError().text(); break; }
+            // 影响 0 行 = 该对象已被调度器抢到删除权（status='reclaiming'）或已删除。
+            // 复活输了就让位：整体回滚，客户端重传即可——绝不留下一条指向已回收对象的条目。
+            if (q.numRowsAffected() != 1) { r.error = "对象已进入回收，请重新上传"; break; }
         }
 
         if (!db.commit()) {
@@ -427,7 +431,8 @@ bool FileObjectStore::refObject(qint64 objectId)
     QSqlDatabase db = conn.database();
     if (!db.transaction()) return false;
     QSqlQuery q(db);
-    q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+    q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready',reclaim_at=NULL "
+                      "WHERE object_id=? AND status IN ('ready','pending_reclaim')");
     q.addBindValue(objectId);
     bool ok = q.exec() && q.numRowsAffected() > 0 && db.commit();
     if (!ok) db.rollback();
@@ -459,7 +464,8 @@ bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner)
         if (!obj.isNull()) {
             const qint64 oid = obj.toLongLong();
             q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
-                      "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                      "status=IF(refcount<=0,'pending_reclaim','ready'),"
+                      "reclaim_at=IF(refcount<=0,NOW(),NULL) WHERE object_id=?");
             q.addBindValue(oid);
             if (!q.exec()) break;                   // 归零→待回收（验收3），绝不删物理文件（D3）
         }
@@ -523,7 +529,8 @@ bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
             const QVariant obj = objectIds[i];
             if (!obj.isNull()) {
                 q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
-                          "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                          "status=IF(refcount<=0,'pending_reclaim','ready'),"
+                      "reclaim_at=IF(refcount<=0,NOW(),NULL) WHERE object_id=?");
                 q.addBindValue(obj.toLongLong());
                 if (!q.exec()) { ok = false; break; }
             }
@@ -813,9 +820,13 @@ FileObjectStore::AttachResult FileObjectStore::attachExistingObject(
         }
 
         // 引用计数 +1（D3：pending_reclaim 对象被复用即置回 ready，待回收 ≠ 已删除）
-        q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+        // 谓词里的 status IN (...) 是删除权的对侧：调度器把行抢成 'reclaiming' 后，
+        // 这句必然影响 0 行——复活与回收在同一行上串行化，不靠时序约定。
+        q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready',reclaim_at=NULL "
+                      "WHERE object_id=? AND status IN ('ready','pending_reclaim')");
         q.addBindValue(objectId);
         if (!q.exec()) { r.error = q.lastError().text(); break; }
+        if (q.numRowsAffected() != 1) { r.error = "对象已进入回收，请重新上传"; break; }
         done = true;
     } while (false);
 
@@ -903,7 +914,8 @@ bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& 
             if (!q.exec()) { err = q.lastError().text(); ok = false; break; }
             if (!objs[i].isNull()) {
                 q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
-                          "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                          "status=IF(refcount<=0,'pending_reclaim','ready'),"
+                      "reclaim_at=IF(refcount<=0,NOW(),NULL) WHERE object_id=?");
                 q.addBindValue(objs[i].toLongLong());
                 if (!q.exec()) { err = q.lastError().text(); ok = false; break; }
             }
@@ -1004,9 +1016,11 @@ FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
                 fileId = q.lastInsertId().toLongLong();
             }
             if (newRef) {
-                q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+                q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready',reclaim_at=NULL "
+                      "WHERE object_id=? AND status IN ('ready','pending_reclaim')");
                 q.addBindValue(objectId);
                 if (!q.exec()) { r.error = q.lastError().text(); break; }
+                if (q.numRowsAffected() != 1) { r.error = "对象已进入回收，请重新上传"; break; }
             }
         }
         r.fileId = fileId;
@@ -1074,9 +1088,11 @@ FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
             r.groupFileId = q.lastInsertId().toLongLong();
         }
         // 3) 群引用 +1
-        q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready' WHERE object_id=?");
+        q.prepare("UPDATE file_object SET refcount=refcount+1,status='ready',reclaim_at=NULL "
+                      "WHERE object_id=? AND status IN ('ready','pending_reclaim')");
         q.addBindValue(objectId);
         if (!q.exec()) { r.error = q.lastError().text(); break; }
+        if (q.numRowsAffected() != 1) { r.error = "对象已进入回收，请重新上传"; break; }
         done = true;
     } while (false);
 
@@ -1114,7 +1130,8 @@ bool FileObjectStore::releaseGroupFile(qint64 groupFileId, quint64 groupId,
 
         if (!obj.isNull()) {
             q.prepare("UPDATE file_object SET refcount=GREATEST(refcount-1,0),"
-                      "status=IF(refcount<=0,'pending_reclaim','ready') WHERE object_id=?");
+                      "status=IF(refcount<=0,'pending_reclaim','ready'),"
+                      "reclaim_at=IF(refcount<=0,NOW(),NULL) WHERE object_id=?");
             q.addBindValue(obj.toLongLong());
             if (!q.exec()) { err = q.lastError().text(); break; }
         }
