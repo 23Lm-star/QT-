@@ -73,7 +73,7 @@ public:
     void onGroupDownloadRespond(PDU* pdu);     // 106
     void onAbortRespond(PDU* pdu);             // 108
 
-    // 控制（仅上传任务可用）
+    // 控制（上传/下载两方向可用；REQ-EXT-TRANSFER-002 起下载支持暂停/继续/取消/续传）
     void pause(quint64 key);
     void resume(quint64 key);
     void cancel(quint64 key);
@@ -119,6 +119,10 @@ private:
     void sendAbortIfActive(Task& t);
     Task* taskByTransferId(quint64 id);
     bool beginReceiving(Task& t, const QString& fileName);
+    // REQ-EXT-TRANSFER-002 C5：续传 = 重开同一分片并 seek 到声明起点（不新建 (N) 文件）
+    bool resumeReceiving(Task& t, qint64 offset);
+    // REQ-EXT-TRANSFER-002 C2：下载「继续/重试」共用路径（摘旧映射 + 起点 = 分片大小）
+    void resumeDownload(Task& t);
     quint64 stableKeyOf(quint64 transferId);
 
     QHash<quint64, Task> m_tasks;        // key = 稳定行键

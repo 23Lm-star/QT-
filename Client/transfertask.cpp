@@ -47,7 +47,8 @@ quint64 TransferManager::allocId()
 
 // ===================== 会话间持久化（transfers_<user>.json） =====================
 // 设计：快照只在状态跃迁点写入（入队/完成/暂停/恢复/取消/重试），进度字节不落盘——
-// 续传点由协议决定（个人上传 97/30 回带 offset；下载整文件重传），落盘进度只会误导。
+// 续传点由协议决定（个人上传 97/30 回带 offset；下载续传点 = 本地分片物理大小，
+// REQ-EXT-TRANSFER-002 D9），落盘进度只会误导。
 
 QString TransferManager::snapshotPath() const
 {
@@ -77,6 +78,10 @@ void TransferManager::saveSnapshot()
         o[QStringLiteral("groupId")] = double(t.groupId);
         o[QStringLiteral("groupFileId")] = double(t.groupFileId);
         o[QStringLiteral("totalBytes")] = double(t.totalBytes);
+        if (!t.isUpload()) {
+            // REQ-EXT-TRANSFER-002 C9：下载分片路径入快照；进度不落盘（恢复时由分片大小推导，D9）
+            o[QStringLiteral("savePath")] = t.savePath;
+        }
         arr.append(o);
     }
     const QString path = snapshotPath();
@@ -121,6 +126,11 @@ void TransferManager::restoreSavedTasks()
             }
         } else {
             t.totalBytes = qint64(o[QStringLiteral("totalBytes")].toDouble());
+            // REQ-EXT-TRANSFER-002 C9：分片路径入快照；起点按分片物理大小回填（D9）。
+            // 旧快照无 savePath → 空 → 起点 0 →「继续」即今日整文件重传（I3 无回归）。
+            t.savePath = o[QStringLiteral("savePath")].toString();
+            const QFileInfo shardInfo(t.savePath);
+            t.doneBytes = (t.savePath.isEmpty() || !shardInfo.isFile()) ? 0 : shardInfo.size();
             t.state = Paused;
             ++m_restoredCount;
         }
@@ -479,6 +489,9 @@ void TransferManager::startTask(Task& t)
         PDU* pdu = mkPDU(uint(pathBytes.size() + 1));
         pdu->uiType = ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST;
         memcpy(pdu->caData, nameBytes.constData(), qMin(nameBytes.size(), 31));
+        // REQ-EXT-TRANSFER-002 C3：声明续传起点（新任务 doneBytes=0 = 从头，旧语义由 mkPDU 清零保证）
+        const qint64 startOffset = t.doneBytes;
+        memcpy(pdu->caData + DOWNLOAD_RESUME_OFFSET, &startOffset, sizeof(startOffset));
         memcpy(pdu->caData + TRANSFER_ID_OFFSET, &t.id, sizeof(t.id));
         memcpy(pdu->caMsg, pathBytes.constData(), size_t(pathBytes.size()));
         t.state = Running;
@@ -493,6 +506,9 @@ void TransferManager::startTask(Task& t)
         groupAppendU64(payload, t.groupFileId);
         PDU* pdu = mkPDU(uint(payload.size()));
         pdu->uiType = ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST;
+        // REQ-EXT-TRANSFER-002 C3：与 40 同一常量同一偏移；caMsg 群信封零改动（I7）
+        const qint64 startOffset = t.doneBytes;
+        memcpy(pdu->caData + DOWNLOAD_RESUME_OFFSET, &startOffset, sizeof(startOffset));
         memcpy(pdu->caData + TRANSFER_ID_OFFSET, &t.id, sizeof(t.id));
         memcpy(pdu->caMsg, payload.constData(), size_t(payload.size()));
         t.state = Running;
@@ -568,6 +584,35 @@ bool TransferManager::beginReceiving(Task& t, const QString& fileName)
     t.savePath = savePath;
     t.displayName = safeName;
     return true;
+}
+
+// REQ-EXT-TRANSFER-002 C5：续传 = 重开同一分片（ReadWrite）并 seek 到声明起点；(N) 递推仅属于新任务
+bool TransferManager::resumeReceiving(Task& t, qint64 offset)
+{
+    closeRecv(t);
+    if (t.savePath.isEmpty()) {
+        t.failReason = QStringLiteral("无法打开下载分片");
+        return false;
+    }
+    t.recvFile = new QFile(t.savePath);
+    if (!t.recvFile->open(QIODevice::ReadWrite) || !t.recvFile->seek(offset)) {
+        delete t.recvFile;
+        t.recvFile = nullptr;
+        t.failReason = QStringLiteral("无法打开下载分片");
+        return false;
+    }
+    t.doneBytes = offset;
+    return true;
+}
+
+// REQ-EXT-TRANSFER-002 C4 ①-⑤：续传护栏。requested>0 时任何不匹配都必须**明确失败**，
+// 绝不把后缀写进错误偏移造成静默损坏（D6：旧服务端采纳起点恒 0 → accepted != requested）。
+// 返回值：0 = 正常受理；1 = 失败（未接受续传起点）；2 = 服务端文件已变化（需删分片，D8）。
+static int checkResumeRespond(qint64 requested, qint64 accepted, qint64 size, qint64 knownTotal)
+{
+    if (requested > 0 && (accepted != requested)) return 1;
+    if (requested > 0 && size != knownTotal) return 2;
+    return 0;
 }
 
 TransferManager::Task* TransferManager::taskByTransferId(quint64 id)
@@ -704,20 +749,43 @@ void TransferManager::onDownloadRespond(PDU* pdu)
     Task* t = taskByTransferId(id);
     if (t == nullptr) return;
     bool ret = false;
-    qint64 fileSize = 0;
+    qint64 fileSize = 0, accepted = 0;
     memcpy(&ret, pdu->caData, sizeof(ret));
     memcpy(&fileSize, pdu->caData + sizeof(bool), sizeof(fileSize));
+    memcpy(&accepted, pdu->caData + DOWNLOAD_ACCEPTED_OFFSET, sizeof(accepted));
     QString fileName = QString::fromUtf8(pdu->caData + 32);
     if (fileName.isEmpty()) fileName = QStringLiteral("download.bin");
+    const qint64 requested = t->doneBytes;   // 本次 40 声明的起点（0 = 新任务/从头）
     if (!ret) {
-        finishTask(*t, Failed, QStringLiteral("服务端拒绝下载请求"));
+        finishTask(*t, Failed, requested > 0
+                ? QStringLiteral("服务端未接受续传起点")
+                : QStringLiteral("服务端拒绝下载请求"));
         return;
     }
-    t->totalBytes = fileSize;
-    t->doneBytes = 0;
-    if (!beginReceiving(*t, fileName)) {
-        finishTask(*t, Failed, t->failReason);
+    const int resumeProblem = checkResumeRespond(requested, accepted, fileSize, t->totalBytes);
+    if (resumeProblem == 1) {   // D6 护栏：含新客户端×旧服务端（采纳区间恒 0）
+        finishTask(*t, Failed, QStringLiteral("服务端未接受续传起点"));
         return;
+    }
+    if (resumeProblem == 2) {   // D8：前缀不可信 → 删分片 + 起点归零，绝不拼损坏件
+        QFile::remove(t->savePath);
+        t->savePath.clear();
+        t->doneBytes = 0;
+        finishTask(*t, Failed, QStringLiteral("服务端文件已变化，无法续传"));
+        return;
+    }
+    t->totalBytes = fileSize;   // C4⑤：统一回写权威大小
+    if (requested > 0) {
+        if (!resumeReceiving(*t, accepted)) {
+            finishTask(*t, Failed, t->failReason);
+            return;
+        }
+    } else {
+        t->doneBytes = 0;
+        if (!beginReceiving(*t, fileName)) {
+            finishTask(*t, Failed, t->failReason);
+            return;
+        }
     }
     emit tasksChanged();
 }
@@ -727,6 +795,9 @@ void TransferManager::onGroupDownloadRespond(PDU* pdu)
     const quint64 id = transferIdOf(pdu);
     Task* t = taskByTransferId(id);
     if (t == nullptr) return;
+    const qint64 requested = t->doneBytes;   // 本次 105 声明的起点（0 = 新任务/从头）
+    quint64 accepted = 0;
+    memcpy(&accepted, pdu->caData + DOWNLOAD_ACCEPTED_OFFSET, sizeof(accepted));
     if (pdu->uiMsgLen < 36) {
         finishTask(*t, Failed, QStringLiteral("群下载响应截断"));
         return;
@@ -744,7 +815,10 @@ void TransferManager::onGroupDownloadRespond(PDU* pdu)
         return;
     }
     if (code != 0) {
-        finishTask(*t, Failed, QStringLiteral("群文件下载失败（%1）").arg(qint32(code)));
+        // D1：-2108=续传起点非法；D7：-2107=并发上限。续传请求未获受理时统一呈现（design C4①）
+        finishTask(*t, Failed, requested > 0
+                ? QStringLiteral("服务端未接受续传起点")
+                : QStringLiteral("群文件下载失败（%1）").arg(qint32(code)));
         return;
     }
     quint64 sizeBytes = 0;
@@ -755,11 +829,33 @@ void TransferManager::onGroupDownloadRespond(PDU* pdu)
         finishTask(*t, Failed, QStringLiteral("群下载元数据截断"));
         return;
     }
-    t->totalBytes = qint64(sizeBytes);
-    t->doneBytes = 0;
-    if (!beginReceiving(*t, QString::fromUtf8(nameBytes))) {
-        finishTask(*t, Failed, t->failReason);
+    const qint64 fileSize = qint64(sizeBytes);
+    const int resumeProblem = checkResumeRespond(requested, qint64(accepted), fileSize, t->totalBytes);
+    if (resumeProblem == 1) {
+        // D6 护栏（同 41）：采纳起点 != 声明起点 → 明确失败，含新客户端×旧服务端
+        finishTask(*t, Failed, QStringLiteral("服务端未接受续传起点"));
         return;
+    }
+    if (resumeProblem == 2) {
+        // D8：前缀不可信 → 删分片 + 起点归零，绝不拼损坏件
+        QFile::remove(t->savePath);
+        t->savePath.clear();
+        t->doneBytes = 0;
+        finishTask(*t, Failed, QStringLiteral("服务端文件已变化，无法续传"));
+        return;
+    }
+    t->totalBytes = fileSize;   // C4⑤：统一回写权威大小
+    if (requested > 0) {
+        if (!resumeReceiving(*t, qint64(accepted))) {
+            finishTask(*t, Failed, t->failReason);
+            return;
+        }
+    } else {
+        t->doneBytes = 0;
+        if (!beginReceiving(*t, QString::fromUtf8(nameBytes))) {
+            finishTask(*t, Failed, t->failReason);
+            return;
+        }
     }
     emit tasksChanged();
 }
@@ -785,10 +881,8 @@ void TransferManager::onDownloadFinish(PDU* pdu)
     if (t == nullptr) return;
     bool success = false;
     memcpy(&success, pdu->caData, sizeof(success));
-    const QString savePath = t->savePath;
-    if (!success && !savePath.isEmpty()) {
-        QFile::remove(savePath);
-    }
+    // REQ-EXT-TRANSFER-002 C6（D7）：失败**不再删除**分片——保留是续传前提，
+    // 清理仅由「取消」承担；失败任务留同名分片直到取消或重试成功（如实记录，无后台清理）。
     finishTask(*t, success ? Done : Failed, success ? QString() : QStringLiteral("下载失败"));
 }
 
@@ -801,9 +895,10 @@ void TransferManager::sendPause(quint64 id)
 }
 
 // 暂停/取消共用 107（服务端处置相同，区别纯在客户端）
+// REQ-EXT-TRANSFER-002 C8：107 现对两方向同义，判定由「上传 && Running」放宽为 Running
 void TransferManager::sendAbortIfActive(Task& t)
 {
-    if (t.isUpload() && t.state == Running) {
+    if (t.state == Running) {
         sendPause(t.id);
     }
 }
@@ -822,7 +917,27 @@ void TransferManager::onAbortRespond(PDU* pdu)
 void TransferManager::pause(quint64 key)
 {
     Task* t = taskByKey(key);
-    if (t == nullptr || !t->isUpload()) return;
+    if (t == nullptr) return;
+    if (!t->isUpload()) {
+        // REQ-EXT-TRANSFER-002 C1：下载暂停。Running → 107 停发+释放名额，**保留分片**；Queued → 移出队列
+        if (t->state == Queued) {
+            m_downloadQueue.removeOne(key);
+            t->state = Paused;
+            saveSnapshot();
+            emit tasksChanged();
+            return;
+        }
+        if (t->state != Running) return;
+        sendAbortIfActive(*t);           // 107：服务端摘环停发、名额即时可复用（不等 108，D3）
+        closeRecv(*t);                   // 已收字节留在磁盘（续传前提，D7）
+        if (m_activeDownloads > 0) --m_activeDownloads;
+        m_idToKey.remove(t->id);         // §4.3 必做防御：摘旧 id 映射，仍在途的旧 id 42 一律落空，不静默串写
+        t->state = Paused;
+        saveSnapshot();
+        emit tasksChanged();
+        pump();
+        return;
+    }
     if (t->state == Queued || t->state == Hashing) {
         m_uploadQueue.removeOne(key);
         m_fastcheckQueue.removeOne(key);
@@ -850,22 +965,36 @@ void TransferManager::pause(quint64 key)
     pump();
 }
 
-// 恢复任务：上传走 29 INIT 续传（服务端按 staging 续），下载重发 41/105
+// REQ-EXT-TRANSFER-002 C2：下载「继续/重试」= 换新 id + 声明起点（= 分片物理大小，D9 唯一权威来源）。
+// §4.3 必做防御：先摘旧 id 映射再入新映射——暂停/失败瞬间仍在途的旧 id 42 数据块一律落空，不静默串写。
+void TransferManager::resumeDownload(Task& t)
+{
+    m_idToKey.remove(t.id);
+    t.id = allocId();
+    m_idToKey.insert(t.id, t.key);
+    qint64 shard = 0;
+    if (!t.savePath.isEmpty()) {
+        const QFileInfo fi(t.savePath);
+        if (fi.isFile()) shard = fi.size();
+        else t.savePath.clear();    // 分片缺失 → 起点 0 → 整文件重下（不报错、无损坏件）
+    }
+    t.doneBytes = shard;
+    t.failReason.clear();
+    t.state = Queued;
+    m_downloadQueue.append(t.key);
+    saveSnapshot();
+    emit tasksChanged();
+    pump();
+}
+
+// 恢复任务：上传走 29 INIT 续传（服务端按 staging 续），下载重发 40/105（起点 = 分片物理大小）
 void TransferManager::resume(quint64 key)
 {
     Task* t = taskByKey(key);
     if (t == nullptr) return;
     if (!t->isUpload()) {
-        // 下载任务同样可"继续"（传输面板的继续按钮对下载条目原先无效）
         if (t->state != Paused && t->state != Failed) return;
-        t->id = allocId();
-        m_idToKey.insert(t->id, key);
-        t->failReason.clear();
-        t->state = Queued;
-        m_downloadQueue.append(key);
-        saveSnapshot();
-        emit tasksChanged();
-        pump();
+        resumeDownload(*t);
         return;
     }
     if (t->state != Paused && t->state != Failed) return;
@@ -894,12 +1023,17 @@ void TransferManager::cancel(quint64 key)
     Task* t = taskByKey(key);
     if (t == nullptr) return;
     if (!t->isUpload()) {
-        // 下载任务取消：Running 归还名额并关收盘文件；排队中移出队列
+        // REQ-EXT-TRANSFER-002 C7：下载取消 = Running 先 107 停发；**删除分片**（仅取消删除）；摘 id 映射
         if (t->state == Running) {
+            sendAbortIfActive(*t);
             if (m_activeDownloads > 0) --m_activeDownloads;
             closeRecv(*t);
         } else if (t->state == Queued) {
             m_downloadQueue.removeOne(key);
+        }
+        if (!t->savePath.isEmpty()) {
+            QFile::remove(t->savePath);
+            t->savePath.clear();
         }
         m_idToKey.remove(t->id);
         m_tasks.remove(key);
@@ -943,14 +1077,7 @@ void TransferManager::retry(quint64 key)
         return;
     }
     if (t->state != Failed) return;
-    t->id = allocId();
-    m_idToKey.insert(t->id, key);
-    t->failReason.clear();
-    t->state = Queued;
-    m_downloadQueue.append(key);
-    saveSnapshot();
-    emit tasksChanged();
-    pump();
+    resumeDownload(*t);   // C2：与"继续"同一路径——摘旧映射、起点 = 分片大小（失败重试不再从头）
 }
 
 void TransferManager::showPanel()
@@ -975,7 +1102,7 @@ TransferTaskPanel::TransferTaskPanel(QWidget* parent)
       m_resumeBtn(new QPushButton(QStringLiteral("继续"), this)),
       m_cancelBtn(new QPushButton(QStringLiteral("取消"), this)),
       m_retryBtn(new QPushButton(QStringLiteral("重试"), this)),
-      m_hint(new QLabel(QStringLiteral("双击传输行不可用；暂停/继续/取消仅对上传任务生效。"), this))
+      m_hint(new QLabel(QStringLiteral("双击传输行不可用；暂停/继续/取消对上传与下载同样生效（下载从本地分片断点续传）。"), this))
 {
     setWindowTitle(QStringLiteral("传输任务"));
     resize(680, 360);
@@ -1023,7 +1150,7 @@ void TransferTaskPanel::refresh()
     const QList<quint64> keys = mgr.taskKeys();
     m_table->setRowCount(int(keys.size()));
     if (mgr.restoredCount() > 0) {
-        m_hint->setText(QStringLiteral("已恢复 %1 个未完成传输（暂停状态，选中后点\"继续\"）。下载的继续对本条目同样生效。")
+        m_hint->setText(QStringLiteral("已恢复 %1 个未完成传输（暂停状态，选中后点\"继续\"）；下载从本地分片断点续传，分片已删则从头重下。")
                         .arg(mgr.restoredCount()));
     }
     int row = 0;

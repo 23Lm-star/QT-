@@ -1772,6 +1772,14 @@ PDU *MsgHandler::downloadfile()
     if(!ret){
         qCWarning(lcFs)<<"[downloadfile] 拒绝越权/不存在下载 conn="<<m_connId<<" 路径:"<<filePath;
     }
+    // REQ-EXT-TRANSFER-002 D1/§2.3：声明的续传起点 > 文件大小 → 明确拒绝、不建流
+    if(ret && m_downloadResumeOffset > fileSize){
+        qCWarning(lcFs)<<"[downloadfile] 拒绝：续传起点非法 conn="<<m_connId
+                       <<" id="<<m_currentTransferId<<" offset="<<m_downloadResumeOffset
+                       <<" size="<<fileSize;
+        ret=false;
+        m_downloadCanonicalPath.clear();
+    }
 
     //仅返回元数据 PDU（不含文件内容），实际数据由 MyTcpSocket 流式发送
     PDU* respdu=mkPDU();
@@ -1780,6 +1788,11 @@ PDU *MsgHandler::downloadfile()
     memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
     // 41 的 [32..62] 被文件名字段占用 → id 落在独立的 [16..23]（D2）
     memcpy(respdu->caData+DOWNLOAD_RESP_TRANSFER_ID_OFFSET,&m_currentTransferId,sizeof(m_currentTransferId));
+    // REQ-EXT-TRANSFER-002 S4/D6：受理并建流时回带采纳起点（R4：拒绝/无流时该区间保持 0）
+    if(ret){
+        const qint64 accepted=m_downloadResumeOffset;
+        memcpy(respdu->caData+DOWNLOAD_ACCEPTED_OFFSET,&accepted,sizeof(accepted));
+    }
     QByteArray fileNameBytes=fileName.toUtf8();
     memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
     qCDebug(lcFs)<<"downloadfile validate path"<<filePath<<"ret"<<ret<<"size"<<fileSize;
@@ -2224,6 +2237,13 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
                 || responseType == ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND) {
             memcpy(out->caData + TRANSFER_ID_OFFSET, &m_currentTransferId, sizeof(m_currentTransferId));
         }
+        // REQ-EXT-TRANSFER-002 S4/D4：106 的 [24..31] = 服务端实际采纳的续传起点，
+        // 仅受理且将建流时写入（R4）；其余区间保持全零，caMsg 信封零改动（I7）。
+        if (responseType == ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND
+                && !m_downloadCanonicalPath.isEmpty()) {
+            const qint64 accepted = m_downloadResumeOffset;
+            memcpy(out->caData + DOWNLOAD_ACCEPTED_OFFSET, &accepted, sizeof(accepted));
+        }
         memcpy(out->caMsg, encoded.constData(), size_t(encoded.size()));
         return out;
     };
@@ -2307,12 +2327,19 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
             // 服务端解析物理路径（group_file.object_id → file_object.storage_path），
             // 绝不接受客户端路径；后续正文走既有 42/43 分块（MyTcpSocket 触发）。
             const QString absPath = FileObjectStore::instance().objectAbsPath(request.objectId);
+            const qint64 effSize = request.sizeBytes < 0 ? 0 : request.sizeBytes;
             if (absPath.isEmpty() || !QFileInfo(absPath).isFile()) {
                 code = -2105;
+            } else if (m_downloadResumeOffset > effSize) {
+                // REQ-EXT-TRANSFER-002 D1/§2.3：续传起点非法 → 明确拒绝、不建流（-2107 已被并发上限占用）
+                code = -2108;
+                qCWarning(lcFs) << "[GROUPFILE] 拒绝：续传起点非法 conn=" << m_connId
+                                << " id=" << m_currentTransferId << " offset=" << m_downloadResumeOffset
+                                << " size=" << effSize;
             } else {
                 m_downloadCanonicalPath = absPath;
                 const QByteArray nameBytes = request.displayName.toUtf8();
-                groupAppendU64(body, quint64(request.sizeBytes < 0 ? 0 : request.sizeBytes));
+                groupAppendU64(body, quint64(effSize));
                 groupAppendU32(body, quint32(nameBytes.size()));
                 body.append(nameBytes);
             }
