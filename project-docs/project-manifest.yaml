@@ -14,7 +14,7 @@ code_intel:              # advisory only -- never changes the audit verdict (aud
   impact_status: not_applicable   # this repo has no statically-reachable automated tests
   impact_reason: "the C++ sources have no in-process unit tests; regression is carried by the socket harnesses under test_gate.suites, which are runtime/harness probes rather than statically-reachable code paths"
 test_gate:                # regression registry -- interpreted by pipeline/test.ps1 via scripts/test-gate.py
-  # All ten suites share ONE server port (5000), ONE database (mydb) and ONE runtime tree
+  # All suites share ONE server port (5000), ONE database (mydb) and ONE runtime tree
   # (Server/filesys, from connect.config line 3 = "./filesys", which is cwd-relative and MUST
   # stay CRLF -- LF makes dist/Server.exe die at startup). They are therefore NOT parallel_safe
   # and the gate serializes them.
@@ -36,7 +36,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
   owner: user
   date: 2026-10-03
   reason: >
-    Ten socket harnesses (369 declared assertions) carry this project's regression, but they do
+    Twelve socket harnesses (406 declared assertions) carry this project's regression, but they do
     not yet own the whole server lifecycle: unique_login_e2e.py needs a binary that the main
     worktree does not build (FINDING-GATE-2). Declared here so the set is checkable and
     auditable rather than living as ten unregistered scripts. Flip to `enforced` after
@@ -127,6 +127,16 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       owner: REQ-EXT-GROUP-004
       added: 2026-10-07
       note: "自管服务端生命周期（_harness/server_ctl.py）。23 条 = 13 条客户端游标状态机 + 10 条服务端已读契约。其中 13 条由 cursor_probe.cpp 直接编译产品头文件 Client/groupchatstate.h 得出：编译失败时按固定编号全部记 FAIL（断言总数不漂移）。探针需要项目工具链 g++（C:/Qt/Tools/mingw730_64/bin），不需要 Qt5Core 链接与运行期 Qt DLL"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: sec002
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SEC-002/verify.py"]
+      cwd: "."
+      asserts: 14
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-SEC-002
+      added: 2026-10-08
+      note: "rename(27)/move(38) 声明字段移交服务端确认的验收面：谎报类型/同名幂等/物理占用/派生名错位/../ 逃逸/缺分隔符。自管生命周期；清场仅触及 sec2a 与 filesys/escape.txt"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: unique-login
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SESSION-001/unique_login_e2e.py"]

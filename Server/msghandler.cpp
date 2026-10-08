@@ -718,7 +718,8 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     qCDebug(lcFs)<<"文件类型:"<<fileType<<" "<<"旧文件路径:"<<oldFilePath<<" "<<"新文件路径:"<<newFilePath<<" ";
     //进行文件或目录的重命名
     bool ret=1;
-    // REQ-FS-003③: 先校验后重命名；未知 fileType 维持原状（ret=1 不执行改名）
+    // REQ-FS-003③: 先校验后重命名
+    // REQ-EXT-SEC-002: fileType 不再采信——条目 is_dir 优先、无条目按物理推导；未知/错位声明只告警
     // REQ-EXT-SEC-001: 目录收敛为 actor 本人用户根（loginName 参数即连接级身份）
     if(!pathInActorRoot(dirPath)){
         ret=0;
@@ -736,25 +737,50 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         const QString renParent = FileObjectStore::normalizeParent(loginName, dirPath);
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, renParent, oldName);
-        if(e.valid()){
+        // REQ-EXT-SEC-002：类型权威=服务端（条目 is_dir 优先，无条目查物理）；客户端声明只做对照告警
+        const QFileInfo oldPhys(oldFilePath);
+        const bool serverIsDir = e.valid() ? e.isDir : oldPhys.isDir();
+        const bool sourceExists = e.valid() || oldPhys.exists();
+        if(fileType!=0 && fileType!=1){
+            qCWarning(lcFs)<<"[renamefile] 客户端类型声明无效，按服务端推导执行 conn="<<m_connId<<":"<<fileType;
+        } else if(bool(fileType==0)!=serverIsDir){
+            qCWarning(lcFs)<<"[renamefile] 客户端类型声明与服务端推导不一致，按服务端推导执行 conn="<<m_connId;
+        }
+        if(oldName==newName){
+            // REQ-EXT-SEC-002：同名幂等由服务端判定（改前只靠客户端早退，服务端会命中自身条目误报占用）
+            ret = sourceExists;
+            if(!ret){
+                qCWarning(lcFs)<<"[renamefile] 同名幂等拒绝：源不存在 conn="<<m_connId;
+            }
+        }
+        else if(e.valid()){
             if(!logicPathInActorRoot(dirPath)){
                 ret=0;
                 qCWarning(lcFs)<<"[renamefile] 拒绝越权重命名（逻辑）conn="<<m_connId<<":"<<dirPath;
+            } else if(QFileInfo(newFilePath).exists()){
+                // REQ-EXT-SEC-002：物理占用前置拒绝（与 movefile 混合检查同口径；改前条目已改、物理撞车只留告警）
+                ret=0;
+                qCWarning(lcFs)<<"[renamefile] 拒绝：目标名已被物理实体占用 conn="<<m_connId<<":"<<newFilePath;
             } else {
                 QString relErr;
                 ret = FileObjectStore::instance().relocateEntry(e.fileId, loginName, renParent, newName, relErr);
                 if(!ret){
                     qCWarning(lcFs)<<"[renamefile] 条目改名失败 conn="<<m_connId<<":"<<relErr;
-                } else if(QFileInfo(oldFilePath).exists()){
-                    bool physOk = (fileType==0) ? QDir().rename(oldFilePath,newFilePath)
-                                                : QFile().rename(oldFilePath,newFilePath);
+                } else if(oldPhys.exists()){
+                    bool physOk = serverIsDir ? QDir().rename(oldFilePath,newFilePath)
+                                              : QFile().rename(oldFilePath,newFilePath);
                     if(!physOk){
                         qCWarning(lcFs)<<"[renamefile] 物理实体同步改名失败（条目为准）conn="<<m_connId<<":"<<oldFilePath;
                     }
                 }
             }
         }
-        else if(fileType==0){//目录（未迁移：物理改名 + 子树条目前缀级联，防幽灵键）
+        else if(!sourceExists){
+            // REQ-EXT-SEC-002：源不存在一律拒绝（改前未知 fileType 不回退任何分支，ret=1 谎报成功）
+            ret=0;
+            qCWarning(lcFs)<<"[renamefile] 拒绝：重命名源不存在 conn="<<m_connId<<":"<<oldFilePath;
+        }
+        else if(serverIsDir){//目录（未迁移：物理改名 + 子树条目前缀级联，防幽灵键）
             QDir dir;
             ret=dir.rename(oldFilePath,newFilePath);
             if(ret){
@@ -764,7 +790,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
                 }
             }
         }
-        else if(fileType==1){//文件
+        else {//文件（未迁移）
             QFile file;
             ret=file.rename(oldFilePath,newFilePath);
         }
@@ -952,17 +978,24 @@ PDU *MsgHandler::movefile(const QString& loginName)
 {
     char srcFileName[32]={'\0'};
     memcpy(srcFileName,pdu->caData,32);
-    QString fileName=QString::fromUtf8(srcFileName).trimmed();
+    const QString claimedName=QString::fromUtf8(srcFileName).trimmed();
 
     // caMsg 格式：srcRel + '\0' + dstRel（两个以\0结尾的C串，srcRel 含文件名）
     QByteArray caMsgBytes(pdu->caMsg, pdu->uiMsgLen);
     int sep = caMsgBytes.indexOf('\0');
-    QString srcRel = QString::fromUtf8(caMsgBytes.left(sep)).trimmed();
-    QString dstRel = QString::fromUtf8(caMsgBytes.mid(sep+1)).trimmed();
+    // REQ-EXT-SEC-002：无 '\0' 分隔的畸形报文显式拒绝（改前 left(-1) 返回整串，靠目标非目录碰巧拒掉）
+    QString srcRel = (sep < 0) ? QString() : QString::fromUtf8(caMsgBytes.left(sep)).trimmed();
+    QString dstRel = (sep < 0) ? QString() : QString::fromUtf8(caMsgBytes.mid(sep+1)).trimmed();
 
     QString userRoot=QDir(Server::getinstance().filesPath).filePath(loginName);
     QString srcPath=QDir(userRoot).filePath(srcRel);   // srcRel 已含文件名
     QString dstDir =QDir(userRoot).filePath(dstRel);    // 目标目录
+    // REQ-EXT-SEC-002：移动后的文件名权威=服务端从 srcRel 末段派生（回退分支 dstPath 因此不再受未校验字段影响，
+    // 堵 "fileName=../x" 逃出已校验 dstDir）；caData 声称名只做对照告警，不一致按派生名执行（sharefile 同式）
+    const QString fileName = QFileInfo(srcPath).fileName();
+    if(!claimedName.isEmpty() && claimedName != fileName){
+        qCWarning(lcFs)<<"movefile 声称名与 srcRel 末段不一致，按服务端派生执行 conn="<<m_connId<<":"<<fileName;
+    }
     QString dstPath=QDir(dstDir).filePath(fileName);
     QString finalDstPath = dstPath;
 
@@ -982,7 +1015,14 @@ PDU *MsgHandler::movefile(const QString& loginName)
     const QString mvSrcParent = FileObjectStore::normalizeParent(loginName, srcInfo.absolutePath());
     const FileObjectStore::EntryInfo mvEntry =
             FileObjectStore::instance().entryByPath(loginName, mvSrcParent, fileName);
-    if(mvEntry.valid()){
+    // REQ-EXT-SEC-002：显式拒畸形分隔符与非法派生名（改前 caData 名零校验：可含 '/'/'\'落脏 display_name、可与 srcRel 错位）
+    if(sep < 0){
+        qCWarning(lcFs)<<"movefile 拒绝：caMsg 缺少 '\\0' 分隔符（畸形请求）conn="<<m_connId;
+    }
+    else if(fileName.isEmpty() || fileName.contains('/') || fileName.contains('\\')){
+        qCWarning(lcFs)<<"movefile 拒绝：服务端派生名非法 conn="<<m_connId<<":"<<srcRel;
+    }
+    else if(mvEntry.valid()){
         const QString dstNorm = FileObjectStore::normalizeParent(loginName, dstDir);
         // F-3/D5：mvSrcParent/dstNorm 为逻辑键；"目录自身键"只在逻辑空间拼接，
         // 物理存在性检查一律用原始物理路径 dstDir（键与物理已解耦）。
