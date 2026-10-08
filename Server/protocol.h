@@ -194,8 +194,11 @@ static const int GROUP_FILE_DOWNLOAD_RESP_NAME_OFFSET     = 36;  // 展示名 UT
 static const int GROUP_FILE_MAX_NAME_BYTES       = 70;  // group_file.display_name 列宽（UTF-8 字节）
 static const int GROUP_FILE_MAX_LIST_LIMIT       = 200; // 单页上限
 
-static constexpr uint MAX_INBOUND_PDU_SIZE = 16 * 1024;
-static constexpr int MAX_PENDING_INBOUND_BYTES = 256 * 1024;
+static constexpr uint MAX_INBOUND_PDU_SIZE = 16 * 1024;   // 通用入站单包上限（16 KB）——REQ-EXT-TRANSFER-003 抬高的只有上传数据通道
+// ===== REQ-EXT-TRANSFER-003：上传数据通道（31）分片上限（仅 31 生效；客户端 Client/uploader.h 的 UPLOAD_CHUNK_MAX 须 ≤ 此处） =====
+static constexpr uint MAX_UPLOAD_DATA_CHUNK = 1024 * 1024;                    // 31 单块正文上限 1 MiB
+static constexpr uint MAX_UPLOAD_DATA_PDU_SIZE = MAX_UPLOAD_DATA_CHUNK + 4096; // 31 整包上限 = 正文 + 头/余量
+static constexpr int  MAX_PENDING_INBOUND_BYTES = 1024 * 1024 + 8192;         // 每连接入站累积上界（≥ 单包上限 + 余量；原 256 KB）
 
 struct PDU{//协议数据单元
     uint uiTotalLen;    //总长度

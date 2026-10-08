@@ -1236,17 +1236,31 @@ PDU *MsgHandler::uploadfileinit()
                     ctx.expectedSha = m_pendingFastcheck.shaHex;
                     adoptedFastcheck = true;
                 } else {
-                    // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
-                    ctx.sessionId = OperateDB::instance().createUploadSession(
-                        m_actorName, parentPath, fileName, fileSize,
-                        QString(), ctx.session.stagingFilePath(), result.offset, 3600);
-                    if (ctx.sessionId < 0) {
-                        qCWarning(lcFs) << "uploadfileinit 会话登记失败 conn=" << m_connId;
+                    // REQ-EXT-TRANSFER-003 S13/D7：先按暂存键找未完成行复用（同一 .part 只有一行）；
+                    // 29 不携带请求键 → 不改写 client_request_id。未命中才新登记。
+                    const qint64 reuseId = OperateDB::instance().findReusableUploadSession(
+                                m_actorName, ctx.session.stagingFilePath());
+                    if (reuseId >= 0) {
+                        OperateDB::instance().restartUploadSession(
+                                    reuseId, parentPath, fileName, fileSize, QString(),
+                                    ctx.session.stagingFilePath(), result.offset, 3600);
+                        ctx.sessionId = reuseId;
+                    } else {
+                        // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
+                        ctx.sessionId = OperateDB::instance().createUploadSession(
+                            m_actorName, parentPath, fileName, fileSize,
+                            QString(), ctx.session.stagingFilePath(), result.offset, 3600);
+                        if (ctx.sessionId < 0) {
+                            qCWarning(lcFs) << "uploadfileinit 会话登记失败 conn=" << m_connId;
+                        }
                     }
                 }
                 ret = true;
                 resumeOffset = result.offset;
                 complete = result.complete;
+                // REQ-EXT-TRANSFER-003 S8：节流基准以本次续传起点与当前时刻初始化
+                ctx.lastPersistOffset = result.offset;
+                ctx.lastPersistMs = QDateTime::currentMSecsSinceEpoch();
                 if (result.complete) {
                     // 0 字节或断点已到尾部：立即落定（仍走服务端复算，验收4）
                     finalizeUploadOnComplete();
@@ -1293,6 +1307,24 @@ MsgHandler::UploadCtx* MsgHandler::findUpload(quint64 id)
     return it == m_uploads.end() ? nullptr : &it.value();
 }
 
+// REQ-EXT-TRANSFER-003 S5 补充：释放除 keepId 外所有指向同一暂存路径的句柄。
+// 同一逻辑上传可能同时挂在两个上下文上（97 预检查的 id=0 槽 + 真实传输槽；幂等重放的旧槽），
+// 它们指向同一个 .part——留着的第二个写句柄会让 rename/delete/truncate 在 Windows 上失败。
+void MsgHandler::releaseOtherStagingHandles(quint64 keepId, const QString &stagingPath)
+{
+    if (stagingPath.isEmpty()) {
+        return;
+    }
+    for (QHash<quint64, UploadCtx>::iterator it = m_uploads.begin(); it != m_uploads.end(); ++it) {
+        if (it.key() == keepId) {
+            continue;
+        }
+        if (it->session.stagingFilePath() == stagingPath) {
+            it->session.releaseStagingFile();
+        }
+    }
+}
+
 MsgHandler::UploadCtx& MsgHandler::currentUpload()
 {
     UploadCtx& ctx = m_uploads[m_currentTransferId];
@@ -1327,6 +1359,9 @@ void MsgHandler::abortUpload(quint64 id)
     // 越过 upload_session.confirmed_offset，续传起点（beginStaged 按文件大小派生）与 DB 记录不一致。
     const QString staging = cp->session.stagingFilePath();
     const qint64 confirmed = cp->session.receivedSize();
+    // REQ-EXT-TRANSFER-003 S5②：动文件（截断）前必须先释放共享暂存句柄（无在途写才能走到这里）
+    cp->session.releaseStagingFile();
+    releaseOtherStagingHandles(id, staging);
     if (!staging.isEmpty()) {
         QFile f(staging);
         if (f.open(QIODevice::ReadWrite) && f.size() > confirmed) {
@@ -1479,6 +1514,8 @@ PDU *MsgHandler::uploadfilefastcheck()
 
     // 本地：以本次请求的 parent/display/size 建立暂存会话（未命中与"失败重试"共用）。
     // retrySessionId >= 0 = 复用既有会话行（uk_req 下不可再插一行，只能原地重置）。
+    // REQ-EXT-TRANSFER-003 S14/D7：入参来源扩展——请求键未命中时再按暂存键找同一 .part 的
+    // 未完成行；按暂存键命中即把请求键改写为本次 reqId（任何 reqId 重放都收敛到同一行）。
     auto beginStagedSession = [&](qint64 retrySessionId) {
         const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
                     m_actorName, parent, displayName, fileSize, true);
@@ -1486,14 +1523,24 @@ PDU *MsgHandler::uploadfilefastcheck()
             qCWarning(lcFs) << "[fastcheck] 暂存会话建立失败 conn=" << m_connId;
             return;
         }
+        QString rewriteReqId;
+        if (retrySessionId < 0) {
+            retrySessionId = OperateDB::instance().findReusableUploadSession(
+                        m_actorName, ctx.session.stagingFilePath());
+            if (retrySessionId >= 0) {
+                rewriteReqId = reqId;
+            }
+        }
         if (retrySessionId >= 0) {
             if (!OperateDB::instance().restartUploadSession(
                         retrySessionId, parent, displayName, fileSize, shaHex,
-                        ctx.session.stagingFilePath(), br.offset, 3600)) {
+                        ctx.session.stagingFilePath(), br.offset, 3600, rewriteReqId)) {
                 qCWarning(lcFs) << "[fastcheck] 会话重置失败 conn=" << m_connId;
                 return;
             }
             ctx.sessionId = retrySessionId;
+            ctx.lastPersistOffset = br.offset;   // S8：节流基准随本次续传起点
+            ctx.lastPersistMs = QDateTime::currentMSecsSinceEpoch();
         } else {
             ctx.sessionId = OperateDB::instance().createUploadSession(
                         m_actorName, parent, displayName, fileSize, shaHex,
@@ -1538,6 +1585,8 @@ PDU *MsgHandler::uploadfilefastcheck()
         if (br.ok) {
             ctx.sessionId = prior.sessionId;
             ctx.expectedSha = prior.clientSha256;
+            ctx.lastPersistOffset = br.offset;   // S8：节流基准随本次续传起点
+            ctx.lastPersistMs = QDateTime::currentMSecsSinceEpoch();
             ret = true; sessionId = prior.sessionId; nextOffset = br.offset;
             if (br.complete) {
                 const qint64 pending = ctx.sessionId;
@@ -1691,6 +1740,10 @@ FileObjectStore::CommitResult MsgHandler::finalizeUploadOnComplete()
     qCDebug(lcFs) << "[finalizeUpload] verifying conn=" << m_connId << " id=" << tid
                   << " owner=" << owner << " display=" << display;
     OperateDB::instance().finishUploadSession(sessionId, "verifying");
+    // REQ-EXT-TRANSFER-003 S5①③：复算/rename/删除都发生在提交内部 → 提交前一并释放共享句柄
+    // （含同一 .part 的别名上下文句柄：97 预检查槽可能仍开着同一文件）
+    cp->session.releaseStagingFile();
+    releaseOtherStagingHandles(tid, staging);
     r = FileObjectStore::instance().commitUpload(owner, parent, display, expected, staging,
                                                 /*copyOnly=*/false, expectedSha);
     // REQ-EXT-GROUP-003：群作用域上传在个人条目落定后，同规则建群目录引用（+1 引用计数）。
@@ -1715,11 +1768,12 @@ FileObjectStore::CommitResult MsgHandler::finalizeUploadOnComplete()
     }
     if (r.ok) {
         // 同写 file_id：使"已完成会话"能被请求级幂等短路直接命中（§2 步骤3）
-        OperateDB::instance().finishUploadSession(sessionId, "done", r.fileId);
+        // REQ-EXT-TRANSFER-003 S10：完成态强制写 confirmed_offset == expected_size（不依赖节流）
+        OperateDB::instance().finishUploadSession(sessionId, "done", r.fileId, expected);
         qCDebug(lcFs) << "[finalizeUpload] 落定 fileId=" << r.fileId << " objId=" << r.objectId
                       << " dedup=" << r.dedupHit << " 定名=" << r.displayName;
     } else {
-        OperateDB::instance().finishUploadSession(sessionId, "failed");
+        OperateDB::instance().finishUploadSession(sessionId, "failed", -1, 0);   // S10：暂存已删，偏移归零
         qCWarning(lcFs) << "[finalizeUpload] 拒绝转正 conn=" << m_connId << " 原因=" << r.error;
     }
     m_uploads.remove(tid);   // 上下文释放（Committed → [无]）
@@ -2356,14 +2410,26 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
                 qCWarning(lcFs) << "[GROUPFILE] 暂存会话建立失败 conn=" << m_connId
                                 << " group=" << request.groupId;
             } else {
-                sessionId = OperateDB::instance().createUploadSession(
-                            m_actorName, parent, request.displayName, request.fileSize,
-                            request.shaHex, ctx.session.stagingFilePath(), br.offset, 3600);
+                // REQ-EXT-TRANSFER-003 S15/D7：同个人路径，先按暂存键复用未完成行（101 不携带请求键）
+                const qint64 reuseId = OperateDB::instance().findReusableUploadSession(
+                            m_actorName, ctx.session.stagingFilePath());
+                if (reuseId >= 0) {
+                    OperateDB::instance().restartUploadSession(
+                                reuseId, parent, request.displayName, request.fileSize,
+                                request.shaHex, ctx.session.stagingFilePath(), br.offset, 3600);
+                    sessionId = reuseId;
+                } else {
+                    sessionId = OperateDB::instance().createUploadSession(
+                                m_actorName, parent, request.displayName, request.fileSize,
+                                request.shaHex, ctx.session.stagingFilePath(), br.offset, 3600);
+                }
                 if (sessionId < 0) {
                     code = -2105;
                     m_uploads.remove(tid);
                     qCWarning(lcFs) << "[GROUPFILE] 上传会话登记失败 conn=" << m_connId;
                 } else {
+                    ctx.lastPersistOffset = br.offset;   // S8：节流基准随本次续传起点
+                    ctx.lastPersistMs = QDateTime::currentMSecsSinceEpoch();
                     ctx.sessionId = sessionId;
                     ctx.expectedSha = request.shaHex;
                     ctx.groupId = request.groupId;

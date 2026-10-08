@@ -270,6 +270,7 @@ quint64 TransferManager::enqueueGroupDownload(quint64 groupId, quint64 groupFile
 // 两方向预算独立（D6）：上传 3 / 下载 3，各自覆盖个人与群路径
 void TransferManager::pump()
 {
+    if (m_connectionDown) return;   // G7/C7：与服务端断开期间不启动新任务（重连登录后由 onConnectionRestored 恢复）
     while (m_activeUploads < int(MAX_PARALLEL_UPLOADS) && !m_uploadQueue.isEmpty()) {
         const quint64 key = m_uploadQueue.takeFirst();
         Task* t = taskByKey(key);
@@ -296,6 +297,7 @@ void TransferManager::startGroupHash(Task& t)
         watcher->deleteLater();
         Task* tt = taskByKey(key);
         if (tt == nullptr) return;
+        if (tt->state != Hashing) return;   // G7/C6：断线已把任务收敛为失败 → 迟到的 SHA 回调不得复活它
         if (sha.isEmpty()) {
             finishTask(*tt, Failed, QStringLiteral("读取文件失败"));
             return;
@@ -361,10 +363,42 @@ void TransferManager::submitFastcheck(quint64 key, const QByteArray& shaHex)
 {
     Task* t = taskByKey(key);
     if (t == nullptr) return;
+    if (t->state != Hashing) return;   // G7/C6：断线失败后到达的 97 提交不得复活任务
     t->shaHex = shaHex;
     m_fastcheckQueue.append(key);
     emit tasksChanged();
     pumpFastcheck();
+}
+
+// ===== REQ-EXT-TRANSFER-003 G7：断线任务态收敛 =====
+// 与服务端断开（socket disconnected / 90 s 心跳丢失）：在途（Running/Hashing）任务即刻判失败并归还名额，
+// 任务行不再永久"传输中"、队列可继续前进；Queued/Paused/Done/Failed 一律不动。
+// 边界：不删任何本地分片、不动服务端暂存与会话行（留给"重试即续传"）；不做自动重发。
+void TransferManager::onConnectionLost(const QString& reason)
+{
+    m_connectionDown = true;
+    m_fastcheckQueue.clear();      // 在途 97 的归属一并作废（迟到 98 由"无在途即丢弃"吞掉）
+    m_fastcheckInFlight = 0;
+    m_fastcheckInFlightToken.clear();
+    const QList<quint64> keys = m_tasks.keys();
+    for (quint64 key : keys) {
+        Task* t = taskByKey(key);
+        if (t == nullptr) continue;
+        if (t->state != Running && t->state != Hashing) continue;
+        // §4.3 同款防御：摘旧 id 映射，防止迟到 32/42 喂进下一条任务
+        m_idToKey.remove(t->id);
+        finishTask(*t, Failed, reason);
+    }
+    emit tasksChanged();
+}
+
+// 重连并重新登录后恢复调度（由 Client 的 LOGIN_RESPOND 分支调用，不依赖 setCurrentUser 的提前返回）
+void TransferManager::onConnectionRestored()
+{
+    if (!m_connectionDown) return;
+    m_connectionDown = false;
+    qCDebug(lcCli) << "[transfer] 连接恢复，重新调度排队任务";
+    pump();
 }
 
 void TransferManager::failTask(quint64 key, const QString& reason)
@@ -609,6 +643,12 @@ void TransferManager::onUploadInitRespond(PDU* pdu)
         finishTask(*t, Failed, QStringLiteral("服务端拒绝上传初始化"));
         return;
     }
+    // REQ-EXT-TRANSFER-003 C3/D9：空文件或断点已在尾部（resumeOffset >= 本地大小，含 0>=0）
+    // → 服务端在 result.complete 时已转正，客户端直接判完成，不建 Uploader（否则空文件必失败）
+    if (resumeOffset >= t->totalBytes) {
+        finishTask(*t, Done);
+        return;
+    }
     t->uploader = new Uploader(id, t->localPath, resumeOffset, this);
     connect(t->uploader, &Uploader::seedMsg, &Client::getinstance(), &Client::seedMsg);
     const quint64 uploadKey = t->key;
@@ -678,6 +718,11 @@ void TransferManager::onGroupUploadInitRespond(PDU* pdu)
     const bool hit = (quint8(payload.at(GROUP_FILE_INIT_RESP_HIT_OFFSET)) != 0);
     const qint64 nextOffset = qint64(readU64At(GROUP_FILE_INIT_RESP_NEXT_OFFSET));
     if (hit) {
+        finishTask(*t, Done);
+        return;
+    }
+    // REQ-EXT-TRANSFER-003 C3/D9：断点已在尾部（含 0 字节）→ 服务端已落定，直接完成
+    if (nextOffset >= t->totalBytes) {
         finishTask(*t, Done);
         return;
     }
@@ -832,6 +877,7 @@ void TransferManager::pause(quint64 key)
             pumpFastcheck();
         }
         if (t->state == Hashing && m_activeUploads > 0) --m_activeUploads;
+        m_idToKey.remove(t->id);   // S-E/C4：摘旧 id 映射（防旧 id 的迟到 32 喂进后续新 uploader）
         t->state = Paused;
         saveSnapshot();
         emit tasksChanged();
@@ -840,6 +886,7 @@ void TransferManager::pause(quint64 key)
     if (t->state != Running) return;
     sendAbortIfActive(*t);
     // 停发 + 释放本地名额（服务端槽位由 107 释放；TCP 顺序保证 107 先于后续 INIT 到达）
+    m_idToKey.remove(t->id);   // S-E/C4：摘旧 id 映射（108 仅日志，迟到 32 不再有归属）
     if (t->uploader) {
         t->uploader->deleteLater();
         t->uploader = nullptr;
@@ -870,6 +917,7 @@ void TransferManager::resume(quint64 key)
     }
     if (t->state != Paused && t->state != Failed) return;
     // S3：以新 id 重走 INIT，服务端由 (owner|parent|display|size) 派生同一 staging → 续传
+    m_idToKey.remove(t->id);   // S-E/C4：换 id 前摘旧映射，防旧 id 的迟到 32 喂进新 uploader
     t->id = allocId();
     m_idToKey.insert(t->id, key);
     t->failReason.clear();

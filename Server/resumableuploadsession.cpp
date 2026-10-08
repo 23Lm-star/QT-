@@ -95,6 +95,9 @@ ResumableUploadSession::BeginResult ResumableUploadSession::beginStaged(
     m_parent = parentPath;
     m_display = displayName;
 
+    // REQ-EXT-TRANSFER-003 S1（方案 B）：暂存句柄打开后**不移交、不关闭**，挂在会话上共享所有权。
+    // 写任务只 seek+write+flush（S3）；无需 Append——每块显式 seek 到 chunkOffset。
+
     QFileInfo fileInfo(m_filePath);
     qint64 offset = 0;
     if (resumeEnabled && fileInfo.exists() && fileInfo.isFile()) {
@@ -108,14 +111,16 @@ ResumableUploadSession::BeginResult ResumableUploadSession::beginStaged(
         }
     }
 
-    QFile file(m_filePath);
-    QIODevice::OpenMode mode = QIODevice::WriteOnly;
-    mode |= ((resumeEnabled && offset > 0) ? QIODevice::Append : QIODevice::Truncate);
-    if (!file.open(mode)) {
+    QSharedPointer<QFile> file(new QFile(m_filePath));
+    QIODevice::OpenMode mode = QIODevice::ReadWrite;
+    if (offset == 0) {
+        mode |= QIODevice::Truncate;   // 重头（含 resumeEnabled=false）：清掉既有残留
+    }
+    if (!file->open(mode)) {
         reset();
         return result;
     }
-    file.close();
+    m_stagingFile = file;
 
     m_receivedSize = offset;
     m_totalSize = totalSize;
@@ -156,6 +161,8 @@ QString ResumableUploadSession::stagingFilePath() const
 
 void ResumableUploadSession::reset()
 {
+    // REQ-EXT-TRANSFER-003 S2：会话重置即释放共享句柄（最后一个引用释放才会真正关闭）
+    m_stagingFile.clear();
     m_filePath.clear();
     m_receivedSize = 0;
     m_totalSize = 0;

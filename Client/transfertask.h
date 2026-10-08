@@ -100,6 +100,13 @@ public:
     void submitFastcheck(quint64 key, const QByteArray& shaHex);
     void failTask(quint64 key, const QString& reason);
 
+    // ===== REQ-EXT-TRANSFER-003 G7：断线任务态收敛（纯客户端，不涉协议） =====
+    // 与服务端断开：在途（Running/Hashing）任务即刻失败并归还名额；排队/暂停保持原态；
+    // 不删本地分片、不动服务端暂存（留给"重试即续传"）。
+    void onConnectionLost(const QString& reason);
+    // 重连并重新登录后恢复调度（由 Client 的 LOGIN_RESPOND 分支调用）
+    void onConnectionRestored();
+
 signals:
     void tasksChanged();
     void hashDue(quint64 key, const QString& localPath);   // M5：请求后台计算 SHA-256
@@ -133,6 +140,7 @@ private:
     QList<quint64> m_fastcheckQueue;      // 已算出摘要、待发 97 的任务键
     quint64 m_fastcheckInFlight = 0;      // 正在等待 98 的任务键（0 = 无）
     QString m_fastcheckInFlightToken;     // AUD-3：在途 97 的请求标识（与 98 回带比对；不匹配 = 迟到，丢弃）
+    bool m_connectionDown = false;        // G7：与服务端断开期间不启动新任务（重连登录后复位）
 
     // 持久化（transfers_<user>.json，AppLocalDataLocation）
     void saveSnapshot();
