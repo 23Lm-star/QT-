@@ -50,8 +50,8 @@ public:
     int m_rrCursor = 0;
     bool m_downloadNextChunkScheduled;
     static constexpr qint64 DOWNLOAD_WRITE_HIGH_WATER = 256 * 1024;
-    // REQ-EXT-TRANSFER-002 S3：startOffset = 采纳的续传起点（0 = 从头，旧调用语义不变）
-    void startDownloadStream(const QString& filePath, quint64 transferId, qint64 startOffset = 0);
+    // REQ-EXT-TRANSFER-002 S3：startOffset = 采纳的续传起点（0 = 从头；调用方已按 §2.3 先行拒绝非法起点）
+    void startDownloadStream(const QString& filePath, quint64 transferId, qint64 startOffset);
     void scheduleNextDownloadChunk();
     void removeDownloadStream(quint64 id);
     void seedDownloadFinish(quint64 id, bool success);
