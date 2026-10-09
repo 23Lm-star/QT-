@@ -611,6 +611,9 @@ void TransferManager::finishTask(Task& t, State s, const QString& reason)
         }
     } else {
         if (t.state == Running && m_activeDownloads > 0) --m_activeDownloads;
+        // REQ-EXT-TRANSFER-002 §4.3（FINDING-AUDIT-1）：收尾即摘 id 映射——否则已 Failed/Done 的
+        // 下载任务仍被在途 42/43 经 taskByTransferId 命中，43 会把失败态翻转成 Done（静默损坏件）。
+        m_idToKey.remove(t.id);
         closeRecv(t);
     }
     t.state = s;
@@ -971,6 +974,9 @@ void TransferManager::onDownloadFinish(PDU* pdu)
     const quint64 id = transferIdOf(pdu);
     Task* t = taskByTransferId(id);
     if (t == nullptr) return;
+    // REQ-EXT-TRANSFER-002（FINDING-AUDIT-1 双保险）：43 仅对 Running 任务有意义；
+    // 护栏/IO 失败后映射虽已摘除，仍拒绝在途 43 改写非 Running 的终态。
+    if (t->state != Running) return;
     bool success = false;
     memcpy(&success, pdu->caData, sizeof(success));
     // REQ-EXT-TRANSFER-002 C6（D7）：失败**不再删除**分片——保留是续传前提，

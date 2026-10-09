@@ -1,6 +1,6 @@
 # REQ-EXT-TRANSFER-002 下载暂停/取消与断点续传：e2e（裸 socket 驱动服务端可观测面）。
-# 断言口径：design.md §6（F7）——静态面 S-01..S-03（3 条）+ 动态面 T2-01..T2-14（14 行，
-# 含 a/b 子断言，共 19 条）+ 环境锚点 E0/E0b/E1（3 条）= 25 条。GUI 8 项（design §6.3）属
+# 断言口径：design.md §6（F7）——静态面 S-01..S-04（4 条，S-04 为 FINDING-AUDIT-1 回归钉）+
+# 动态面 T2-01..T2-14（14 行，含 a/b 子断言，共 19 条）+ 环境锚点 E0/E0b/E1（3 条）= 26 条。GUI 8 项（design §6.3）属
 # NEEDS-HUMAN，不在本套件范围。纯客户端状态机（暂停按钮生效/分片保留/快照恢复）由 wire 级护栏
 # 与静态契约覆盖到可自动化边界，动态人工项见 design §6.3 清单。
 # 运行形态（E2E-RUNFORM）：py -3.13 project-docs/evidence/REQ-EXT-TRANSFER-002/verify.py
@@ -204,7 +204,7 @@ def drain_quiet(c, keep, quiet=1.2, total=15.0):
     return acc, fin
 
 # ================= 静态面（§6.1） =================
-print("=== 静态面：S-01..S-03 ===")
+print("=== 静态面：S-01..S-04 ===")
 def read(p): return open(os.path.join(REPO, p), encoding="utf-8").read()
 cph, sph = read("Client/protocol.h"), read("Server/protocol.h")
 pat002 = re.compile(r"// ===== REQ-EXT-TRANSFER-002.*?DOWNLOAD_ACCEPTED_OFFSET = 24;.*\n", re.S)
@@ -223,6 +223,13 @@ def offval(txt, name):
 check("S-03", "40/105 起点偏移 == 32、41/106 采纳起点偏移 == 24（双端同值）",
       offval(cph, "DOWNLOAD_RESUME_OFFSET") == 32 and offval(sph, "DOWNLOAD_RESUME_OFFSET") == 32
       and offval(cph, "DOWNLOAD_ACCEPTED_OFFSET") == 24 and offval(sph, "DOWNLOAD_ACCEPTED_OFFSET") == 24, "")
+# S-04（FINDING-AUDIT-1 回归钉）：§4.3 必做防御第 4 项——finishTask 下载分支必须摘除 id 映射，
+# 否则护栏 Failed 后在途 43 经 taskByTransferId 命中将终态翻转为 Done（静默损坏件）。
+ttxt = read("Client/transfertask.cpp")
+_ft = re.search(r"void TransferManager::finishTask\(.*?\n\}", ttxt, re.S)
+_dl = _ft.group(0).split("} else {", 1) if _ft else []
+check("S-04", "finishTask 下载分支摘除 m_idToKey（§4.3 第四项，钉住 FINDING-AUDIT-1）",
+      len(_dl) == 2 and "m_idToKey.remove(t.id)" in _dl[1], "")
 
 # ================= 环境准备 =================
 print("=== 环境准备 ===")
