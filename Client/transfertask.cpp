@@ -49,10 +49,10 @@ quint64 TransferManager::allocId()
 // 设计：快照只在状态跃迁点写入（入队/完成/暂停/恢复/取消/重试），进度字节不落盘——
 // 续传点由协议决定（个人上传 97/30 回带 offset；下载整文件重传），落盘进度只会误导。
 
-QString TransferManager::snapshotPath() const
+QString TransferManager::snapshotPath(const QString& user) const
 {
     QString safe;
-    for (const QChar &ch : m_currentUser) {
+    for (const QChar &ch : user) {
         const ushort u = ch.unicode();
         safe += ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9')
                  || u >= 0x4E00) ? ch : QChar('_');   // 中文/字母数字保留，其余转 _（防路径注入）
@@ -63,7 +63,15 @@ QString TransferManager::snapshotPath() const
 
 void TransferManager::saveSnapshot()
 {
-    if (m_currentUser.isEmpty()) return;
+    // D-a：没有当前用户也不再静默丢写——以"最近一次有效登录名"兜底；两者皆无则明确告警。
+    const QString user = m_currentUser.isEmpty() ? m_lastKnownUser : m_currentUser;
+    if (user.isEmpty()) {
+        qCWarning(lcCli) << "[transfer] 快照跳过：既无当前用户也无历史登录名，本轮任务不落盘";
+        return;
+    }
+    if (m_currentUser.isEmpty()) {
+        qCWarning(lcCli) << "[transfer] 当前用户名为空，快照按最近一次登录名兜底写入 user=" << user;
+    }
     QJsonArray arr;
     for (auto it = m_tasks.constBegin(); it != m_tasks.constEnd(); ++it) {
         const Task &t = it.value();
@@ -79,11 +87,40 @@ void TransferManager::saveSnapshot()
         o[QStringLiteral("totalBytes")] = double(t.totalBytes);
         arr.append(o);
     }
-    const QString path = snapshotPath();
+    const QString path = snapshotPath(user);
     QDir().mkpath(QFileInfo(path).absolutePath());
     QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qCWarning(lcCli) << "[transfer] 快照写入失败（无法打开）path=" << path;
+        return;
+    }
     f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+// D-b：任务身份（快照合并用；不含 key/id/进度/状态）——同身份视为同一条任务，内存为准
+static bool sameTaskIdentity(const TransferManager::Task& a, const TransferManager::Task& b)
+{
+    if (a.kind != b.kind) return false;
+    if (a.kind == TransferManager::PersonalUpload) {
+        return a.localPath == b.localPath && a.displayName == b.displayName
+                && a.dirPath == b.dirPath;
+    }
+    if (a.kind == TransferManager::GroupUpload) {
+        return a.localPath == b.localPath && a.displayName == b.displayName
+                && a.groupId == b.groupId;
+    }
+    if (a.kind == TransferManager::PersonalDownload) return a.serverPath == b.serverPath;
+    return a.groupId == b.groupId && a.groupFileId == b.groupFileId;
+}
+
+// 内存里是否已有同身份任务（有则快照同名条目不再补入）
+static bool containsIdentity(const QHash<quint64, TransferManager::Task>& tasks,
+                             const TransferManager::Task& probe)
+{
+    for (auto it = tasks.constBegin(); it != tasks.constEnd(); ++it) {
+        if (sameTaskIdentity(it.value(), probe)) return true;
+    }
+    return false;
 }
 
 void TransferManager::restoreSavedTasks()
@@ -92,7 +129,7 @@ void TransferManager::restoreSavedTasks()
     if (m_restoredUser == m_currentUser) return;   // 断线重连不重复恢复（内存为准）
     m_restoredUser = m_currentUser;
     m_restoredCount = 0;
-    QFile f(snapshotPath());
+    QFile f(snapshotPath(m_currentUser));
     if (!f.open(QIODevice::ReadOnly)) return;
     const QJsonArray arr = QJsonDocument::fromJson(f.readAll()).array();
     for (const QJsonValue &v : arr) {
@@ -106,6 +143,9 @@ void TransferManager::restoreSavedTasks()
         t.serverPath = o[QStringLiteral("serverPath")].toString();
         t.groupId = quint64(o[QStringLiteral("groupId")].toDouble());
         t.groupFileId = quint64(o[QStringLiteral("groupFileId")].toDouble());
+        // D-b：按键合并——内存已有同身份任务时不补入（内存为准、快照补缺），
+        // 既不清内存也不重复建行。
+        if (containsIdentity(m_tasks, t)) continue;
         t.key = m_nextKey++;
         t.id = allocId();   // Paused 任务无 wire 活动；resume 时会重新分配
         if (t.isUpload()) {
@@ -129,21 +169,28 @@ void TransferManager::restoreSavedTasks()
     if (m_restoredCount > 0) emit tasksChanged();
 }
 
+// D-b：不做"清表重建"。空名/同名（含断线重连、空名→真名）直接保持内存任务不动，
+// 恢复走按键合并；只有确实是另一个账号（m_currentUser 非空且名字不同）才丢弃内存任务。
 void TransferManager::setCurrentUser(const QString& name)
 {
-    if (name.isEmpty() || name == m_currentUser) return;
-    if (!m_currentUser.isEmpty()) saveSnapshot();   // 切用户：上一个用户的内存任务落盘
-    m_tasks.clear();
-    m_idToKey.clear();
-    m_uploadQueue.clear();
-    m_downloadQueue.clear();
-    m_fastcheckQueue.clear();
-    m_fastcheckInFlight = 0;
-    m_fastcheckInFlightToken.clear();
-    m_activeUploads = 0;
-    m_activeDownloads = 0;
+    if (name.isEmpty()) return;
+    m_lastKnownUser = name;                      // D-a：兜底键随每次有效登录名更新
+    if (name == m_currentUser) return;           // 同一账号重连：内存为准，不清不重建
+    if (!m_currentUser.isEmpty()) {
+        // 确实是另一个账号：上一个账号的内存任务先落盘，再丢弃内存侧
+        saveSnapshot();
+        m_tasks.clear();
+        m_idToKey.clear();
+        m_uploadQueue.clear();
+        m_downloadQueue.clear();
+        m_fastcheckQueue.clear();
+        m_fastcheckInFlight = 0;
+        m_fastcheckInFlightToken.clear();
+        m_activeUploads = 0;
+        m_activeDownloads = 0;
+    }
     m_currentUser = name;
-    restoreSavedTasks();
+    restoreSavedTasks();                         // 恢复 = 合并（内存为准、快照补缺）
 }
 
 void TransferManager::saveSnapshotNow()

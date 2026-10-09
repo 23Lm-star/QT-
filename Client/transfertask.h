@@ -87,8 +87,8 @@ public:
     void showPanel();
 
     // ===== 会话间持久化：按用户保存未完成任务，二次登录恢复 =====
-    // 登录成功时调用：切换用户（落盘上一个用户的内存任务）并从快照恢复当前用户未完成任务。
-    // 同一用户重复调用（如断线重连）只生效一次；内存中已有任务时不清不重（以内存为准）。
+    // 登录成功时调用。D-b：不清表重建——同用户（含 空名→真名）保持内存任务并按键合并快照
+    // （内存为准、快照补缺）；只有确实是另一个账号时才丢弃上一个账号的内存任务。
     void setCurrentUser(const QString& name);
     // 程序退出前落盘（把内存中非终态任务写进快照）
     void saveSnapshotNow();
@@ -145,8 +145,9 @@ private:
     // 持久化（transfers_<user>.json，AppLocalDataLocation）
     void saveSnapshot();
     void restoreSavedTasks();
-    QString snapshotPath() const;
+    QString snapshotPath(const QString& user) const;
     QString m_currentUser;
+    QString m_lastKnownUser;              // D-a：最近一次有效登录名（m_currentUser 未就位时快照的兜底键）
     QString m_restoredUser;               // 已为本用户恢复过快照（防断线重连重复恢复）
     int m_restoredCount = 0;
 };

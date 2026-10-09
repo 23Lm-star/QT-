@@ -192,7 +192,11 @@ void Client::handlMsg(PDU *&pdu)
         break;
     }
     case ENUM_MSG_TYPE_LOGIN_RESPOND:{
-        m_mhptr->handllogin();
+        // R-1（REQ-EXT-TRANSFER-003）：登录名在同步路径就位——handllogin() 直接返回名字，
+        // 不再等 1.5 s 的 UI 定时器写 m_LoginName（否则首次登录 setCurrentUser 收到空名 →
+        // 快照整轮不落盘；同进程再登录则清表重建 → 在途任务从列表消失）。
+        const QString loginName = m_mhptr->handllogin();
+        if (!loginName.isEmpty()) m_LoginName = loginName;
         // 按用户载入未完成传输快照（切用户会先落盘上一个用户的内存任务）
         TransferManager::instance().setCurrentUser(m_LoginName);
         // REQ-EXT-TRANSFER-003 G7/C7：重连登录后恢复调度（不依赖 setCurrentUser 的提前返回——同用户重连会提前返回）

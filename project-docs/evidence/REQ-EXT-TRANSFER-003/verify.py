@@ -340,6 +340,52 @@ check("S-05b", "G7 防复活②：submitFastcheck 含 state != Hashing 守卫",
 check("S-05c", "C4 摘旧映射：pause/resume 上传分支均 m_idToKey.remove(t->id)",
       len(re.findall(r"m_idToKey\.remove\(t->id\)", tt)) >= 3, "")
 
+# ---- G7 修复面（FINDING-IND-7 / R-1 + D-a + D-b）源码静态契约：拦住这四处回归 ----
+mh = read("Client/msghandler.cpp")
+mhh = read("Client/msghandler.h")
+lr_body = lr.group(1) if lr is not None else ""
+m_assign = re.search(r"m_LoginName\s*=", lr_body)
+i_setuser = lr_body.find("setCurrentUser(")
+check("S-06a", "R-1：LOGIN_RESPOND 分支内登录名赋值先于 setCurrentUser（同步取值，非 1.5 s 后）",
+      m_assign is not None and i_setuser > m_assign.start() and "handllogin()" in lr_body,
+      f"assign@{m_assign.start() if m_assign else -1} setUser@{i_setuser}")
+hl = re.search(r"QString MsgHandler::handllogin\(\)\s*\{(.*?)\n\}", mh, re.S)
+hlb = hl.group(1) if hl else ""
+check("S-06b", "R-1：handllogin 同步返回登录名且 1.5 s 定时器内不再写 m_LoginName",
+      hl is not None and "return loginName" in hlb
+      and re.search(r"m_LoginName\s*=", hlb) is None
+      and re.search(r"QString\s+handllogin\s*\(\s*\)", mhh) is not None,
+      f"ret={'return loginName' in hlb} in_body_assign={re.search(r'm_LoginName\\s*=', hlb) is not None}")
+snp = re.search(r"void TransferManager::saveSnapshot\(\)\s*\{(.*?)\n\}", tt, re.S)
+sb = snp.group(1) if snp else ""
+sb_lines = sb.splitlines()
+unwarned = [ln.strip() for i, ln in enumerate(sb_lines)
+            if re.search(r"\breturn\s*;", ln) and "qCWarning" not in "\n".join(sb_lines[max(0, i - 4):i])]
+check("S-06c", "D-a：saveSnapshot 无静默丢写（每条 return 前都有 qCWarning 告警）",
+      snp is not None and "qCWarning" in sb and not unwarned, f"unwarned={unwarned}")
+check("S-06d", "D-a：saveSnapshot 以最近一次有效登录名兜底（m_lastKnownUser）",
+      snp is not None and "m_lastKnownUser" in sb, "")
+sc = re.search(r"void TransferManager::setCurrentUser\(.*?\)\s*\{(.*?)\n\}", tt, re.S)
+scb = sc.group(1) if sc else ""
+sc_lines = scb.splitlines()
+ind = lambda s: len(s) - len(s.lstrip())
+ln_guard = next((i for i, l in enumerate(sc_lines) if "!m_currentUser.isEmpty()" in l), -1)
+ln_clear = next((i for i, l in enumerate(sc_lines) if "m_tasks.clear()" in l), -1)
+same_ret = re.search(r"name\s*==\s*m_currentUser[^\n]*return", scb)
+check("S-06e", "D-b：setCurrentUser 同名/空名不清表；清表嵌于\"另一个账号\"条件内且仍调 restoreSavedTasks",
+      sc is not None and same_ret is not None and 0 <= ln_guard < ln_clear
+      and ind(sc_lines[ln_clear]) > ind(sc_lines[ln_guard])
+      and "restoreSavedTasks()" in scb,
+      f"same_ret={same_ret is not None} guard_line={ln_guard} clear_line={ln_clear} "
+      f"nested={ln_guard >= 0 and ln_clear > ln_guard and ind(sc_lines[ln_clear]) > ind(sc_lines[ln_guard])}")
+rs = re.search(r"void TransferManager::restoreSavedTasks\(\)\s*\{(.*?)\n\}", tt, re.S)
+rsb = rs.group(1) if rs else ""
+i_dedup = rsb.find("containsIdentity(")
+i_insert = rsb.find("m_tasks.insert(")
+check("S-06f", "D-b：restoreSavedTasks 按身份去重合并（快照补缺、内存为准，不重复建行）",
+      rs is not None and 0 <= i_dedup < i_insert and "continue;" in rsb[i_dedup:i_insert],
+      f"dedup@{i_dedup} insert@{i_insert}")
+
 # ================= 环境准备 =================
 print("=== 环境准备 ===")
 if not _SRV.start():
