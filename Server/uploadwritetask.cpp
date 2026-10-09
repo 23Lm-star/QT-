@@ -5,11 +5,12 @@
 #include <QFile>
 #include <QMetaObject>
 
-UploadWriteTask::UploadWriteTask(quint64 connectionId, quint64 transferId, const QString &filePath,
+UploadWriteTask::UploadWriteTask(quint64 connectionId, quint64 transferId,
+                                 const QSharedPointer<QFile> &file,
                                  qint64 offset, const QByteArray &data)
     : m_connectionId(connectionId),
       m_transferId(transferId),
-      m_filePath(filePath),
+      m_file(file),
       m_offset(offset),
       m_data(data)
 {
@@ -18,12 +19,12 @@ UploadWriteTask::UploadWriteTask(quint64 connectionId, quint64 transferId, const
 
 void UploadWriteTask::run()
 {
-    QFile file(m_filePath);
-    bool success = file.open(QIODevice::ReadWrite)
-            && file.seek(m_offset)
-            && file.write(m_data) == m_data.size()
-            && file.flush();
-    file.close();
+    // REQ-EXT-TRANSFER-003 S3：句柄由会话共享持有（已打开），此处只定位写入；
+    // 不 open/不 close——关句柄的代价（Windows CreateFileW ≈ 13 ms）不在本路径上。
+    bool success = !m_file.isNull() && m_file->isOpen()
+            && m_file->seek(m_offset)
+            && m_file->write(m_data) == m_data.size()
+            && m_file->flush();
 
     QMetaObject::invokeMethod(&MyTcpServer::getinstance(), "handleUploadWriteFinished",
                               Qt::QueuedConnection,

@@ -11,7 +11,10 @@ public:
     PDU* pdu;
     MsgHandler();
     void handlrigist();
-    void handllogin();
+    // REQ-EXT-TRANSFER-003 R-1：登录成功时**同步**返回登录名（失败/异常返回空串）。
+    // 调用方必须把它写进 Client::m_LoginName 之后再做任何依赖用户名的动作——
+    // 1.5 s 后的 UI 定时器不再承担名字写入。
+    QString handllogin();
     void handlfinduser();
     void handlonlineuser();
     void handlAddFriend();

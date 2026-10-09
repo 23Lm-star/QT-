@@ -55,17 +55,17 @@ void MsgHandler::handlrigist(){
     }
 }
 
-void MsgHandler::handllogin()
+QString MsgHandler::handllogin()
 {
     int ret;
     memcpy(&ret,pdu->caData,sizeof(ret));
     if(ret==-2){
         QMessageBox::information(&Client::getinstance(),"提示","验证码错误，请重新输入");
-        return;
+        return QString();
     }
     if(ret==-3){
         QMessageBox::information(&Client::getinstance(),"提示","验证码已过期，请重新获取");
-        return;
+        return QString();
     }
     if(ret==-4){
         int rem=0;
@@ -74,15 +74,16 @@ void MsgHandler::handllogin()
         Client::getinstance().startCaptchaCooldown(rem > 0 ? rem : 600, true);
         QMessageBox::information(&Client::getinstance(),"提示",
             QString("验证码错误次数过多，账号已锁定，请 %1 分钟后再试").arg(qMax(1,rem/60)));
-        return;
+        return QString();
     }
     if(ret==1){
         Client::getinstance().showLoadingAnimation(true);
         char lName[32]={'\0'};
         memcpy(lName,pdu->caData+32,sizeof(lName));
         QString loginName=QString(lName);
+        // R-1：名字同步返回给调用方（Client::handlMsg 的 LOGIN_RESPOND 分支先落 m_LoginName
+        // 再 setCurrentUser）；本定时器此后只负责 UI 切换与既有延迟刷新。
         QTimer::singleShot(1500,[loginName](){
-            Client::getinstance().m_LoginName=loginName;
             qCDebug(lcCli)<<"登录账号成功，用户名为:"<<loginName;
             // REQ-EXT-GROUP-004：新会话丢弃上一会话的群读状态（换账号登录不得继承旧游标）
             Client::getinstance().resetGroupStates();
@@ -98,6 +99,7 @@ void MsgHandler::handllogin()
                 // 文件列表刷新延迟到用户首次点击"文件"页时
             });
         });
+        return loginName;
     }
     else if(ret==-1){
         Client::getinstance().showLoadingAnimation(false);
@@ -111,6 +113,7 @@ void MsgHandler::handllogin()
             QMessageBox::information(&Client::getinstance(),"提示","状态异常");
         });
     }
+    return QString();
 }
 
 void MsgHandler::handlonlineuser(){

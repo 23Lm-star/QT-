@@ -435,15 +435,21 @@ OperateDB::UploadSessionLookup OperateDB::lookupUploadSessionByRequestId(
 bool OperateDB::restartUploadSession(qint64 sessionId, const QString &parentPath,
                                      const QString &displayName, qint64 expectedSize,
                                      const QString &clientSha256, const QString &stagingPath,
-                                     qint64 confirmedOffset, int ttlSec)
+                                     qint64 confirmedOffset, int ttlSec,
+                                     const QString &clientRequestId)
 {
     if (sessionId < 0) return false;
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if (!connection.isValid()) return false;
     QSqlQuery q(connection.database());
-    q.prepare("UPDATE upload_session SET parent_path=?,display_name=?,expected_size=?,"
-              "client_sha256=?,staging_path=?,confirmed_offset=?,status='uploading',"
-              "expires_at=?,file_id=NULL WHERE session_id=?");
+    QString sql = "UPDATE upload_session SET parent_path=?,display_name=?,expected_size=?,"
+                  "client_sha256=?,staging_path=?,confirmed_offset=?,status='uploading',"
+                  "expires_at=?,file_id=NULL";
+    if (!clientRequestId.isEmpty()) {
+        sql += ",client_request_id=?";   // S14：按暂存键复用时把请求键改写到本行（任何 reqId 重放都收敛于此）
+    }
+    sql += " WHERE session_id=?";
+    q.prepare(sql);
     q.addBindValue(parentPath);
     q.addBindValue(displayName);
     q.addBindValue(expectedSize);
@@ -452,12 +458,33 @@ bool OperateDB::restartUploadSession(qint64 sessionId, const QString &parentPath
     q.addBindValue(confirmedOffset);
     q.addBindValue(QDateTime::currentDateTime().addSecs(ttlSec > 0 ? ttlSec : 3600)
                        .toString("yyyy-MM-dd HH:mm:ss"));
+    if (!clientRequestId.isEmpty()) {
+        q.addBindValue(clientRequestId);
+    }
     q.addBindValue(sessionId);
     if (!q.exec()) {
         qCWarning(lcDb) << "[restartUploadSession] 失败:" << q.lastError().text();
         return false;
     }
     return true;
+}
+
+// REQ-EXT-TRANSFER-003 S12/D7：按 (owner, staging_path) 找可复用的未完成会话行。
+// 暂存路径 = sha1(owner|parent|display|size) 的确定性产物 = "同一逻辑上传"的唯一身份；
+// 状态白名单排除 done（已完成由请求级幂等短路处理），取 session_id 最大者。
+qint64 OperateDB::findReusableUploadSession(const QString &owner, const QString &stagingPath)
+{
+    if (owner.isEmpty() || stagingPath.isEmpty()) return -1;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return -1;
+    QSqlQuery q(connection.database());
+    q.prepare("SELECT session_id FROM upload_session WHERE owner_name=? AND staging_path=? "
+              "AND status IN ('uploading','expired','failed','verifying') "
+              "ORDER BY session_id DESC LIMIT 1");
+    q.addBindValue(owner);
+    q.addBindValue(stagingPath);
+    if (!q.exec() || !q.next()) return -1;
+    return q.value(0).toLongLong();
 }
 
 // REQ-EXT-FILE-002 §2 步骤4：秒传命中即登记完成态会话（零正文传输）。
@@ -502,7 +529,10 @@ bool OperateDB::updateUploadOffset(qint64 sessionId, qint64 confirmedOffset)
     return q.exec();
 }
 
-bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status, qint64 fileId)
+// REQ-EXT-TRANSFER-003 S10：confirmedOffset>=0 时同写 confirmed_offset——
+// 完成路径写 expected_size（完成态不依赖节流），失败路径写 0（暂存已删，值无意义）。
+bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status, qint64 fileId,
+                                    qint64 confirmedOffset)
 {
     if(sessionId < 0) return false;
     if(status != "done" && status != "failed" && status != "expired" && status != "verifying")
@@ -510,10 +540,19 @@ bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status, qin
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
     QSqlQuery q(connection.database());
-    if (fileId >= 0) {
+    if (fileId >= 0 && confirmedOffset >= 0) {
+        q.prepare("UPDATE upload_session SET status=?,file_id=?,confirmed_offset=? WHERE session_id=?");
+        q.addBindValue(status);
+        q.addBindValue(fileId);
+        q.addBindValue(confirmedOffset);
+    } else if (fileId >= 0) {
         q.prepare("UPDATE upload_session SET status=?,file_id=? WHERE session_id=?");
         q.addBindValue(status);
         q.addBindValue(fileId);
+    } else if (confirmedOffset >= 0) {
+        q.prepare("UPDATE upload_session SET status=?,confirmed_offset=? WHERE session_id=?");
+        q.addBindValue(status);
+        q.addBindValue(confirmedOffset);
     } else {
         q.prepare("UPDATE upload_session SET status=? WHERE session_id=?");
         q.addBindValue(status);

@@ -167,6 +167,16 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-10-08
       note: "下载暂停/取消/断点续传（design §6 F7）：静态 3（S-01..03 冻结面逐字一致+落位）+ 动态 19（T2-01..14 含 a/b 子断言）+ 环境锚点 3。自管服务端生命周期；用户 e2etx2，开跑前清本用户 DB 行与共享 .staging；GUI 8 项人工面见 design §6.3（NEEDS-HUMAN）"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: transfer003
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-003/verify.py"]
+      cwd: "."
+      asserts: 59
+      timeout_s: 600
+      blocking: true
+      owner: REQ-EXT-TRANSFER-003
+      added: 2026-10-08
+      note: "上传会话连续性（进度落库节流/会话行复用/共享暂存句柄）与新分片吞吐。59 条 = 20 条静态契约（冻结面 §9 逐字、跨端分片上限、G7 接线与防复活守卫、G7 修复面 R-1/D-a/D-b 六条）+ 37 条动态 + E0 登录/目录 2 条。自管生命周期；运行前自建 dist/filesys/<U>/tx3 并清空 .staging（暂存令牌确定性派生，跨轮残留会歪曲续传起点）。断言数只增不减，改套件须同步本行"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
 directory_contract:      # mirrors .gitignore
   source: Client/, Server/
   artifacts: build*/     # shadow builds go here; never in source dirs

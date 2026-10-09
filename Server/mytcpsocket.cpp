@@ -14,6 +14,10 @@
 #include <QThreadPool>
 #include <cstring>
 
+// REQ-EXT-TRANSFER-003 D6：上传进度落库节流阈值（字节数 / 毫秒，满足其一即落库）
+static constexpr qint64 UPLOAD_PERSIST_MIN_BYTES = 1024 * 1024;
+static constexpr qint64 UPLOAD_PERSIST_MIN_MS = 2000;
+
 MyTcpSocket::MyTcpSocket()
 {
     connect(this,&MyTcpSocket::readyRead,this,&MyTcpSocket::recvmsg);
@@ -353,6 +357,14 @@ void MyTcpSocket::handleUploadData(PDU* pdu)
     memcpy(&chunkOffset,pdu->caData+UPLOAD_CHUNK_OFFSET,sizeof(chunkOffset));
 
     const qint64 expectedOffset=cp->session.receivedSize();
+    // REQ-EXT-TRANSFER-003 D5/S7：超长块显式拒绝（32 ok=false，连接存活），不落到"非法 PDU → 计数断连"
+    if(pdu->uiMsgLen > MAX_UPLOAD_DATA_CHUNK){
+        qCWarning(lcNet) << "[transfer] 超长上传块拒绝 conn=" << m_connectionId
+                         << " id=" << transferId << " len=" << pdu->uiMsgLen
+                         << " cap=" << MAX_UPLOAD_DATA_CHUNK;
+        sendUploadAck(transferId,false,expectedOffset,false);
+        return;
+    }
     if(resumeMagic != UPLOAD_RESUME_MAGIC || cp->writeInFlight
             || chunkOffset != expectedOffset || pdu->uiMsgLen == 0
             || pdu->uiMsgLen > cp->session.totalSize()-expectedOffset
@@ -364,7 +376,7 @@ void MyTcpSocket::handleUploadData(PDU* pdu)
     cp->writeInFlight=true;
     const QByteArray data(pdu->caMsg,pdu->uiMsgLen);
     QThreadPool::globalInstance()->start(new UploadWriteTask(
-            m_connectionId,transferId,cp->session.stagingFilePath(),chunkOffset,data));
+            m_connectionId,transferId,cp->session.stagingFile(),chunkOffset,data));
 }
 
 void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, qint64 length, bool success)
@@ -393,6 +405,17 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
         // AUD-1：该槽已开始承载正文（旧客户端 97→31 直传路径），不再是 97 纯暂存占位 → 重新计入名额
         cp->fastcheckPlaceholder=false;
         cp->lastProgressMs=QDateTime::currentMSecsSinceEpoch();   // 推进空闲回收计时
+        // REQ-EXT-TRANSFER-003 S9/D6：进度落库节流——≥1 MiB 或 ≥2 s 才写一次
+        // （4 KB 旧客户端 ≈ 每 256 块一次；1 MiB 新客户端 ≈ 每块一次）。完成态由 S10 强制写，不依赖节流。
+        const qint64 now=cp->lastProgressMs;
+        const qint64 received=cp->session.receivedSize();
+        if(cp->sessionId>=0
+                && (received-cp->lastPersistOffset>=UPLOAD_PERSIST_MIN_BYTES
+                    || now-cp->lastPersistMs>=UPLOAD_PERSIST_MIN_MS)){
+            OperateDB::instance().updateUploadOffset(cp->sessionId,received);
+            cp->lastPersistOffset=received;
+            cp->lastPersistMs=now;
+        }
     }
     sendUploadAck(transferId,success,ackOffset,complete);
 }
@@ -649,8 +672,11 @@ void MyTcpSocket::recvmsg(){
             uint pduTotalLen=pdu->uiTotalLen;
             
             // 安全校验：解析头部合法性
+            // REQ-EXT-TRANSFER-003 D2：仅上传数据通道（31）按大分片上限校验，其余报文一律保持 16 KB
+            const uint inboundCap = (pdu->uiType == ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST)
+                    ? MAX_UPLOAD_DATA_PDU_SIZE : MAX_INBOUND_PDU_SIZE;
             bool valid = false;
-            if (pduTotalLen >= sizeof(PDU) && pduTotalLen <= MAX_INBOUND_PDU_SIZE) {
+            if (pduTotalLen >= sizeof(PDU) && pduTotalLen <= inboundCap) {
                 if (pdu->uiMsgLen == pduTotalLen - sizeof(PDU) &&
                     pdu->uiType > ENUM_MSG_TYPE_MIN && 
                     pdu->uiType < ENUM_MSG_TYPE_MAX) {

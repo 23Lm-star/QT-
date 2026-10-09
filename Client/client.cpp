@@ -192,9 +192,15 @@ void Client::handlMsg(PDU *&pdu)
         break;
     }
     case ENUM_MSG_TYPE_LOGIN_RESPOND:{
-        m_mhptr->handllogin();
+        // R-1（REQ-EXT-TRANSFER-003）：登录名在同步路径就位——handllogin() 直接返回名字，
+        // 不再等 1.5 s 的 UI 定时器写 m_LoginName（否则首次登录 setCurrentUser 收到空名 →
+        // 快照整轮不落盘；同进程再登录则清表重建 → 在途任务从列表消失）。
+        const QString loginName = m_mhptr->handllogin();
+        if (!loginName.isEmpty()) m_LoginName = loginName;
         // 按用户载入未完成传输快照（切用户会先落盘上一个用户的内存任务）
         TransferManager::instance().setCurrentUser(m_LoginName);
+        // REQ-EXT-TRANSFER-003 G7/C7：重连登录后恢复调度（不依赖 setCurrentUser 的提前返回——同用户重连会提前返回）
+        TransferManager::instance().onConnectionRestored();
         m_loggedIn = true;   // 登录过才监控断开，避免登录界面误报
         break;
     }
@@ -556,6 +562,8 @@ void Client::showLoadingAnimation(bool success){}
 void Client::onServerLost() {
     if (m_serverLostShown) return;
     m_serverLostShown = true;
+    // REQ-EXT-TRANSFER-003 G7/C8②：心跳丢失（服务端假死）同样触发在途任务收敛，任务是"失败可重试"
+    TransferManager::instance().onConnectionLost(QStringLiteral("与服务端断开连接，可重试"));
     qCDebug(lcCli) << "[HEARTBEAT] 服务端失联，弹出重连窗口";
     m_reconnectDlg->show();
     m_reconnectDlg->raise();
@@ -564,6 +572,9 @@ void Client::onServerLost() {
 
 void Client::onSocketDisconnected() {
     qCDebug(lcCli) << "[HEARTBEAT] socket disconnected 信号";
+    // REQ-EXT-TRANSFER-003 G7/C8①：连接断开即在途任务收敛（服务端被杀/网络断），
+    // 不再让任务永久停在"传输中"占着名额（本地分片与服务端暂存保留，重试即续传）
+    TransferManager::instance().onConnectionLost(QStringLiteral("与服务端断开连接，可重试"));
     // 已登录才弹窗（未登录在登录界面，连接失败不应弹重连窗口）
     if (m_loggedIn && !m_serverLostShown) {
         // REQ-EXT-SESSION-001：被服务端版本校验切断时的提示（零协议，仅文案）；后续流程复用既有重连窗口
