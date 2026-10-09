@@ -176,7 +176,10 @@ public:
     bool updateUploadOffset(qint64 sessionId, qint64 confirmedOffset);
     // 完成/失败：写 status（done|failed|expired|verifying）；fileId>=0 时同写 file_id，
     // 使"已完成会话"能被请求级幂等短路直接命中（无需回退到内容预检查）。
-    bool finishUploadSession(qint64 sessionId, const QString &status, qint64 fileId = -1);
+    // REQ-EXT-TRANSFER-003 S10：confirmedOffset>=0 时同写 confirmed_offset（完成=expected_size，失败=0），
+    // = -1（默认）表示不改该列（既有调用方行为不变）。
+    bool finishUploadSession(qint64 sessionId, const QString &status, qint64 fileId = -1,
+                             qint64 confirmedOffset = -1);
 
     // ===== REQ-EXT-FILE-002：请求级幂等短路的读侧（§2 步骤3） =====
     // parentPath/displayName/expectedSize/clientSha256 取自会话行（非本次请求），
@@ -196,10 +199,17 @@ public:
                                                        const QString &clientRequestId);
 
     // 失败/过期/半途会话以同一请求键重试：原地重置为 uploading（避免 uk_req 唯一键冲突）。
+    // REQ-EXT-TRANSFER-003 S14：clientRequestId 非空时同改请求键（97 按暂存键复用行的收敛规则）。
     bool restartUploadSession(qint64 sessionId, const QString &parentPath,
                               const QString &displayName, qint64 expectedSize,
                               const QString &clientSha256, const QString &stagingPath,
-                              qint64 confirmedOffset, int ttlSec);
+                              qint64 confirmedOffset, int ttlSec,
+                              const QString &clientRequestId = QString());
+
+    // REQ-EXT-TRANSFER-003 S12/D7：按 (owner, staging_path) 找可复用的未完成会话行——
+    // 暂存路径是"同一逻辑上传"的确定性身份（sha1(owner|parent|display|size) 产物），
+    // 状态白名单排除 done/cancelled（done 由请求级幂等短路处理）。命中返回 session_id，否则 -1。
+    qint64 findReusableUploadSession(const QString &owner, const QString &stagingPath);
 
     // 秒传命中：登记 status='done' 的会话行（零正文传输的完成态），返回 session_id（<0 失败）。
     qint64 insertCompletedUploadSession(const QString &owner, const QString &parentPath,

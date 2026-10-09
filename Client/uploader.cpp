@@ -30,6 +30,11 @@ void Uploader::start()
     }
 
     m_nextOffset = qMax<qint64>(0, m_resumeOffset);
+    // C2：chunk = clamp(ceil(size / 1024), 64 KiB, 1 MiB)；size==0 取 MIN（由 C3 兜底不发送）
+    const qint64 totalSize = m_file.size();
+    m_chunkSize = qBound<qint64>(UPLOAD_CHUNK_MIN,
+                                 (totalSize + UPLOAD_CHUNK_TARGET_COUNT - 1) / UPLOAD_CHUNK_TARGET_COUNT,
+                                 UPLOAD_CHUNK_MAX);
     if (m_nextOffset > m_file.size() || !m_file.seek(m_nextOffset)) {
         emit errnoMsg("Upload file seek failed");
         finish(false);
@@ -68,7 +73,7 @@ void Uploader::sendNextChunk()
         return;
     }
 
-    const QByteArray chunk = m_file.read(4096);
+    const QByteArray chunk = m_file.read(m_chunkSize);
     if (chunk.isEmpty()) {
         emit errnoMsg("Upload file ended before server confirmation");
         finish(false);

@@ -49,10 +49,10 @@ quint64 TransferManager::allocId()
 // 设计：快照只在状态跃迁点写入（入队/完成/暂停/恢复/取消/重试），进度字节不落盘——
 // 续传点由协议决定（个人上传 97/30 回带 offset；下载整文件重传），落盘进度只会误导。
 
-QString TransferManager::snapshotPath() const
+QString TransferManager::snapshotPath(const QString& user) const
 {
     QString safe;
-    for (const QChar &ch : m_currentUser) {
+    for (const QChar &ch : user) {
         const ushort u = ch.unicode();
         safe += ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9')
                  || u >= 0x4E00) ? ch : QChar('_');   // 中文/字母数字保留，其余转 _（防路径注入）
@@ -63,7 +63,15 @@ QString TransferManager::snapshotPath() const
 
 void TransferManager::saveSnapshot()
 {
-    if (m_currentUser.isEmpty()) return;
+    // D-a：没有当前用户也不再静默丢写——以"最近一次有效登录名"兜底；两者皆无则明确告警。
+    const QString user = m_currentUser.isEmpty() ? m_lastKnownUser : m_currentUser;
+    if (user.isEmpty()) {
+        qCWarning(lcCli) << "[transfer] 快照跳过：既无当前用户也无历史登录名，本轮任务不落盘";
+        return;
+    }
+    if (m_currentUser.isEmpty()) {
+        qCWarning(lcCli) << "[transfer] 当前用户名为空，快照按最近一次登录名兜底写入 user=" << user;
+    }
     QJsonArray arr;
     for (auto it = m_tasks.constBegin(); it != m_tasks.constEnd(); ++it) {
         const Task &t = it.value();
@@ -79,11 +87,40 @@ void TransferManager::saveSnapshot()
         o[QStringLiteral("totalBytes")] = double(t.totalBytes);
         arr.append(o);
     }
-    const QString path = snapshotPath();
+    const QString path = snapshotPath(user);
     QDir().mkpath(QFileInfo(path).absolutePath());
     QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        qCWarning(lcCli) << "[transfer] 快照写入失败（无法打开）path=" << path;
+        return;
+    }
     f.write(QJsonDocument(arr).toJson(QJsonDocument::Compact));
+}
+
+// D-b：任务身份（快照合并用；不含 key/id/进度/状态）——同身份视为同一条任务，内存为准
+static bool sameTaskIdentity(const TransferManager::Task& a, const TransferManager::Task& b)
+{
+    if (a.kind != b.kind) return false;
+    if (a.kind == TransferManager::PersonalUpload) {
+        return a.localPath == b.localPath && a.displayName == b.displayName
+                && a.dirPath == b.dirPath;
+    }
+    if (a.kind == TransferManager::GroupUpload) {
+        return a.localPath == b.localPath && a.displayName == b.displayName
+                && a.groupId == b.groupId;
+    }
+    if (a.kind == TransferManager::PersonalDownload) return a.serverPath == b.serverPath;
+    return a.groupId == b.groupId && a.groupFileId == b.groupFileId;
+}
+
+// 内存里是否已有同身份任务（有则快照同名条目不再补入）
+static bool containsIdentity(const QHash<quint64, TransferManager::Task>& tasks,
+                             const TransferManager::Task& probe)
+{
+    for (auto it = tasks.constBegin(); it != tasks.constEnd(); ++it) {
+        if (sameTaskIdentity(it.value(), probe)) return true;
+    }
+    return false;
 }
 
 void TransferManager::restoreSavedTasks()
@@ -92,7 +129,7 @@ void TransferManager::restoreSavedTasks()
     if (m_restoredUser == m_currentUser) return;   // 断线重连不重复恢复（内存为准）
     m_restoredUser = m_currentUser;
     m_restoredCount = 0;
-    QFile f(snapshotPath());
+    QFile f(snapshotPath(m_currentUser));
     if (!f.open(QIODevice::ReadOnly)) return;
     const QJsonArray arr = QJsonDocument::fromJson(f.readAll()).array();
     for (const QJsonValue &v : arr) {
@@ -106,6 +143,9 @@ void TransferManager::restoreSavedTasks()
         t.serverPath = o[QStringLiteral("serverPath")].toString();
         t.groupId = quint64(o[QStringLiteral("groupId")].toDouble());
         t.groupFileId = quint64(o[QStringLiteral("groupFileId")].toDouble());
+        // D-b：按键合并——内存已有同身份任务时不补入（内存为准、快照补缺），
+        // 既不清内存也不重复建行。
+        if (containsIdentity(m_tasks, t)) continue;
         t.key = m_nextKey++;
         t.id = allocId();   // Paused 任务无 wire 活动；resume 时会重新分配
         if (t.isUpload()) {
@@ -129,21 +169,28 @@ void TransferManager::restoreSavedTasks()
     if (m_restoredCount > 0) emit tasksChanged();
 }
 
+// D-b：不做"清表重建"。空名/同名（含断线重连、空名→真名）直接保持内存任务不动，
+// 恢复走按键合并；只有确实是另一个账号（m_currentUser 非空且名字不同）才丢弃内存任务。
 void TransferManager::setCurrentUser(const QString& name)
 {
-    if (name.isEmpty() || name == m_currentUser) return;
-    if (!m_currentUser.isEmpty()) saveSnapshot();   // 切用户：上一个用户的内存任务落盘
-    m_tasks.clear();
-    m_idToKey.clear();
-    m_uploadQueue.clear();
-    m_downloadQueue.clear();
-    m_fastcheckQueue.clear();
-    m_fastcheckInFlight = 0;
-    m_fastcheckInFlightToken.clear();
-    m_activeUploads = 0;
-    m_activeDownloads = 0;
+    if (name.isEmpty()) return;
+    m_lastKnownUser = name;                      // D-a：兜底键随每次有效登录名更新
+    if (name == m_currentUser) return;           // 同一账号重连：内存为准，不清不重建
+    if (!m_currentUser.isEmpty()) {
+        // 确实是另一个账号：上一个账号的内存任务先落盘，再丢弃内存侧
+        saveSnapshot();
+        m_tasks.clear();
+        m_idToKey.clear();
+        m_uploadQueue.clear();
+        m_downloadQueue.clear();
+        m_fastcheckQueue.clear();
+        m_fastcheckInFlight = 0;
+        m_fastcheckInFlightToken.clear();
+        m_activeUploads = 0;
+        m_activeDownloads = 0;
+    }
     m_currentUser = name;
-    restoreSavedTasks();
+    restoreSavedTasks();                         // 恢复 = 合并（内存为准、快照补缺）
 }
 
 void TransferManager::saveSnapshotNow()
@@ -270,6 +317,7 @@ quint64 TransferManager::enqueueGroupDownload(quint64 groupId, quint64 groupFile
 // 两方向预算独立（D6）：上传 3 / 下载 3，各自覆盖个人与群路径
 void TransferManager::pump()
 {
+    if (m_connectionDown) return;   // G7/C7：与服务端断开期间不启动新任务（重连登录后由 onConnectionRestored 恢复）
     while (m_activeUploads < int(MAX_PARALLEL_UPLOADS) && !m_uploadQueue.isEmpty()) {
         const quint64 key = m_uploadQueue.takeFirst();
         Task* t = taskByKey(key);
@@ -296,6 +344,7 @@ void TransferManager::startGroupHash(Task& t)
         watcher->deleteLater();
         Task* tt = taskByKey(key);
         if (tt == nullptr) return;
+        if (tt->state != Hashing) return;   // G7/C6：断线已把任务收敛为失败 → 迟到的 SHA 回调不得复活它
         if (sha.isEmpty()) {
             finishTask(*tt, Failed, QStringLiteral("读取文件失败"));
             return;
@@ -361,10 +410,42 @@ void TransferManager::submitFastcheck(quint64 key, const QByteArray& shaHex)
 {
     Task* t = taskByKey(key);
     if (t == nullptr) return;
+    if (t->state != Hashing) return;   // G7/C6：断线失败后到达的 97 提交不得复活任务
     t->shaHex = shaHex;
     m_fastcheckQueue.append(key);
     emit tasksChanged();
     pumpFastcheck();
+}
+
+// ===== REQ-EXT-TRANSFER-003 G7：断线任务态收敛 =====
+// 与服务端断开（socket disconnected / 90 s 心跳丢失）：在途（Running/Hashing）任务即刻判失败并归还名额，
+// 任务行不再永久"传输中"、队列可继续前进；Queued/Paused/Done/Failed 一律不动。
+// 边界：不删任何本地分片、不动服务端暂存与会话行（留给"重试即续传"）；不做自动重发。
+void TransferManager::onConnectionLost(const QString& reason)
+{
+    m_connectionDown = true;
+    m_fastcheckQueue.clear();      // 在途 97 的归属一并作废（迟到 98 由"无在途即丢弃"吞掉）
+    m_fastcheckInFlight = 0;
+    m_fastcheckInFlightToken.clear();
+    const QList<quint64> keys = m_tasks.keys();
+    for (quint64 key : keys) {
+        Task* t = taskByKey(key);
+        if (t == nullptr) continue;
+        if (t->state != Running && t->state != Hashing) continue;
+        // §4.3 同款防御：摘旧 id 映射，防止迟到 32/42 喂进下一条任务
+        m_idToKey.remove(t->id);
+        finishTask(*t, Failed, reason);
+    }
+    emit tasksChanged();
+}
+
+// 重连并重新登录后恢复调度（由 Client 的 LOGIN_RESPOND 分支调用，不依赖 setCurrentUser 的提前返回）
+void TransferManager::onConnectionRestored()
+{
+    if (!m_connectionDown) return;
+    m_connectionDown = false;
+    qCDebug(lcCli) << "[transfer] 连接恢复，重新调度排队任务";
+    pump();
 }
 
 void TransferManager::failTask(quint64 key, const QString& reason)
@@ -609,6 +690,12 @@ void TransferManager::onUploadInitRespond(PDU* pdu)
         finishTask(*t, Failed, QStringLiteral("服务端拒绝上传初始化"));
         return;
     }
+    // REQ-EXT-TRANSFER-003 C3/D9：空文件或断点已在尾部（resumeOffset >= 本地大小，含 0>=0）
+    // → 服务端在 result.complete 时已转正，客户端直接判完成，不建 Uploader（否则空文件必失败）
+    if (resumeOffset >= t->totalBytes) {
+        finishTask(*t, Done);
+        return;
+    }
     t->uploader = new Uploader(id, t->localPath, resumeOffset, this);
     connect(t->uploader, &Uploader::seedMsg, &Client::getinstance(), &Client::seedMsg);
     const quint64 uploadKey = t->key;
@@ -678,6 +765,11 @@ void TransferManager::onGroupUploadInitRespond(PDU* pdu)
     const bool hit = (quint8(payload.at(GROUP_FILE_INIT_RESP_HIT_OFFSET)) != 0);
     const qint64 nextOffset = qint64(readU64At(GROUP_FILE_INIT_RESP_NEXT_OFFSET));
     if (hit) {
+        finishTask(*t, Done);
+        return;
+    }
+    // REQ-EXT-TRANSFER-003 C3/D9：断点已在尾部（含 0 字节）→ 服务端已落定，直接完成
+    if (nextOffset >= t->totalBytes) {
         finishTask(*t, Done);
         return;
     }
@@ -832,6 +924,7 @@ void TransferManager::pause(quint64 key)
             pumpFastcheck();
         }
         if (t->state == Hashing && m_activeUploads > 0) --m_activeUploads;
+        m_idToKey.remove(t->id);   // S-E/C4：摘旧 id 映射（防旧 id 的迟到 32 喂进后续新 uploader）
         t->state = Paused;
         saveSnapshot();
         emit tasksChanged();
@@ -840,6 +933,7 @@ void TransferManager::pause(quint64 key)
     if (t->state != Running) return;
     sendAbortIfActive(*t);
     // 停发 + 释放本地名额（服务端槽位由 107 释放；TCP 顺序保证 107 先于后续 INIT 到达）
+    m_idToKey.remove(t->id);   // S-E/C4：摘旧 id 映射（108 仅日志，迟到 32 不再有归属）
     if (t->uploader) {
         t->uploader->deleteLater();
         t->uploader = nullptr;
@@ -870,6 +964,7 @@ void TransferManager::resume(quint64 key)
     }
     if (t->state != Paused && t->state != Failed) return;
     // S3：以新 id 重走 INIT，服务端由 (owner|parent|display|size) 派生同一 staging → 续传
+    m_idToKey.remove(t->id);   // S-E/C4：换 id 前摘旧映射，防旧 id 的迟到 32 喂进新 uploader
     t->id = allocId();
     m_idToKey.insert(t->id, key);
     t->failReason.clear();

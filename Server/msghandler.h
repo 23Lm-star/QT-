@@ -36,6 +36,9 @@ public:
         // AUD-4：107 在写盘在途时到达 → 延迟释放。立即 abort 会让在途写落在 ctx 消失之后，
         // 使暂存物理大小越过 upload_session.confirmed_offset。置位后由 handleUploadWriteFinished 收尾。
         bool     pendingAbort = false;
+        // REQ-EXT-TRANSFER-003 S8/D6：进度落库节流（≥1 MiB 或 ≥2 s 才 UPDATE 一次）
+        qint64   lastPersistOffset = 0;  // 上次落库时的已确认偏移
+        qint64   lastPersistMs = 0;      // 上次落库时刻
     };
     QHash<quint64, UploadCtx> m_uploads;   // key 0 = 旧单流路径
     // handlMsg 按 PDU 落位写入的当前传输 id（29/31/40/101/105/107）；非传输族 = 0
@@ -52,6 +55,10 @@ public:
     };
     PendingFastcheck m_pendingFastcheck;
     UploadCtx* findUpload(quint64 id);
+    // REQ-EXT-TRANSFER-003 S5 补充：同一暂存路径可能被一个以上上下文引用（97 预检查槽 / 幂等重放 /
+    // 旧客户端占位）。动文件（rename/delete/truncate）前必须释放**全部**指向该路径的句柄，
+    // 否则 Windows 下会被占用句柄拒绝（实测：97 别名句柄让 commitUpload 的 rename 失败 → 会话判 failed）。
+    void releaseOtherStagingHandles(quint64 keepId, const QString &stagingPath);
     UploadCtx& currentUpload();            // 不存在则新建（调用方须先过 acquireUploadSlot）
     // 上限（D7）与重复 id（T-17）判定；true = 可占用该槽（id=0 每次重置旧槽）
     bool acquireUploadSlot(quint64 id);

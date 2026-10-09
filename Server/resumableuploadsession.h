@@ -2,6 +2,9 @@
 #define RESUMABLEUPLOADSESSION_H
 
 #include <QString>
+#include <QSharedPointer>
+
+class QFile;
 
 class ResumableUploadSession
 {
@@ -33,6 +36,10 @@ public:
     qint64 receivedSize() const;
     qint64 totalSize() const;
     QString stagingFilePath() const;
+    // REQ-EXT-TRANSFER-003 S1/S2：暂存句柄共享所有权——beginStaged 打开后不关闭，
+    // 写任务持引用做 seek+write+flush；最后一个引用释放即关闭。
+    QSharedPointer<QFile> stagingFile() const { return m_stagingFile; }
+    void releaseStagingFile() { m_stagingFile.clear(); }
     void reset();
 
     // 逻辑条目定位（commitUpload 用）
@@ -44,6 +51,7 @@ private:
     QString m_filePath;
     qint64 m_receivedSize;
     qint64 m_totalSize;
+    QSharedPointer<QFile> m_stagingFile;   // REQ-EXT-TRANSFER-003：暂存打开句柄（仅 beginStaged 持有）
     // T4 暂存归属（仅 beginStaged 写入）
     QString m_owner;
     QString m_parent;
