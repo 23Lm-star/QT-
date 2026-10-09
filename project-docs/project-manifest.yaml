@@ -5,10 +5,13 @@ trunk: master            # remote set-head done 2026-09-27; origin/main is dead,
 bootstrap:
   gitignore: done        # 2026-09-13 session + closeout commit e700d22
   trunk_unified: done
-  pipeline: skeleton     # build filled (Qt 5.14.2 mingw73_64), test = 0 registered, audit = frozen paths active
-  frozen_paths: active
-frozen_paths:            # enforced by pipeline/audit.ps1 -- hit = escalate to LARGE + user approval
+  pipeline: active       # build/test/audit/artifact scripts are present; test_gate remains explicitly waived
+  sensitive_paths: active # 敏感路径边界：命中产生审查 finding，不单独决定 LARGE
+sensitive_paths:          # 敏感路径（项目边界）：命中由 AI 生成影响分析和审批卡
   - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
+  - Server/protocol.h
+frozen_paths:             # 迁移期兼容别名；新流程优先读取 sensitive_paths
+  - Client/protocol.h
   - Server/protocol.h
 code_intel:              # advisory only -- never changes the audit verdict (audit.ps1 §4)
   impact_status: not_applicable   # this repo has no statically-reachable automated tests
