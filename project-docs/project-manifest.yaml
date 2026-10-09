@@ -157,6 +157,16 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-10-01
       note: "needs a debug-capable Server.exe: the N-1 crash was only reproducible with symbols and gdb"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: transfer002
+      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-002/verify.py"]
+      cwd: "."
+      asserts: 26
+      timeout_s: 600
+      blocking: true
+      owner: REQ-EXT-TRANSFER-002
+      added: 2026-10-08
+      note: "下载暂停/取消/断点续传（design §6 F7）：静态 4（S-01..03 冻结面逐字一致+落位；S-04 finishTask 下载分支摘除 id 映射＝FINDING-AUDIT-1 回归钉）+ 动态 19（T2-01..14 含 a/b 子断言）+ 环境锚点 3。自管服务端生命周期；用户 e2etx2，开跑前清本用户 DB 行与共享 .staging；GUI 8 项人工面见 design §6.3（NEEDS-HUMAN）"
+      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: transfer003
       cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-003/verify.py"]
       cwd: "."

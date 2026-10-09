@@ -218,6 +218,10 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         // D7：超下载上限时 41 回 ret=false（同 id 重发视为替换，不占额外名额）
         m_MsgHandler->m_downloadSlotAvailable =
                 (m_downloads.contains(transferId) || m_downloads.size() < int(MAX_PARALLEL_DOWNLOADS));
+        // REQ-EXT-TRANSFER-002 S2：读出 40 声明的续传起点（TRANSFER_ID_OFFSET 的同一读法；旧客户端为 0）
+        qint64 resumeOffset=0;
+        memcpy(&resumeOffset,pdu->caData+DOWNLOAD_RESUME_OFFSET,sizeof(resumeOffset));
+        m_MsgHandler->m_downloadResumeOffset=resumeOffset;
         respdu=m_MsgHandler->downloadfile();
         if(respdu){
             bool valid=false;
@@ -225,14 +229,15 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
             sendAndRelease(respdu);
             respdu=nullptr;
             if(valid && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
-                startDownloadStream(m_MsgHandler->m_downloadCanonicalPath,transferId);
+                startDownloadStream(m_MsgHandler->m_downloadCanonicalPath,transferId,resumeOffset);
             }
         }
         return nullptr;
     }
     // REQ-EXT-TRANSFER-001：上传任务释放（暂停/取消共用；108 回带 id）
+    // REQ-EXT-TRANSFER-002 S1：107 现对上传/下载两方向同义
     case ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST:{
-        return handleUploadAbort(pdu);
+        return handleTransferAbort(pdu);
     }
     case ENUM_MSG_TYPE_CAPTCHA_REQUEST:{
         respdu=m_MsgHandler->captcha();
@@ -306,13 +311,17 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         // D7：超下载上限时 106 的 code = -2107（同 id 重发视为替换）
         m_MsgHandler->m_downloadSlotAvailable =
                 (m_downloads.contains(transferId) || m_downloads.size() < int(MAX_PARALLEL_DOWNLOADS));
+        // REQ-EXT-TRANSFER-002 S2：读出 105 声明的续传起点（与 40 同一常量同一偏移；caMsg 零改动）
+        qint64 resumeOffset=0;
+        memcpy(&resumeOffset,pdu->caData+DOWNLOAD_RESUME_OFFSET,sizeof(resumeOffset));
+        m_MsgHandler->m_downloadResumeOffset=resumeOffset;
         respdu=m_MsgHandler->groupFileRequest(pdu->uiType);
         if(respdu){
             const QString src=m_MsgHandler->m_downloadCanonicalPath;
             sendAndRelease(respdu);
             respdu=nullptr;
             if(!src.isEmpty()){
-                startDownloadStream(src,transferId);
+                startDownloadStream(src,transferId,resumeOffset);
             }
         }
         return nullptr;
@@ -411,24 +420,30 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
     sendUploadAck(transferId,success,ackOffset,complete);
 }
 
-// 107：释放上传槽位（暂停/取消同处置：会话 expired，staging 保留）；未知 id → ret=false
-PDU* MyTcpSocket::handleUploadAbort(PDU* pdu)
+// 107：释放传输槽位。上传（暂停/取消同处置：会话 expired，staging 保留）；
+// REQ-EXT-TRANSFER-002 S1：未命中上传槽时再查下载流 → 摘环停发、名额回落。
+// 未知 id → ret=false；id=0 一律不受理（维持既有断言 T-12a，旧单流路径不受 107 影响）。
+PDU* MyTcpSocket::handleTransferAbort(PDU* pdu)
 {
     quint64 transferId=TRANSFER_ID_LEGACY;
     memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
     bool ret=false;
-    MsgHandler::UploadCtx* cp=(transferId!=TRANSFER_ID_LEGACY)
-            ? m_MsgHandler->findUpload(transferId) : nullptr;
-    if(cp!=nullptr){
-        // AUD-4：写盘在途时不得立即释放——否则在途写会落在 ctx 消失之后（回调落空），暂存物理大小
-        // 越过 upload_session.confirmed_offset。标记延迟释放，由 handleUploadWriteFinished 收尾；
-        // 108 仍即时回 ret=true（客户端不再向该 id 发正文，槽位语义不受影响）。
-        if(cp->writeInFlight){
-            cp->pendingAbort=true;
-        }else{
-            m_MsgHandler->abortUpload(transferId);
+    if(transferId!=TRANSFER_ID_LEGACY){
+        MsgHandler::UploadCtx* cp=m_MsgHandler->findUpload(transferId);
+        if(cp!=nullptr){
+            // AUD-4：写盘在途时不得立即释放——否则在途写会落在 ctx 消失之后（回调落空），暂存物理大小
+            // 越过 upload_session.confirmed_offset。标记延迟释放，由 handleUploadWriteFinished 收尾；
+            // 108 仍即时回 ret=true（客户端不再向该 id 发正文，槽位语义不受影响）。
+            if(cp->writeInFlight){
+                cp->pendingAbort=true;
+            }else{
+                m_MsgHandler->abortUpload(transferId);
+            }
+            ret=true;
+        }else if(m_downloads.contains(transferId)){
+            removeDownloadStream(transferId);
+            ret=true;
         }
-        ret=true;
     }
     PDU* resp=mkPDU();
     resp->uiType=ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND;
@@ -460,8 +475,10 @@ void MyTcpSocket::seedDownloadFinish(quint64 transferId, bool success)
     seedMsg(finishPdu);
 }
 
-// 新流加入环尾（id=0 = 旧单流路径）
-void MyTcpSocket::startDownloadStream(const QString& filePath, quint64 transferId)
+// 新流加入环尾（id=0 = 旧单流路径）。
+// REQ-EXT-TRANSFER-002 S3：startOffset = 采纳的续传起点，seek 后只发后缀；起点==大小即 0 字节正文 + 43 success（D5）。
+// 起点>大小在调用方已按 §2.3 拒绝，此处仅断言式防护：不建流并明确失败，绝不静默拼坏文件。
+void MyTcpSocket::startDownloadStream(const QString& filePath, quint64 transferId, qint64 startOffset)
 {
     DownloadStream& st=m_downloads[transferId];
     st.id=transferId;
@@ -480,11 +497,20 @@ void MyTcpSocket::startDownloadStream(const QString& filePath, quint64 transferI
         return;
     }
     st.totalSize=st.file->size();
-    st.sentSize=0;
+    if(startOffset<0||startOffset>st.totalSize||!st.file->seek(startOffset)){
+        qCWarning(lcNet)<<"续传起点非法，不建流:"<<filePath<<"offset"<<startOffset<<"size"<<st.totalSize<<"id"<<transferId;
+        st.file->close();
+        delete st.file;
+        st.file=nullptr;
+        m_downloads.remove(transferId);
+        seedDownloadFinish(transferId,false);
+        return;
+    }
+    st.sentSize=startOffset;
     if(!m_downloadRing.contains(transferId)){
         m_downloadRing.append(transferId);
     }
-    qCDebug(lcNet)<<"开始流式下载:"<<filePath<<"大小:"<<st.totalSize<<"id"<<transferId;
+    qCDebug(lcNet)<<"开始流式下载:"<<filePath<<"大小:"<<st.totalSize<<"起点"<<startOffset<<"id"<<transferId;
     scheduleNextDownloadChunk();
 }
 

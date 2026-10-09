@@ -50,14 +50,15 @@ public:
     int m_rrCursor = 0;
     bool m_downloadNextChunkScheduled;
     static constexpr qint64 DOWNLOAD_WRITE_HIGH_WATER = 256 * 1024;
-    void startDownloadStream(const QString& filePath, quint64 transferId);
+    // REQ-EXT-TRANSFER-002 S3：startOffset = 采纳的续传起点（0 = 从头；调用方已按 §2.3 先行拒绝非法起点）
+    void startDownloadStream(const QString& filePath, quint64 transferId, qint64 startOffset);
     void scheduleNextDownloadChunk();
     void removeDownloadStream(quint64 id);
     void seedDownloadFinish(quint64 id, bool success);
     void handleUploadData(PDU* pdu);
     void sendUploadAck(quint64 transferId, bool success, qint64 nextOffset, bool complete);
-    // 107/108：上传任务释放（暂停/取消共用）
-    PDU* handleUploadAbort(PDU* pdu);
+    // 107/108：传输任务释放（暂停/取消共用；REQ-EXT-TRANSFER-002 S1 起上传/下载同义）
+    PDU* handleTransferAbort(PDU* pdu);
     // D5：上传上下文空闲回收（连接级定时器，间隔 15s）
     static const int UPLOAD_IDLE_REAP_SEC = 60;
     QTimer* m_reapTimer;

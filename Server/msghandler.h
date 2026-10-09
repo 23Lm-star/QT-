@@ -150,6 +150,9 @@ public:
     // REQ-EXT-TRANSFER-001 D7：下载方向并发名额是否可用（由 MyTcpSocket 在本连接会话前写入；
     // 超上限时 40 → ret=false、105 → code=-2107，且不建流）
     bool m_downloadSlotAvailable = true;
+    // REQ-EXT-TRANSFER-002 S2：客户端在 40/105 声明的续传起点（由 MyTcpSocket 处理前写入；
+    // 0 = 从头，旧客户端由 mkPDU 全量清零天然写 0）
+    qint64 m_downloadResumeOffset = 0;
 
     // ===== REQ-EXT-FILE-001 T3/T4：内容寻址上传落定 =====
     // REQ-EXT-FILE-002 D2：上传声明的 SHA-256（= upload_session.client_sha256）现落在 UploadCtx.expectedSha，
