@@ -37,6 +37,29 @@
 - 审计独立度为 `limited`；最强独立信号是非空转断言（group-002 p7 要求 >0 条真实 drop 日志；transfer003 S-03a/b 要求与批准字面逐字节相符）。
 - 未做 GUI / 旧服务端人工复验。
 
+### dist 运行时 DLL 可验证化（R1）
+
+`artifacts.ps1` 曾把 2018-04-25 版 Qt DLL 覆盖进 `dist/`。手工还原后，2026-10-11 对
+`dist/*.dll` 与 canonical 逐字节 `cmp`：**14 个有对应源的全部相同、0 个不同**；`icudt58.dll` /
+`icuin58.dll` / `icuuc58.dll` 在 canonical 目录无对应源，未参与比对（不在被污染集内）。
+比对源：`C:\Qt\5.14.2\mingw73_64\bin`、`C:\Qt\Tools\mingw730_64\bin`。
+
+被还原的 9 个文件 sha256：
+
+| DLL | sha256 |
+|---|---|
+| `Qt5Core.dll` | `019ab6aa811087b36d0a91c35a70b8eb7756b7f0f072afa0449b3805ccac7efc` |
+| `Qt5Gui.dll` | `43deed28133c0e530ed44fff3649a87022a80bdb4ef493048518c72ac4656b99` |
+| `Qt5Network.dll` | `5f013568cbdf748337821460af19fa7283ac6e3befb9685543b0517eda2f3e90` |
+| `Qt5Widgets.dll` | `90fe759952447724da52351e7bcee6f51248b5d9577ab39f22bfd548c8931de9` |
+| `Qt5Svg.dll` | `e8543ca27629869a6287ac20e55e542ac0f094d336b988c72db570fe913d408e` |
+| `libEGL.dll` | `6f2af191db10019374e79e2afe2febfaa53c21257efcd4d41b50d947c700e2d3` |
+| `libGLESv2.dll` | `46998b7ca48999b07005d4bcaa4256abce3150cc5f2c527fff26779cd76f1bd8` |
+| `d3dcompiler_47.dll` | `e994847e01a6f1e4cbdc5a864616ac262f67ee4f14db194984661a8d927ab7f4` |
+| `libmysql.dll` | `425ab60c449b939cae492f0285275ae09b164e0d88e27beb37099a2dd03918ae` |
+
+复核命令（应无输出）：`for f in dist/*.dll; do n=$(basename $f); cmp -s "$f" "/c/Qt/5.14.2/mingw73_64/bin/$n" 2>/dev/null || cmp -s "$f" "/c/Qt/Tools/mingw730_64/bin/$n" 2>/dev/null || echo "DIFF $n"; done`
+
 ## 归档索引（sha256）
 
 | 文件 | sha256 |
