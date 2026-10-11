@@ -9,6 +9,12 @@ CONFIG += c++11 utf8_source
 # 重定向文件也进不了管道，套件（group-002 p7_slow_conn_dropped）无法断言丢包日志。
 # 加回控制台子系统后 `dist/Server.exe > log 2>&1` 与 Popen(stdout=FILE) 均可捕获。
 CONFIG += console
+# qmake 的 console 会跳过 QMAKE_LIBS_QT_ENTRY（win32-g++ 里是 "-lmingw32 -lqtmain"，生成器
+# 只在非 console 时追加），于是 MinGW 的 CRT 启动对象找不到 WinMain：
+#   libmingw32.a(crt0_c.o): undefined reference to `WinMain'
+# 而 main.cpp 只提供 main()。直接补 LIBS（改 QMAKE_LIBS_QT_ENTRY 无效，已被生成器跳过）。
+# 子系统决定控制台是否附着（console → 有 stdout/stderr），入口符号由 qtmain 提供并转调 main()。
+LIBS += -lmingw32 -L$$[QT_INSTALL_LIBS] -lqtmain
 
 # Deploy destination policy:
 #   Debug   -> stay beside Qt Creator's run config (green triangle works as-is)

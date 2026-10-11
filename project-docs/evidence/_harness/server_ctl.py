@@ -166,9 +166,16 @@ class ServerCtl:
             out_dest, err_dest = self._logf, subprocess.STDOUT
         else:
             out_dest, err_dest = subprocess.DEVNULL, subprocess.DEVNULL
+        # QT_ASSUME_STDERR_HAS_CONSOLE=1 是必需的：重定向到文件时 stderr 不是控制台，Qt 会
+        # 改走 OutputDebugString，日志进不了文件（实测 0 字节）。置位后 qCWarning/qCDebug 才写
+        # stderr。与 Server.pro 的 CONFIG += console 是一对：前者让子进程有可写的 stderr，
+        # 后者让 Qt 认它是控制台。
+        env = dict(os.environ)
+        if self.log_path:
+            env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
         try:
             self.pid = subprocess.Popen(
-                [self.exe], cwd=self.cwd,
+                [self.exe], cwd=self.cwd, env=env,
                 stdout=out_dest, stderr=err_dest).pid
         except OSError as e:
             self.pid = None
