@@ -5,7 +5,7 @@ trunk: master            # remote set-head done 2026-09-27; origin/main is dead,
 bootstrap:
   gitignore: done        # 2026-09-13 session + closeout commit e700d22
   trunk_unified: done
-  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and currently blocked by RED suites
+  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and GREEN at 4e76269 (14/14, 514 assertions)
   sensitive_paths: active # 敏感路径边界：命中产生审查 finding，不单独决定 LARGE
 sensitive_paths:          # 敏感路径（项目边界）：命中由 AI 生成影响分析和审批卡
   - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
@@ -36,18 +36,20 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
   owner: user
   date: 2026-10-09
   reason: >
-    Fourteen socket harnesses (491 declared assertions) carry this project's regression. The
-    FINDING-GATE-2 lifecycle blocker is closed: the two previously external-lifecycle suites
-    start dist/Server.exe themselves, clean only their own PID, and use dist/filesys consistently;
-    unique-login reuses the parent service for its nested SEC-001 run. The gate is enforced and
-    remains blocking on any missing suite, assertion-count drift, timeout, or failure. Baseline
-    re-measured 2026-10-11 (run-20261011-02, HEAD 6d597e6): 11 of 14 green; the three reds were
-    parallel-transfer (harness/gate assertion-count artifact -- NOTE prose printed after the
-    "54/54 passed" line contained "31/32", which the runner's last-`\d+/\d+` heuristic took as the
-    count; fixed by printing the summary last), transfer003 S-03a/b (the `git diff master` base is
-    empty once master carries the approved block; fixed by pinning the pre-change commit) and
-    group-002 (never reached setup -- external-server precondition; now self-managing). Residual:
-    group-002 p7_slow_conn_dropped only.
+    Fourteen socket harnesses (514 declared assertions) carry this project's regression. The
+    FINDING-GATE-2 lifecycle blocker is closed: every suite that needs a server starts
+    dist/Server.exe itself and cleans only its own PID; unique-login reuses the parent service for
+    its nested SEC-001 run. The gate is enforced and blocking on any missing suite, assertion-count
+    drift, timeout, or failure. Baseline GREEN re-measured 2026-10-11 (run-20261011-06, candidate
+    4e76269): 14 of 14 suites, every observed count equal to its declared count. The three reds
+    first seen at 6d597e6 were all non-product and are repaired on the same branch:
+    parallel-transfer (the runner took the last `\d+/\d+` in the output, which was "31/32" inside
+    trailing NOTE prose rather than the real "54/54"; the suite now prints its summary last),
+    transfer003 S-03a/b (a `git diff master` base goes empty once master carries the approved
+    block, so the check evaluated a null input; the base is now pinned to the pre-change commit)
+    and group-002 (it never reached setup because it required an externally started server; it now
+    self-manages, and Server.pro gained CONFIG += console so its p7_slow_conn_dropped drop-log
+    assertion has a console to read).
   suites:
     - id: sec001
       cmd: ["py", "project-docs/evidence/REQ-EXT-SEC-001/verify.py"]
@@ -57,7 +59,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-SEC-001
       added: 2026-09-29
-      note: "security baseline. BASE falls back to the literal E:/qt/xiangmu when SEC001_BASE is unset -- see FINDING-GATE-3. D5-adapted IN PLACE on 2026-10-03: its four storage-model assertions (K1c/K1f/K1i-or-K2a/K2b) now read the DB fact layer instead of the filesystem, so this file is NO LONGER byte-identical to its original -- the earlier 'original stays byte-identical' position is retired. It gained a mysql CLI dependency (SEC001_MYSQL / SEC001_DB overridable) and now self-starts dist/Server.exe, while nested unique-login runs reuse the parent PID. Protocol and security assertions are untouched"
+      note: "security baseline. BASE is derived from __file__ (repo root) instead of a hardcoded literal, so the suite is relocatable; SEC001_BASE still overrides it. D5-adapted IN PLACE on 2026-10-03: its four storage-model assertions (K1c/K1f/K1i-or-K2a/K2b) now read the DB fact layer instead of the filesystem, so this file is NO LONGER byte-identical to its original -- the earlier 'original stays byte-identical' position is retired. It gained a mysql CLI dependency (SEC001_MYSQL / SEC001_DB overridable) and now self-starts dist/Server.exe, while nested unique-login runs reuse the parent PID. Protocol and security assertions are untouched"
       isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false, extra: "mysql CLI at SEC001_MYSQL"}
     - id: sec001-regression
       cmd: ["py", "project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py"]
@@ -115,7 +117,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-GROUP-002
       added: 2026-10-01
-      note: "2026-10-11 FINDING-GATE-2 收口：本套件原先要求外部先起 dist/Server.exe，在 enforced 门禁下前面的套件会清掉自己的进程，必然 ConnectionRefused；现改为自管生命周期（server_ctl，按 PID）。同时修 ROOT（parents[2]→parents[3]）、filesys 改用 dist/filesys。声明数原写 15，是套件从未跑过 setup 的残留值；实跑为 38。残留红：p7_slow_conn_dropped 需读服务端控制台日志，而 Server.pro 无 CONFIG += console（GUI 子系统，无 stdout，Qt 日志走 OutputDebugString），自管启动无法捕获 —— 待主人决定产品侧可观测性或改断言口径"
+      note: "2026-10-11 FINDING-GATE-2 收口：本套件原先要求外部先起 dist/Server.exe，在 enforced 门禁下前面的套件会清掉自己的进程，必然 ConnectionRefused；现改为自管生命周期（server_ctl，按 PID）。同时修 ROOT（parents[2]→parents[3]）、filesys 改用 dist/filesys。声明数原写 15，是套件从未跑过 setup 的残留值；实跑为 38。p7_slow_conn_dropped 需读服务端控制台日志，为此 Server.pro 加 CONFIG += console（GUI 子系统无 stdout，Qt 日志会走 OutputDebugString），并由 server_ctl 在传 log_path 时置 QT_ASSUME_STDERR_HAS_CONSOLE=1；两者缺一则日志捕获为 0 字节。已 38/38 通过"
       isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: groupfile
       cmd: ["py", "project-docs/evidence/REQ-EXT-GROUP-003/groupfile_e2e.py"]
