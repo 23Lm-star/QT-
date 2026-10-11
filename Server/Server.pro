@@ -4,6 +4,12 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++11 utf8_source
 
+# console: 必须有。缺省时 MinGW 目标按 GUI 子系统链接（-Wl,-subsystem,windows），进程没有
+# stdout/stderr，Qt 的 qDebug/qWarning 全部走 OutputDebugString —— 服务端运行日志既进不了
+# 重定向文件也进不了管道，套件（group-002 p7_slow_conn_dropped）无法断言丢包日志。
+# 加回控制台子系统后 `dist/Server.exe > log 2>&1` 与 Popen(stdout=FILE) 均可捕获。
+CONFIG += console
+
 # Deploy destination policy:
 #   Debug   -> stay beside Qt Creator's run config (green triangle works as-is)
 #   Release -> converge into repo-root dist/ (the single deployable artifact)
