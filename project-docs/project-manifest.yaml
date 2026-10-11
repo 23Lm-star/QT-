@@ -40,9 +40,14 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
     FINDING-GATE-2 lifecycle blocker is closed: the two previously external-lifecycle suites
     start dist/Server.exe themselves, clean only their own PID, and use dist/filesys consistently;
     unique-login reuses the parent service for its nested SEC-001 run. The gate is enforced and
-    remains blocking on any missing suite, assertion-count drift, timeout, or failure. The current
-    baseline still reports independent failures in group-002, sec002, transfer002, transfer003,
-    and a parallel-transfer assertion-observation mismatch; those remain merge blockers.
+    remains blocking on any missing suite, assertion-count drift, timeout, or failure. Baseline
+    re-measured 2026-10-11 (run-20261011-02, HEAD 6d597e6): 11 of 14 green; the three reds were
+    parallel-transfer (harness/gate assertion-count artifact -- NOTE prose printed after the
+    "54/54 passed" line contained "31/32", which the runner's last-`\d+/\d+` heuristic took as the
+    count; fixed by printing the summary last), transfer003 S-03a/b (the `git diff master` base is
+    empty once master carries the approved block; fixed by pinning the pre-change commit) and
+    group-002 (never reached setup -- external-server precondition; now self-managing). Residual:
+    group-002 p7_slow_conn_dropped only.
   suites:
     - id: sec001
       cmd: ["py", "project-docs/evidence/REQ-EXT-SEC-001/verify.py"]
@@ -105,12 +110,13 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
     - id: group-002
       cmd: ["py", "project-docs/evidence/REQ-EXT-GROUP-002/verify.py"]
       cwd: "."
-      asserts: 15
+      asserts: 38
       timeout_s: 300
       blocking: true
       owner: REQ-EXT-GROUP-002
       added: 2026-10-01
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+      note: "2026-10-11 FINDING-GATE-2 收口：本套件原先要求外部先起 dist/Server.exe，在 enforced 门禁下前面的套件会清掉自己的进程，必然 ConnectionRefused；现改为自管生命周期（server_ctl，按 PID）。同时修 ROOT（parents[2]→parents[3]）、filesys 改用 dist/filesys。声明数原写 15，是套件从未跑过 setup 的残留值；实跑为 38。残留红：p7_slow_conn_dropped 需读服务端控制台日志，而 Server.pro 无 CONFIG += console（GUI 子系统，无 stdout，Qt 日志走 OutputDebugString），自管启动无法捕获 —— 待主人决定产品侧可观测性或改断言口径"
+      isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: groupfile
       cmd: ["py", "project-docs/evidence/REQ-EXT-GROUP-003/groupfile_e2e.py"]
       cwd: "."

@@ -683,10 +683,12 @@ print("\n=== 汇总 ===")
 okn = sum(1 for _, _, cc in results if cc)
 for sid, desc, cc in results:
     if not cc: print(f"  FAIL -> {sid} {desc}")
-print(f"{okn}/{len(results)} passed")
 print("NOTE: 纯客户端行为（多选选择器/任务列表/暂停继续取消按钮/**客户端队列不发起第 4 个 29**/"
       "大文件摘要不卡 UI）属 design §6.3 人工清单，非本套件可断言范围；"
       "wire 级握手保真（T-19：97→98→29→30→31/32）与客户端队列的**静态契约**（T-22）已由本套件覆盖，"
       "但客户端队列的**动态**断言（第 4 个 29 确实未发出）仍需人工项——本仓无客户端测试宿主。")
+# NOTE 必须打印在汇总行之前：test-gate.py 以输出中**最后一个** `\d+/\d+` 作为断言行数，
+# NOTE 里的 "31/32" 会盖掉真正的 "54/54"（实测 observed 31/declared 54 的假红）。
+print(f"{okn}/{len(results)} passed")
 stop_server()
 sys.exit(0 if okn == len(results) else 1)

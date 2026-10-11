@@ -301,7 +301,12 @@ check("S-02a", "Client/uploader.h 三常量存在（1024 块 / 64 KiB 下限 / 1
 check("S-02b", "跨端一致：UPLOAD_CHUNK_MAX ≤ 服务端 MAX_UPLOAD_DATA_CHUNK",
       0 < vmax <= evalint(smax.group(1)) if smax else False, f"{vmax} <= {evalint(smax.group(1)) if smax else '?'}")
 
-diff_srv = subprocess.run(["git", "diff", "master", "--", "Server/protocol.h"],
+# 基准必须是"批准改动引入之前"的提交，不能是移动的 master：master 一旦合并本改动，
+# `git diff master -- Server/protocol.h` 恒为空，S-03a/b 在任何 master 后代树上都空转失败
+# （实测 rem=[] / n=0）。固定基准 = 本改动落地提交 b861351 之前最后一次改本文件的提交
+# （f820e61，002 开发提交）。用 b861351^ 会连 002 的常量块一起带出，S-03b 逐字比对即失败。
+T003_FROZEN_BASE = os.environ.get("T003_FROZEN_BASE", "f820e614bb45fe0c36b255f8a97f989fa9273ad4")
+diff_srv = subprocess.run(["git", "diff", T003_FROZEN_BASE, "--", "Server/protocol.h"],
                           cwd=REPO, capture_output=True, text=True).stdout
 rem = [l[1:].strip() for l in diff_srv.splitlines()
        if l.startswith("-") and not l.startswith("---") and l[1:].strip()]
