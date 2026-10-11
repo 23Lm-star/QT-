@@ -123,12 +123,16 @@ class ServerCtl:
     """
 
     def __init__(self, exe, cwd=None, host="127.0.0.1", port=5000,
-                 startup_timeout=25, poll=0.4):
+                 startup_timeout=25, poll=0.4, log_path=None):
         self.exe = exe
         self.cwd = cwd or os.path.dirname(exe)
         self.host = host
         self.port = port
         self.startup_timeout = startup_timeout
+        # log_path: 把服务端控制台接到该文件（追加）。默认 None = DEVNULL，保持既有套件行为不变；
+        # 需要读服务端日志做断言的套件（如 group-002 的 p7_slow_conn_dropped）才传。
+        self.log_path = log_path
+        self._logf = None
         self.poll = poll
         self.pid = None
         self.last_error = None
@@ -156,10 +160,23 @@ class ServerCtl:
             return False
 
         ensure_qt_path()
+        if self.log_path:
+            os.makedirs(os.path.dirname(os.path.abspath(self.log_path)), exist_ok=True)
+            self._logf = open(self.log_path, "ab")
+            out_dest, err_dest = self._logf, subprocess.STDOUT
+        else:
+            out_dest, err_dest = subprocess.DEVNULL, subprocess.DEVNULL
+        # QT_ASSUME_STDERR_HAS_CONSOLE=1 是必需的：重定向到文件时 stderr 不是控制台，Qt 会
+        # 改走 OutputDebugString，日志进不了文件（实测 0 字节）。置位后 qCWarning/qCDebug 才写
+        # stderr。与 Server.pro 的 CONFIG += console 是一对：前者让子进程有可写的 stderr，
+        # 后者让 Qt 认它是控制台。
+        env = dict(os.environ)
+        if self.log_path:
+            env["QT_ASSUME_STDERR_HAS_CONSOLE"] = "1"
         try:
             self.pid = subprocess.Popen(
-                [self.exe], cwd=self.cwd,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid
+                [self.exe], cwd=self.cwd, env=env,
+                stdout=out_dest, stderr=err_dest).pid
         except OSError as e:
             self.pid = None
             self.last_error = f"启动失败: {e}"
@@ -186,18 +203,26 @@ class ServerCtl:
     def stop(self):
         """只结束自己启动的那个 PID。返回是否执行了结束动作。"""
         pid, self.pid = self.pid, None
-        if not pid:
-            return False
-        if self._pid_gone(pid):
-            return False
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
-        # 等端口真正释放，否则紧接的 start 会撞上"端口已占用"
-        dl = time.time() + 10
-        while time.time() < dl:
-            if not port_busy(self.host, self.port):
-                break
-            time.sleep(self.poll)
-        return True
+        try:
+            if not pid:
+                return False
+            if self._pid_gone(pid):
+                return False
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+            # 等端口真正释放，否则紧接的 start 会撞上"端口已占用"
+            dl = time.time() + 10
+            while time.time() < dl:
+                if not port_busy(self.host, self.port):
+                    break
+                time.sleep(self.poll)
+            return True
+        finally:
+            if self._logf:
+                try:
+                    self._logf.close()
+                except OSError:
+                    pass
+                self._logf = None
 
     def __enter__(self):
         if not self.start():

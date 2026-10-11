@@ -29,10 +29,31 @@ T_PULL, T_PULL_R = 91, 92
 T_CONFIRM, T_CONFIRM_R = 93, 94
 T_UNREAD, T_UNREAD_R = 95, 96
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 SERVER_LOG = ROOT / 'build' / 'group002' / 'server-console.log'
 if '--server-log' in sys.argv:
     SERVER_LOG = Path(sys.argv[sys.argv.index('--server-log') + 1])
+# FINDING-GATE-2 收口：本套件原先要求"外部已有 dist/Server.exe 在跑"，在 enforced 门禁下
+# 前面的套件会清掉自己启动的进程，于是这里必然 ConnectionRefused（WinError 10061）。
+# 改为自管生命周期（按 PID，端口被别人占用时直接报错、不盲杀），与其余套件同形。
+DIST = ROOT / 'dist'
+EXE = DIST / 'Server.exe'
+sys.path.insert(0, str(ROOT / 'project-docs' / 'evidence' / '_harness'))
+import server_ctl
+_SRV = server_ctl.ServerCtl(str(EXE), str(DIST), HOST, PORT, log_path=str(SERVER_LOG))
+
+
+def start_server():
+    if not _SRV.start():
+        print('[E] ' + str(_SRV.last_error))
+        return False
+    return True
+
+
+def stop_server():
+    _SRV.stop()
+
+
 # 失败码（服务端为 quint32 负数，客户端按无符号读取）
 N1001, N2001, N2002 = (1 << 32) - 1001, (1 << 32) - 2001, (1 << 32) - 2002
 N2101, N2102, N2103, N2104 = (1 << 32) - 2101, (1 << 32) - 2102, (1 << 32) - 2103, (1 << 32) - 2104
@@ -262,6 +283,9 @@ USERS = ['g2owner', 'g2m1', 'g2m2', 'g2m3', 'g2out', 'g2quit', 'g2gone']
 # ---------- 环境与迁移前置 ----------
 commit = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], cwd=ROOT,
                         capture_output=True, text=True).stdout.strip()
+if not start_server():
+    print('[E] 无法启动 dist/Server.exe，套件中止')
+    sys.exit(1)
 for n in USERS:
     ensure_user(n)
 print('[SETUP] users ready; candidate commit ' + commit)
@@ -576,7 +600,7 @@ row = db_one("SELECT issuccess FROM message_info WHERE seed_name='g2m1' AND rev_
 check('p8b_one_to_one_offline_row', row is not None and row[0] == 0, f'issuccess={row[0] if row else None}')
 m2 = cap_login('g2m2')
 # c) 文件分享外链全流程（F-1 场景回归）：建文件→生成两次链接→他人解析第二次链接→落盘
-fsroot = Path((ROOT / 'Server' / 'connect.config').read_text(encoding='utf-8').splitlines()[2])
+fsroot = DIST / 'filesys'   # 部署运行形态：服务端 cwd=dist，其 ./filesys 即 dist/filesys
 (fsroot / 'g2m1').mkdir(parents=True, exist_ok=True)
 (fsroot / 'g2m1' / 'g2p8.bin').write_text('G2-P8-CONTENT')   # 发布者 m1 本人根
 r = m1.ask(pdu(T_CPL, msg=b'g2p8.bin'), T_CPL_R)
@@ -609,4 +633,5 @@ outdir = ROOT / 'build' / 'group002'
 (outdir / 'evidence.json').write_text(json.dumps(
     {'commit': commit, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'), 'passed': passed, 'total': len(results),
      'results': [{'label': l, 'ok': o, 'detail': d} for l, o, d in results]}, ensure_ascii=False, indent=2), encoding='utf-8')
+stop_server()
 sys.exit(0 if passed == len(results) else 1)

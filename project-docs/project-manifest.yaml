@@ -5,7 +5,7 @@ trunk: master            # remote set-head done 2026-09-27; origin/main is dead,
 bootstrap:
   gitignore: done        # 2026-09-13 session + closeout commit e700d22
   trunk_unified: done
-  pipeline: active       # build/test/audit/artifact scripts are present; test_gate remains explicitly waived
+  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and GREEN at 4e76269 (14/14, 514 assertions)
   sensitive_paths: active # 敏感路径边界：命中产生审查 finding，不单独决定 LARGE
 sensitive_paths:          # 敏感路径（项目边界）：命中由 AI 生成影响分析和审批卡
   - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
@@ -18,7 +18,7 @@ code_intel:              # advisory only -- never changes the audit verdict (aud
   impact_reason: "the C++ sources have no in-process unit tests; regression is carried by the socket harnesses under test_gate.suites, which are runtime/harness probes rather than statically-reachable code paths"
 test_gate:                # regression registry -- interpreted by pipeline/test.ps1 via scripts/test-gate.py
   # All suites share ONE server port (5000), ONE database (mydb) and ONE runtime tree
-  # (Server/filesys, from connect.config line 3 = "./filesys", which is cwd-relative and MUST
+  # (dist/filesys for deployed suites, from connect.config line 3 = "./filesys", which is cwd-relative and MUST
   # stay CRLF -- LF makes dist/Server.exe die at startup). They are therefore NOT parallel_safe
   # and the gate serializes them.
   #
@@ -29,34 +29,40 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
   # project-docs/evidence/_harness/server_ctl.py, which tracks the PID it started and refuses
   # to kill anything else; a busy port is reported, not blindly cleared.
   #
-  # REMAINING blocker for `enforced` -- FINDING-GATE-2: the harnesses still do not own the whole
-  # server lifecycle. unique_login_e2e.py additionally requires a binary at
-  # build/build-Server/release/Server.exe, which does not exist in the main worktree (it was
-  # built inside a detached test worktree). Verified pre-existing, not caused by the PID
-  # cleanup: the unmodified suite fails the same way. Its 16 assertions are therefore counted
-  # as declared, not as green here.
-  status: waived          # pending -> enforced once FINDING-GATE-2 is closed
+  # FINDING-GATE-2 closed on 2026-10-09: SEC-001 and unique-login own the deployed
+  # dist/Server.exe lifecycle; nested SEC-001 reuses the parent PID. The runner now
+  # executes all declared suites and requires their fixed assertion counts.
+  status: enforced
   owner: user
-  date: 2026-10-03
+  date: 2026-10-09
   reason: >
-    Twelve socket harnesses (406 declared assertions) carry this project's regression, but they do
-    not yet own the whole server lifecycle: unique_login_e2e.py needs a binary that the main
-    worktree does not build (FINDING-GATE-2). Declared here so the set is checkable and
-    auditable rather than living as ten unregistered scripts. Flip to `enforced` after
-    FINDING-GATE-2 closes.
+    Fourteen socket harnesses (514 declared assertions) carry this project's regression. The
+    FINDING-GATE-2 lifecycle blocker is closed: every suite that needs a server starts
+    dist/Server.exe itself and cleans only its own PID; unique-login reuses the parent service for
+    its nested SEC-001 run. The gate is enforced and blocking on any missing suite, assertion-count
+    drift, timeout, or failure. Baseline GREEN re-measured 2026-10-11 (run-20261011-06, candidate
+    4e76269): 14 of 14 suites, every observed count equal to its declared count. The three reds
+    first seen at 6d597e6 were all non-product and are repaired on the same branch:
+    parallel-transfer (the runner took the last `\d+/\d+` in the output, which was "31/32" inside
+    trailing NOTE prose rather than the real "54/54"; the suite now prints its summary last),
+    transfer003 S-03a/b (a `git diff master` base goes empty once master carries the approved
+    block, so the check evaluated a null input; the base is now pinned to the pre-change commit)
+    and group-002 (it never reached setup because it required an externally started server; it now
+    self-manages, and Server.pro gained CONFIG += console so its p7_slow_conn_dropped drop-log
+    assertion has a console to read).
   suites:
     - id: sec001
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SEC-001/verify.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-SEC-001/verify.py"]
       cwd: "."
       asserts: 48
       timeout_s: 300
       blocking: true
       owner: REQ-EXT-SEC-001
       added: 2026-09-29
-      note: "security baseline. BASE falls back to the literal E:/qt/xiangmu when SEC001_BASE is unset -- see FINDING-GATE-3. D5-adapted IN PLACE on 2026-10-03: its four storage-model assertions (K1c/K1f/K1i-or-K2a/K2b) now read the DB fact layer instead of the filesystem, so this file is NO LONGER byte-identical to its original -- the earlier 'original stays byte-identical' position is retired. It gained a mysql CLI dependency (SEC001_MYSQL / SEC001_DB overridable) and still does not self-start the server. Protocol and security assertions are untouched"
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false, extra: "mysql CLI at SEC001_MYSQL"}
+      note: "security baseline. BASE is derived from __file__ (repo root) instead of a hardcoded literal, so the suite is relocatable; SEC001_BASE still overrides it. D5-adapted IN PLACE on 2026-10-03: its four storage-model assertions (K1c/K1f/K1i-or-K2a/K2b) now read the DB fact layer instead of the filesystem, so this file is NO LONGER byte-identical to its original -- the earlier 'original stays byte-identical' position is retired. It gained a mysql CLI dependency (SEC001_MYSQL / SEC001_DB overridable) and now self-starts dist/Server.exe, while nested unique-login runs reuse the parent PID. Protocol and security assertions are untouched"
+      isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false, extra: "mysql CLI at SEC001_MYSQL"}
     - id: sec001-regression
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-FILE-001/sec001_regression.py"]
       cwd: "."
       asserts: 48
       timeout_s: 300
@@ -64,9 +70,9 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       owner: REQ-EXT-FILE-001
       added: 2026-09-30
       note: "D5-adapted copy of sec001. Historically this was the ONLY adapted copy while the original kept its assertions; since 2026-10-03 the original was adapted in place too, so the two now carry equivalent storage-model assertions and this suite is redundant-but-retained as the self-starting variant"
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+      isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: entry-ops
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/entry_ops_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-FILE-001/entry_ops_e2e.py"]
       cwd: "."
       asserts: 43
       timeout_s: 420
@@ -75,7 +81,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-09-30
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: dedup
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/dedup_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-FILE-001/dedup_e2e.py"]
       cwd: "."
       asserts: 13
       timeout_s: 300
@@ -85,7 +91,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       note: "FINDING-GATE-1 fixed 2026-10-03: PID-only via _harness/server_ctl.py"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: cross-tree
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-001/cross_tree_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-FILE-001/cross_tree_e2e.py"]
       cwd: "."
       asserts: 41
       timeout_s: 420
@@ -95,7 +101,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       note: "spawns a second tree under build/xtree-file001 with a junction to the shared filesys and the shared mydb -- it is the reason cross-tree idempotency is checkable at all"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: fastupload
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-FILE-002/fastupload_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-FILE-002/fastupload_e2e.py"]
       cwd: "."
       asserts: 46
       timeout_s: 300
@@ -104,16 +110,17 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-10-01
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: group-002
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-002/verify.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-GROUP-002/verify.py"]
       cwd: "."
-      asserts: 15
+      asserts: 38
       timeout_s: 300
       blocking: true
       owner: REQ-EXT-GROUP-002
       added: 2026-10-01
-      isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+      note: "2026-10-11 FINDING-GATE-2 收口：本套件原先要求外部先起 dist/Server.exe，在 enforced 门禁下前面的套件会清掉自己的进程，必然 ConnectionRefused；现改为自管生命周期（server_ctl，按 PID）。同时修 ROOT（parents[2]→parents[3]）、filesys 改用 dist/filesys。声明数原写 15，是套件从未跑过 setup 的残留值；实跑为 38。p7_slow_conn_dropped 需读服务端控制台日志，为此 Server.pro 加 CONFIG += console（GUI 子系统无 stdout，Qt 日志会走 OutputDebugString），并由 server_ctl 在传 log_path 时置 QT_ASSUME_STDERR_HAS_CONSOLE=1；两者缺一则日志捕获为 0 字节。已 38/38 通过"
+      isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: groupfile
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-003/groupfile_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-GROUP-003/groupfile_e2e.py"]
       cwd: "."
       asserts: 45
       timeout_s: 300
@@ -122,7 +129,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-10-01
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: group004
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-GROUP-004/verify.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-GROUP-004/verify.py"]
       cwd: "."
       asserts: 23
       timeout_s: 300
@@ -132,7 +139,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       note: "自管服务端生命周期（_harness/server_ctl.py）。23 条 = 13 条客户端游标状态机 + 10 条服务端已读契约。其中 13 条由 cursor_probe.cpp 直接编译产品头文件 Client/groupchatstate.h 得出：编译失败时按固定编号全部记 FAIL（断言总数不漂移）。探针需要项目工具链 g++（C:/Qt/Tools/mingw730_64/bin），不需要 Qt5Core 链接与运行期 Qt DLL"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: sec002
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SEC-002/verify.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-SEC-002/verify.py"]
       cwd: "."
       asserts: 14
       timeout_s: 300
@@ -142,7 +149,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       note: "rename(27)/move(38) 声明字段移交服务端确认的验收面：谎报类型/同名幂等/物理占用/派生名错位/../ 逃逸/缺分隔符。自管生命周期；清场仅触及 sec2a 与 filesys/escape.txt"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: unique-login
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-SESSION-001/unique_login_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-SESSION-001/unique_login_e2e.py"]
       cwd: "."
       asserts: 16
       timeout_s: 300
@@ -151,7 +158,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-09-30
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: parallel-transfer
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-001/parallel_e2e.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-TRANSFER-001/parallel_e2e.py"]
       cwd: "."
       asserts: 54
       timeout_s: 600
@@ -161,7 +168,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       note: "needs a debug-capable Server.exe: the N-1 crash was only reproducible with symbols and gdb"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: transfer002
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-002/verify.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-TRANSFER-002/verify.py"]
       cwd: "."
       asserts: 26
       timeout_s: 600
@@ -171,7 +178,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       note: "下载暂停/取消/断点续传（design §6 F7）：静态 4（S-01..03 冻结面逐字一致+落位；S-04 finishTask 下载分支摘除 id 映射＝FINDING-AUDIT-1 回归钉）+ 动态 19（T2-01..14 含 a/b 子断言）+ 环境锚点 3。自管服务端生命周期；用户 e2etx2，开跑前清本用户 DB 行与共享 .staging；GUI 8 项人工面见 design §6.3（NEEDS-HUMAN）"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: transfer003
-      cmd: ["py", "-3.13", "project-docs/evidence/REQ-EXT-TRANSFER-003/verify.py"]
+      cmd: ["py", "project-docs/evidence/REQ-EXT-TRANSFER-003/verify.py"]
       cwd: "."
       asserts: 59
       timeout_s: 600

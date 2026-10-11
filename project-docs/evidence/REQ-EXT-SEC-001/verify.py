@@ -1,5 +1,5 @@
-# REQ-EXT-SEC-001 端到端负向/回归 harness（仅会话使用，不入库）
-# 前置：Server.exe 已在 127.0.0.1:5000 运行，CWD=Server/
+# REQ-EXT-SEC-001 端到端负向/回归 harness（自管理 Server 生命周期）
+# 默认启动 <repo>/dist/Server.exe，cwd=dist，并只按自己启动的 PID 清理。
 #
 # ★ D5 适配（2026-10-03 完成）—— 四条断言已就地适配，与 sec001_regression.py 逐字等价：
 #     K1c: 物理落盘 -> 条目 active + 对象 sha256/size 一致 + 用户树确认无物理写
@@ -13,17 +13,22 @@
 #   mysql CLI 的依赖（MYSQL/DBQ/sql()，与副本同一套）。这是必要的—— D5 之后"落地"根本
 #   不再表现为文件系统事件，协议层无法观测它，只能问数据库。
 #
-# FINDING-GATE-2 补充：本harness 唯一不自启动 Server（历史上靠"前置：已运行，CWD=Server/"），
-# 所以它的**检查路径必须与服务器的实际 cwd 一致**。它通过 PDU 把 "./filesys/..." 字面量发给
-# 服务器，服务器按自己的 cwd 解析落地位置；而本文件用 SBX 去检查落地结果。若两者 cwd 不同
-# （例如统一改用部署形态 dist/），文件会落在 dist/filesys 而本文件仍去 Server/filesys 找，
-# 于是每一条落地断言都误报 FAIL—— 表现为 "L1b MKDIR ret=False" 这类看似产品缺陷的结果。
-# 因此 SBX 改为可由环境变量指定，默认仍是历史的 Server/filesys。
-import hashlib, os, socket, struct, subprocess, sys, time
+# FINDING-GATE-2：原 harness 依赖外部预启动 Server，导致 test_gate 无法独立执行。
+# 服务器按 cwd 解析 "./filesys/..."，所以检查沙箱必须和服务端 cwd 同步为 dist/filesys。
+# SEC001_REUSE_SERVER=1 仅供 unique_login_e2e.py 嵌套调用时复用其父套件的服务进程。
+import atexit, hashlib, os, socket, struct, subprocess, sys, time
 
-BASE = os.environ.get("SEC001_BASE", r"E:/qt/xiangmu")
-SBX = os.environ.get("SEC001_SBX", os.path.join(BASE, "Server", "filesys"))
+BASE = os.environ.get(
+    "SEC001_BASE",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+DIST = os.path.join(BASE, "dist")
+EXE = os.path.join(DIST, "Server.exe")
+SBX = os.environ.get("SEC001_SBX", os.path.join(DIST, "filesys"))
 HOST, PORT = "127.0.0.1", 5000
+REUSE_SERVER = os.environ.get("SEC001_REUSE_SERVER") == "1"
+sys.path.insert(0, os.path.join(BASE, "project-docs", "evidence", "_harness"))
+import server_ctl
+_SRV = server_ctl.ServerCtl(EXE, DIST, HOST, PORT)
 
 # D5 适配引入的 DB 查询通道（与 sec001_regression.py 同一套，SEC001_DB 可覆盖）。
 # 仅四条落地断言用它；其余断言仍纯协议层。
@@ -62,6 +67,17 @@ def f32(s):
 def pdu(t, msg=b"", dat=b""):
     dat = dat[:64].ljust(64, b"\0")
     return struct.pack("<III", HDR + len(msg), len(msg), t) + dat + msg
+
+
+if REUSE_SERVER:
+    if not server_ctl.port_busy(HOST, PORT):
+        print("FATAL: SEC001_REUSE_SERVER=1 but no parent Server is listening")
+        sys.exit(2)
+else:
+    if not _SRV.start():
+        print(f"FATAL: {_SRV.last_error}")
+        sys.exit(2)
+    atexit.register(_SRV.stop)
 
 def creds(name, pwd=PWD):
     return f32(name) + hashlib.md5(pwd.encode()).hexdigest().encode()

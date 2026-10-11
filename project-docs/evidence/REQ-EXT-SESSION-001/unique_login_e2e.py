@@ -1,7 +1,7 @@
 # REQ-EXT-SESSION-001 唯一登录 e2e harness（开发段自证，E1-E7）
 # 自管理 Server.exe 生命周期；DB 断言走 mysql CLI（仿 FILE-001 entry_ops_e2e.py 模式，无新依赖）。
 # 运行：仓库根目录  py -3.13 project-docs/evidence/REQ-EXT-SESSION-001/unique_login_e2e.py
-import hashlib, os, socket, struct, subprocess, sys, threading, time
+import atexit, hashlib, os, socket, struct, subprocess, sys, threading, time
 
 HOST, PORT = "127.0.0.1", 5000
 HDR = 76
@@ -83,6 +83,8 @@ def start_server():
 
 def stop_server():
     _SRV.stop()
+
+atexit.register(stop_server)
 
 results = []
 def check(sid, desc, cond, detail):
@@ -193,7 +195,11 @@ check("E3d", "较低版本连接已失效（EOF 或后续被切断）", cl.eof o
 cw.close(); cl.close()
 
 # ---------- E7 回归：SEC-001 全量 verify.py + protocol.h 零命中 ----------
-env = dict(os.environ); env["SEC001_BASE"] = os.path.abspath(".")
+# SEC-001 独立作为 test_gate 套件时会自启动；这里复用本套件已启动的同一 PID。
+env = dict(os.environ)
+env["SEC001_BASE"] = os.path.abspath(".")
+env["SEC001_SBX"] = os.path.join(env["SEC001_BASE"], "dist", "filesys")
+env["SEC001_REUSE_SERVER"] = "1"
 r = subprocess.run([sys.executable, os.path.join("project-docs", "evidence", "REQ-EXT-SEC-001", "verify.py")],
                    capture_output=True, text=True, timeout=600, env=env)
 fails = [l for l in (r.stdout or "").splitlines() if l.startswith("[FAIL]")]
