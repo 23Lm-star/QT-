@@ -156,6 +156,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       blocking: true
       owner: REQ-EXT-SESSION-001
       added: 2026-09-30
+      note: "E7b 的语义是**分支范围**，不是主干护栏：unique_login_e2e.py:210-213 用三点 `git diff master...HEAD -- Server/protocol.h Client/protocol.h project-docs/init_test_data.sql`，断言本**分支**没碰冻结协议头（依据：REQ-EXT-SESSION-001/manifest.txt「frozen paths: branch diff protocol.h zero-hit (E7b + audit PASS)」、independent-test-fc1b6c7.md、audit-fc1b6c7-REJECT.md 三处同一口径）。因此合并进主干后三点 diff 恒空、E7b 恒真 —— 这是它的语义边界，不是缺口，不要去『修』它。主干侧的冻结面护栏由另外两处承担：audit.ps1 的 sensitive_paths 检查 + transfer003 的 S-03a/b（基准已钉到改动引入前的提交，主干实测 59/59 通过）"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
     - id: parallel-transfer
       cmd: ["py", "project-docs/evidence/REQ-EXT-TRANSFER-001/parallel_e2e.py"]
