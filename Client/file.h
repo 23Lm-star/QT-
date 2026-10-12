@@ -28,6 +28,8 @@ public:
     void flushfile();//刷新当前文件->引导刷新
     void updateCurrfile(QList<FileInfo*>qFileinfolist);//利用文件信息列表刷新文件信息
     void flushCurrLE();
+    //按当前登录身份重算用户根与当前路径（每次登录成功必须调用；未登录时空转）
+    void resetUserPath();
     void onGetShareLink();
     void handleListDirRespond(PDU *pdu);//LISTDIR_RESPOND 转发给目录选择弹窗
     explicit File(QWidget *parent = nullptr);

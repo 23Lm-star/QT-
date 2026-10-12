@@ -68,13 +68,7 @@ File::File(QWidget *parent) :
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
-    m_strUserPath=QString("%1/%2").arg(Client::getinstance().m_strRootPath).arg(Client::getinstance().m_LoginName);
-    m_strCurPath=m_strUserPath;
-    ui->currPath_LE->setText(m_strCurPath);
-    //创建用户目录和资源目录,若是不存在会创建，存在就不创建了
-    QDir dir;
-    qCDebug(lcCli)<<"创建用户目录:"<<m_strUserPath.section('/', -1)<<" "<<dir.mkdir(m_strUserPath)<<endl;
-    qCDebug(lcCli)<<"创建用户今日目录:"<<QDate::currentDate().toString("yyyy-MM")<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
+    resetUserPath();
     m_shareFile=new ShareFile;
 
     // REQ-EXT-TRANSFER-001：支持多选（下载可一次并发多个）
@@ -180,6 +174,25 @@ File::~File()
     delete m_shareFile;
     delete ui;
 
+}
+
+// 用户根与当前路径不能在构造时定格：重连会把 Index/File 的构造提前到登录之前
+// （Client::forceReLogin 为了隐藏主界面先取单例），那时 m_LoginName 还是空的，
+// 于是 m_strUserPath 退化成 "<root>/"，文件页停在存储根目录、后续增删改全落在错的目录。
+// 因此每次登录成功都按当时的登录身份重算一次；未登录（空名）直接空转，不创建任何目录。
+void File::resetUserPath()
+{
+    const Client& cli=Client::getinstance();
+    if(cli.m_LoginName.isEmpty()){
+        return;
+    }
+    m_strUserPath=QString("%1/%2").arg(cli.m_strRootPath).arg(cli.m_LoginName);
+    m_strCurPath=m_strUserPath;
+    ui->currPath_LE->setText(m_strCurPath);
+    //创建用户目录和资源目录,若是不存在会创建，存在就不创建了
+    QDir dir;
+    qCDebug(lcCli)<<"创建用户目录:"<<m_strUserPath.section('/', -1)<<" "<<dir.mkdir(m_strUserPath)<<endl;
+    qCDebug(lcCli)<<"创建用户今日目录:"<<QDate::currentDate().toString("yyyy-MM")<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
 }
 
 void File::flushfile()

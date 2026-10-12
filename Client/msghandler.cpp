@@ -87,6 +87,9 @@ QString MsgHandler::handllogin()
             qCDebug(lcCli)<<"登录账号成功，用户名为:"<<loginName;
             // REQ-EXT-GROUP-004：新会话丢弃上一会话的群读状态（换账号登录不得继承旧游标）
             Client::getinstance().resetGroupStates();
+            // 文件页的用户根按本次登录身份重算——重连路径下 File 可能先于登录被构造，
+            // 那次构造拿到的空登录名会让文件页停在存储根目录
+            Index::getinstance().getFile()->resetUserPath();
             Index::getinstance().show();
             Client::getinstance().hide();
             // 主界面完全构造并显示后，在事件循环下一轮触发初始刷新（仅好友列表）
