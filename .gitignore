@@ -72,13 +72,18 @@ Desktop.ini
 # decision on 2026-10-12: they are workflow scripts, not the thing being shipped.
 /pipeline/
 
-# ...but two things under project-docs/ are CODE, not process records, and stay tracked:
+# ...but three things under project-docs/ are CODE, not process records, and stay tracked:
 #   - project-docs/project-manifest.yaml  the process identity: frozen_paths AND the test_gate
 #                                        suite registry. Losing it silently disarms every gate.
 #   - project-docs/evidence/**/*.py        the regression harnesses themselves (10 suites /
 #                                        369 assertions). They are the project's only test
 #                                        code; untracked they cannot be reviewed, reverted,
 #                                        shared, or reproduced on another machine.
+#   - project-docs/init_test_data.sql      the base DDL + seed. WITHOUT IT THE PROJECT CANNOT RUN:
+#                                        user_info / login_record / friend exist nowhere else (no
+#                                        CREATE TABLE in any Server/*.cpp), and the harness
+#                                        unique_login_e2e.py reads this exact path. It is the
+#                                        project's "body", not a record of work done on it.
 #
 # Shape matters twice over here, and both mistakes were made and measured on this repo:
 #  1. `/project-docs/*`, never a bare `/project-docs/`. Git refuses to descend into an excluded
@@ -91,6 +96,7 @@ Desktop.ini
 # Net effect: harness sources tracked, every log / report / json under evidence still local.
 /project-docs/*
 !/project-docs/project-manifest.yaml
+!/project-docs/init_test_data.sql
 !/project-docs/evidence/
 /project-docs/evidence/*
 !/project-docs/evidence/*/
