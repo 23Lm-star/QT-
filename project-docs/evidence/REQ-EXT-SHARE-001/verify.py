@@ -189,6 +189,12 @@ def hash_of(link):
         token_of(link).encode()).hexdigest()
 
 
+def landed(json_txt):
+    """55 响应 caMsg 是 {"saved_path":"分享链接/xxx"}（服务端复制到请求者目录后的相对路径）"""
+    m = re.search(r'"saved_path":"([^"]*)"', json_txt or "")
+    return FS / OWNER / m.group(1) if m else None
+
+
 def row():
     return q1("SELECT token_hash, expire_time, revoked FROM share_link "
               "WHERE owner_name=%s AND relative_path=%s ORDER BY created_at DESC, id DESC LIMIT 1",
@@ -207,9 +213,9 @@ def block(path):
 
 bc = block(REPO / "Client" / "protocol.h")
 bs = block(REPO / "Server" / "protocol.h")
-check("S1-same-block", "两端 protocol.h 的 REQ-EXT-SHARE-001 常量块逐字节一致",
+check("S1-same-block :: 两端 protocol.h 的 REQ-EXT-SHARE-001 常量块逐字节一致",
       bc is not None and bc == bs, "len=%d" % len(bc or ""))
-check("S2-consts", "块内含状态字偏移/三态常量/两个动作字面量/续期缺省",
+check("S2-consts :: 块内含状态字偏移/三态常量/两个动作字面量/续期缺省",
       all(k in (bc or "") for k in ("PUBLINK_STATE_OFFSET = 8", "PUBLINK_STATE_EXPIRED",
                                     "PUBLINK_STATE_REVOKED", '"new"', '"renew"',
                                     "PUBLINK_RENEW_DEFAULT_SECONDS")))
@@ -248,10 +254,11 @@ try:
 
     e1, s1, link1q = query(c, REL)
     check("A4 查询 exists=true/state=VALID/返回 hash 形式链接",
-          e1 is True and s1 == ST_VALID and link1q == row()[0], "state=%s" % s1)
+          e1 is True and s1 == ST_VALID and token_of(link1q) == row()[0], "state=%s" % s1)
 
     ok, saved = resolve(c, tok1)
-    check("A5 有效链接可解析落地", ok is True and (FS / OWNER / saved).is_file(), "ok=%s %s" % (ok, saved))
+    f = landed(saved)
+    check("A5 有效链接可解析落地", ok is True and f is not None and f.is_file(), "ok=%s %s" % (ok, saved))
 
     exec_sql("UPDATE share_link SET expire_time=%s WHERE owner_name=%s AND relative_path=%s",
              ((datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"), OWNER, REL))
@@ -297,11 +304,12 @@ try:
     ok, _ = resolve(c, old_hash)
     check("C4 旧链接立即失效（解析被拒）", ok is False, "ok=%s" % ok)
     ok, saved = resolve(c, new_tok)
-    check("C5 新链接可解析落地", ok is True and (FS / OWNER / saved).is_file(), "ok=%s %s" % (ok, saved))
+    f = landed(saved)
+    check("C5 新链接可解析落地", ok is True and f is not None and f.is_file(), "ok=%s %s" % (ok, saved))
 
     e4, s4, link4 = query(c, REL)
     check("C6 重新生成后查询回到 VALID 且指向新 hash",
-          e4 is True and s4 == ST_VALID and link4 == row()[0], "state=%s" % s4)
+          e4 is True and s4 == ST_VALID and token_of(link4) == row()[0], "state=%s" % s4)
 
     # ---------------- 向后兼容面 ----------------
     print("=== 向后兼容 ===")

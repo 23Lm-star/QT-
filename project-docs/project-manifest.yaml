@@ -5,7 +5,7 @@ trunk: master            # remote set-head done 2026-09-27; origin/main is dead,
 bootstrap:
   gitignore: done        # 2026-09-13 session + closeout commit e700d22
   trunk_unified: done
-  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and GREEN at 4e76269 (14/14, 514 assertions)
+  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and GREEN at 4e76269 (14/14, 514 assertions); +share001 (15/15, 539) added 2026-10-12
   sensitive_paths: active # 敏感路径边界：命中产生审查 finding，不单独决定 LARGE
 sensitive_paths:          # 敏感路径（项目边界）：命中由 AI 生成影响分析和审批卡
   - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
@@ -36,7 +36,8 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
   owner: user
   date: 2026-10-09
   reason: >
-    Fourteen socket harnesses (514 declared assertions) carry this project's regression. The
+    Fifteen socket harnesses (539 declared assertions) carry this project's regression
+    (share001 added 2026-10-12 with REQ-EXT-SHARE-001). The
     FINDING-GATE-2 lifecycle blocker is closed: every suite that needs a server starts
     dist/Server.exe itself and cleans only its own PID; unique-login reuses the parent service for
     its nested SEC-001 run. The gate is enforced and blocking on any missing suite, assertion-count
@@ -188,6 +189,16 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
       added: 2026-10-08
       note: "上传会话连续性（进度落库节流/会话行复用/共享暂存句柄）与新分片吞吐。59 条 = 20 条静态契约（冻结面 §9 逐字、跨端分片上限、G7 接线与防复活守卫、G7 修复面 R-1/D-a/D-b 六条）+ 37 条动态 + E0 登录/目录 2 条。自管生命周期；运行前自建 dist/filesys/<U>/tx3 并清空 .staging（暂存令牌确定性派生，跨轮残留会歪曲续传起点）。断言数只增不减，改套件须同步本行"
       isolation: {port: 5000, db: mydb, filesys: "./Server/filesys", kill_policy: pid_only, parallel_safe: false}
+    - id: share001
+      cmd: ["py", "project-docs/evidence/REQ-EXT-SHARE-001/verify.py"]
+      cwd: "."
+      asserts: 25
+      timeout_s: 300
+      blocking: true
+      owner: REQ-EXT-SHARE-001
+      added: 2026-10-12
+      note: "外链分享生命周期（重新生成/续期/状态字）。25 条 = 静态 2（两端 protocol.h 的 REQ-EXT-SHARE-001 常量块逐字节一致 + 块内常量形状）+ 动态 23（旧语义与查询三态 A1-A8、续期 B1-B6、重新生成 C1-C6、向后兼容 D1-D2 + 夹具 A0）。自管服务端生命周期（_harness/server_ctl.py，按 PID）。清场只触及 sh1user/sh1other 两行与其 dist/filesys 目录。断言数只增不减，改套件须同步本行"
+      isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false}
 directory_contract:      # mirrors .gitignore
   source: Client/, Server/
   artifacts: build*/     # shadow builds go here; never in source dirs
