@@ -30,6 +30,10 @@ public:
     void flushCurrLE();
     void onGetShareLink();
     void handleListDirRespond(PDU *pdu);//LISTDIR_RESPOND 转发给目录选择弹窗
+    // REQ-EXT-SHARE-001：外链已过期/已撤销时的处置选择（重新生成 / 续期）
+    void promptShareLinkRecovery(quint32 state, const QString &note = QString());
+    // REQ-EXT-SHARE-001：发 CREATE_PUBLINK；action 非空则在路径 NUL 之后附动作区
+    void sendCreatePublishLink(const QString &relativePath, const QString &action, int seconds);
     explicit File(QWidget *parent = nullptr);
     ~File();
 protected:
@@ -89,6 +93,7 @@ private:
     void rebuildFileList();//集中执行 QListWidget clear() + addItem()
     void scheduleUiRefresh();//合并排队：最多排入一个 UI 刷新回调
     QString selectedFileRelativePath(QListWidgetItem *item);//计算选中文件相对用户根目录的路径
+    QString relativePathForName(const QString &fileName) const;//按文件名算相对用户根目录的路径
     FolderSelectDialog* m_moveDlg = nullptr;               // 移动文件时的目标目录选择弹窗
     QPushButton* m_tasksBtn = nullptr;                     // 传输任务列表入口
     QPushButton* m_addUploadBtn = nullptr;                 // 添加待传（购物车上传入口）

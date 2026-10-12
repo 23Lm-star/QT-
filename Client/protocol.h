@@ -282,4 +282,17 @@ static const quint32 MAX_PARALLEL_DOWNLOADS = 3;          // 单连接并发下�
 // ===== REQ-EXT-TRANSFER-002：下载续传起点（两端逐字节一致，仅追加；0 = 从头） =====
 static const int DOWNLOAD_RESUME_OFFSET = 32;             // u64；40/105 请求：客户端声明的续传起点
 static const int DOWNLOAD_ACCEPTED_OFFSET = 24;           // u64；41/106 响应：服务端实际采纳的起点
+
+// ===== REQ-EXT-SHARE-001：外链分享生命周期（两端逐字节一致，仅追加） =====
+// 53/57 响应 caData[PUBLINK_STATE_OFFSET]：u32 状态字。旧服务端不写此区间、
+// mkPDU 全零初始化 → 旧客户端读到 0 = 有效，语义与旧版一致。
+static const int PUBLINK_STATE_OFFSET = 8;
+static const quint32 PUBLINK_STATE_VALID = 0;
+static const quint32 PUBLINK_STATE_EXPIRED = 1;
+static const quint32 PUBLINK_STATE_REVOKED = 2;
+// 52 请求 caMsg 的附加动作区：<relativePath>\0[<action>\0[<seconds>]]。action 缺省 = 旧语义
+// （有记录则复用、无则新建）。旧服务端用 fixedString 读到首个 NUL 即止 → 附加区被忽略，向后兼容。
+static const char PUBLINK_ACTION_NEW[] = "new";       // 作废旧行并重新生成
+static const char PUBLINK_ACTION_RENEW[] = "renew";   // 续期：延长既有行有效期
+static const int PUBLINK_RENEW_DEFAULT_SECONDS = 30 * 24 * 3600;   // 续期缺省 30 天
 #endif // PROTOCOL_H

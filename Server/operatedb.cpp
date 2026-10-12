@@ -648,13 +648,74 @@ QString OperateDB::getShareLinkByPath(const QString &owner, const QString &path)
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return QString();
     QSqlQuery q(connection.database());
-    q.prepare("SELECT token_hash FROM share_link WHERE owner_name = ? AND relative_path = ? ORDER BY created_at DESC LIMIT 1");
+    // created_at 是秒精度，同秒两行时排序不稳定；以 id 兜底，保证"同一逻辑行"在
+    // getShareLinkByPath / getShareLinkInfoByPath 两个入口上取值一致
+    q.prepare("SELECT token_hash FROM share_link WHERE owner_name = ? AND relative_path = ? "
+              "ORDER BY created_at DESC, id DESC LIMIT 1");
     q.addBindValue(owner);
     q.addBindValue(path);
     if(q.exec() && q.next()){
         return q.value(0).toString();
     }
     return QString();
+}
+
+// REQ-EXT-SHARE-001：按 owner+path 取最新一行的完整信息（getShareLinkByPath 只回 hash，
+// 判断"有效/过期/撤销"还需要 expire_time 与 revoked）
+bool OperateDB::getShareLinkInfoByPath(const QString &owner, const QString &path, ShareLinkInfo &outInfo)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("SELECT token_hash, expire_time, revoked FROM share_link "
+              "WHERE owner_name = ? AND relative_path = ? ORDER BY created_at DESC, id DESC LIMIT 1");
+    q.addBindValue(owner);
+    q.addBindValue(path);
+    if(q.exec() && q.next()){
+        outInfo.ownerName = owner;
+        outInfo.relativePath = path;
+        outInfo.tokenHash = q.value(0).toString();
+        outInfo.expireTime = q.value(1).toDateTime();
+        outInfo.revoked = q.value(2).toInt() != 0;
+        return true;
+    }
+    return false;
+}
+
+// REQ-EXT-SHARE-001：续期只延长 expire_time，token 与相对路径不动；
+// 已撤销的行（revoked=1）不参与，续期不能让一条被作废的链接复活
+bool OperateDB::renewShareLink(const QString &owner, const QString &path, const QDateTime &newExpire)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE share_link SET expire_time = ? WHERE owner_name = ? AND relative_path = ? AND revoked = 0");
+    q.addBindValue(newExpire.toString("yyyy-MM-dd HH:mm:ss"));
+    q.addBindValue(owner);
+    q.addBindValue(path);
+    if(!q.exec()){
+        qCWarning(lcDb) << "[renewShareLink] 续期失败:" << q.lastError().text()
+                        << " owner=" << owner << " path=" << path;
+        return false;
+    }
+    return q.numRowsAffected() > 0;
+}
+
+// REQ-EXT-SHARE-001：重新生成前作废旧行（精确路径，不含 path/ 子路径）
+bool OperateDB::removeShareLinkExact(const QString &owner, const QString &path)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("DELETE FROM share_link WHERE owner_name = ? AND relative_path = ?");
+    q.addBindValue(owner);
+    q.addBindValue(path);
+    if(!q.exec()){
+        qCWarning(lcDb) << "[removeShareLinkExact] 作废旧链接失败:" << q.lastError().text()
+                        << " owner=" << owner << " path=" << path;
+        return false;
+    }
+    return true;
 }
 
 // 跨功能联动：删除文件/目录时，清理对应的分享链接记录

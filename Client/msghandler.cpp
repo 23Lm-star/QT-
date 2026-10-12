@@ -487,12 +487,20 @@ void MsgHandler::handlLogoff()
 void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
     bool exists = false;
     memcpy(&exists, pdu->caData, sizeof(exists));
-    
+    quint32 state = PUBLINK_STATE_VALID;
+    memcpy(&state, pdu->caData + PUBLINK_STATE_OFFSET, sizeof(state));
+
     if (!exists) {
         QMessageBox::information(&Index::getinstance(), "提示", "暂无分享链接");
         return;
     }
-    
+    // REQ-EXT-SHARE-001：链接已过期/已撤销时给出「重新生成 / 续期」的选择，
+    // 不再把一条已知失效的链接当有效链接展示给主人
+    if (state != PUBLINK_STATE_VALID) {
+        Index::getinstance().getFile()->promptShareLinkRecovery(state);
+        return;
+    }
+
     QString link = QString::fromUtf8(pdu->caMsg);
     // 需要根据当前上下文打开对话框
     // 假设 Index 有当前选中的文件路径
@@ -506,10 +514,17 @@ void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
 void MsgHandler::handleCreatePublishLink(PDU* pdu) {
     bool ok = false;
     memcpy(&ok, pdu->caData, sizeof(ok));
+    quint32 state = PUBLINK_STATE_VALID;
+    memcpy(&state, pdu->caData + PUBLINK_STATE_OFFSET, sizeof(state));
     QString link = QString::fromUtf8(pdu->caMsg);
-    if (ok) {
+    if (ok && state == PUBLINK_STATE_VALID) {
         QMessageBox::information(&Index::getinstance(), "提示",
             QString("生成成功！\n分享链接：%1").arg(link));
+    } else if (state != PUBLINK_STATE_VALID) {
+        // 旧语义复用了一条已失效的链接，或续期被拒（例如链接已被撤销）→ 回到选择框，
+        // 已撤销时「续期」按钮不可用，只能改走「重新生成链接」
+        Index::getinstance().getFile()->promptShareLinkRecovery(
+            state, QStringLiteral("（本次操作没有拿到可用链接）"));
     } else {
         QMessageBox::information(&Index::getinstance(), "提示", "生成分享链接失败");
     }

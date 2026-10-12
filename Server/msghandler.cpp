@@ -1912,30 +1912,99 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
     QString ownerName = loginName;
     qCDebug(lcFs) << "[createPublishLink] 收到生成请求: owner=" << ownerName << " relativePath=" << relativePath;
 
-    QDateTime expire = ShareLinkService::defaultExpireTime();
+    // REQ-EXT-SHARE-001：解析 caMsg 附加动作区（首个 NUL 之后）。旧客户端不带该区 → action 为空，
+    // 走"有记录复用、无则新建"的旧语义；旧服务端用 fixedString 读路径即止，附加区被忽略。
+    QString action;
+    int renewSeconds = 0;
+    {
+        const uint cap = pdu->uiMsgLen;
+        uint nul = 0;
+        while(nul < cap && pdu->caMsg[nul] != '\0'){ ++nul; }
+        if(nul + 1 < cap){
+            const QByteArray raw(pdu->caMsg + nul + 1, static_cast<int>(cap - nul - 1));
+            const int sep = raw.indexOf('\0');
+            action = QString::fromUtf8(sep >= 0 ? raw.left(sep) : raw).trimmed();
+            if(sep >= 0 && sep + 1 < raw.size()){
+                bool numOk = false;
+                renewSeconds = QString::fromUtf8(raw.mid(sep + 1)).trimmed().toInt(&numOk);
+                if(!numOk) renewSeconds = 0;
+            }
+        }
+    }
+    if(renewSeconds <= 0){
+        renewSeconds = PUBLINK_RENEW_DEFAULT_SECONDS;
+    }
 
-    // F-1 修复：同一 owner+path 已有链接时，原实现仍返回"新生成但未入库"的 token，
-    // 该链接永远无法解析（库里只有旧记录的 hash）。原始 token 不可反推，但
-    // resolvePublishLink 支持 64 位十六进制 hash 直接查库，故去重复用时返回已存 hash 形式链接。
+    OperateDB::ShareLinkInfo existing;
+    const bool hasExisting = OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, existing);
+    quint32 state = PUBLINK_STATE_VALID;
+    if(hasExisting){
+        const bool expired = QDateTime::currentDateTime() >= existing.expireTime;
+        state = existing.revoked ? PUBLINK_STATE_REVOKED
+                                 : (expired ? PUBLINK_STATE_EXPIRED : PUBLINK_STATE_VALID);
+    }
+
     QString linkValue;
     bool ok = false;
-    const QString existingHash = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
-    if(!existingHash.isEmpty()){
-        linkValue = existingHash;
+    if(action == PUBLINK_ACTION_NEW){
+        // 重新生成：先作废旧行（旧链接立即失效），再建新 token——"重新获取"要能换掉泄露出去的旧链接
+        if(hasExisting && !OperateDB::instance().removeShareLinkExact(ownerName, relativePath)){
+            qCWarning(lcFs) << "[createPublishLink] 作废旧链接失败，放弃重新生成 owner=" << ownerName;
+        } else {
+            const QString token = ShareLinkService::generateToken();
+            ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName,
+                                                       relativePath, ShareLinkService::defaultExpireTime());
+            if(ok){
+                linkValue = token;
+                state = PUBLINK_STATE_VALID;
+            }
+        }
+    } else if(action == PUBLINK_ACTION_RENEW){
+        if(!hasExisting){
+            // 没有记录可续期 → 等同首次创建，按请求的时长生效
+            const QString token = ShareLinkService::generateToken();
+            ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName,
+                                                       relativePath,
+                                                       QDateTime::currentDateTime().addSecs(renewSeconds));
+            if(ok){
+                linkValue = token;
+                state = PUBLINK_STATE_VALID;
+            }
+        } else if(existing.revoked){
+            qCWarning(lcFs) << "[createPublishLink] 拒绝续期：链接已撤销 owner=" << ownerName;
+        } else {
+            ok = OperateDB::instance().renewShareLink(ownerName, relativePath,
+                                                      QDateTime::currentDateTime().addSecs(renewSeconds));
+            if(ok){
+                linkValue = existing.tokenHash;   // 续期不改 token，链接文本不变、只是重新可用
+                state = PUBLINK_STATE_VALID;
+            }
+        }
+    } else if(hasExisting){
+        // F-1 修复：同一 owner+path 已有链接时，原实现仍返回"新生成但未入库"的 token，
+        // 该链接永远无法解析（库里只有旧记录的 hash）。原始 token 不可反推，但
+        // resolvePublishLink 支持 64 位十六进制 hash 直接查库，故复用时返回已存 hash 形式链接。
+        linkValue = existing.tokenHash;
         ok = true;
         qCDebug(lcFs) << "[createPublishLink] 复用已有链接，返回 hash 形式链接（可直接解析）owner=" << ownerName;
     } else {
         const QString token = ShareLinkService::generateToken();
-        ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName, relativePath, expire);
-        linkValue = token;
-        if(!ok){
+        ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName,
+                                                   relativePath, ShareLinkService::defaultExpireTime());
+        if(ok){
+            linkValue = token;
+        } else {
             qCWarning(lcFs) << "[createPublishLink] 写入数据库失败，生成分享链接未完成";
         }
     }
 
+    qCDebug(lcFs) << "[createPublishLink] action=" << action << " ok=" << ok << " state=" << state;
     PDU* respdu = mkPDU(128);
     respdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND;
     memcpy(respdu->caData, &ok, sizeof(ok));
+    // 状态字回真实状态而不是"ok 就当有效"：旧语义复用的可能正是一条过期链接，
+    // 客户端要靠这一格才知道拿到的是死链、该给重新生成/续期的选择
+    memcpy(respdu->caData + PUBLINK_STATE_OFFSET, &state, sizeof(state));
     if(ok) {
         QString link = QString("cloud-disk://share/%1").arg(linkValue);
         QByteArray linkBytes = link.toUtf8();
@@ -2050,11 +2119,23 @@ PDU* MsgHandler::queryFilePublishLink() {
     }
     
     QString token = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
-    
+
     PDU* respdu = mkPDU(128);
     respdu->uiType = ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND;
     bool exists = !token.isEmpty();
     memcpy(respdu->caData, &exists, sizeof(exists));
+    // REQ-EXT-SHARE-001：回带状态字——只有 exists 时旧版客户端看不出链接是否已过期/撤销，
+    // 只能等解析失败才知道；这一格让"获取分享链接"当场给出重新生成/续期的选择
+    quint32 state = PUBLINK_STATE_VALID;
+    if(exists){
+        OperateDB::ShareLinkInfo info;
+        if(OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, info)){
+            const bool expired = QDateTime::currentDateTime() >= info.expireTime;
+            state = info.revoked ? PUBLINK_STATE_REVOKED
+                                 : (expired ? PUBLINK_STATE_EXPIRED : PUBLINK_STATE_VALID);
+        }
+    }
+    memcpy(respdu->caData + PUBLINK_STATE_OFFSET, &state, sizeof(state));
     if (exists) {
         QString link = QString("cloud-disk://share/%1").arg(token);
         QByteArray linkBytes = link.toUtf8();
