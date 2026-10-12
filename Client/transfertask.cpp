@@ -667,6 +667,12 @@ bool TransferManager::beginReceiving(Task& t, const QString& fileName)
     }
     t.savePath = savePath;
     t.displayName = safeName;
+    // 立刻落盘。分片路径原来只在内存里，直到下一次状态变化（暂停/取消/收尾）才写进快照；
+    // 而下载中直接关闭客户端（没有先暂停）不会触发任何一次，快照仍停留在入队时那一版 ——
+    // 那时 savePath 还是空的。于是重启恢复出空 savePath → 起点 0 → beginReceiving → 另起
+    // 一个 (N) 新文件。实测：暂停后关闭能续传，下载中直接断开则不能。路径一旦确定就写，
+    // 这个窗口即消失。（进度不必落盘：恢复时按分片物理大小推导，见 D9。）
+    saveSnapshot();
     return true;
 }
 
