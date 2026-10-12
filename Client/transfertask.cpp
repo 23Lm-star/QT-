@@ -1073,13 +1073,22 @@ void TransferManager::resumeDownload(Task& t)
     t.id = allocId();
     m_idToKey.insert(t.id, t.key);
     qint64 shard = 0;
+    QString shardNotice;
     if (!t.savePath.isEmpty()) {
         const QFileInfo fi(t.savePath);
         if (fi.isFile()) shard = fi.size();
-        else t.savePath.clear();    // 分片缺失 → 起点 0 → 整文件重下（不报错、无损坏件）
+        else {
+            // 分片缺失。这里过去是静默 clear()，于是「用户自己删了分片」（正常）与「分片路径解析
+            // 失效 / 跨月目录变化」（异常）表现完全一样：进度悄悄归零、另起一个新文件，界面上没有
+            // 任何提示——排查时只能看到「又开始从头下载」。现在把结论写成可见的原因（面板第 4 列
+            // 「失败原因」原样显示 failReason），并保留原路径，用来区分是这两类中的哪一类。
+            shardNotice = QStringLiteral("未找到本地分片，改为整文件重下（原分片路径：%1）")
+                              .arg(t.savePath);
+            t.savePath.clear();
+        }
     }
     t.doneBytes = shard;
-    t.failReason.clear();
+    t.failReason = shardNotice;   // 无分片问题时为空串，等于沿用既有「继续即清空旧原因」语义
     t.state = Queued;
     m_downloadQueue.append(t.key);
     saveSnapshot();
