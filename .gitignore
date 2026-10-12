@@ -53,16 +53,24 @@ Desktop.ini
 /.planning/
 /.ui_headers_backup_*/
 
-# AI development workflow (Development OS) — local only, not shipped with the app
+# AI development workflow (Development OS) — the workflow *records* AND the gate scripts stay
+# local: neither is product source. The repo's rule is that only product source and the app
+# itself are pushed. See the pipeline/ note below.
 #
 # NOTE the shape of the project-docs rule. It must be `/project-docs/*` (a wildcard over the
 # DIRECTORY'S CHILDREN), never a bare `/project-docs/`: git refuses to descend into an excluded
 # directory, so with the bare form every negation below it is silently inert and the exceptions
 # cannot possibly take effect. Re-excluding the children individually afterwards is what makes the
 # two carve-outs real.
-/pipeline/
 /AGENTS.md
 /CLAUDE.md
+
+# pipeline/ (build.ps1 / test.ps1 / audit.ps1 / merge.ps1 / state.ps1 / artifacts.ps1 /
+# Invoke-SkillPython.ps1 / ENVIRONMENT.md) is Development OS tooling, not product source. The repo
+# pushes only product source and the app itself, so it stays untracked -- and it is a per-worktree
+# copy by design anyway. A reversal attempted on 2026-10-12 (tracking it) was reverted by user
+# decision on 2026-10-12: they are workflow scripts, not the thing being shipped.
+/pipeline/
 
 # ...but two things under project-docs/ are CODE, not process records, and stay tracked:
 #   - project-docs/project-manifest.yaml  the process identity: frozen_paths AND the test_gate
@@ -138,3 +146,29 @@ __pycache__/
 
 # Codegraph index (local tooling artifact)
 .codegraph/
+
+# Local run artifacts produced by the gate / audit scripts and ad-hoc runs. The
+# build/, dist/ and evidence/ rules above already stop most of these; this catches
+# strays at any path (a gate run started from the repo root drops its log here).
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# Local runtime databases. The server's file store (Server/filesys/) is already
+# ignored above; these cover any sqlite/db file dropped by a local experiment.
+*.db
+*.sqlite
+*.sqlite3
+
+# Evidence products the enumerated extension list above does not name yet. Both shapes were found
+# tracked in this repo (FINDING-GATE-2-lifecycle/.../events.ndjson and
+# TRANSFER-003/.../concurrent-audit-repair.diff.regenerated) -- `*.diff` does not match the latter.
+/project-docs/evidence/**/*.ndjson
+/project-docs/evidence/**/*.regenerated
+
+# Qt Creator / CMake strays not covered by the rules above.
+*.autosave
+.qtc_clangd/
+CMakeLists.txt.user
