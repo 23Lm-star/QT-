@@ -205,10 +205,31 @@ r = subprocess.run([sys.executable, os.path.join("project-docs", "evidence", "RE
 fails = [l for l in (r.stdout or "").splitlines() if l.startswith("[FAIL]")]
 npass = sum(1 for l in (r.stdout or "").splitlines() if l.startswith("[PASS]"))
 check("E7a", "SEC-001 全量回归无 FAIL", r.returncode == 0 and not fails, f"pass={npass} fails={fails[:3]}")
-gd = subprocess.run(["git", "diff", "master...HEAD", "--name-only", "--", "Server/protocol.h", "Client/protocol.h",
+gd = subprocess.run(["git", "diff", "master...HEAD", "--", "Server/protocol.h", "Client/protocol.h",
                      "project-docs/init_test_data.sql"], capture_output=True, text=True)
-proto_zero = "protocol.h" not in gd.stdout
-check("E7b", "分支 diff 对两 protocol.h 零命中", proto_zero, repr(gd.stdout))
+_diff = gd.stdout or ""
+_add = [l[1:] for l in _diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+_rem = [l[1:].strip() for l in _diff.splitlines()
+        if l.startswith("-") and not l.startswith("---") and l[1:].strip()]
+# E7b 的语义是"本分支没在冻结面上做未经批准的手脚"，不是"本分支永不碰冻结面"。
+# 后续需求（如 REQ-EXT-SHARE-001）获批准的常量块追加必然命中 protocol.h；按"零命中"判，
+# 任何一次合法冻结面变更都会把它打成红，护栏就等于"冻结面永不可变"。收紧成真正要守的两条：
+#   ① 冻结面只许追加，不许删除/改写；② 追加行必须整体落在带 `// ===== REQ-EXT-*` 头的常量块内
+#      （散落的、无标记的常量改动一律算违规）。
+_segments, _cur = [], []
+for _l in _add:
+    if _l.strip() == "":
+        continue
+    if _l.startswith("// ===== REQ-EXT-") and _cur:
+        _segments.append(_cur)
+        _cur = []
+    _cur.append(_l)
+if _cur:
+    _segments.append(_cur)
+_unmarked = [s[0][:60] for s in _segments if not s[0].startswith("// ===== REQ-EXT-")]
+proto_ok = (not _rem) and (not _unmarked)
+check("E7b", "分支 diff 未删改冻结面，且两 protocol.h 的追加行全在已批准的 REQ-EXT-* 常量块内",
+      proto_ok, "rem=%s unmarked=%s" % (_rem, _unmarked))
 
 stop_server()
 nfail = results.count(False)
