@@ -5,7 +5,7 @@ trunk: master            # remote set-head done 2026-09-27; origin/main is dead,
 bootstrap:
   gitignore: done        # 2026-09-13 session + closeout commit e700d22
   trunk_unified: done
-  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and GREEN at 4e76269 (14/14, 514 assertions); +share001 (15/15, 539) added 2026-10-12; +relogoff-login (16/16, 552) added 2026-10-13; +reconcile-online (17/17, 563) added 2026-10-13
+  pipeline: active       # build/test/audit/artifact scripts are present; test_gate is enforced and GREEN at 4e76269 (14/14, 514 assertions); +share001 (15/15, 539) added 2026-10-12; +relogoff-login (16/16, 552) added 2026-10-13; +reconcile-online (17/17, 565) added 2026-10-13
   sensitive_paths: active # 敏感路径边界：命中产生审查 finding，不单独决定 LARGE
 sensitive_paths:          # 敏感路径（项目边界）：命中由 AI 生成影响分析和审批卡
   - Client/protocol.h    # PDU 消息协议（ENUM_MSG_TYPE_*、结构布局）
@@ -36,7 +36,7 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
   owner: user
   date: 2026-10-09
   reason: >
-    Seventeen socket harnesses (563 declared assertions) carry this project's regression
+    Seventeen socket harnesses (565 declared assertions) carry this project's regression
     (share001 added 2026-10-12 with REQ-EXT-SHARE-001; relogoff-login added 2026-10-13
     with the REQ-EXT-SESSION-001 logout/regist-registry regression; reconcile-online added
     2026-10-13 with the REQ-EXT-SESSION-002 startup online-state reconciliation). The
@@ -214,12 +214,12 @@ test_gate:                # regression registry -- interpreted by pipeline/test.
     - id: reconcile-online
       cmd: ["py", "project-docs/evidence/REQ-EXT-SESSION-001/reconcile_online_e2e.py"]
       cwd: "."
-      asserts: 11
+      asserts: 13
       timeout_s: 300
       blocking: true
       owner: REQ-EXT-SESSION-002
       added: 2026-10-13
-      note: "启动期在线态对账（REQ-EXT-SESSION-002）。缺陷定因：online 置 0 只发生在 OperateDB::handleOffLine（连接断开时按人调用），服务端被 kill/崩溃/断电时当时在线的人没有任何机会走它 → 库里永久留 online=1 幽灵（在线列表与用户信息照旧当在线返回，加好友还会朝幽灵转发）；只有本人重新登录再断开才自愈；init_test_data.sql 的种子 tester/friend1 也是 online=1，装库即自带幽灵。修复=main 在 a.exec() 之前（DB 可用之后、本进程零连接）全量归零，失败即 fail-fast。11 条 = 正常路径基线 A1-A3（注册/登录置 1/断开归零，防把在线功能一起砍掉）+ B1-B3 造崩溃现场（SQL 置 1 → taskkill /F 杀进程 → 库中仍为 1）+ B4 核心：重启后归零 + B5 在线列表不含幽灵 + B6 二次崩溃重启仍归零 + B7-B8 不误伤真实会话。自管服务端生命周期（stop→start 即崩溃语义），清场只触及 rc_u1/rc_u2 两行与其 dist/filesys 目录。断言数只增不减，改套件须同步本行"
+      note: "启动期在线态对账（REQ-EXT-SESSION-002）。缺陷定因：online 置 0 只发生在 OperateDB::handleOffLine（连接断开时按人调用），服务端被 kill/崩溃/断电时当时在线的人没有任何机会走它 → 库里永久留 online=1 幽灵（在线列表与用户信息照旧当在线返回，加好友还会朝幽灵转发）；只有本人重新登录再断开才自愈；init_test_data.sql 的种子 tester/friend1 也是 online=1，装库即自带幽灵。修复=main 在 a.exec() 之前（DB 可用之后、本进程零连接）全量归零，失败即 fail-fast。13 条 = 正常路径基线 A1-A3（注册/登录置 1/断开归零，防把在线功能一起砍掉）+ B1-B3 造崩溃现场（SQL 置 1 → taskkill /F 杀进程 → 库中仍为 1）+ B4 核心：重启后归零 + B5a/B5b/B5c 在线列表先不含幽灵、U1 真实登录后立刻含 U1（证明列表不是恒空）、关闭后清场 + B6 二次崩溃重启仍归零 + B7-B8 不误伤真实会话。自管服务端生命周期（stop→start 即崩溃语义），清场只触及 rc_u1/rc_u2 两行与其 dist/filesys 目录。断言数只增不减，改套件须同步本行"
       isolation: {port: 5000, db: mydb, filesys: "./dist/filesys", kill_policy: pid_only, parallel_safe: false}
 directory_contract:      # mirrors .gitignore
   source: Client/, Server/

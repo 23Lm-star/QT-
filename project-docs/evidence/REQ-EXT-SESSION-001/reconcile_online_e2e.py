@@ -198,31 +198,41 @@ try:
     check("B4 【核心】重启后遗留在线态被对账归零",
           online(U1) == 0 and online(U2) == 0, (online(U1), online(U2)))
 
+    # 在线列表（7/8）会排除"自己"，所以只用 U2 的连接观察 U1 的在/不在
     c2, ret2 = login(U2)
     names = online_list(c2)
-    check("B5 在线列表不再把幽灵当在线（含刚登录的 U2、不含 U1）",
-          ret2 == 1 and U2 in names and U1 not in names, names)
+    check("B5a 重启后在线列表不含幽灵 U1",
+          ret2 == 1 and U1 not in names, names)
+
+    ca, ra = login(U1)
+    names2 = online_list(c2)
+    check("B5b U1 真实登录后同一列表立刻含 U1（证明列表功能正常，不是恒空）",
+          ra == 1 and U1 in names2, names2)
+    ca.close()
     c2.close()
     time.sleep(1.0)
+    check("B5c 两条连接关闭后均归零（为下一步的幂等性检查清场）",
+          online(U1) == 0 and online(U2) == 0, (online(U1), online(U2)))
 
-    # 幂等 / 无残留路径：再崩溃再重启一次
-    exec_sql("UPDATE user_info SET online=1 WHERE name=%s", (U1,))
+    # 幂等：再崩溃一次、再重启一次
+    exec_sql("UPDATE user_info SET online=1 WHERE name IN (%s,%s)", (U1, U2))
     ctl.stop()
     if not ctl.start():
         print("FATAL: server did not come back (2nd): " + str(ctl.last_error))
         sys.exit(3)
-    check("B6 再次崩溃→重启仍归零（对账可重复执行）", online(U1) == 0, online(U1))
+    check("B6 再次崩溃→重启仍归零（对账可重复执行）",
+          online(U1) == 0 and online(U2) == 0, (online(U1), online(U2)))
 
     # 不误伤真实会话
-    ca, ra = login(U1)
     cb, rb = login(U2)
-    check("B7 重启后真实登录照常置 1（对账不误伤活连接）",
-          ra == 1 and rb == 1 and online(U1) == 1 and online(U2) == 1,
-          (ra, rb, online(U1), online(U2)))
-    ca.close()
+    check("B7 重启后真实登录照常置 1（对账不误伤活连接）", rb == 1 and online(U2) == 1,
+          (rb, online(U2)))
+    cc, rc = login(U1)
+    cc.close()          # 断开 U1，U2 保持在线的 cb 不动
     time.sleep(1.0)
     check("B8 其中一个断开只归零自己，另一在线者不受影响",
-          online(U1) == 0 and online(U2) == 1, (online(U1), online(U2)))
+          rc == 1 and online(U1) == 0 and online(U2) == 1,
+          (rc, online(U1), online(U2)))
     cb.close()
 finally:
     ctl.stop()
