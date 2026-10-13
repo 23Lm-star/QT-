@@ -25,6 +25,15 @@ int main(int argc, char *argv[])
         qCCritical(lcApp) << "DB schema not ready (see lcDb critical log). Exiting.";
         return 1;
     }
+    // REQ-EXT-SESSION-002：启动期在线态对账——上个进程被 kill/崩溃/断电时，当时在线的用户
+    // 没有任何机会走 handleOffLine，库里会留下 online=1 的幽灵（在线列表与用户信息照旧把
+    // 它们当在线，"加好友"还会朝幽灵转发）。必须在这里、a.exec() 之前做：此刻本进程一条
+    // 连接都没有，任何 online=1 都必然是上个进程的残留。失败即退出——库不可写时登录/注册
+    // 同样会失败，带着幽灵启动只是把问题藏起来。
+    if (!OperateDB::instance().reconcileOnlineFlags()) {
+        qCCritical(lcApp) << "Online-state reconciliation failed (see lcDb critical log). Exiting.";
+        return 1;
+    }
     // REQ-EXT-FILE-001 F-3/D5 修复：存量"绝对机器路径"键一次性确定性转换为逻辑键
     //（幂等可重放；必须先于迁移，否则他树旧行与新键并存产生重复/错误命中）。
     OperateDB::instance().normalizeLogicKeys();
