@@ -34,6 +34,14 @@ public:
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
+    // REQ-EXT-SESSION-002：启动期在线态对账——把上一个进程遗留的 online=1 全部归零。
+    // 依据：online 的唯一权威来源是本进程的活连接（断开即由 handleOffLine 归零），
+    // 启动瞬间本进程一条连接都没有，故库里残留的 online=1 一律是幽灵。
+    // 单实例假设：本项目单进程单端口单库；若将来多实例共享一库，全量归零会误清另一实例的在线用户，
+    // 那时必须改成"按实例/租约"的形态，不能沿用本函数。
+    // 返回是否成功；失败时由调用方决定是否阻止启动（main 当前按 fail-fast 处理）。
+    bool reconcileOnlineFlags();
+
     // 群请求操作编号（业务层内部枚举，不等同于网络 PDU 编号）。
     enum GroupOperation {
         GroupCreate = 1, GroupInvite, GroupAcceptInvitation, GroupRejectInvitation,

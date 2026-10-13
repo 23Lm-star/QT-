@@ -110,6 +110,45 @@ bool OperateDB::checkSchemaVersion()
     return true;
 }
 
+// ===== REQ-EXT-SESSION-002：启动期在线态对账 =====
+// 为什么需要：online 的唯一权威来源是本进程的活连接——置 1 在 handleLogin，置 0 只在
+// handleOffLine。服务端被 kill / 崩溃 / 断电时，当时在线的人没有任何机会走 handleOffLine，
+// 于是库里永久留下 online=1 的幽灵：在线列表与用户信息把它们当在线返回，"加好友"还会
+// 朝幽灵转发请求（无接收者、静默丢弃）。只有该用户自己重新登录再断开才会自愈。
+// 为什么可以全量清零：启动瞬间本进程一条连接都没有，任何 online=1 都必然是上个进程的残留；
+// 而"断开即归零"由 handleOffLine 保证，故清零后不会冤枉任何真实在线的会话。
+// 单实例假设（重要）：本项目是单进程单端口单库。若将来多实例共享同一库，全量清零会误清
+// 另一个实例正在服务的在线用户——那时必须改成"按实例/租约"判活，不能沿用本实现。
+bool OperateDB::reconcileOnlineFlags()
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) {
+        qCCritical(lcDb) << "[reconcileOnline] 数据库不可达：无法对账上一进程遗留的在线态";
+        return false;
+    }
+    QSqlQuery q(connection.database());
+    if (!q.exec("SELECT COUNT(*) FROM user_info WHERE online <> 0")) {
+        qCCritical(lcDb) << "[reconcileOnline] 统计遗留在线态失败:" << q.lastError().text();
+        return false;
+    }
+    qint64 stale = 0;
+    if (q.next()) {
+        stale = q.value(0).toLongLong();
+    }
+    if (stale == 0) {
+        qCDebug(lcDb) << "[reconcileOnline] 无遗留在线态，跳过";
+        return true;
+    }
+    QSqlQuery upd(connection.database());
+    if (!upd.exec("UPDATE user_info SET online = 0 WHERE online <> 0")) {
+        qCCritical(lcDb) << "[reconcileOnline] 归零失败:" << upd.lastError().text();
+        return false;
+    }
+    qCWarning(lcDb) << "[reconcileOnline] 已把上一进程遗留的在线态归零，条数=" << stale
+                    << "（服务端异常终止后客户端没机会走 handleOffLine，属预期残留）";
+    return true;
+}
+
 // ===== REQ-EXT-FILE-001 T6：存量迁移（design §7：幂等、失败不删旧、file_migration_map 双向映射）=====
 void OperateDB::migrateLegacyFiles()
 {
