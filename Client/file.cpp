@@ -620,14 +620,14 @@ void File::onFileListContextMenu(const QPoint &pos) {
     menu.exec(ui->file_LW->viewport()->mapToGlobal(pos));
 }
 
-QString File::selectedFileRelativePath(QListWidgetItem *item)
+QString File::relativePathForName(const QString &fileName) const
 {
     // 注意：绝不能对成员变量 m_strCurPath 做原地 remove，否则会污染当前路径，
     // 导致后续 flush/返回上级都发出错误路径（表现为列表刷出 Server 工程目录）。
     QString prefix = Client::getinstance().m_strRootPath + "/" + Client::getinstance().m_LoginName;
     QString relCur = m_strCurPath;   // 副本
     relCur.remove(prefix);
-    QString relativePath = QString("%1/%2").arg(relCur).arg(item->text());
+    QString relativePath = QString("%1/%2").arg(relCur).arg(fileName);
     if (relativePath.startsWith("/")) relativePath = relativePath.mid(1);
     // 处理多级重复拼接问题：确保移除后的部分不重复拼接
     if (relativePath.startsWith(m_strUserPath)) {
@@ -637,9 +637,72 @@ QString File::selectedFileRelativePath(QListWidgetItem *item)
     return relativePath;
 }
 
+QString File::selectedFileRelativePath(QListWidgetItem *item)
+{
+    return relativePathForName(item->text());
+}
+
+// REQ-EXT-SHARE-001：外链已失效时不再只丢一句"链接无效"——让主人当场在
+// 「重新生成链接」（作废旧链接、换一条新的）与「续期」（延长当前链接有效期）之间选。
+// 已撤销的链接不给续期入口：续期只改 expire_time，不会让作废的链接复活。
+void File::promptShareLinkRecovery(quint32 state, const QString &note)
+{
+    if(m_strShareFileName.isEmpty()){
+        QMessageBox::information(this, "提示", "请先在文件列表里选中一个文件");
+        return;
+    }
+    const QString rel = relativePathForName(m_strShareFileName);
+    QMessageBox box(this);
+    box.setWindowTitle("分享链接已失效");
+    box.setText(QString("文件「%1」的分享链接%2。%3\n\n可以重新生成一条新链接（旧链接随即失效），"
+                        "或给当前链接续期。")
+                .arg(m_strShareFileName)
+                .arg(state == PUBLINK_STATE_REVOKED ? "已被撤销" : "已过期")
+                .arg(note));
+    QPushButton* regenBtn = box.addButton("重新生成链接", QMessageBox::AcceptRole);
+    QPushButton* renewBtn = box.addButton("续期", QMessageBox::ActionRole);
+    box.addButton("取消", QMessageBox::RejectRole);
+    if(state == PUBLINK_STATE_REVOKED){
+        renewBtn->setEnabled(false);
+    }
+    box.exec();
+    if(box.clickedButton() == regenBtn){
+        sendCreatePublishLink(rel, QString::fromLatin1(PUBLINK_ACTION_NEW), 0);
+    } else if(box.clickedButton() == renewBtn){
+        const QStringList choices = {"7 天", "30 天", "90 天", "365 天"};
+        bool picked = false;
+        const QString choice = QInputDialog::getItem(this, "续期时长", "续期后多久失效：", choices, 1, false, &picked);
+        if(!picked) return;
+        const int idx = choices.indexOf(choice);
+        const int days = QList<int>{7, 30, 90, 365}.value(idx, 30);
+        sendCreatePublishLink(rel, QString::fromLatin1(PUBLINK_ACTION_RENEW), days * 24 * 3600);
+    }
+}
+
+void File::sendCreatePublishLink(const QString &relativePath, const QString &action, int seconds)
+{
+    const QByteArray relBytes = relativePath.toUtf8();
+    QByteArray tail;
+    if(!action.isEmpty()){
+        tail = action.toUtf8() + '\0';
+        if(seconds > 0){
+            tail += QByteArray::number(seconds);
+        }
+    }
+    PDU* pdu = mkPDU(uint(relBytes.size()) + 1 + uint(tail.size()));
+    pdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST;
+    // 路径 + 结尾 NUL（mkPDU 已把整个报文清零），动作区跟在那个 NUL 之后
+    memcpy(pdu->caMsg, relBytes.constData(), size_t(relBytes.size()));
+    if(!tail.isEmpty()){
+        memcpy(pdu->caMsg + relBytes.size() + 1, tail.constData(), size_t(tail.size()));
+    }
+    Client::getinstance().seedMsg(pdu);
+}
+
 void File::onGetShareLink() {
     QListWidgetItem *item = ui->file_LW->currentItem();
     if (!item) return;
+    m_strShareFileName = item->text();   // 失效时要靠它算相对路径弹选择框
     QString relativePath = selectedFileRelativePath(item);
     PDU* pdu = mkPDU(relativePath.toUtf8().size() + 1);
     pdu->uiType = ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_REQUEST;
@@ -667,11 +730,8 @@ void File::on_genlink_PB_clicked()
         QMessageBox::information(this, "提示", "文件夹不能生成分享链接");
         return;
     }
-    QString relativePath = selectedFileRelativePath(item);
-    PDU* pdu = mkPDU(relativePath.toUtf8().size() + 1);
-    pdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST;
-    memcpy(pdu->caMsg, relativePath.toUtf8().constData(), relativePath.toUtf8().size());
-    Client::getinstance().seedMsg(pdu);
+    m_strShareFileName = item->text();   // 生成失败要弹选择框时靠它算相对路径
+    sendCreatePublishLink(selectedFileRelativePath(item), QString(), 0);
 }
 
 void File::on_fetchshare_PB_clicked()

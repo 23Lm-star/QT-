@@ -155,9 +155,16 @@ public:
         QString relativePath;
         QDateTime expireTime;
         bool revoked;
+        QString tokenHash;      // REQ-EXT-SHARE-001：按路径取信息时回带，供复用/续期拼链接
     };
     bool getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo);
     QString getShareLinkByPath(const QString &owner, const QString &path);
+    // REQ-EXT-SHARE-001：按 owner+path 取最新一行的完整信息（含 token_hash）
+    bool getShareLinkInfoByPath(const QString &owner, const QString &path, ShareLinkInfo &outInfo);
+    // REQ-EXT-SHARE-001：续期——只改 expire_time，不动 token/相对路径/撤销位；返回是否命中行
+    bool renewShareLink(const QString &owner, const QString &path, const QDateTime &newExpire);
+    // REQ-EXT-SHARE-001：重新生成前作废旧行（精确路径，不含子路径）
+    bool removeShareLinkExact(const QString &owner, const QString &path);
 
     // 跨功能联动维护（文件删除/重命名/移动 → 分享链接记录一致性）
     bool deleteShareLinkByPath(const QString &owner, const QString &path);
