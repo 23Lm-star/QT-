@@ -252,6 +252,15 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->logoff(revoked);
         if(revoked){
             // REQ-EXT-SEC-001 T1：注销成功，撤销业务访问（连接保留，D2），后续请求被入口门拒绝
+            // REQ-EXT-SESSION-001 修复（注销→同名重注册→登录被误杀）：注销删除了 user_info 行，
+            // 重新注册会把 login_version 计数器归零。必须在这里同步释放该用户的登记表条目，
+            // 否则注销前残留的高版本号仍在 m_loginVersionRegistry 里，重新注册后的首次登录
+            // 分配到的低版本会被 setLoginVersion 的单调 CAS 丢弃，随后 closeStaleSockets 按
+            // "m_loginVersion != cur" 把这条刚登录成功的连接自己 abort（客户端收不到
+            // LOGIN_RESPOND，DB 留下 online=1 幽灵）。释放条目还顺带收紧语义：账号已删除后，
+            // 同用户其它存活连接下次请求会因登记值为 0 ≠ 自身版本被踢，不再保留访问权。
+            // 必须在 m_strLoginName.clear() 之前调用（释放按用户名定位）。
+            MyTcpServer::getinstance().removeLoginVersion(m_strLoginName);
             m_actorAuthenticated=false;
             ++m_actorSessionVersion;
             m_strLoginName.clear();

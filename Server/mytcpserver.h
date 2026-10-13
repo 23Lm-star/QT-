@@ -41,7 +41,7 @@ public:
     // 由重连强制登录自然重建）。登录成功先 set 再踢旧；校验=内存比对，热路径零 DB。
     void setLoginVersion(const QString& user, quint64 ver);
     quint64 currentLoginVersion(const QString& user);   // 无登记返回 0
-    void removeLoginVersion(const QString& user);       // 仅权威会话下线时移除对应项
+    void removeLoginVersion(const QString& user);       // 权威会话下线、或账号被注销（删除 user_info 行、计数器归零）时移除对应项
     // 关闭该用户名下已认证且版本≠登记表现值的全部存量连接（锁内快照、出锁 abort，仿僵尸扫描纪律；
     // 现值取单调登记表，并发下自含式正确：低版本登录者也会把自己关掉）
     void closeStaleSockets(const QString& user);
