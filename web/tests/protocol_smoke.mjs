@@ -13,6 +13,7 @@ const chat = await import(`${SRC}/commands/chat.js`);
 const friend = await import(`${SRC}/commands/friend.js`);
 const drive = await import(`${SRC}/commands/drive.js`);
 const group = await import(`${SRC}/commands/group.js`);
+const share = await import(`${SRC}/commands/share.js`);
 const { T } = await import(`${SRC}/msgtypes.js`);
 
 let pass = 0;
@@ -463,6 +464,144 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(up.value, uploader);
   assert.strictEqual(nm.value, name);
   ok('99/100 群文件列表响应记录字段（u64×3 + S + S）顺序读取还原');
+}
+
+// 29) 33 分享请求：caData[0..31]=分享人、[32..35]=人数；caMsg=N×32B 接收人 + 源路径+NUL。
+{
+  const src = './filesys/alice/a.txt';
+  const f = share.buildShareFileFrame({ sharerName: 'alice', receivers: ['bob', 'carol'], sourceAbsPath: src });
+  assert.strictEqual(f.type, T.SHAREFILE_REQUEST);
+  assert.strictEqual(fields.readFixedString(f.caData, 0, 32), 'alice');
+  assert.strictEqual(new DataView(f.caData.buffer).getInt32(32, true), 2);
+  assert.strictEqual(f.msg.length, 64 + Buffer.byteLength(src) + 1);
+  assert.strictEqual(fields.readFixedString(f.msg, 0, 32), 'bob');
+  assert.strictEqual(fields.readFixedString(f.msg, 32, 32), 'carol');
+  assert.strictEqual(fields.readFixedString(f.msg, 64, f.msg.length - 64), src);
+  assert.strictEqual(f.msg[f.msg.length - 1], 0);
+  assert.throws(() => share.buildShareFileFrame({ sharerName: 'a', receivers: ['x'.repeat(32)], sourceAbsPath: 'p' }), /长度非法/);
+  assert.throws(() => share.buildShareFileFrame({ sharerName: 'a', receivers: [], sourceAbsPath: 'p' }), /至少选择/);
+  ok('33 分享请求布局：caData 分享人+人数、caMsg N×32B 接收人+源路径+NUL');
+}
+
+// 30) 35 push：caData[0..31]=分享人、caMsg=源路径+NUL → {sharer, sourceAbsPath, fileName}。
+{
+  const caData = new Uint8Array(64);
+  fields.writeFixedStringNul(caData, 0, 32, 'bob');
+  const msg = fields.concatBytes('./filesys/bob/报告.txt', new Uint8Array(1));
+  const inv = share.parseShareInvite({ caData, caMsg: msg, uiMsgLen: msg.length });
+  assert.deepStrictEqual(inv, { sharer: 'bob', sourceAbsPath: './filesys/bob/报告.txt', fileName: '报告.txt' });
+  ok('35 分享邀请 push 解析（分享人 + 源路径 + 文件名）');
+}
+
+// 31) 36 接受请求：caData[0..31]=接收人、caMsg=源路径+NUL；37 回执 bool@0。
+{
+  const src = './filesys/bob/x.txt';
+  const f = share.buildShareAcceptFrame({ receiverName: 'bob', sourceAbsPath: src });
+  assert.strictEqual(f.type, T.SHAREFILE_AGREE_RESPOND);
+  assert.strictEqual(fields.readFixedString(f.caData, 0, 32), 'bob');
+  assert.strictEqual(fields.readFixedString(f.msg, 0, f.msg.length), src);
+  assert.strictEqual(f.msg[f.msg.length - 1], 0);
+  const ca = new Uint8Array(64); ca[0] = 1;
+  assert.strictEqual(share.parseShareFinish({ caData: ca, caMsg: new Uint8Array(0), uiMsgLen: 0 }).ok, true);
+  ca[0] = 0;
+  assert.strictEqual(share.parseShareFinish({ caData: ca, caMsg: new Uint8Array(0), uiMsgLen: 0 }).ok, false);
+  ok('36/37 接受分享请求与回执（接收人 + 源路径 / bool）');
+}
+
+// 32) 52 创建外链请求：路径+NUL + [action+NUL + [seconds]]。
+{
+  const base = share.buildCreatePublishLinkFrame({ relativePath: 'a.txt' });
+  assert.strictEqual(base.type, T.CREATE_PUBLINK_REQUEST);
+  assert.strictEqual(base.caData, null);
+  assert.deepStrictEqual(Array.from(base.msg), Array.from(fields.concatBytes('a.txt', new Uint8Array(1))));
+
+  const fresh = share.buildCreatePublishLinkFrame({ relativePath: 'dir/a.txt', action: 'new' });
+  assert.deepStrictEqual(Array.from(fresh.msg),
+    Array.from(fields.concatBytes('dir/a.txt', new Uint8Array(1), 'new', new Uint8Array(1))));
+
+  const renew = share.buildCreatePublishLinkFrame({ relativePath: 'a.txt', action: 'renew', seconds: 604800 });
+  assert.deepStrictEqual(Array.from(renew.msg),
+    Array.from(fields.concatBytes('a.txt', new Uint8Array(1), 'renew', new Uint8Array(1), '604800')));
+
+  assert.throws(() => share.buildCreatePublishLinkFrame({ relativePath: '' }), /不能为空/);
+  assert.throws(() => share.buildCreatePublishLinkFrame({ relativePath: 'a', action: 'bogus' }), /未知/);
+  ok('52 创建外链请求布局：路径+NUL+[action+NUL+[seconds]]');
+}
+
+// 33) 53 创建外链响应：ok@0、state@8、caMsg=cloud-disk://share/<token>。
+{
+  const caData = new Uint8Array(64);
+  caData[0] = 1;
+  new DataView(caData.buffer).setUint32(share.PUBLINK_STATE_OFFSET, share.PUBLINK_STATE_EXPIRED, true);
+  const link = 'cloud-disk://share/AbC-_1234567890abcd';
+  const msg = fields.concatBytes(link, new Uint8Array(1));
+  const r = share.parseCreatePublishLinkResponse({ caData, caMsg: msg, uiMsgLen: msg.length });
+  assert.deepStrictEqual(r, { ok: true, state: share.PUBLINK_STATE_EXPIRED, link });
+  caData[0] = 0;
+  const r0 = share.parseCreatePublishLinkResponse({ caData, caMsg: new Uint8Array(0), uiMsgLen: 0 });
+  assert.deepStrictEqual([r0.ok, r0.state, r0.link], [false, share.PUBLINK_STATE_EXPIRED, '']);
+  ok('53 创建外链响应：ok@0、state@8、链接文本');
+}
+
+// 34) 56/57 查询外链：owner 32B + 相对路径+NUL；响应 exists@0、state@8。
+{
+  const f = share.buildQueryPublishLinkFrame({ owner: 'alice', relativePath: 'dir/f.txt' });
+  assert.strictEqual(f.type, T.QUERY_FILE_PUBLINK_REQUEST);
+  assert.strictEqual(fields.readFixedString(f.caData, 0, 32), 'alice');
+  assert.strictEqual(fields.readFixedString(f.msg, 0, f.msg.length), 'dir/f.txt');
+
+  const caData = new Uint8Array(64);
+  new DataView(caData.buffer).setUint32(share.PUBLINK_STATE_OFFSET, share.PUBLINK_STATE_REVOKED, true);
+  const none = share.parseQueryPublishLinkResponse({ caData, caMsg: new Uint8Array(0), uiMsgLen: 0 });
+  assert.deepStrictEqual(none, { exists: false, state: share.PUBLINK_STATE_REVOKED, link: '' });
+
+  caData[0] = 1;
+  const link = 'cloud-disk://share/' + 'f'.repeat(64);
+  const msg = fields.concatBytes(link, new Uint8Array(1));
+  const hit = share.parseQueryPublishLinkResponse({ caData, caMsg: msg, uiMsgLen: msg.length });
+  assert.deepStrictEqual(hit, { exists: true, state: share.PUBLINK_STATE_REVOKED, link });
+  ok('56/57 查询外链请求与响应（exists/state/链接文本）');
+}
+
+// 35) 54/55 外链取文件：前缀剥离 + saved_path JSON（坏 JSON 安全返回空路径）。
+{
+  assert.strictEqual(share.tokenFromLink('cloud-disk://share/AbC-_1'), 'AbC-_1');
+  assert.strictEqual(share.tokenFromLink('  tok  '), 'tok');
+  assert.strictEqual(share.tokenFromLink(''), '');
+  const f = share.buildResolvePublishLinkFrame('cloud-disk://share/tok123');
+  assert.strictEqual(f.type, T.RESOLVE_PUBLINK_REQUEST);
+  assert.deepStrictEqual(Array.from(f.msg), Array.from(fields.concatBytes('tok123', new Uint8Array(1))));
+  assert.throws(() => share.buildResolvePublishLinkFrame('   '), /不能为空/);
+
+  const mkPdu = (ok, text) => {
+    const caData = new Uint8Array(64);
+    caData[0] = ok ? 1 : 0;
+    const msg = fields.concatBytes(text, new Uint8Array(1));
+    return { caData, caMsg: msg, uiMsgLen: msg.length };
+  };
+  assert.deepStrictEqual(share.parseResolvePublishLinkResponse(mkPdu(true, '{"saved_path":"分享链接/a.txt"}')),
+    { ok: true, savedPath: '分享链接/a.txt' });
+  assert.deepStrictEqual(share.parseResolvePublishLinkResponse(mkPdu(true, '{broken')),
+    { ok: true, savedPath: '' });
+  assert.deepStrictEqual(share.parseResolvePublishLinkResponse(mkPdu(false, '{"saved_path":"x"}')),
+    { ok: false, savedPath: '' });
+  ok('54/55 外链取文件：token 前缀剥离、saved_path JSON 解析、坏 JSON/失败安全');
+}
+
+// 36) 分享路径与状态工具。
+{
+  assert.strictEqual(share.relativePathOf('./filesys/alice/dir/f.txt', './filesys/alice'), 'dir/f.txt');
+  assert.strictEqual(share.relativePathOf('./filesys/alice/f.txt', './filesys/alice/'), 'f.txt');
+  assert.strictEqual(share.relativePathOf('./filesys/alice', './filesys/alice'), '');
+  assert.strictEqual(share.relativePathOf('./filesys/alice2/f.txt', './filesys/alice'), '');
+  assert.strictEqual(share.relativePathOf('', './filesys/alice'), '');
+  assert.strictEqual(share.fileNameOf('./filesys/a/b.txt'), 'b.txt');
+  assert.strictEqual(share.fileNameOf('b.txt'), 'b.txt');
+  assert.deepStrictEqual(
+    [share.PUBLINK_STATE_VALID, share.PUBLINK_STATE_EXPIRED, share.PUBLINK_STATE_REVOKED].map(share.describePublishState),
+    ['有效', '已过期', '已撤销'],
+  );
+  ok('分享路径/状态工具：相对路径、文件名、状态文案');
 }
 
 console.log(`\n[protocol_smoke] 全部通过：${pass} 组断言`);

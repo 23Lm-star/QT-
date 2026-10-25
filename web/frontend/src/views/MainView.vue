@@ -1,5 +1,5 @@
 <script setup>
-// 主布局：顶部状态栏 + 里程碑页签（M2 仅"好友"可用，其余为占位）+ 好友申请对话框。
+// 主布局：顶部状态栏 + 四个页签（好友/云盘/群聊/分享）+ 全局邀请弹窗。
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth.js';
@@ -9,10 +9,13 @@ import { useDriveStore } from '../stores/drive.js';
 import { useTransferStore } from '../stores/transfer.js';
 import { useGroupStore } from '../stores/group.js';
 import { useGroupChatStore } from '../stores/groupchat.js';
+import { useShareStore } from '../stores/share.js';
 import FriendPanel from '../components/FriendPanel.vue';
 import DriveView from './DriveView.vue';
 import GroupView from './GroupView.vue';
+import ShareView from './ShareView.vue';
 import FriendRequestDialog from '../components/FriendRequestDialog.vue';
+import ShareInviteDialog from '../components/ShareInviteDialog.vue';
 
 const auth = useAuthStore();
 const friends = useFriendsStore();
@@ -21,6 +24,7 @@ const drv = useDriveStore();
 const transfer = useTransferStore();
 const grp = useGroupStore();
 const grpChat = useGroupChatStore();
+const share = useShareStore();
 const router = useRouter();
 const tab = ref('friend');
 
@@ -28,7 +32,7 @@ const tabs = [
   { key: 'friend', label: '好友' },
   { key: 'drive', label: '云盘' },
   { key: 'group', label: '群聊' },
-  { key: 'share', label: '分享', milestone: 'M5' },
+  { key: 'share', label: '分享' },
 ];
 
 const totalGroupUnread = computed(() =>
@@ -39,6 +43,7 @@ onMounted(() => {
   friends.init();
   chat.init();
   transfer.init(); // 传输引擎路由与页签无关地接线（云盘/群文件共用，幂等：同一 net 只绑一次）
+  share.init();    // 35 分享邀请与页签无关，全局接线
   friends.loadFriends();
   friends.startSync(); // 10s 轮询 + 聚焦刷新：让"被删方"也能感知好友关系变化
 });
@@ -54,6 +59,7 @@ function onLogout() {
   transfer.reset();
   grp.reset();
   grpChat.reset();
+  share.reset();
   router.push({ name: 'login' });
 }
 </script>
@@ -72,7 +78,7 @@ function onLogout() {
         {{ t.label }}
         <span v-if="t.key === 'friend' && chat.totalUnread > 0" class="badge">{{ chat.totalUnread }}</span>
         <span v-if="t.key === 'group' && totalGroupUnread > 0" class="badge">{{ totalGroupUnread }}</span>
-        <span v-if="t.milestone" class="soon">{{ t.milestone }}</span>
+        <span v-if="t.key === 'share' && share.pendingInviteCount > 0" class="badge">{{ share.pendingInviteCount }}</span>
       </button>
     </nav>
 
@@ -80,13 +86,11 @@ function onLogout() {
       <FriendPanel v-if="tab === 'friend'" />
       <DriveView v-else-if="tab === 'drive'" />
       <GroupView v-else-if="tab === 'group'" />
-      <div v-else class="placeholder">
-        <h3>{{ tabs.find((t) => t.key === tab).label }}</h3>
-        <p>该模块属于里程碑 {{ tabs.find((t) => t.key === tab).milestone }}，尚未实现。当前分支已完成 M1 登录、M2 好友私聊、M3 云盘传输与 M4 群。</p>
-      </div>
+      <ShareView v-else-if="tab === 'share'" />
     </main>
 
     <FriendRequestDialog v-if="friends.incomingRequest" />
+    <ShareInviteDialog />
   </div>
 </template>
 
@@ -101,8 +105,6 @@ function onLogout() {
 .tabs { display: flex; gap: 4px; padding: 8px 16px 0; background: #fff; border-bottom: 1px solid #e5e7eb; flex: none; }
 .tab { position: relative; padding: 8px 18px; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; background: transparent; cursor: pointer; font-size: 14px; color: #4b5563; }
 .tab.active { background: #f3f4f6; border-color: #e5e7eb; color: #111827; font-weight: 600; }
-.tab .soon { margin-left: 6px; font-size: 10px; color: #9ca3af; border: 1px solid #e5e7eb; border-radius: 4px; padding: 0 4px; }
 .tab .badge { position: absolute; top: 2px; right: 4px; min-width: 16px; height: 16px; line-height: 16px; border-radius: 8px; background: #ef4444; color: #fff; font-size: 10px; text-align: center; padding: 0 3px; }
 .body { flex: 1; min-height: 0; background: #f3f4f6; }
-.placeholder { padding: 48px; text-align: center; color: #6b7280; }
 </style>
