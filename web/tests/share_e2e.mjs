@@ -1,8 +1,9 @@
-// M5 端到端：三用户经 WebSocket 网关对真实 Server.exe 验证好友文件分享（本期范围）。
-// 覆盖：33→34、35 push、36→37（含离线接收者丢失、重复接受失败、非本人源拒绝转发、
-// 多接收人逐个邀请与接受）。
-// 外链分享 52-57 暂缓：服务端 resolvePublishLink 只复制物理实体，对象存储文件取回失败
-// （见 docs/changes/REQ-WEB-001/记录.md 的 M5 阻塞节）；协议层单测仍在 protocol_smoke。
+// M5 端到端：三用户经 WebSocket 网关对真实 Server.exe 验证分享。
+// 覆盖：好友文件分享 33→34、35 push、36→37（离线丢失、重复接受失败、非本人源拒绝转发、
+// 多接收人）；外链 56 无记录、52 新建、57 命中（hash 形式）、52 复用、54/55 取文件
+// （raw token / 64hex、条目零复制、同内容幂等、同名不同对象 (n)、路径逃逸拒绝、
+// 续期 1s 过期、缺省续期恢复、new 换 token 旧链接失效、目录不可取）。
+// M5b：服务端 resolvePublishLink 改为条目优先（对象文件），物理文件回退保留。
 // 前置：dist/Server.exe 监听 5000，网关监听 8080（run_m5_e2e.py 编排与清理）。
 // 运行：node web/tests/share_e2e.mjs
 import assert from 'node:assert';
@@ -230,6 +231,118 @@ async function main() {
     const cRoot = await listNames(C, `${ROOT}/${USER_C}`);
     check('S10', '第二位接收人接受成功并落自己根目录',
       okC === true && cRoot.includes(fileName), `ret=${okC} C 根目录=${cRoot.join(',')}`);
+
+    // ===== 外链分享 =====
+    const rel = fileName;
+    const q0 = await share.queryPublishLink({ owner: USER_A, relativePath: rel }, A.net);
+    check('L1', '56 无记录时 exists=false', q0.exists === false && q0.link === '', `exists=${q0.exists}`);
+
+    const c1 = await share.createPublishLink({ relativePath: rel }, A.net);
+    const token1 = share.tokenFromLink(c1.link);
+    check('L2', '52 新建链接成功（ok=true/state=有效/raw token 22 字符）',
+      c1.ok && c1.state === share.PUBLINK_STATE_VALID && token1.length === 22 &&
+      c1.link.startsWith(share.PUBLINK_PREFIX),
+      `ok=${c1.ok} state=${c1.state} tokenLen=${token1.length}`);
+
+    const q1 = await share.queryPublishLink({ owner: USER_A, relativePath: rel }, A.net);
+    const hash1 = share.tokenFromLink(q1.link);
+    check('L3', '57 命中并回带 state=有效（库内为 64hex token_hash）',
+      q1.exists && q1.state === share.PUBLINK_STATE_VALID && /^[0-9a-f]{64}$/.test(hash1),
+      `exists=${q1.exists} state=${q1.state} hashLen=${hash1.length}`);
+
+    const c2 = await share.createPublishLink({ relativePath: rel }, A.net);
+    check('L4', '52 缺省动作复用同一链接（返回 hash 形式）',
+      c2.ok && c2.state === share.PUBLINK_STATE_VALID && share.tokenFromLink(c2.link) === hash1,
+      `link=${c2.link.slice(0, 32)}…`);
+
+    // 条目优先（M5b）：raw token 取回对象文件，零物理复制
+    const r1 = await share.resolvePublishLink(c1.link, B.net);
+    check('L5', '54→55 用 raw token 取文件成功（条目优先）',
+      r1.ok && r1.savedPath.startsWith(`${share.PUBLINK_SAVE_DIR}/`),
+      `ok=${r1.ok} saved=${r1.savedPath}`);
+    const bRootAfter = await listNames(B, `${ROOT}/${USER_B}`);
+    check('L6', '分享链接落点目录出现在接收者根目录', bRootAfter.includes(share.PUBLINK_SAVE_DIR),
+      `B 根目录=${bRootAfter.join(',')}`);
+    if (r1.ok) {
+      const got = await downloadFile(B, { serverAbs: `${ROOT}/${USER_B}/${r1.savedPath}` });
+      check('L7', '外链取回文件内容与源一致', got.success && sha256Hex(got.data) === sha256Hex(Buffer.from(fileData)),
+        `size=${got.size} saved=${r1.savedPath}`);
+    } else { check('L7', '外链取回文件内容与源一致', false, '跳过：L5 失败'); }
+
+    // 同名同对象再次取回：条目幂等，保持同一保存路径、不产生副本
+    const r2 = await share.resolvePublishLink(q1.link, B.net);
+    check('L8', '54→55 用 64hex 链接取同一文件为幂等（同一 saved_path）',
+      r2.ok && r2.savedPath === r1.savedPath, `saved1=${r1.savedPath} saved2=${r2.savedPath}`);
+
+    const rBad = await share.resolvePublishLink('not-a-real-token', B.net);
+    check('L9', '坏 token 取文件失败（55 ok=false）', rBad.ok === false, `ok=${rBad.ok}`);
+
+    // 续期 1 秒 → 过期
+    const cRenew1 = await share.createPublishLink({
+      relativePath: rel, action: share.PUBLINK_ACTION_RENEW, seconds: 1,
+    }, A.net);
+    check('L10', '52 续期 1 秒成功', cRenew1.ok && cRenew1.state === share.PUBLINK_STATE_VALID,
+      `ok=${cRenew1.ok} state=${cRenew1.state}`);
+    await sleep(2200);
+    const qExpired = await share.queryPublishLink({ owner: USER_A, relativePath: rel }, A.net);
+    check('L11', '57 过期后 state=1', qExpired.exists && qExpired.state === share.PUBLINK_STATE_EXPIRED,
+      `state=${qExpired.state}`);
+
+    const cReuseDead = await share.createPublishLink({ relativePath: rel }, A.net);
+    check('L12', '52 缺省复用如实回带过期状态（ok=true/state=1）',
+      cReuseDead.ok && cReuseDead.state === share.PUBLINK_STATE_EXPIRED,
+      `ok=${cReuseDead.ok} state=${cReuseDead.state}`);
+
+    const cRenewDefault = await share.createPublishLink({
+      relativePath: rel, action: share.PUBLINK_ACTION_RENEW,
+    }, A.net);
+    const qRenewed = await share.queryPublishLink({ owner: USER_A, relativePath: rel }, A.net);
+    check('L13', '52 缺省续期恢复有效', cRenewDefault.ok &&
+      cRenewDefault.state === share.PUBLINK_STATE_VALID && qRenewed.state === share.PUBLINK_STATE_VALID,
+      `state=${qRenewed.state}`);
+
+    // 重新生成：换 token，旧链接立即失效
+    const cNew = await share.createPublishLink({ relativePath: rel, action: share.PUBLINK_ACTION_NEW }, A.net);
+    const newToken = share.tokenFromLink(cNew.link);
+    check('L14', '52 new 重新生成新 token', cNew.ok && newToken.length === 22 && newToken !== token1,
+      `old=${token1.slice(0, 6)}… new=${newToken.slice(0, 6)}…`);
+    const oldDead = await share.resolvePublishLink(q1.link, B.net);
+    check('L15', '重新生成后旧链接失效（55 ok=false）', oldDead.ok === false, `ok=${oldDead.ok}`);
+    const newAlive = await share.resolvePublishLink(cNew.link, B.net);
+    check('L16', '新链接可取文件', newAlive.ok, `ok=${newAlive.ok} saved=${newAlive.savedPath}`);
+
+    // 目录路径：52 不校验类型（服务端会建链接），54 取回失败
+    const dirName = `dir_${ts}`;
+    const mk = await drive.makeDirectory(`${ROOT}/${USER_A}`, dirName, A.net);
+    check('L17', '准备目录用于类型负例', mk === true, `mkdir=${mk}`);
+    const cDir = await share.createPublishLink({ relativePath: dirName }, A.net);
+    const rDir = await share.resolvePublishLink(cDir.link, B.net);
+    check('L18', '目录链接可创建但取回失败（55 ok=false）',
+      cDir.ok && cDir.link.startsWith(share.PUBLINK_PREFIX) && rDir.ok === false,
+      `create=${cDir.ok} resolve=${rDir.ok}`);
+
+    // 同名不同对象：接收者「分享链接」已有同名文件 → (1) 后缀 + 内容为第二个源
+    const subDir = `sub_${ts}`;
+    const data2 = randBuf(70 * 1024);
+    const mkSub = await drive.makeDirectory(`${ROOT}/${USER_A}`, subDir, A.net);
+    await uploadFile(A, { name: fileName, dirAbs: `${ROOT}/${USER_A}/${subDir}`, data: data2 });
+    const cSub = await share.createPublishLink({ relativePath: `${subDir}/${fileName}` }, A.net);
+    const rSub = await share.resolvePublishLink(cSub.link, B.net);
+    const expectedSuffix = `${fileName.replace(/\.bin$/, '')}(1).bin`;
+    check('L19', '同名不同对象取回自动生成 (1) 后缀',
+      mkSub && cSub.ok && rSub.ok && rSub.savedPath === `${share.PUBLINK_SAVE_DIR}/${expectedSuffix}`,
+      `saved=${rSub.savedPath} expect=${expectedSuffix}`);
+    if (rSub.ok) {
+      const got2 = await downloadFile(B, { serverAbs: `${ROOT}/${USER_B}/${rSub.savedPath}` });
+      check('L20', '(1) 副本内容等于第二个源', got2.success && sha256Hex(got2.data) === sha256Hex(Buffer.from(data2)),
+        `size=${got2.size}`);
+    } else { check('L20', '(1) 副本内容等于第二个源', false, '跳过：L19 失败'); }
+
+    // 路径逃逸：分享路径指到他人根（52 不校验，54 必须拒绝）
+    const cEscape = await share.createPublishLink({ relativePath: `../${USER_B}/${fileName}` }, A.net);
+    const rEscape = await share.resolvePublishLink(cEscape.link, B.net);
+    check('L21', '外链源路径逃逸出分享人根时取回失败',
+      cEscape.ok && rEscape.ok === false, `create=${cEscape.ok} resolve=${rEscape.ok}`);
   } finally {
     for (const s of [A, B, C]) s.close();
   }

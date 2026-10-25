@@ -15,7 +15,7 @@
 - [ ] 【待复核｜BUG-ARC-RECOVERY-001】旧记录说回退丢失功能，后续已恢复大量能力但未找到逐项对应关闭结论；按其原清单与当前 PRD 能力核对。禁止整体回退或整批恢复历史提交。[原报告](docs/archive/legacy-development-os-2026-10-24/project-docs/defects/BUG-ARC-RECOVERY-001.md)。
 - [ ] 【体验缺口｜分享与复制】历史需求提出大文件好友分享使用同步复制、缺进度或取消反馈；当前秒传、逻辑引用和普通上传下载已实现，仍需针对真正发生复制的分享路径验证界面阻塞、批量结果与错误提示，不混同传输任务进度。本轮未验证。
 - [ ] 【缺陷｜目录删除后幽灵残留】MKDIR 建立的目录被删除请求（25）按条目路径软删（`releaseSubtree` 纯 DB 操作）后，物理空目录未删除，flushfile 的"物理回退合并"又把它列出来：客户端提示删除成功但目录仍出现在列表，需第二次删除（此时无条目、走物理 `removeRecursively` 分支）才消失。REQ-WEB-001 M3 e2e（`web/tests/drive_e2e.mjs` 删除断言，2026-10-24）实证复现；桌面客户端同样受影响，网页端按服务端零改动约束如实镜像。修复方向候选：deldir 条目分支软删成功后同步删除物理目录，或 flushfile 合并时跳过已软删条目对应的物理目录。位置：`Server/msghandler.cpp` deldir、`Server/fileobjectstore.cpp` releaseSubtree。
-- [ ] 【缺陷｜外链取文件与对象存储】54 外链解析在服务端只认物理实体：`Server/msghandler.cpp` 的 resolvePublishLink 用 `QFileInfo(srcPath).exists()/isFile()` 判定、`QFile::copy` 复制；REQ-EXT-FILE-001 之后上传、好友分享接收、群文件都只有逻辑条目（内容在 `filesys/objects/<sha2>/<oid>`），用户路径无物理文件 → 55 恒 ok=false。桌面端走同一命令同样受影响。修复方向：条目优先 `FileObjectStore::attachEntry`（零复制）+ 旧物理文件回退。影响 REQ-WEB-001 M5 外链交付（用户 2026-10-25 选择暂缓，见 [变更记录](docs/changes/REQ-WEB-001/记录.md) M5 阻塞节）。
+- [x] 【已修｜外链取文件与对象存储】（2026-10-25，REQ-WEB-001 M5b）54 外链解析原只认物理实体：`Server/msghandler.cpp` 的 resolvePublishLink 用 `QFileInfo(srcPath).exists()/isFile()` 判定、`QFile::copy` 复制；REQ-EXT-FILE-001 之后上传、好友分享接收、群文件都只有逻辑条目（内容在 `filesys/objects/<sha2>/<oid>`），用户路径无物理文件 → 55 恒 ok=false。已按用户批准修复：条目优先 `FileObjectStore::attachExistingObject`（零复制，同名同对象幂等、不同对象 `(n)`）+ 旧物理文件复制回退 + 归一后限定分享人根内；重建 `dist/Server.exe`，分享 e2e 32/32、REQ-EXT-SHARE-001 25/25。证据：[变更记录](docs/changes/REQ-WEB-001/记录.md) M5b 节。
 
 ## 测试与验证缺口
 

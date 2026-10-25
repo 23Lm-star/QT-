@@ -2056,9 +2056,43 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
             QString ownerRoot = QDir(Server::getinstance().filesPath).filePath(info.ownerName);
             QString srcPath = QDir(ownerRoot).filePath(info.relativePath);
             QFileInfo srcFi(srcPath);
-            if (ShareLinkService::validatePath(ownerRoot, info.relativePath)
-                    && srcFi.exists() && srcFi.isFile()) {
+            // REQ-EXT-FILE-001 D5：条目优先。对象文件只有逻辑条目、用户路径无物理实体，
+            // 原实现按 QFileInfo.exists 判定会一律失败；归属仍以归一后的绝对路径断言。
+            const QString cleanOwnerRoot = QDir::cleanPath(QFileInfo(ownerRoot).absoluteFilePath());
+            const QString cleanSrcPath = QDir::cleanPath(srcFi.absoluteFilePath());
+            const bool inOwnerRoot = cleanSrcPath.startsWith(cleanOwnerRoot + QLatin1Char('/'));
+            FileObjectStore::EntryInfo srcEntry;
+            if (inOwnerRoot) {
+                const QFileInfo cleanSrcFi(cleanSrcPath);
+                srcEntry = FileObjectStore::instance().entryByPath(
+                    info.ownerName,
+                    FileObjectStore::normalizeParent(info.ownerName, cleanSrcFi.absolutePath()),
+                    cleanSrcFi.fileName());
+            }
+            if (inOwnerRoot && srcEntry.valid() && !srcEntry.isDir) {
                 // 目标目录：服务端【请求者】用户目录下的“分享链接”文件夹
+                QString userRoot = QDir(Server::getinstance().filesPath).filePath(loginName);
+                QString shareDir = QDir(userRoot).filePath("分享链接");
+                QDir().mkpath(shareDir);
+                // 引用同一对象（零复制）；同名安置/幂等复用 attachExistingObject 语义
+                const FileObjectStore::AttachResult attached =
+                    FileObjectStore::instance().attachExistingObject(
+                        loginName, shareDir, QFileInfo(cleanSrcPath).fileName(), srcEntry.objectId, -1);
+                if (attached.ok) {
+                    ok = true;
+                    savedRelPath = QString("分享链接/%1").arg(attached.displayName);
+                    qCDebug(lcFs) << "[resolvePublishLink] 条目引用完成 fileId=" << attached.fileId
+                             << " objId=" << srcEntry.objectId
+                             << " name=" << attached.displayName
+                             << " idempotent=" << attached.idempotent;
+                } else {
+                    qCWarning(lcFs) << "[resolvePublishLink] 条目安置失败:" << attached.error
+                             << " src=" << srcPath;
+                }
+            } else if (inOwnerRoot
+                    && ShareLinkService::validatePath(ownerRoot, info.relativePath)
+                    && srcFi.exists() && srcFi.isFile()) {
+                // 旧未迁移物理文件回退：保持原有复制语义
                 QString userRoot = QDir(Server::getinstance().filesPath).filePath(loginName);
                 QString shareDir = QDir(userRoot).filePath("分享链接");
                 QDir().mkpath(shareDir);
