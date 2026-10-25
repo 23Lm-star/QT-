@@ -5,18 +5,23 @@ import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useChatStore } from '../stores/chat.js';
+import { useDriveStore } from '../stores/drive.js';
+import { useTransferStore } from '../stores/transfer.js';
 import FriendPanel from '../components/FriendPanel.vue';
+import DriveView from './DriveView.vue';
 import FriendRequestDialog from '../components/FriendRequestDialog.vue';
 
 const auth = useAuthStore();
 const friends = useFriendsStore();
 const chat = useChatStore();
+const drv = useDriveStore();
+const transfer = useTransferStore();
 const router = useRouter();
 const tab = ref('friend');
 
 const tabs = [
   { key: 'friend', label: '好友' },
-  { key: 'drive', label: '云盘', milestone: 'M3' },
+  { key: 'drive', label: '云盘' },
   { key: 'group', label: '群聊', milestone: 'M4' },
   { key: 'share', label: '分享', milestone: 'M5' },
 ];
@@ -35,6 +40,8 @@ function onLogout() {
   auth.logout();
   friends.reset();
   chat.reset();
+  drv.reset();
+  transfer.reset();
   router.push({ name: 'login' });
 }
 </script>
@@ -58,9 +65,10 @@ function onLogout() {
 
     <main class="body">
       <FriendPanel v-if="tab === 'friend'" />
+      <DriveView v-else-if="tab === 'drive'" />
       <div v-else class="placeholder">
         <h3>{{ tabs.find((t) => t.key === tab).label }}</h3>
-        <p>该模块属于里程碑 {{ tabs.find((t) => t.key === tab).milestone }}，尚未实现。当前分支已完成 M1 登录与 M2 好友私聊。</p>
+        <p>该模块属于里程碑 {{ tabs.find((t) => t.key === tab).milestone }}，尚未实现。当前分支已完成 M1 登录、M2 好友私聊与 M3 云盘传输。</p>
       </div>
     </main>
 

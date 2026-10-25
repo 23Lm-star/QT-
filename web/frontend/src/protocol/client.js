@@ -25,6 +25,7 @@ export class NetClient {
     this.openHandlers = new Set();
     this.closeHandlers = new Set();
     this.heartbeatTimer = null;
+    this._hbWorker = null;   // 心跳 Worker（后台标签页防节流）
     this.lastPongMs = 0;
     this.connected = false;
   }
@@ -140,13 +141,26 @@ export class NetClient {
 
   _startHeartbeat() {
     this._stopHeartbeat();
-    this.heartbeatTimer = setInterval(() => {
+    // 心跳定时器放 Web Worker：后台/隐藏标签页中主线程 setInterval 会被浏览器节流到
+    // ≥1 分钟，超过服务端 90s 存活阈值会被踢线；Worker 定时器不受该节流影响。
+    const tick = () => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         try { this.sendFrame(T.HEARTBEAT_REQUEST); } catch { /* ignore */ }
       }
-    }, HEARTBEAT_INTERVAL_MS);
+    };
+    try {
+      const blob = new Blob(
+        [`setInterval(function(){postMessage(1)},${HEARTBEAT_INTERVAL_MS})`],
+        { type: 'text/javascript' });
+      this._hbWorker = new Worker(URL.createObjectURL(blob));
+      this._hbWorker.onmessage = tick;
+    } catch {
+      // Worker 不可用（如严格 CSP）时回退主线程定时器（前台标签页仍可靠）。
+      this.heartbeatTimer = setInterval(tick, HEARTBEAT_INTERVAL_MS);
+    }
   }
   _stopHeartbeat() {
     if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+    if (this._hbWorker) { try { this._hbWorker.terminate(); } catch { /* ignore */ } this._hbWorker = null; }
   }
 }
