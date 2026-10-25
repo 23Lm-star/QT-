@@ -1,0 +1,13 @@
+{
+  "name": "cloudpan-web-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "REQ-WEB-001 WebSocket<->TCP 透明网关：转发浏览器与 Qt 服务端之间的自定义二进制协议字节流，不解析 PDU。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

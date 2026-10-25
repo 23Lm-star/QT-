@@ -1,0 +1,23 @@
+{
+  "name": "cloudpan-web-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "REQ-WEB-001 网页端前端：Vue 3 + Vite，浏览器端实现 Qt 云盘聊天系统的 PDU 二进制协议。",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "hash-wasm": "^4.12.0",
+    "js-md5": "^0.8.3",
+    "pinia": "^2.3.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "vite": "^6.0.7"
+  }
+}
