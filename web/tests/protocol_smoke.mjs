@@ -12,6 +12,7 @@ const account = await import(`${SRC}/commands/account.js`);
 const chat = await import(`${SRC}/commands/chat.js`);
 const friend = await import(`${SRC}/commands/friend.js`);
 const drive = await import(`${SRC}/commands/drive.js`);
+const group = await import(`${SRC}/commands/group.js`);
 const { T } = await import(`${SRC}/msgtypes.js`);
 
 let pass = 0;
@@ -274,6 +275,194 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   const r = drive.parseAbortResponse({ caData: cd });
   assert.strictEqual(r.ret, true); assert.strictEqual(r.tid, 7n);
   ok('107/108 任务释放帧布局');
+}
+
+// ===== M4：群协议帧布局（group.js）=====
+
+// 19) 群信封 20B 逐字节：version u16@0、envelope_length u16@2、request_id u64@4、group_id u64@12。
+{
+  const reqId = 0x0102030405060708n;
+  const gid = 9n;
+  const env = group.gEnvelope(reqId, gid);
+  assert.strictEqual(env.length, 20);
+  const dv = new DataView(env.buffer);
+  assert.strictEqual(dv.getUint16(0, true), 1);            // version
+  assert.strictEqual(dv.getUint16(2, true), 20);           // envelope_length
+  assert.strictEqual(dv.getBigUint64(4, true), reqId);     // request_id
+  assert.strictEqual(dv.getBigUint64(12, true), gid);      // group_id
+  ok('群信封 20B 逐字节布局');
+}
+
+// 20) groupAppendString：u32 字节长（小端）+ 裸 UTF-8，无 NUL。
+{
+  const s = group.gStr('中文a');
+  assert.strictEqual(group.rU32(s, 0), 7);                 // 中(3)+文(3)+a(1)
+  assert.strictEqual(s.length, 11);                        // 4 + 7
+  const read = group.readStr(s, 0);
+  assert.strictEqual(read.value, '中文a');
+  assert.strictEqual(read.offset, 11);
+  ok('群变长字符串 u32+len 编解码往返（含中文按字节）');
+}
+
+// 21) 91 拉取请求体非对齐布局：u8 mode@0、u64 cursor@1、u16 limit@9，总 11B。
+{
+  const body = group.buildGroupPullBody(1, 1234567890123n, 100);
+  assert.strictEqual(body.length, 11);
+  assert.strictEqual(body[0], 1);
+  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  assert.strictEqual(dv.getBigUint64(1, true), 1234567890123n); // 非对齐 cursor
+  assert.strictEqual(dv.getUint16(9, true), 100);
+  assert.throws(() => group.buildGroupPullBody(2, 0n, 50), /mode/);
+  assert.throws(() => group.buildGroupPullBody(0, 0n, 0), /limit/);
+  assert.throws(() => group.buildGroupPullBody(0, 0n, 101), /limit/);
+  ok('91 拉取体：mode/cursor(非对齐)/limit 与越界校验');
+}
+
+// 22) readGroupResponse：校验信封、抽出 code(i32)、requestId/groupId。
+{
+  const body = fields.concatBytes(group.gEnvelope(42n, 7n), group.groupU32Bytes(-2101 >>> 0));
+  const r = group.readGroupResponse({ caMsg: body, uiMsgLen: body.length });
+  assert.strictEqual(r.requestId, 42n);
+  assert.strictEqual(r.groupId, 7n);
+  assert.strictEqual(r.code, -2101);
+  assert.strictEqual(group.describeGroupCode(-2101), '你不是该群成员');
+  // 非法 version 必须抛
+  const bad = new Uint8Array(24); new DataView(bad.buffer).setUint16(0, 9, true);
+  assert.throws(() => group.readGroupResponse({ caMsg: bad, uiMsgLen: 24 }), /信封非法/);
+  ok('响应信封解析与错误码中文映射（含非法 version 抛错）');
+}
+
+// 23) 101 群文件上传初始化帧体 + 102 解析往返（hit/next/finalName/tid@caData[48]）。
+{
+  const sha = 'a'.repeat(64);
+  const body = group.buildGroupFileInitBody(4096n, sha, '群文件.bin');
+  const dvb = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  assert.strictEqual(dvb.getBigUint64(0, true), 4096n);
+  assert.strictEqual(dvb.getUint32(8, true), 64);
+  assert.strictEqual(body.length, 8 + (4 + 64) + (4 + Buffer.byteLength('群文件.bin')));
+  assert.throws(() => group.buildGroupFileInitBody(1n, 'Z'.repeat(64), 'x'), /64 位小写 hex/);
+  assert.throws(() => group.buildGroupFileInitBody(1n, sha, 'a/b'), /路径分隔符/);
+
+  // 构造 102 响应：envelope(reqId=5=tid, gid=7) + code(0)@20 + hit@24 + 3零 +
+  // fileId@28 + gfid@36 + session@44 + next@52 + nameLen@60 + name@64
+  const name = 'final.bin';
+  const msg = new Uint8Array(64 + Buffer.byteLength(name));
+  const dm = new DataView(msg.buffer);
+  msg.set(group.gEnvelope(5n, 7n), 0);
+  dm.setUint32(20, 0, true);
+  msg[24] = 0; // hit=0 需分块
+  dm.setBigInt64(28, 88n, true);
+  dm.setBigInt64(36, 0n, true);
+  dm.setBigInt64(44, 555n, true);
+  dm.setBigInt64(52, 2048n, true);
+  dm.setUint32(60, Buffer.byteLength(name), true);
+  msg.set(Buffer.from(name), 64);
+  const cd = new Uint8Array(64); new DataView(cd.buffer).setBigUint64(48, 5n, true);
+  const r = group.parseGroupFileInitResponse({ caMsg: msg, uiMsgLen: msg.length, caData: cd });
+  assert.strictEqual(r.code, 0);
+  assert.strictEqual(r.tid, 5n);
+  assert.strictEqual(r.hit, false);
+  assert.strictEqual(r.fileId, 88n);
+  assert.strictEqual(r.sessionId, 555n);
+  assert.strictEqual(r.nextOffset, 2048n);
+  assert.strictEqual(r.finalName, name);
+  ok('101/102 群文件上传初始化帧布局与解析（含秒传 hit 位）');
+}
+
+// 24) 105 下载体 + 106 解析（size@24/nameLen@32/name@36、accepted@caData[24]、tid@caData[48]）。
+{
+  const dlBody = group.buildGroupFileDownloadBody(123n);
+  assert.strictEqual(new DataView(dlBody.buffer).getBigUint64(0, true), 123n);
+  const name = 'down.bin';
+  const msg = new Uint8Array(36 + Buffer.byteLength(name));
+  const dm = new DataView(msg.buffer);
+  msg.set(group.gEnvelope(6n, 7n), 0);
+  dm.setUint32(20, 0, true);
+  dm.setBigUint64(24, 999n, true);
+  dm.setUint32(32, Buffer.byteLength(name), true);
+  msg.set(Buffer.from(name), 36);
+  const cd = new Uint8Array(64); const dcd = new DataView(cd.buffer);
+  dcd.setBigInt64(24, 100n, true);  // accepted
+  dcd.setBigUint64(48, 6n, true);   // tid
+  const r = group.parseGroupFileDownloadResponse({ caMsg: msg, uiMsgLen: msg.length, caData: cd });
+  assert.strictEqual(r.tid, 6n);
+  assert.strictEqual(r.accepted, 100n);
+  assert.strictEqual(r.size, 999n);
+  assert.strictEqual(r.displayName, name);
+  ok('105/106 群文件下载帧布局与解析（accepted/tid 走 caData）');
+}
+
+// 25) 84/85 成员/邀请事件 push：固定 36B，group_id@12、version u64@24、event_type u32@32。
+{
+  const msg = new Uint8Array(36);
+  const dm = new DataView(msg.buffer);
+  msg.set(group.gEnvelope(0n, 77n), 0);
+  dm.setUint32(20, 0, true);
+  dm.setBigUint64(24, 5n, true);   // group version
+  dm.setUint32(32, 1, true);        // event_type 1=成员变化
+  const ev = group.parseGroupMemberEvent({ caMsg: msg, uiMsgLen: 36 });
+  assert.strictEqual(ev.groupId, 77n);
+  assert.strictEqual(ev.version, 5n);
+  assert.strictEqual(ev.eventType, 1);
+  ok('84/85 群事件 push 解析（36B 定长，无字符串体）');
+}
+
+// 26) 90 群消息 push：group_id + seq + msg_id + S(sender) + u8 msg_type + u64 created_at + S(content)。
+{
+  const sender = 'alice', content = '大家好';
+  const parts = [
+    group.gEnvelope(0n, 88n),
+    group.groupU32Bytes(0),                 // code@20
+    group.groupU64Bytes(88n),               // group_id@24
+    group.groupU64Bytes(3n),                // seq@32
+    group.groupU64Bytes(1003n),             // msg_id@40
+    group.gStr(sender),                     // sender@48
+    new Uint8Array([0]),                    // msg_type=0 text
+    group.groupU64Bytes(1700000000000n),    // created_at_ms
+    group.gStr(content),                    // content
+  ];
+  const u8 = new Uint8Array(Buffer.concat(parts.map((p) => Buffer.from(p))));
+  const ev = group.parseGroupMessageEvent({ caMsg: u8, uiMsgLen: u8.length });
+  assert.strictEqual(ev.groupId, 88n);
+  assert.strictEqual(ev.seq, 3n);
+  assert.strictEqual(ev.msgId, 1003n);
+  assert.strictEqual(ev.sender, sender);
+  assert.strictEqual(ev.msgType, 0);
+  assert.strictEqual(ev.createdAt, 1700000000000n);
+  assert.strictEqual(ev.content, content);
+  ok('90 群消息事件 push 解析（记录字段自 @32 复用消息记录读取）');
+}
+
+// 27) 发送校验：空/超长正文（>2000 字节）/非法 clientMsgId 在联网前即拒绝（async→rejected）。
+{
+  await assert.rejects(() => group.sendGroupMessage(1n, 'id1', ''), /不能为空/);
+  await assert.rejects(() => group.sendGroupMessage(1n, 'id1', 'x'.repeat(2001)), /过长/);
+  await assert.rejects(() => group.sendGroupMessage(1n, '', 'hi'), /clientMsgId/);
+  ok('88 发送侧内容 2000 字节上限与空消息拦截');
+}
+
+// 28) 99/100 群文件列表记录字段布局（page_count/total + N×{u64 gfId, u64 size, u64 created, S(uploader), S(name)}）。
+{
+  const uploader = 'bob', name = 'f.txt';
+  const rec = Buffer.concat([
+    Buffer.from(group.groupU64Bytes(7n)),           // gfId
+    Buffer.from(group.groupU64Bytes(1234n)),        // size
+    Buffer.from(group.groupU64Bytes(1700000000n)),  // created_at_ms
+    Buffer.from(group.gStr(uploader)),
+    Buffer.from(group.gStr(name)),
+  ]);
+  const recU8 = new Uint8Array(rec);
+  // 从记录区按读取原语顺序走一遍，证明布局可定位、字段可还原
+  let off = 0;
+  const gfId = group.rU64(recU8, off); off += 8;
+  const size = group.rU64(recU8, off); off += 8;
+  const created = group.rU64(recU8, off); off += 8;
+  const up = group.readStr(recU8, off); off = up.offset;
+  const nm = group.readStr(recU8, off);
+  assert.deepStrictEqual([gfId, size, created], [7n, 1234n, 1700000000n]);
+  assert.strictEqual(up.value, uploader);
+  assert.strictEqual(nm.value, name);
+  ok('99/100 群文件列表响应记录字段（u64×3 + S + S）顺序读取还原');
 }
 
 console.log(`\n[protocol_smoke] 全部通过：${pass} 组断言`);

@@ -19,6 +19,7 @@ import { defineStore } from 'pinia';
 import { getNet } from '../protocol/net.js';
 import { T } from '../protocol/msgtypes.js';
 import * as drive from '../protocol/commands/drive.js';
+import * as gcmd from '../protocol/commands/group.js';
 import Sha256Worker from '../workers/sha256.worker.js?worker';
 
 // ===== 模块级引擎状态 =====
@@ -143,6 +144,16 @@ export const useTransferStore = defineStore('transfer', {
       });
       net.onPush(T.UPLOADFILE_ABORT_RESPOND, () => { /* 108 仅确认，暂停/取消已本地落定 */ });
 
+      // 群文件初始化响应按 transfer_id 路由（102 上传、106 下载），与个人 30/41 复用同一等待机制。
+      net.onPush(T.GROUP_FILE_UPLOAD_INIT_RESPOND, (pdu) => {
+        const r = gcmd.parseGroupFileInitResponse(pdu);
+        deliver(`u102:${r.tid}`, r);
+      });
+      net.onPush(T.GROUP_FILE_DOWNLOAD_RESPOND, (pdu) => {
+        const r = gcmd.parseGroupFileDownloadResponse(pdu);
+        deliver(`d106:${r.tid}`, r);
+      });
+
       // 断线收敛（桌面端 G7 同款）：在途判失败并摘 id；排队/暂停保留。
       // 下载内存缓冲是"已收到"的字节，断线不作废——重连点"继续"从 doneBytes 续传。
       net.onClose(() => {
@@ -156,7 +167,7 @@ export const useTransferStore = defineStore('transfer', {
             this._patch(t.key, { state: 'failed', failReason: '与服务端的连接已断开' });
           }
         }
-        for (const p of ['fc:', 'u30:', 'u32:', 'd41:', 'dlfin:']) rejectWaiters(p, new Error('连接断开'));
+        for (const p of ['fc:', 'u30:', 'u32:', 'd41:', 'dlfin:', 'u102:', 'd106:']) rejectWaiters(p, new Error('连接断开'));
       });
 
       this.initialized = true;
@@ -196,6 +207,36 @@ export const useTransferStore = defineStore('transfer', {
     enqueueDownload(serverAbsPath, name) {
       this.tasks.push({
         key: ++keySeq, kind: 'download', name, serverPath: serverAbsPath,
+        state: 'queued', doneBytes: 0, totalBytes: 0, failReason: '', finalName: '',
+        tid: null, control: null, speed: 0,
+      });
+      this._pump();
+      return keySeq;
+    },
+
+    // 群文件上传入队：与个人共用 31/32 停等通道，仅 INIT 用 101（秒传内嵌，无 97）。
+    enqueueGroupUpload(groupId, file, displayName) {
+      const name = displayName || file.name;
+      const nameBytes = new TextEncoder().encode(name).length;
+      if (nameBytes < 1 || nameBytes > 255 || /[\/\\\0]/.test(name)) {
+        this.tasks.push({
+          key: ++keySeq, kind: 'upload', groupId, name, state: 'failed', doneBytes: 0, totalBytes: file.size,
+          failReason: '群文件名非法（1-255 字节，不含路径分隔符）', finalName: '', speed: 0,
+        });
+        return null;
+      }
+      this.tasks.push({
+        key: ++keySeq, kind: 'upload', groupId, name, file,
+        state: 'queued', doneBytes: 0, totalBytes: file.size, failReason: '', finalName: '',
+        shaHex: '', tid: null, control: null, skipFastcheck: true, speed: 0, hashProgress: 0,
+      });
+      this._pump();
+      return keySeq;
+    },
+    // 群文件下载入队：INIT 用 105，正文走 42/43（与个人下载同聚合/保存）。
+    enqueueGroupDownload(groupId, gfId, displayName) {
+      this.tasks.push({
+        key: ++keySeq, kind: 'download', groupId, gfId, name: displayName,
         state: 'queued', doneBytes: 0, totalBytes: 0, failReason: '', finalName: '',
         tid: null, control: null, speed: 0,
       });
@@ -256,7 +297,7 @@ export const useTransferStore = defineStore('transfer', {
           if (fc.version !== drive.FASTCHECK_VERSION) throw new Error('服务端秒传协议版本不匹配');
           if (!fc.ret) throw new Error('服务端拒绝秒传预检查');
           if (fc.hit) {
-            this._patch(key, { state: 'done', doneBytes: t.totalBytes, finalName: fc.finalName || t.name, speed: 0 });
+            this._patch(key, { state: 'done', doneBytes: t.totalBytes, finalName: fc.finalName || t.name, speed: 0, fastHit: true });
             return;
           }
         }
@@ -264,19 +305,33 @@ export const useTransferStore = defineStore('transfer', {
         if (t.control === 'cancel') { this._patch(key, { state: 'cancelled', control: null }); return; }
         if (t.control === 'pause') { this._patch(key, { state: 'paused', control: null }); return; }
 
-        // 29/30 初始化（ret=false=并发上限/id 冲突 → 退避重试）
+        // 初始化：个人 29/30（RSUM 续传），群 101/102（秒传内嵌，无独立 97）
         let init = null;
+        const isGroup = t.groupId != null;
         for (let attempt = 0; attempt < 5 && !init; attempt++) {
           const tid = allocId();
           this._patch(key, { tid: tid.toString() });
           tidToKey.set(tid.toString(), key);
-          const f = drive.buildUploadInitFrame({ name: t.name, fileSize: BigInt(t.file.size), tid, dirAbsPath: t.dirPath });
-          const w = waitFor(`u30:${tid}`, 15000, '上传初始化');
-          net.sendFrame(f.type, f.caData, f.msg);
-          const r = await w;
-          if (r.__error) throw r.__error;
-          if (r.ret) { init = r; }
-          else { tidToKey.delete(tid.toString()); await sleep(300 + attempt * 300); }
+          t = this._task(key);
+          if (isGroup) {
+            const f = gcmd.buildGroupFileInitFrame({ groupId: t.groupId, fileSize: BigInt(t.file.size), shaHex: t.shaHex, displayName: t.name, tid });
+            const w = waitFor(`u102:${tid}`, 15000, '群上传初始化');
+            net.sendFrame(f.type, f.caData, f.msg);
+            const r = await w;
+            if (r.__error) throw r.__error;
+            if (r.code === 0) { init = { resumeOffset: r.nextOffset, hit: r.hit, finalName: r.finalName }; break; }
+            tidToKey.delete(tid.toString());
+            if (r.code === -2106) { await sleep(300 + attempt * 300); t = this._task(key); if (t.control) break; continue; }
+            throw new Error(gcmd.describeGroupCode(r.code) || `群上传初始化失败 code=${r.code}`);
+          } else {
+            const f = drive.buildUploadInitFrame({ name: t.name, fileSize: BigInt(t.file.size), tid, dirAbsPath: t.dirPath });
+            const w = waitFor(`u30:${tid}`, 15000, '上传初始化');
+            net.sendFrame(f.type, f.caData, f.msg);
+            const r = await w;
+            if (r.__error) throw r.__error;
+            if (r.ret) init = { resumeOffset: r.resumeOffset };
+            else { tidToKey.delete(tid.toString()); await sleep(300 + attempt * 300); }
+          }
           t = this._task(key);
           if (t.control) break; // 暂停/取消：跳出交给块边界处理
         }
@@ -285,12 +340,12 @@ export const useTransferStore = defineStore('transfer', {
         if (t.control === 'pause') { this._patch(key, { state: 'paused', control: null }); return; }
         if (!init) throw new Error('上传初始化屡被拒绝（服务端并发上限），请稍后点"继续"');
 
-        // 31/32 停等分片
-        let offset = Number(init.resumeOffset);
-        if (BigInt(offset) >= BigInt(t.file.size)) {
-          this._patch(key, { state: 'done', doneBytes: t.file.size, speed: 0 }); // 0 字节或断点已在尾部
+        // 群秒传命中（零正文即完成）/ 续传起点已到尾部（含 0 字节）→ 直接完成
+        if (init.hit || BigInt(init.resumeOffset) >= BigInt(t.file.size)) {
+          this._patch(key, { state: 'done', doneBytes: t.file.size, finalName: init.finalName || t.name, speed: 0, fastHit: !!init.hit });
           return;
         }
+        let offset = Number(init.resumeOffset);
         const chunkSize = drive.chunkSizeFor(t.file.size);
         while (offset < t.file.size) {
           t = this._task(key);
@@ -363,24 +418,45 @@ export const useTransferStore = defineStore('transfer', {
 
         const requested = dlTotal(ds); // 会话内续传：声明已聚合字节
         if (requested !== t.doneBytes) this._patch(key, { doneBytes: requested });
-        const f = drive.buildDownloadFrame({ name: t.name, resumeOffset: BigInt(requested), tid, serverAbsPath: t.serverPath });
-        const w41 = waitFor(`d41:${tid}`, 15000, '下载受理');
-        net.sendFrame(f.type, f.caData, f.msg);
-        const r41 = await w41;
-        if (stale()) return;           // 受理窗口内被暂停/取消：静默退出（finally 归还名额）
-        if (r41.__stale) return;
-        if (r41.__error) throw r41.__error;
-        if (!r41.ret) {
-          if (requested > 0) {
-            dlDrop(ds); this._patch(key, { doneBytes: 0 });
-            throw new Error('服务端不接受续传起点，缓冲已清空，点"继续"将整文件重下');
+        // 受理：个人 40/41，群 105/106（正文与 42/43 通道一致，故后续完全共享）。
+        let meta;
+        if (t.groupId != null) {
+          const f = gcmd.buildGroupFileDownloadFrame({ groupId: t.groupId, gfId: BigInt(t.gfId), resumeOffset: BigInt(requested), tid });
+          const w = waitFor(`d106:${tid}`, 15000, '群下载受理');
+          net.sendFrame(f.type, f.caData, f.msg);
+          const r = await w;
+          if (stale()) return;
+          if (r.__stale) return;
+          if (r.__error) throw r.__error;
+          if (r.code !== 0) {
+            if (requested > 0) {
+              dlDrop(ds); this._patch(key, { doneBytes: 0 });
+              throw new Error(`${gcmd.describeGroupCode(r.code) || '群下载被拒'}，缓冲已清空，点"继续"将整文件重下`);
+            }
+            throw new Error(gcmd.describeGroupCode(r.code) || '服务端拒绝群文件下载');
           }
-          throw new Error('服务端拒绝下载请求');
+          meta = { size: r.size, accepted: r.accepted };
+        } else {
+          const f = drive.buildDownloadFrame({ name: t.name, resumeOffset: BigInt(requested), tid, serverAbsPath: t.serverPath });
+          const w = waitFor(`d41:${tid}`, 15000, '下载受理');
+          net.sendFrame(f.type, f.caData, f.msg);
+          const r = await w;
+          if (stale()) return;
+          if (r.__stale) return;
+          if (r.__error) throw r.__error;
+          if (!r.ret) {
+            if (requested > 0) {
+              dlDrop(ds); this._patch(key, { doneBytes: 0 });
+              throw new Error('服务端不接受续传起点，缓冲已清空，点"继续"将整文件重下');
+            }
+            throw new Error('服务端拒绝下载请求');
+          }
+          meta = { size: r.fileSize, accepted: r.accepted };
         }
-        const size = Number(r41.fileSize);
-        if (requested > 0 && Number(r41.accepted) !== requested) {
+        const size = Number(meta.size);
+        if (requested > 0 && Number(meta.accepted) !== requested) {
           dlDrop(ds); this._patch(key, { doneBytes: 0 });
-          throw new Error(`服务端采纳的续传起点与请求不符（请求 ${requested}，采纳 ${r41.accepted}），缓冲已清空，点"继续"将整文件重下`);
+          throw new Error(`服务端采纳的续传起点与请求不符（请求 ${requested}，采纳 ${meta.accepted}），缓冲已清空，点"继续"将整文件重下`);
         }
         if (requested > 0 && t.totalBytes > 0 && size !== t.totalBytes) {
           dlDrop(ds);

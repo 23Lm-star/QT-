@@ -1,14 +1,17 @@
 <script setup>
 // 主布局：顶部状态栏 + 里程碑页签（M2 仅"好友"可用，其余为占位）+ 好友申请对话框。
-import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useChatStore } from '../stores/chat.js';
 import { useDriveStore } from '../stores/drive.js';
 import { useTransferStore } from '../stores/transfer.js';
+import { useGroupStore } from '../stores/group.js';
+import { useGroupChatStore } from '../stores/groupchat.js';
 import FriendPanel from '../components/FriendPanel.vue';
 import DriveView from './DriveView.vue';
+import GroupView from './GroupView.vue';
 import FriendRequestDialog from '../components/FriendRequestDialog.vue';
 
 const auth = useAuthStore();
@@ -16,19 +19,26 @@ const friends = useFriendsStore();
 const chat = useChatStore();
 const drv = useDriveStore();
 const transfer = useTransferStore();
+const grp = useGroupStore();
+const grpChat = useGroupChatStore();
 const router = useRouter();
 const tab = ref('friend');
 
 const tabs = [
   { key: 'friend', label: '好友' },
   { key: 'drive', label: '云盘' },
-  { key: 'group', label: '群聊', milestone: 'M4' },
+  { key: 'group', label: '群聊' },
   { key: 'share', label: '分享', milestone: 'M5' },
 ];
+
+const totalGroupUnread = computed(() =>
+  Object.values(grp.unread).reduce((s, n) => s + (n || 0), 0)
+);
 
 onMounted(() => {
   friends.init();
   chat.init();
+  transfer.init(); // 传输引擎路由与页签无关地接线（云盘/群文件共用，幂等：同一 net 只绑一次）
   friends.loadFriends();
   friends.startSync(); // 10s 轮询 + 聚焦刷新：让"被删方"也能感知好友关系变化
 });
@@ -42,6 +52,8 @@ function onLogout() {
   chat.reset();
   drv.reset();
   transfer.reset();
+  grp.reset();
+  grpChat.reset();
   router.push({ name: 'login' });
 }
 </script>
@@ -59,6 +71,7 @@ function onLogout() {
       <button v-for="t in tabs" :key="t.key" class="tab" :class="{ active: tab === t.key }" @click="tab = t.key">
         {{ t.label }}
         <span v-if="t.key === 'friend' && chat.totalUnread > 0" class="badge">{{ chat.totalUnread }}</span>
+        <span v-if="t.key === 'group' && totalGroupUnread > 0" class="badge">{{ totalGroupUnread }}</span>
         <span v-if="t.milestone" class="soon">{{ t.milestone }}</span>
       </button>
     </nav>
@@ -66,9 +79,10 @@ function onLogout() {
     <main class="body">
       <FriendPanel v-if="tab === 'friend'" />
       <DriveView v-else-if="tab === 'drive'" />
+      <GroupView v-else-if="tab === 'group'" />
       <div v-else class="placeholder">
         <h3>{{ tabs.find((t) => t.key === tab).label }}</h3>
-        <p>该模块属于里程碑 {{ tabs.find((t) => t.key === tab).milestone }}，尚未实现。当前分支已完成 M1 登录、M2 好友私聊与 M3 云盘传输。</p>
+        <p>该模块属于里程碑 {{ tabs.find((t) => t.key === tab).milestone }}，尚未实现。当前分支已完成 M1 登录、M2 好友私聊、M3 云盘传输与 M4 群。</p>
       </div>
     </main>
 
