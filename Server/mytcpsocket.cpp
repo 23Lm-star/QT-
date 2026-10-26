@@ -560,6 +560,10 @@ void MyTcpSocket::scheduleNextDownloadChunk()
 
 void MyTcpSocket::onBytesWritten(qint64)
 {
+    // 任意类型 PDU 成功写出都算连接活跃（下载流/推送/响应皆然）：网页切到后台时
+    // 浏览器可能挂起心跳定时器，若只按收到的 PDU 计时，90s 后会把仍在传文件的连接
+    // 误判为僵尸并 abort。入站方向已由 recvmsg 统一刷新。
+    m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
     if(!m_downloadRing.isEmpty() && bytesToWrite()<DOWNLOAD_WRITE_HIGH_WATER){
         scheduleNextDownloadChunk();
     }
