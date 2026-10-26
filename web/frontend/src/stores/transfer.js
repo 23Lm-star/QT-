@@ -93,7 +93,7 @@ function staleWake(tid) {
 }
 
 // Worker 增量 SHA-256；onProgress(doneBytes)。
-function hashFileSha256(file, onProgress) {
+function hashWithWorker(file, onProgress) {
   return new Promise((resolve, reject) => {
     if (!uploadWorker) uploadWorker = new Sha256Worker();
     const id = `h${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -107,6 +107,22 @@ function hashFileSha256(file, onProgress) {
     uploadWorker.addEventListener('message', onMsg);
     uploadWorker.postMessage({ id, file });
   });
+}
+
+// 移动端/受限 WebView 的 Worker 可能无法结构化克隆 File 或加载 WASM：
+// 失败后退回主线程 WebCrypto 整文件摘要（限制体积，避免把大文件读进内存）。
+async function hashFileSha256(file, onProgress) {
+  try {
+    return await hashWithWorker(file, onProgress);
+  } catch (err) {
+    if (!globalThis.crypto || !crypto.subtle) throw err;
+    if (file.size > 128 * 1024 * 1024) {
+      throw new Error(`哈希计算失败（${err.message || err}）；文件过大无法在主线程回退，请改用桌面浏览器`);
+    }
+    if (onProgress) onProgress(file.size);
+    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+  }
 }
 
 // Blob → a[download] 触发浏览器保存（保存到浏览器默认下载目录，重名由浏览器加 (n)；
