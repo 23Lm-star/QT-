@@ -105,6 +105,7 @@ function doDownload() {
       <input class="path" v-model="pathInput" @keydown.enter="doChdir" title="服务端路径字面量（须与服务端文件根一致）" />
       <button @click="doChdir">跳转</button>
       <button @click="drv.refresh()">刷新</button>
+      <span v-if="drv.loading" class="loading">加载中…</span>
       <button @click="doMkdir">新建文件夹</button>
       <button class="primary" @click="pickFiles">上传文件</button>
       <button @click="doDownload">下载</button>
@@ -178,6 +179,7 @@ function doDownload() {
 .toolbar .danger { color: #b91c1c; border-color: #fecaca; }
 .toolbar .toggle { margin-left: auto; }
 .path { flex: 1; min-width: 220px; padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; font-family: Consolas, monospace; }
+.loading { font-size: 12px; color: #6b7280; }
 .crumbs { font-size: 13px; color: #4b5563; display: flex; flex-wrap: wrap; gap: 2px; align-items: center; }
 .crumbs a { color: #2563eb; cursor: pointer; }
 .crumbs a.current { color: #111827; font-weight: 600; cursor: default; }

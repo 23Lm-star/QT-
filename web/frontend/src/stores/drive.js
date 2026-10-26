@@ -10,6 +10,8 @@ export const useDriveStore = defineStore('drive', {
     userRoot: '',
     curPath: '',
     entries: [],       // [{name,isDir}]
+    entriesPath: '',   // entries 对应的目录（公网高延迟下防止旧列表配新路径）
+    navSeq: 0,         // 目录刷新序号：只应用最新一次响应
     loading: false,
     message: '',
     messageType: 'info',
@@ -44,35 +46,50 @@ export const useDriveStore = defineStore('drive', {
     },
 
     async refresh() {
-      if (!this.curPath) return;
+      const path = this.curPath;
+      if (!path) return;
+      const seq = ++this.navSeq;
       this.loading = true;
       try {
-        this.entries = await drive.listDirectory(this.curPath);
+        const entries = await drive.listDirectory(path);
+        if (seq !== this.navSeq) return; // 已有更新的导航/刷新，丢弃迟到响应
+        this.entries = entries;
+        this.entriesPath = path;
       } catch (e) {
+        if (seq !== this.navSeq) return;
         this._msg(e.message || '列目录失败', 'error');
+        // 刷新失败/超时：把路径退回列表所属目录，避免"新路径 + 旧列表"错配（下载会打到错路径）
+        if (this.entriesPath) this.curPath = this.entriesPath;
+        else this.entries = [];
       } finally {
-        this.loading = false;
+        if (seq === this.navSeq) this.loading = false;
       }
+    },
+
+    // 单飞导航：高延迟下列表未回来前忽略重复进入/返回，避免路径叠加与旧列表误操作。
+    async navigateTo(target) {
+      if (!target || target === this.curPath || this.loading) return false;
+      this.curPath = target;
+      await this.refresh();
+      return true;
     },
 
     // 双击目录进入（与桌面端一致：拼路径后直接刷新，不发 21）。
     async enterDir(name) {
-      this.curPath = drive.joinPath(this.curPath, name);
-      await this.refresh();
+      return this.navigateTo(drive.joinPath(this.curPath, name));
     },
     async gotoCrumb(abs) {
-      this.curPath = abs;
-      await this.refresh();
+      return this.navigateTo(abs);
     },
     async back() {
-      if (!this.curPath || this.curPath === this.userRoot) return;
+      if (!this.curPath || this.curPath === this.userRoot) return false;
       const idx = this.curPath.lastIndexOf('/');
-      if (idx <= 0) return;
-      this.curPath = this.curPath.slice(0, idx);
-      await this.refresh();
+      if (idx <= 0) return false;
+      return this.navigateTo(this.curPath.slice(0, idx));
     },
     // 手动跳转（21→22）：服务端回显可进入目录；越权/不存在会被拒。
     async chdirTo(inputPath) {
+      if (this.loading) return;
       const target = (inputPath || '').trim();
       if (!target) return;
       try {
@@ -95,7 +112,7 @@ export const useDriveStore = defineStore('drive', {
     },
 
     async remove(entry) {
-      const abs = drive.joinPath(this.curPath, entry.name);
+      const abs = drive.joinPath(this.entriesPath || this.curPath, entry.name);
       try {
         const ok = await drive.deleteEntry(abs, entry.isDir ? drive.TYPE_DIR : drive.TYPE_FILE);
         this._msg(ok ? `已删除 ${entry.name}${entry.isDir ? '（含子树，分享链接已联动清理）' : ''}` : '删除失败', ok ? 'success' : 'error');
@@ -108,7 +125,7 @@ export const useDriveStore = defineStore('drive', {
       if (newName === entry.name) return false;
       if (!drive.isValidFileName(newName)) { this._msg('新文件名不合法（≤31 字节，不含特殊字符）', 'error'); return false; }
       try {
-        const ok = await drive.renameEntry(this.curPath, entry.name, newName, entry.isDir ? drive.TYPE_DIR : drive.TYPE_FILE);
+        const ok = await drive.renameEntry(this.entriesPath || this.curPath, entry.name, newName, entry.isDir ? drive.TYPE_DIR : drive.TYPE_FILE);
         this._msg(ok ? `已重命名为 ${newName}` : '重命名失败：目标名被占用或源不存在', ok ? 'success' : 'error');
         if (ok) await this.refresh();
         return ok;
@@ -130,10 +147,11 @@ export const useDriveStore = defineStore('drive', {
       this.moveDirRel = rel;
       await this._loadMoveDirs(rel);
     },
-    // 源条目相对用户根路径 = 当前目录相对段 + 名字。
+    // 源条目相对用户根路径 = 当前展示列表所在目录 + 名字（不用可能已变化的 curPath）。
     _relOfCurrent() {
-      if (!this.curPath.startsWith(this.userRoot)) return '';
-      return this.curPath.slice(this.userRoot.length).replace(/^\/+/, '');
+      const base = this.entriesPath || this.curPath;
+      if (!base.startsWith(this.userRoot)) return '';
+      return base.slice(this.userRoot.length).replace(/^\/+/, '');
     },
     async doMove() {
       if (!this.moveSrc) return false;
@@ -167,13 +185,15 @@ export const useDriveStore = defineStore('drive', {
       if (entry.isDir) { this._msg('目录不可下载（与桌面端一致，仅普通文件）', 'error'); return false; }
       const transfer = useTransferStore();
       transfer.init();
-      transfer.enqueueDownload(drive.joinPath(this.curPath, entry.name), entry.name);
+      // 用条目所属目录构造路径：公网高延迟下 curPath 可能已切换，不能拿新路径配旧列表条目
+      transfer.enqueueDownload(drive.joinPath(this.entriesPath || this.curPath, entry.name), entry.name);
       this._msg(`已加入下载队列：${entry.name}`, 'success');
       return true;
     },
 
     reset() {
-      this.userRoot = ''; this.curPath = ''; this.entries = [];
+      this.userRoot = ''; this.curPath = ''; this.entries = []; this.entriesPath = '';
+      this.navSeq += 1; this.loading = false;
       this.message = ''; this.moveSrc = null; this.moveDirs = []; this.moveDirRel = '';
     },
   },

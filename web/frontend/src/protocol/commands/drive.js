@@ -56,6 +56,9 @@ export const FASTCHECK_RESP_NAME_LEN_OFFSET = 32;
 
 export const MAX_PARALLEL_UPLOADS = 3;
 export const MAX_PARALLEL_DOWNLOADS = 3;
+// 目录类请求与上传共用一条连接；公网慢链路下控制帧可能排在一个分片之后，
+// 默认 8s 会把正常但迟到的 24/22 当成失败（表现为跳转报错、旧列表配新路径）。
+export const DRIVE_REQ_TIMEOUT_MS = 30000;
 
 // ===== 小工具 =====
 function dv(u8) { return new DataView(u8.buffer, u8.byteOffset, u8.byteLength); }
@@ -104,7 +107,7 @@ function pathMsg(p) { return concatBytes(textEncoder.encode(p), new Uint8Array(1
 
 // 23→24 列目录（absPath 为服务端路径字面量）。
 export async function listDirectory(absPath, net = getNet()) {
-  const resp = await net.request(T.FLUSHFILE_REQUEST, T.FLUSHFILE_RESPOND, null, pathMsg(absPath));
+  const resp = await net.request(T.FLUSHFILE_REQUEST, T.FLUSHFILE_RESPOND, null, pathMsg(absPath), DRIVE_REQ_TIMEOUT_MS);
   return parseFileInfoArray(resp.caMsg, resp.uiMsgLen);
 }
 
@@ -112,13 +115,13 @@ export async function listDirectory(absPath, net = getNet()) {
 export async function makeDirectory(parentAbsPath, dirName, net = getNet()) {
   const caData = new Uint8Array(64);
   writeFixedStringNul(caData, 0, 32, dirName);
-  const resp = await net.request(T.MKDIR_REQUEST, T.MKDIR_RESPOND, caData, pathMsg(parentAbsPath));
+  const resp = await net.request(T.MKDIR_REQUEST, T.MKDIR_RESPOND, caData, pathMsg(parentAbsPath), DRIVE_REQ_TIMEOUT_MS);
   return resp.caData[0] !== 0;
 }
 
 // 21→22 跳转目录：返回 {exists, path}（传文件路径时服务端回其父目录）。
 export async function changeDirectory(targetAbsPath, net = getNet()) {
-  const resp = await net.request(T.CHANGEDIR_REQUEST, T.CHANGEDIR_RESPOND, null, pathMsg(targetAbsPath));
+  const resp = await net.request(T.CHANGEDIR_REQUEST, T.CHANGEDIR_RESPOND, null, pathMsg(targetAbsPath), DRIVE_REQ_TIMEOUT_MS);
   const exists = resp.caData[0] !== 0;
   const path = exists ? readFixedString(resp.caMsg, 0, resp.uiMsgLen) : '';
   return { exists, path };
@@ -126,7 +129,7 @@ export async function changeDirectory(targetAbsPath, net = getNet()) {
 
 // 25→26 删除文件/目录（uiType: 0=目录 1=文件）。
 export async function deleteEntry(absPath, uiType, net = getNet()) {
-  const resp = await net.request(T.DELFILE_REQUEST, T.DELFILE_RESPOND, u32ToBytes(uiType), pathMsg(absPath));
+  const resp = await net.request(T.DELFILE_REQUEST, T.DELFILE_RESPOND, u32ToBytes(uiType), pathMsg(absPath), DRIVE_REQ_TIMEOUT_MS);
   return resp.caData[0] !== 0;
 }
 
@@ -136,7 +139,7 @@ export async function renameEntry(dirAbsPath, oldName, newName, uiType, net = ge
   writeFixedStringNul(caData, 0, 32, oldName);
   writeFixedStringNul(caData, 32, 32, newName);
   const msg = concatBytes(u32ToBytes(uiType), textEncoder.encode(dirAbsPath), new Uint8Array(1));
-  const resp = await net.request(T.RENAMEFILE_REQUEST, T.RENAMEFILE_RESPOND, caData, msg);
+  const resp = await net.request(T.RENAMEFILE_REQUEST, T.RENAMEFILE_RESPOND, caData, msg, DRIVE_REQ_TIMEOUT_MS);
   return resp.caData[0] !== 0;
 }
 
@@ -145,13 +148,13 @@ export async function moveEntry(srcRel, dstRel, srcName, net = getNet()) {
   const caData = new Uint8Array(64);
   writeFixedStringNul(caData, 0, 32, srcName);
   const msg = concatBytes(textEncoder.encode(srcRel), new Uint8Array(1), textEncoder.encode(dstRel), new Uint8Array(1));
-  const resp = await net.request(T.MOVEFILE_REQUEST, T.MOVEFILE_RESPOND, caData, msg);
+  const resp = await net.request(T.MOVEFILE_REQUEST, T.MOVEFILE_RESPOND, caData, msg, DRIVE_REQ_TIMEOUT_MS);
   return { ok: resp.caData[0] !== 0, finalName: readFixedString(resp.caData, 32, 32) };
 }
 
 // 58→59 列子目录（移动目标选择用；relPath 空 = 用户根）。
 export async function listSubDirs(relPath, net = getNet()) {
-  const resp = await net.request(T.LISTDIR_REQUEST, T.LISTDIR_RESPOND, null, pathMsg(relPath || ''));
+  const resp = await net.request(T.LISTDIR_REQUEST, T.LISTDIR_RESPOND, null, pathMsg(relPath || ''), DRIVE_REQ_TIMEOUT_MS);
   return parseFileInfoArray(resp.caMsg, resp.uiMsgLen).map((e) => e.name);
 }
 

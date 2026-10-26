@@ -36,6 +36,10 @@ let engineBound = null;         // 已绑定 push 路由的 NetClient
 
 // 内存分片达到 64MiB 就滚存为 Blob 段，防止 parts 数组无上限堆积原始 Uint8Array。
 const PART_FLUSH_BYTES = 64 * 1024 * 1024;
+// 主线程读文件 → Worker 增量哈希的片大小；上传分片上限低于协议 1MiB，
+// 避免公网慢上行时单个大帧长时间占住 WebSocket 发送队列、阻塞目录/聊天等控制请求。
+const HASH_CHUNK = 1024 * 1024;
+const UPLOAD_CHUNK_WEB_MAX = 128 * 1024;
 
 const allocId = () => (idCounter += 1n);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -92,36 +96,69 @@ function staleWake(tid) {
   deliver(`dlfin:${tid}`, { __stale: true });
 }
 
-// Worker 增量 SHA-256；onProgress(doneBytes)。
+// Worker 增量 SHA-256；onProgress(doneBytes)。主线程负责读 File 切片，
+// 只把 ArrayBuffer 送进 Worker（避免移动端 WebView 不支持 File 结构化克隆）。
 function hashWithWorker(file, onProgress) {
   return new Promise((resolve, reject) => {
     if (!uploadWorker) uploadWorker = new Sha256Worker();
     const id = `h${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    let off = 0;
+    let finished = false;
+
+    const cleanup = () => { finished = true; uploadWorker.removeEventListener('message', onMsg); };
+    const fail = (err) => { cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
+
+    const sendNext = async () => {
+      if (finished) return;
+      if (off >= file.size) { uploadWorker.postMessage({ id, type: 'end' }); return; }
+      const end = Math.min(off + HASH_CHUNK, file.size);
+      const buf = await file.slice(off, end).arrayBuffer();
+      if (finished) return;
+      off = end;
+      uploadWorker.postMessage({ id, type: 'chunk', buf }, [buf]);
+    };
+
     const onMsg = (e) => {
       const d = e.data;
       if (!d || d.id !== id) return;
-      if (d.done) { uploadWorker.removeEventListener('message', onMsg); resolve(d.shaHex); }
-      else if (d.error) { uploadWorker.removeEventListener('message', onMsg); reject(new Error(d.error)); }
-      else if (onProgress) onProgress(d.progress);
+      if (d.error) { fail(new Error(d.error)); return; }
+      if (d.done) { cleanup(); resolve(d.shaHex); return; }
+      if (d.ready || d.progress !== undefined) {
+        if (d.progress !== undefined && onProgress) onProgress(d.progress);
+        sendNext().catch(fail);
+      }
     };
+
     uploadWorker.addEventListener('message', onMsg);
-    uploadWorker.postMessage({ id, file });
+    uploadWorker.postMessage({ id, type: 'init' });
   });
 }
 
-// 移动端/受限 WebView 的 Worker 可能无法结构化克隆 File 或加载 WASM：
-// 失败后退回主线程 WebCrypto 整文件摘要（限制体积，避免把大文件读进内存）。
+// 主线程分片回退：Worker/File 读取不可用时，用 hash-wasm 增量 + 让出事件循环，
+// 避免整文件 arrayBuffer/WebCrypto 长时间卡住 UI（那会连带目录操作与路径状态错乱）。
+async function hashOnMainThread(file, onProgress) {
+  const { createSHA256 } = await import('hash-wasm');
+  const hasher = await createSHA256();
+  hasher.init();
+  for (let off = 0; off < file.size; off += HASH_CHUNK) {
+    const end = Math.min(off + HASH_CHUNK, file.size);
+    const buf = await file.slice(off, end).arrayBuffer();
+    hasher.update(new Uint8Array(buf));
+    if (onProgress) onProgress(end);
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  return hasher.digest('hex');
+}
+
 async function hashFileSha256(file, onProgress) {
   try {
     return await hashWithWorker(file, onProgress);
   } catch (err) {
-    if (!globalThis.crypto || !crypto.subtle) throw err;
-    if (file.size > 128 * 1024 * 1024) {
-      throw new Error(`哈希计算失败（${err.message || err}）；文件过大无法在主线程回退，请改用桌面浏览器`);
+    try {
+      return await hashOnMainThread(file, onProgress);
+    } catch (e2) {
+      throw new Error(`哈希计算失败（Worker: ${err.message || err}；主线程: ${e2.message || e2}）`);
     }
-    if (onProgress) onProgress(file.size);
-    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
-    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
   }
 }
 
@@ -379,7 +416,7 @@ export const useTransferStore = defineStore('transfer', {
           return;
         }
         let offset = Number(init.resumeOffset);
-        const chunkSize = drive.chunkSizeFor(t.file.size);
+        const chunkSize = Math.min(drive.chunkSizeFor(t.file.size), UPLOAD_CHUNK_WEB_MAX);
         while (offset < t.file.size) {
           t = this._task(key);
           if (t.control === 'cancel' || t.control === 'pause') {
