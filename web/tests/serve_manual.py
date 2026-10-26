@@ -36,7 +36,7 @@ def main():
         if server_ctl.port_busy("127.0.0.1", p):
             print("[serve] 端口 %d 被占，放弃。" % p)
             return 3
-    ctl = server_ctl.ServerCtl(EXE, DIST, HOST, PORT)
+    ctl = server_ctl.ServerCtl(EXE, DIST, HOST, PORT, log_path=os.path.join(HERE, ".serve_server.log"))
     gw = None
     try:
         if not ctl.start():
@@ -47,7 +47,8 @@ def main():
         env["GATEWAY_TARGET_HOST"] = "127.0.0.1"
         env["GATEWAY_TARGET_PORT"] = str(PORT)
         gw = subprocess.Popen(["node", "server.js"], cwd=GATEWAY_DIR, env=env,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdout=open(os.path.join(HERE, ".serve_gateway.log"), "ab"),
+                              stderr=subprocess.STDOUT,
                               creationflags=CREATE_NO_WINDOW)
         dl = time.time() + 12
         while time.time() < dl and not server_ctl.port_busy("127.0.0.1", GW_PORT):

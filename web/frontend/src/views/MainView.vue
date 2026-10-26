@@ -70,6 +70,9 @@ function onLogout() {
       <span class="app">QT 云盘聊天系统 · 网页端</span>
       <span class="who">已登录：{{ auth.loginName }}</span>
       <span class="conn" :class="auth.connectState">{{ auth.connectState === 'open' ? '在线' : '离线' }}</span>
+      <span v-if="auth.connectState !== 'open' && auth.lastClose" class="closeinfo" :title="`code=${auth.lastClose.code} reason=${auth.lastClose.reason}`">
+        {{ auth.lastClose.text }}
+      </span>
       <button class="logout" @click="onLogout">退出登录</button>
     </header>
 
@@ -101,6 +104,7 @@ function onLogout() {
 .bar .who { font-size: 13px; color: #d1d5db; }
 .bar .conn { font-size: 12px; padding: 2px 10px; border-radius: 10px; background: #374151; }
 .bar .conn.open { background: #166534; }
+.bar .closeinfo { font-size: 12px; color: #fca5a5; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar .logout { margin-left: auto; padding: 6px 14px; border-radius: 6px; border: none; background: #ef4444; color: #fff; cursor: pointer; font-size: 13px; }
 .tabs { display: flex; gap: 4px; padding: 8px 16px 0; background: #fff; border-bottom: 1px solid #e5e7eb; flex: none; }
 .tab { position: relative; padding: 8px 18px; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; background: transparent; cursor: pointer; font-size: 14px; color: #4b5563; }

@@ -27,6 +27,7 @@ export const useAuthStore = defineStore('auth', {
   state: () => ({
     clientId: '',
     connectState: 'idle', // idle | connecting | open | closed
+    lastClose: null,     // {code,reason,text,at} 最近一次断线原因，供主界面显示
     loggedIn: false,
     loginName: '',
     captchaCode: '',
@@ -41,15 +42,23 @@ export const useAuthStore = defineStore('auth', {
     _ensureNet() {
       if (net) return net;
       net = getNet((n) => {
-        n.onOpen(() => { this.connectState = 'open'; });
+        n.onOpen(() => { this.connectState = 'open'; this.lastClose = null; });
         n.onClose((ev) => {
           this.connectState = 'closed';
           this.loggedIn = false;
-          // 4001=上游连不上，4003=网关满载，其余按通用断线提示。
-          const reason = ev && ev.code === 4001 ? '无法连接到服务端（上游 TCP 失败）'
-            : ev && ev.code === 4003 ? '网关连接数已满'
-            : '与服务端的连接已断开';
-          this._setMsg(reason, 'error');
+          // 区分断线原因，便于公网/移动端排障：网关自定义码、上游关闭（被踢/回收/重启）、
+          // 异常码（隧道或网络中断）分别给出可判读的文案。
+          const code = ev && typeof ev.code === 'number' ? ev.code : 0;
+          const rs = (ev && ev.reason) || '';
+          let text = '与服务端的连接已断开';
+          if (code === 4001) text = '无法连接到服务端（上游 TCP 失败）';
+          else if (code === 4003) text = '网关连接数已满';
+          else if (rs === 'upstream closed') text = '服务端关闭了连接（多为账号在其他端登录被踢，或服务端回收/重启）';
+          else if (code === 1006) text = '网络或隧道中断（连接异常关闭 1006）';
+          else if (code === 1011) text = '网关/隧道转发异常（1011）';
+          else if (code) text = `连接已断开（code=${code}${rs ? ' ' + rs : ''}）`;
+          this.lastClose = { code, reason: rs, text, at: Date.now() };
+          this._setMsg(text, 'error');
         });
       });
       return net;
@@ -135,6 +144,7 @@ export const useAuthStore = defineStore('auth', {
       this.loggedIn = false;
       this.loginName = '';
       this.captchaCode = '';
+      this.lastClose = null;
       try { net && net.close(); } catch { /* ignore */ }
       this.connectState = 'closed';
       this._setMsg('已退出登录', 'info');
