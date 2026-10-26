@@ -26,7 +26,8 @@ import Sha256Worker from '../workers/sha256.worker.js?worker';
 let idCounter = 0n;             // 会话级 transfer_id，从 1 单调递增（0 为服务端旧单流保留值）
 let keySeq = 0;                 // 任务行键
 const tidToKey = new Map();     // tid 字符串 -> 任务 key（30/32/41/42/43 路由）
-const waiters = new Map();      // 等待键 -> {resolve, timer|null}
+const waiters = new Map();      // 等待键 -> {resolve, timer|null, beat|null}
+let lastBeatMs = 0;             // 传输途中心跳节流时间戳
 const dlState = new Map();      // 下载任务 key -> {blobs, blobBytes, parts, partsBytes, epoch}
 let fcCurrentReqId = '';        // 秒传单飞：在途 97 的请求标识
 let fcQueue = Promise.resolve(); // 秒传单飞链（串行化 97）
@@ -43,19 +44,34 @@ const dlTotal = (ds) => ds.blobBytes + ds.partsBytes;
 const dlDrop = (ds) => { ds.blobs = []; ds.blobBytes = 0; ds.parts = []; ds.partsBytes = 0; };
 
 // timeoutMs <= 0 表示不设超时（下载完成事件可 long-running，断线由 onClose 收敛）。
+// 等待期间每 20s 补发一次业务心跳：移动端后台会节流主线程/Worker 定时器，
+// 仅靠 30s 心跳可能超过服务端 90s 静默阈值；传输在途时由数据/确认驱动心跳更可靠。
+function pulseSession() {
+  const now = Date.now();
+  if (now - lastBeatMs < 15000) return;
+  lastBeatMs = now;
+  try { getNet().sendFrame(T.HEARTBEAT_REQUEST); } catch { /* 断线由 onClose 收敛 */ }
+}
 function waitFor(wkey, timeoutMs, desc) {
   return new Promise((resolve, reject) => {
     let timer = null;
     if (timeoutMs > 0) {
-      timer = setTimeout(() => { waiters.delete(wkey); reject(new Error(`${desc}等待超时`)); }, timeoutMs);
+      timer = setTimeout(() => {
+        clearInterval(beat);
+        waiters.delete(wkey);
+        reject(new Error(`${desc}等待超时`));
+      }, timeoutMs);
     }
+    const beat = setInterval(pulseSession, 20000);
     waiters.set(wkey, {
-      resolve: (v) => { if (timer) clearTimeout(timer); waiters.delete(wkey); resolve(v); },
+      resolve: (v) => { if (timer) clearTimeout(timer); clearInterval(beat); waiters.delete(wkey); resolve(v); },
       timer,
+      beat,
     });
   });
 }
 function deliver(wkey, value) {
+  pulseSession();
   const w = waiters.get(wkey);
   if (w) w.resolve(value);
 }
@@ -64,6 +80,7 @@ function rejectWaiters(prefix, err) {
   for (const [k, w] of [...waiters.entries()]) {
     if (k.startsWith(prefix)) {
       if (w.timer) clearTimeout(w.timer);
+      if (w.beat) clearInterval(w.beat);
       waiters.delete(k);
       w.resolve({ __error: err });
     }
@@ -315,7 +332,7 @@ export const useTransferStore = defineStore('transfer', {
           t = this._task(key);
           if (isGroup) {
             const f = gcmd.buildGroupFileInitFrame({ groupId: t.groupId, fileSize: BigInt(t.file.size), shaHex: t.shaHex, displayName: t.name, tid });
-            const w = waitFor(`u102:${tid}`, 15000, '群上传初始化');
+            const w = waitFor(`u102:${tid}`, 30000, '群上传初始化');
             net.sendFrame(f.type, f.caData, f.msg);
             const r = await w;
             if (r.__error) throw r.__error;
@@ -325,7 +342,7 @@ export const useTransferStore = defineStore('transfer', {
             throw new Error(gcmd.describeGroupCode(r.code) || `群上传初始化失败 code=${r.code}`);
           } else {
             const f = drive.buildUploadInitFrame({ name: t.name, fileSize: BigInt(t.file.size), tid, dirAbsPath: t.dirPath });
-            const w = waitFor(`u30:${tid}`, 15000, '上传初始化');
+            const w = waitFor(`u30:${tid}`, 30000, '上传初始化');
             net.sendFrame(f.type, f.caData, f.msg);
             const r = await w;
             if (r.__error) throw r.__error;
@@ -358,7 +375,7 @@ export const useTransferStore = defineStore('transfer', {
           const prev = offset;
           const end = Math.min(offset + chunkSize, t.file.size);
           const buf = new Uint8Array(await t.file.slice(offset, end).arrayBuffer());
-          const ackP = waitFor(`u32:${BigInt(t.tid)}`, 60000, '分片确认');
+          const ackP = waitFor(`u32:${BigInt(t.tid)}`, 180000, '分片确认');
           const cf = drive.buildUploadChunkFrame({ offset: BigInt(offset), tid: BigInt(t.tid), chunk: buf });
           net.sendFrame(cf.type, cf.caData, cf.msg);
           const ack = await ackP;
@@ -389,7 +406,7 @@ export const useTransferStore = defineStore('transfer', {
         const f = drive.buildFastcheckFrame({
           shaHex: t.shaHex, name: t.name, dirAbsPath: t.dirPath, fileSize: BigInt(t.file.size), reqId,
         });
-        const w = waitFor(`fc:${reqId}`, 20000, '秒传预检');
+        const w = waitFor(`fc:${reqId}`, 60000, '秒传预检');
         net.sendFrame(f.type, f.caData, f.msg);
         const r = await w;
         if (fcCurrentReqId === reqId) fcCurrentReqId = '';
@@ -422,7 +439,7 @@ export const useTransferStore = defineStore('transfer', {
         let meta;
         if (t.groupId != null) {
           const f = gcmd.buildGroupFileDownloadFrame({ groupId: t.groupId, gfId: BigInt(t.gfId), resumeOffset: BigInt(requested), tid });
-          const w = waitFor(`d106:${tid}`, 15000, '群下载受理');
+          const w = waitFor(`d106:${tid}`, 30000, '群下载受理');
           net.sendFrame(f.type, f.caData, f.msg);
           const r = await w;
           if (stale()) return;
@@ -438,7 +455,7 @@ export const useTransferStore = defineStore('transfer', {
           meta = { size: r.size, accepted: r.accepted };
         } else {
           const f = drive.buildDownloadFrame({ name: t.name, resumeOffset: BigInt(requested), tid, serverAbsPath: t.serverPath });
-          const w = waitFor(`d41:${tid}`, 15000, '下载受理');
+          const w = waitFor(`d41:${tid}`, 30000, '下载受理');
           net.sendFrame(f.type, f.caData, f.msg);
           const r = await w;
           if (stale()) return;
@@ -499,6 +516,7 @@ export const useTransferStore = defineStore('transfer', {
 
     // 42：追加到内存分片，满 64MiB 滚存为 Blob 段；未知 id/非 Running 落空。
     _onDownloadData(pdu) {
+      pulseSession();
       const { tid, chunk } = drive.parseDownloadData(pdu);
       const key = tidToKey.get(tid.toString());
       if (key == null) return;
