@@ -9,6 +9,8 @@
 #include <QTextStream>
 #include <QCoreApplication>
 #include <QSet>
+// 连接管理实现。所有槽函数运行在主线程；对连接表的遍历一律先加锁取快照，
+// 出锁后再执行可能触发重入（abort → disconnected → clientOffLine → removeSocket）的操作。
 MyTcpServer::MyTcpServer(){
     // 读取僵尸连接阈值（zombie_timeout.cfg，单位秒；默认 90s = 3×30s 心跳周期）
     m_zombieTimeoutMs = 90000;
@@ -28,6 +30,7 @@ MyTcpServer::MyTcpServer(){
         qCDebug(lcNet) << "[ZOMBIE] 未找到 zombie_timeout.cfg，使用默认阈值 90s";
     }
 
+    // 周期扫描由父对象 this 托管，随单例析构自动停止。
     m_sweepTimer = new QTimer(this);
     connect(m_sweepTimer, &QTimer::timeout, this, &MyTcpServer::onSweepTimeout);
     m_sweepTimer->start(30000);   // 每 30s 扫描一次僵尸连接
@@ -36,6 +39,8 @@ MyTcpServer::MyTcpServer(){
 void MyTcpServer::incomingConnection(qintptr handle)
 {
     qCDebug(lcNet)<<"新客户端连接"<<endl;
+    // handle 是系统 socket 描述符，交给 QAbstractSocket 接管后由 Qt 负责关闭。
+    // 新对象无父对象：生命周期由连接表 + removeSocket(deleteLater) 管理。
     MyTcpSocket * m_tcpSocket=new MyTcpSocket;
     m_tcpSocket->setSocketDescriptor(handle);
     {
@@ -49,6 +54,8 @@ void MyTcpServer::incomingConnection(qintptr handle)
     qCDebug(lcNet)<<"新客户端连接完成"<<endl;
 }
 
+// 线程池写盘完成后的主线程回调：按连接号找到存活连接再转交；
+// 连接可能已断开（指针不在表内），此时直接丢弃结果。
 void MyTcpServer::handleUploadWriteFinished(quint64 connectionId, quint64 transferId,
                                             qint64 offset, qint64 length, bool success)
 {
@@ -56,6 +63,19 @@ void MyTcpServer::handleUploadWriteFinished(quint64 connectionId, quint64 transf
     for(MyTcpSocket* socket : tcpsocketlist){
         if(socket->m_connectionId == connectionId){
             socket->handleUploadWriteFinished(transferId,offset,length,success);
+            return;
+        }
+    }
+}
+
+// REQ-EXT-PERF-002：复算结果路由——连接可能已断开（指针不在表内），此时直接丢弃结果。
+void MyTcpServer::handleStagingHashFinished(quint64 connectionId, quint64 transferId,
+                                            bool ok, const QString& shaHex, qint64 sizeBytes)
+{
+    QMutexLocker locker(&m_tcpsocketlistMutex);
+    for(MyTcpSocket* socket : tcpsocketlist){
+        if(socket->m_connectionId == connectionId){
+            socket->handleStagingHashFinished(transferId,ok,shaHex,sizeBytes);
             return;
         }
     }

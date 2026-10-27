@@ -7,6 +7,10 @@
 #include <QHash>
 #include <QStringList>
 #include "mytcpsocket.h"
+// 连接管理器（单例）：维护全部在线连接、登录版本登记表、分享握手登记与僵尸清扫。
+// 线程归属：随 main 的事件循环运行在主线程；tcpsocketlist 由其互斥量保护，
+// 任何涉及 socket 的写操作都必须在锁外或锁内短临界区完成（避免回环死锁）。
+// 锁序约定：DB → m_registryMutex → m_tcpsocketlistMutex，禁止反向获取。
 //管理所有客户端连接的一个类
 class MyTcpServer : public QTcpServer
 {
@@ -14,20 +18,26 @@ class MyTcpServer : public QTcpServer
 public:
     //单例模式，一个实例管理所有的客户端连接
     static MyTcpServer& getinstance();
+    // 禁止拷贝：内部持有互斥量与连接表，复制无意义且危险。
     MyTcpServer(const MyTcpServer&)=delete;
     MyTcpServer& operator=(const MyTcpServer&)=delete;
 public:
     //进行信号监听
+    // 新连接入口：创建 MyTcpSocket、分配连接号并登记到连接表（锁内）。
     void incomingConnection(qintptr handle) override;
     //移除已经和客户端断开连接的socket对象
+    // 先从表内摘除，再 deleteLater（不在槽函数栈内直接析构自己）。
     void removeSocket(MyTcpSocket* m);
     //添加好友
+    // 向指定在线用户转发 PDU；不接管 pdu 所有权（调用方负责释放）。
     void seedAddFriend(char* tarname,PDU*pdu);
     //单次拥有型转发（供 addfriend() 在线路径使用，写后 memfree）
     void sendAddFriendAndRelease(char* tarname, PDU* pdu);
     //信息转发
+    // 与 seedAddFriend 相同但用于聊天消息；同样不接管所有权。
     void reseed(char*tarname,PDU*pdu);
     // REQ-EXT-GROUP-001：向当前在线群成员广播已提交的成员/邀请事件。
+    // 事件 PDU 为一次性所有权：内部广播后 memfree，调用方不得再访问。
     void sendGroupEvent(const QStringList& users, PDU* pdu);
     // REQ-EXT-GROUP-002 T3：群消息在线广播——锁内仅收集目标连接快照，锁外逐连接入
     // 每连接有界发送队列；队列满只丢该连接实时投递（拉取兜底），不阻塞事务与其他成员。
@@ -48,14 +58,20 @@ public:
 public slots:
     void handleUploadWriteFinished(quint64 connectionId, quint64 transferId,
                                    qint64 offset, qint64 length, bool success);
+    // REQ-EXT-PERF-002：复算任务回主线程的入口——同 handleUploadWriteFinished 按连接号定位，
+    // 连接已断开（指针不在表内）时直接丢弃结果。
+    void handleStagingHashFinished(quint64 connectionId, quint64 transferId,
+                                   bool ok, const QString& shaHex, qint64 sizeBytes);
 private:
     MyTcpServer();
     //记录所有已经建立连接的 socket对象 链表
+    // 仅由主线程修改；跨函数遍历/快照时须持有下面的互斥量。
     QList<MyTcpSocket*>tcpsocketlist;
     QMutex m_tcpsocketlistMutex;
     // REQ-EXT-SESSION-001：用户域登录版本登记表（独立短临界区锁；锁序 DB→registry→socketlist）
     QHash<QString,quint64> m_loginVersionRegistry;
     QMutex m_registryMutex;
+    // 连接号分配器：只增不减，0 保留给未登记连接。
     quint64 m_nextConnectionId = 0;
 
     //僵尸连接检测：每隔一段时间扫描，静默超过阈值的连接直接 abort 清理
@@ -63,6 +79,7 @@ private:
     QTimer* m_sweepTimer;
     void onSweepTimeout();
 
+    // 分享握手记录：接收者 + 服务端规范化后的源路径 + 登记时刻（用于 TTL 惰性清理）。
     struct PendingShare { QString receiver; QString canonicalSource; qint64 addedMs; };
     QList<PendingShare> m_pendingShares;    // 30 分钟过期、上限 1024，添加时惰性清理
     static const qint64 PENDING_SHARE_TTL_MS = 30*60*1000;

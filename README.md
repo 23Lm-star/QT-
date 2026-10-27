@@ -117,6 +117,7 @@ npm --prefix web/frontend run dev     # 打开 http://127.0.0.1:5173/
 | 多任务并行传输 | `project-docs/evidence/REQ-EXT-TRANSFER-001/parallel_e2e.py` |
 | 下载暂停/取消/继续 | `project-docs/evidence/REQ-EXT-TRANSFER-002/verify.py` |
 | 上传连续性与吞吐 | `project-docs/evidence/REQ-EXT-TRANSFER-003/verify.py` |
+| 服务端复算异步化（REQ-EXT-PERF-002，含 256MiB 响应性探针） | `project-docs/evidence/REQ-EXT-PERF-002/perf002_e2e.py` |
 | 分享链接生命周期 | `project-docs/evidence/REQ-EXT-SHARE-001/verify.py` |
 | 注销后同名重注册登录 | `project-docs/evidence/REQ-EXT-SESSION-001/relogoff_login_e2e.py` |
 | 启动期在线态对账 | `project-docs/evidence/REQ-EXT-SESSION-001/reconcile_online_e2e.py` |

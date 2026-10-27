@@ -1,3 +1,7 @@
+// msghandler.h — 服务端「单连接请求处理器」MsgHandler 的声明。
+// 每个客户端连接（MyTcpSocket）持有一个实例：按 PDU 类型分发到注册/登录/好友/
+// 文件与传输/群组等处理函数，并集中保存该连接的认证身份、验证码状态与传输上下文。
+// 所有方法都在连接所属的 I/O 线程内调用，类内部不加锁。
 #ifndef MSGHANDLER_H
 #define MSGHANDLER_H
 
@@ -6,6 +10,7 @@
 #include "resumableuploadsession.h"
 
 #include <QString>
+#include <QByteArray>
 #include <QDateTime>
 #include <QPair>
 #include <QMap>
@@ -15,9 +20,11 @@
 class MsgHandler
 {
 public:
+    // 构造：pdu 置空、验证码失败计数归零；首次构造时顺带播种全局 qrand。
     MsgHandler();
     //记录客户端发送的请求DPU
     PDU* pdu;
+    // 历史用户名槽位（当前源码未使用；授权一律以 m_actorName 为准）
     QString ClientName;
 
     // ===== REQ-EXT-TRANSFER-001：每连接 per-transfer 上传上下文（D8：id=0 旧单流路径落入同一容器） =====
@@ -39,6 +46,22 @@ public:
         // REQ-EXT-TRANSFER-003 S8/D6：进度落库节流（≥1 MiB 或 ≥2 s 才 UPDATE 一次）
         qint64   lastPersistOffset = 0;  // 上次落库时的已确认偏移
         qint64   lastPersistMs = 0;      // 上次落库时刻
+        // ===== REQ-EXT-PERF-002：完成复算在途与迟到应答上下文 =====
+        // 复算在途（线程池算整文件 SHA-256 期间）：该槽不被空闲回收（与 writeInFlight 同口径），
+        // 107 到达转 pendingAbort 延迟执行；结果回主线程时按 transferId 校验本标志，不符即丢弃。
+        bool     hashInFlight = false;
+        // 复算落定后要迟到补发的应答类型（DeferredRespond）。
+        quint8   deferredRespond = 0;
+        // 32：末块落定时的 success/下一偏移（复算结果不改变这两个字段，与改前一致）。
+        bool     deferredAckSuccess = false;
+        qint64   deferredAckOffset = 0;
+        // 98：回带的 97 请求标识 + 命中时的续传起点（=文件总大小）。
+        QByteArray deferredReqId;
+        // 98/102：登记的文件总大小（迟到应答的 nextOffset 字段）。
+        qint64   deferredFileSize = 0;
+        // 102：群信封 request_id 与展示名（应答体重建用）。
+        quint64  deferredRequestId = 0;
+        QString  deferredName;
     };
     QHash<quint64, UploadCtx> m_uploads;   // key 0 = 旧单流路径
     // handlMsg 按 PDU 落位写入的当前传输 id（29/31/40/101/105/107）；非传输族 = 0
@@ -54,6 +77,8 @@ public:
         qint64  size = 0;
     };
     PendingFastcheck m_pendingFastcheck;
+    // 按传输 id 查找上下文；不存在返回 nullptr。返回指针指向哈希表内部节点，
+    // 后续 m_uploads 的插入/删除可能使其失效，不可跨调用长期持有。
     UploadCtx* findUpload(quint64 id);
     // REQ-EXT-TRANSFER-003 S5 补充：同一暂存路径可能被一个以上上下文引用（97 预检查槽 / 幂等重放 /
     // 旧客户端占位）。动文件（rename/delete/truncate）前必须释放**全部**指向该路径的句柄，
@@ -97,9 +122,12 @@ public:
     PDU* uploadfileinit();//上传文件初始化
     PDU* uploadfilefastcheck();//REQ-EXT-FILE-002：秒传预检查（命中零正文，未命中登记暂存会话）
     PDU* uploadfiledata();//上传文件数据
+    // 下载校验：只解析/校验目标并回元数据，正文由 MyTcpSocket 流式发送。
     PDU* downloadfile();
     PDU* chatmsg();//获取聊天消息
+    // 取验证码：成功则生成新码并从 caMsg 返回，锁定/冷却中只回状态码与剩余秒数。
     PDU* captcha();//验证码生成
+    // 从固定字符表随机生成 length 位验证码（依赖 MsgHandler 构造时的 qrand 播种）。
     QString generateCaptchaCode(int length = 6);
     PDU* getuserinformation();//获取用户信息
     PDU* logoff(bool& revoked);//注销账户（REQ-EXT-SEC-001：授权依据为连接级身份，revoked 供会话撤销）
@@ -161,7 +189,33 @@ public:
     // 上传完成时调用：commitUpload（对象 find-or-create + 条目 + 引用计数，同事务）
     // + finishUploadSession；staging 由 FileObjectStore 转正或丢弃。
     // 返回转正结果（调用方可忽略）；失败时 CommitResult.ok=false。
+    // REQ-EXT-PERF-002：本函数不再在主线程复算整文件——校验通过即投递 StagingHashTask
+    // 并返回 CommitResult.deferred=true；后半段（提交/群引用/会话落定/迟到应答）在
+    // onStagingHashFinished 中完成。校验失败的即时拒绝路径 deferred=false，语义同改前。
     FileObjectStore::CommitResult finalizeUploadOnComplete();
+
+    // REQ-EXT-PERF-002：复算落定入口（主线程）。ctx.deferredRespond 决定迟到应答：
+    // 32 → 连接层补发 sendUploadAck；98/102 → 连接层 seedMsg 发出 respondPdu（所有权转移）。
+    enum DeferredRespond {
+        DeferredNone = 0,
+        DeferredDataAck32 = 1,
+        DeferredFastcheck98 = 2,
+        DeferredGroupInit102 = 3
+    };
+    struct HashFinishAction {
+        PDU* respondPdu = nullptr;   // 迟到补发的 98/102（已构造，发送并 memfree 由连接层负责）
+        bool needDataAck = false;    // 迟到补发的 32
+        bool ackSuccess = false;
+        qint64 ackOffset = 0;
+    };
+    HashFinishAction onStagingHashFinished(quint64 transferId, bool hashOk,
+                                           const QString& shaHex, qint64 sizeBytes);
+    // 98 应答体构造（同步尾部与迟到路径共用，字段布局逐字节一致）。
+    PDU* buildFastcheck98(bool ret, bool hit, qint64 fileId, qint64 sessionId, qint64 nextOffset,
+                          const QByteArray& finalName, const QByteArray& reqIdBytes);
+    // 102 应答体构造（信封 + caData 回带 transfer_id，同 groupFileRequest 内 response()）。
+    PDU* buildGroupInit102(quint64 requestId, quint64 groupId, int code,
+                           const QByteArray& body, quint64 transferId);
 
     // REQ-FS-003: 统一路径沙箱校验（集中一处，所有路径入口调用）
     // 根与路径分别做 canonical 归一（解析 ../ 与符号链接）后判前缀；

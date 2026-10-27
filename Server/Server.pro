@@ -50,6 +50,7 @@ SOURCES += \
     resumableuploadsession.cpp \
     server.cpp \
     sharelinkservice.cpp \
+    staginghashtask.cpp \
     uploadwritetask.cpp \
     ThreadCache.cpp \
     CentralCache.cpp \
@@ -70,6 +71,7 @@ HEADERS += \
     resumableuploadsession.h \
     server.h \
     sharelinkservice.h \
+    staginghashtask.h \
     uploadwritetask.h \
     Common.h \
     ThreadCache.h \

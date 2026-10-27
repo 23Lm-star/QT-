@@ -6,6 +6,11 @@
 #include <QStringList>
 #include <QList>
 
+// 文件对象存储（单例）对外接口。
+// 磁盘布局：filesys/objects/<sha 前2位>/<object_id> 为最终对象，filesys/.staging/*.part 为上传暂存。
+// 数据表：file_object 存物理对象与 refcount，user_file / group_file 存逻辑条目。
+// 删除一律软删并减引用，物理 unlink 由 ReclaimScheduler 异步完成。
+
 // REQ-EXT-FILE-001 T2：内容寻址对象存储层。
 // 物理对象唯一（sha256），逻辑条目（user_file）引用对象；
 // 对象命中+条目创建+引用计数在同一个 DB 事务内完成；
@@ -14,6 +19,7 @@ class FileObjectStore : public QObject
 {
     Q_OBJECT
 public:
+    // commitUpload 的返回：成功时 fileId/objectId 均已落定，失败时 error 为原因。
     struct CommitResult {
         bool ok = false;
         qint64 fileId = -1;      // 最终落定的 user_file.file_id
@@ -21,8 +27,12 @@ public:
         QString displayName;     // 服务端定名（含 (1) 后缀规则）
         bool dedupHit = false;   // 命中已有对象（秒传地基，本分支不开 PDU）
         QString error;
+        // REQ-EXT-PERF-002：true = 复算已交线程池，转正与应答在结果落定后完成；
+        // 调用方此时不得据 ok/error 应答（即时拒绝路径仍为 false）。
+        bool deferred = false;
     };
 
+    // 逻辑条目快照（列表/查找用）；目录条目的 objectId 为 -1。
     struct EntryInfo {
         qint64 fileId = -1;
         QString displayName;
@@ -50,6 +60,7 @@ public:
         QString error;
     };
 
+    // 进程级单例，首次调用时构造。
     static FileObjectStore& instance();
 
     // 服务端复算 staging 的 SHA-256 与大小（流式，1MiB 缓冲）
@@ -68,6 +79,14 @@ public:
                               const QString& displayName, qint64 expectedSize,
                               const QString& stagingPath, bool copyOnly = false,
                               const QString& expectedSha = QString());
+
+    // REQ-EXT-PERF-002：整文件复算已在线程池完成后由主线程调用（computedSha/computedSize
+    // 来自 hashStaging 同算法结果）。守卫、事务与搬移语义和 commitUpload 完全一致。
+    CommitResult commitUploadPreHashed(const QString& owner, const QString& parentPath,
+                                       const QString& displayName, qint64 expectedSize,
+                                       const QString& stagingPath, bool copyOnly,
+                                       const QString& expectedSha,
+                                       const QString& computedSha, qint64 computedSize);
 
     // REQ-EXT-FILE-002 §2.1：指向既有对象的条目安置（复用 commitUpload 步骤 2/3/4，同事务）。
     // 不读客户端路径、不复制物理文件、不传输正文；pending_reclaim 对象复用即置回 ready。
@@ -95,6 +114,7 @@ public:
                           const QString& actor, bool actorIsOwner, QString& err);
 
     // 新建引用（分享=同对象新条目，+1 引用，物理零复制）。
+    // pending_reclaim 对象被引用即置回 ready；对象已被调度器抢权时返回 false。
     bool refObject(qint64 objectId);
 
     // 条目 → 对象绝对路径（下载/迁移用）；对象不存在或已标回收失败返回空。
@@ -141,6 +161,7 @@ public:
     static QString normalizeParent(const QString& owner, const QString& dirPath);
 
 private:
+    // 私有构造：只允许通过 instance() 获取单例。
     explicit FileObjectStore(QObject* parent = nullptr);
     FileObjectStore(const FileObjectStore&) = delete;
     FileObjectStore& operator=(const FileObjectStore&) = delete;

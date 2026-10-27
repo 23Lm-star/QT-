@@ -1,3 +1,8 @@
+// 单连接实现文件。
+// 线程模型：本对象及其槽函数都在 MyTcpServer 所属主线程执行；写盘任务投递到
+// QThreadPool，完成后经队列连接回到主线程（handleUploadWriteFinished），
+// 因此 m_downloads/m_dpulist 等成员无需加锁。
+// 内存约定：本文件产生的 PDU 一律由 memalloc 分配、memfree 释放，不得与 malloc/free 混用。
 #include "logging.h"
 #include "mytcpsocket.h"
 #include "operatedb.h"
@@ -18,6 +23,7 @@
 static constexpr qint64 UPLOAD_PERSIST_MIN_BYTES = 1024 * 1024;
 static constexpr qint64 UPLOAD_PERSIST_MIN_MS = 2000;
 
+// 构造函数：信号槽都在本对象线程内直连；m_connectionId 由 server 在登记后赋值。
 MyTcpSocket::MyTcpSocket()
 {
     connect(this,&MyTcpSocket::readyRead,this,&MyTcpSocket::recvmsg);
@@ -36,6 +42,7 @@ MyTcpSocket::MyTcpSocket()
     m_reapTimer->start(15000);
 }
 
+// 销毁路径：正常断线时 clientOffLine 已清空下载流，这里兜底处理未走断线信号的残留。
 MyTcpSocket::~MyTcpSocket(){
     for(QHash<quint64,DownloadStream>::iterator it=m_downloads.begin();it!=m_downloads.end();++it){
         if(it->file){
@@ -110,6 +117,8 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     m_MsgHandler->m_actorName=this->m_strLoginName;
     m_MsgHandler->m_connId=this->m_connectionId;
 
+    // 分派表：绝大多数分支返回响应 PDU（由调用方发送/释放）；
+    // 流式上传/下载与 abort 分支返回 nullptr，响应已在本函数内自行写出。
     switch(pdu->uiType){
         case ENUM_MSG_TYPE_REGIST_REQUEST :{
              respdu=m_MsgHandler->rigist();
@@ -383,6 +392,7 @@ void MyTcpSocket::handleUploadData(PDU* pdu)
     }
 
     cp->writeInFlight=true;
+    // 深拷贝正文：pdu 的所有权在 handlMsg 返回后即被上层释放，异步任务不能持有其指针。
     const QByteArray data(pdu->caMsg,pdu->uiMsgLen);
     QThreadPool::globalInstance()->start(new UploadWriteTask(
             m_connectionId,transferId,cp->session.stagingFile(),chunkOffset,data));
@@ -409,7 +419,15 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
     if(complete){
         // REQ-EXT-FILE-001 T4：末块写完→服务端复算转正+建条目+引用计数（会释放上下文）
         m_MsgHandler->m_currentTransferId=transferId;
-        m_MsgHandler->finalizeUploadOnComplete();
+        // REQ-EXT-PERF-002：登记 32 迟到补发参数（success/偏移取写落定时的值，与改前同），
+        // 整文件复算转线程池，32 由 handleStagingHashFinished 在转正落定后补发。
+        cp->deferredRespond = MsgHandler::DeferredDataAck32;
+        cp->deferredAckSuccess = success;
+        cp->deferredAckOffset = ackOffset;
+        const FileObjectStore::CommitResult r = m_MsgHandler->finalizeUploadOnComplete();
+        if (r.deferred) {
+            return;
+        }
     }else if(success){
         // AUD-1：该槽已开始承载正文（旧客户端 97→31 直传路径），不再是 97 纯暂存占位 → 重新计入名额
         cp->fastcheckPlaceholder=false;
@@ -429,6 +447,21 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
     sendUploadAck(transferId,success,ackOffset,complete);
 }
 
+// REQ-EXT-PERF-002：线程池复算落定的主线程入口——转正后半段由 MsgHandler 完成，
+// 本函数只负责按动作执行迟到应答（98/102 经 seedMsg 发送并释放；32 走既有 ack 构造）。
+void MyTcpSocket::handleStagingHashFinished(quint64 transferId, bool ok,
+                                            const QString& shaHex, qint64 sizeBytes)
+{
+    const MsgHandler::HashFinishAction act =
+            m_MsgHandler->onStagingHashFinished(transferId, ok, shaHex, sizeBytes);
+    if (act.respondPdu != nullptr) {
+        seedMsg(act.respondPdu);
+    }
+    if (act.needDataAck) {
+        sendUploadAck(transferId, act.ackSuccess, act.ackOffset, true);
+    }
+}
+
 // 107：释放传输槽位。上传（暂停/取消同处置：会话 expired，staging 保留）；
 // REQ-EXT-TRANSFER-002 S1：未命中上传槽时再查下载流 → 摘环停发、名额回落。
 // 未知 id → ret=false；id=0 一律不受理（维持既有断言 T-12a，旧单流路径不受 107 影响）。
@@ -443,7 +476,8 @@ PDU* MyTcpSocket::handleTransferAbort(PDU* pdu)
             // AUD-4：写盘在途时不得立即释放——否则在途写会落在 ctx 消失之后（回调落空），暂存物理大小
             // 越过 upload_session.confirmed_offset。标记延迟释放，由 handleUploadWriteFinished 收尾；
             // 108 仍即时回 ret=true（客户端不再向该 id 发正文，槽位语义不受影响）。
-            if(cp->writeInFlight){
+            // REQ-EXT-PERF-002：复算在途同口径——延迟到 onStagingHashFinished 落定后执行 abortUpload。
+            if(cp->writeInFlight || cp->hashInFlight){
                 cp->pendingAbort=true;
             }else{
                 m_MsgHandler->abortUpload(transferId);
@@ -464,6 +498,8 @@ PDU* MyTcpSocket::handleTransferAbort(PDU* pdu)
 void MyTcpSocket::sendUploadAck(quint64 transferId, bool success, qint64 nextOffset, bool complete)
 {
     PDU* response=mkPDU();
+    // caData 布局：0=success(bool)，8=nextOffset(qint64)，16=complete(bool)，
+    // 40=resumeMagic(u32)，48=transfer_id(qint64)；偏移与 Client 端逐字节一致。
     const uint resumeMagic=UPLOAD_RESUME_MAGIC;
     response->uiType=ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND;
     memcpy(response->caData,&success,sizeof(success));
@@ -668,6 +704,7 @@ void MyTcpSocket::sendNextChunk()
 //接收客户端消息
 void MyTcpSocket::recvmsg(){
     m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
+    // TCP 是字节流：一次 readyRead 可能拿到多个 PDU，也可能只有半个，统一追加到缓存。
     QByteArray dpui=this->readAll();
     this->m_dpulist.append(dpui);
     
@@ -680,7 +717,10 @@ void MyTcpSocket::recvmsg(){
         return;
     }
 
+    // 循环不变量：只有当缓存中至少有一个完整 PDU（uiTotalLen 字节）时才消费；
+    // 不足一个头的尾部留给下一次 readyRead，避免半包被误解析。
     while(this->m_dpulist.size()>=(int)sizeof (PDU)){
+            // QByteArray::data() 指向连续内存，可直接按 PDU 视图访问（只读解析，不接管所有权）。
             PDU* pdu=(PDU*)m_dpulist.data();
             uint pduTotalLen=pdu->uiTotalLen;
             

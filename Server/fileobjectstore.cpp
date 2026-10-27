@@ -13,6 +13,11 @@
 #include <QSqlError>
 #include <QSqlQuery>
 
+// fileobjectstore.cpp — 内容寻址对象存储实现。
+// 关键不变量：staging 的大小/SHA-256 复算通过后才 rename 进 objects/；DB 事务失败时
+// 尽力把已搬移的对象文件搬回 staging；物理对象只在 refcount 归零且被调度器抢权后删除。
+// 所有路径参数先经 normalizeParent 归一为 owner 相对逻辑键，再写入 user_file.parent_path。
+
 namespace {
 const int kMaxParentChars = 150;   // user_file.parent_path 列宽
 const int kMaxNameBytes   = 70;    // display_name 列宽（UTF-8 字节）
@@ -20,6 +25,7 @@ const int kNameSuffixCap  = 100;   // "(N)" 递推上限
 
 QString clampUtf8(const QString& s, int maxBytes);
 
+// 拆分扩展名：最后一个 '.' 之后为 ext；点位于首位或不存在时整体视为 base。
 void splitName(const QString& name, QString& base, QString& ext)
 {
     const int dot = name.lastIndexOf('.');
@@ -89,6 +95,7 @@ QString logicDirKey(const QString& parentKey, const QString& name)
     return parentKey + name + QLatin1Char('/');
 }
 
+// 同目录下是否存在同名 active 条目（软删行不占名，可被复活）。
 bool nameTaken(const QString& owner, const QString& parent, const QString& display, QSqlDatabase& db)
 {
     QSqlQuery q(db);
@@ -100,6 +107,7 @@ bool nameTaken(const QString& owner, const QString& parent, const QString& displ
 }
 }
 
+// 函数内静态对象：C++11 起线程安全，保证进程内唯一实例。
 FileObjectStore& FileObjectStore::instance()
 {
     static FileObjectStore s;
@@ -161,6 +169,7 @@ QString FileObjectStore::normalizeParent(const QString& owner, const QString& di
     return QLatin1Char('/') + rest + QLatin1Char('/');
 }
 
+// 流式复算暂存文件：1MiB 缓冲避免整文件读入内存，同时得到实际字节数。
 bool FileObjectStore::hashStaging(const QString& stagingPath, QString& shaHex, qint64& sizeBytes) const
 {
     QFile f(stagingPath);
@@ -198,6 +207,7 @@ qint64 FileObjectStore::findObjectBySha(const QString& shaHex, qint64 sizeBytes)
     return q.value(0).toLongLong();
 }
 
+// storage_path 是相对 filesys 的路径；objects_tmp/ 占位表示对象尚未转正，返回空。
 QString FileObjectStore::objectAbsPath(qint64 objectId) const
 {
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
@@ -220,6 +230,28 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
         const QString& wantedName, qint64 expectedSize, const QString& stagingPath,
         bool copyOnly, const QString& expectedSha)
 {
+    // REQ-EXT-PERF-002：同步入口保留给线程池外的调用方（如 T6 存量迁移 copyOnly）；
+    // 上传转正路径改为线程池复算后调用 commitUploadPreHashed，主线程不再等待整文件哈希。
+    CommitResult r;
+    r.displayName = wantedName;
+    QString sha;
+    qint64 size = 0;
+    if (!hashStaging(stagingPath, sha, size)) {
+        r.error = "staging 复算失败";
+        return r;
+    }
+    return commitUploadPreHashed(owner, rawParentPath, wantedName, expectedSize,
+                                 stagingPath, copyOnly, expectedSha, sha, size);
+}
+
+// REQ-EXT-PERF-002：复算（computedSha/computedSize）已在线程池完成后的转正提交。
+// 大小/摘要守卫、事务与文件搬移语义与 commitUpload 逐字节一致——复算只是换了执行线程。
+FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
+        const QString& owner, const QString& rawParentPath,
+        const QString& wantedName, qint64 expectedSize, const QString& stagingPath,
+        bool copyOnly, const QString& expectedSha,
+        const QString& computedSha, qint64 computedSize)
+{
     CommitResult r;
     r.displayName = wantedName;
     if (owner.isEmpty() || wantedName.isEmpty() || expectedSize < 0) {
@@ -233,12 +265,8 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
         return r;
     }
 
-    QString sha;
-    qint64 size = 0;
-    if (!hashStaging(stagingPath, sha, size)) {
-        r.error = "staging 复算失败";
-        return r;
-    }
+    const QString& sha = computedSha;
+    const qint64 size = computedSize;
     if (size != expectedSize) {
         r.error = "复算大小与登记不符，拒绝转正";
         qCWarning(lcFs) << "[commitUpload] conn-owner" << owner
@@ -423,6 +451,7 @@ FileObjectStore::CommitResult FileObjectStore::commitUpload(
     return r;
 }
 
+// 条件更新：仅 ready/pending_reclaim 可被加引用，与调度器 reclaiming 抢权互斥。
 bool FileObjectStore::refObject(qint64 objectId)
 {
     if (objectId < 0) return false;
@@ -439,6 +468,8 @@ bool FileObjectStore::refObject(qint64 objectId)
     return ok;
 }
 
+// 单条目软删：先按 (file_id, owner) 锁行确认归属与 active，再减对象引用。
+// 任一步失败整体回滚，保证条目状态与 refcount 一致。
 bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner)
 {
     if (fileId < 0 || owner.isEmpty()) return false;
@@ -478,6 +509,7 @@ bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner)
     return ok;
 }
 
+// 目录软删：在内存中用逻辑键前缀匹配收集整棵子树，避免 SQL LIKE 通配歧义。
 bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
 {
     if (dirFileId < 0 || owner.isEmpty()) return false;
@@ -546,6 +578,7 @@ bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
     return ok;
 }
 
+// 目录列表：LEFT JOIN 取对象大小（目录无对象，size 记为 0）。
 QList<FileObjectStore::EntryInfo> FileObjectStore::listEntries(
         const QString& owner, const QString& rawParentPath) const
 {
@@ -572,6 +605,7 @@ QList<FileObjectStore::EntryInfo> FileObjectStore::listEntries(
     return out;
 }
 
+// 精确查单条目；未命中返回 fileId=-1 的默认值。
 FileObjectStore::EntryInfo FileObjectStore::entryByPath(
         const QString& owner, const QString& rawParentPath, const QString& displayName) const
 {
@@ -594,6 +628,7 @@ FileObjectStore::EntryInfo FileObjectStore::entryByPath(
     return e;
 }
 
+// 改名/移动只改逻辑键；目录则同事务把后代 parent_path 的前缀整体平移。
 bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
                                     const QString& newRawParent, const QString& newDisplayName,
                                     QString& err)
@@ -677,6 +712,7 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
     return ok;
 }
 
+// 目录条目无对象（object_id=NULL），同名目录重复创建按幂等成功处理。
 bool FileObjectStore::insertDirEntry(const QString& owner, const QString& rawParent,
                                      const QString& displayName, QString& err)
 {
@@ -836,6 +872,7 @@ FileObjectStore::AttachResult FileObjectStore::attachExistingObject(
     return r;
 }
 
+// 轻量包装：不校验对象大小，把 AttachResult 转成 fileId/-1。
 qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawParent,
                                     const QString& wantedName, qint64 objectId, QString& err)
 {
@@ -844,6 +881,8 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
     return r.ok ? r.fileId : -1;
 }
 
+// 旧目录物理改名后的条目级联；oldDir/newDir 均为 '/' 结尾的逻辑键。
+// 无匹配条目视为成功（未迁移旧树）。
 bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldDirRaw,
                                        const QString& newDirRaw, QString& err)
 {
@@ -886,6 +925,7 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
     return ok;
 }
 
+// 旧目录物理删除后的条目软删；dir 为 '/' 结尾逻辑键，空匹配直接提交成功。
 bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& dirRaw, QString& err)
 {
     err.clear();
@@ -1102,6 +1142,7 @@ FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
     return r;
 }
 
+// 群文件软删：group_file 置 removed 并减引用；group_id 作为归属谓词防跨群操作。
 bool FileObjectStore::releaseGroupFile(qint64 groupFileId, quint64 groupId,
                                        const QString& actor, bool actorIsOwner, QString& err)
 {
