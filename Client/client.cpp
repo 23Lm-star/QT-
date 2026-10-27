@@ -1,3 +1,6 @@
+// Client 主窗口实现：连接管理、登录/注册、验证码冷却、心跳与失联重连、
+// 以及接收流的 PDU 拆包与按类型分发。
+// 所有代码运行在 GUI 线程；PDU 所指向的接收缓冲只在当前槽内有效。
 #include "logging.h"
 #include "client.h"
 #include "index.h"
@@ -25,17 +28,20 @@
 #include <string>
 
 namespace {
+// 口令在协议中只传 MD5 的 32 字节十六进制文本（不传明文）。
 QByteArray passwordHashForProtocol(const QString &password)
 {
     return QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Md5).toHex();
 }
 
+// 复制到定长字段并保证以 NUL 结尾：最多拷贝 dstSize-1 字节。
 void copyFixedField(char *dst, int dstSize, const QByteArray &src)
 {
     memset(dst, 0, dstSize);
     memcpy(dst, src.constData(), qMin(src.size(), dstSize - 1));
 }
 
+// 复制到定长字段但不保留结尾 NUL（用于 32 字节 MD5 十六进制串等恰好占满的字段）。
 void copyExactField(char *dst, int dstSize, const QByteArray &src)
 {
     memset(dst, 0, dstSize);
@@ -52,12 +58,15 @@ QString formatCooldown(int sec)
 }
 }
 
+// 构造：建控件、读配置、恢复/生成客户端 ID、启动验证码与心跳定时器，
+// 最后发起 TCP 连接并挂接 connected/readyRead/disconnected 三个槽。
 Client::Client(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Client)
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
+    // 基准 600×420 放大 2 倍（最多收敛到屏幕可用区 95%）。
     setFixedSize(scaledWindowSize(600,420));
     this->m_mhptr=new MsgHandler;
     loadconfig();
@@ -71,11 +80,13 @@ Client::Client(QWidget *parent)
         }
     }
     ui->loadingLabel->hide();
+    // 验证码冷却：初值 0/未锁定，定时器由 startCaptchaCooldown 按需启动。
     m_captchaCooldownSec=0;
     m_captchaLocked=false;
     m_captchaCooldownTimer=new QTimer(this);
     connect(m_captchaCooldownTimer,&QTimer::timeout,this,&Client::onCaptchaCooldownTick);
     
+    // 心跳固定 30s 一次；parent=this 保证随窗口销毁。
     m_heartbeatTimer = new QTimer(this);
     connect(m_heartbeatTimer, &QTimer::timeout, this, &Client::sendHeartbeat);
     m_heartbeatTimer->start(30000);
@@ -88,6 +99,7 @@ Client::Client(QWidget *parent)
     connect(m_reconnectDlg, &ReconnectDialog::reconnectClicked,
             this, &Client::onReconnectRequested);
 
+    // 异步连接（立即返回）；成功后进入 connectsort。
     sorket.connectToHost(QHostAddress(this->m_strlp),this->m_usPort);
     connect(&sorket,&QTcpSocket::connected,this,&Client::connectsort);
     connect(&sorket,&QTcpSocket::readyRead,this,&Client::recvmsg);
@@ -101,6 +113,7 @@ Client::~Client(){
 
 void Client::loadconfig()
 {
+    // 配置内嵌在 Qt 资源中，格式固定为 3 行 CRLF：IP / 端口 / 存储根。
     QFile f(":/connect.config");
     if(f.open(QIODevice::ReadOnly)){
         QString s=QString(f.readAll());
@@ -116,6 +129,7 @@ void Client::loadconfig()
 }
 
 Client &Client::getinstance(){
+    // C++11 函数内静态变量：首次调用构造（可能失败/阻塞于连接），进程退出时析构。
     static Client instance;
     return instance;
 }
@@ -134,6 +148,7 @@ QSize Client::scaledWindowSize(int baseW, int baseH)
 
 void Client::flus()
 {
+    // 只清账号/密码；验证码输入框保留占位提示。
     ui->name_LE->clear();
     ui->pwd_LE->clear();
 }
@@ -180,7 +195,9 @@ void Client::sendHeartbeat() {
 
 void Client::handlMsg(PDU *&pdu)
 {
+    // 把当前 PDU 交给 MsgHandler；它只借用指针，不负责释放。
     m_mhptr->pdu=pdu;
+    // 纯分发，无默认提示：未知类型静默忽略（向前兼容新消息）。
     switch(pdu->uiType){
     case ENUM_MSG_TYPE_HEARTBEAT_RESPOND: {
         m_lastPongMs = QDateTime::currentMSecsSinceEpoch();
@@ -313,10 +330,6 @@ void Client::handlMsg(PDU *&pdu)
         Index::getinstance().getFile()->handleListDirRespond(pdu);
         break;
     }
-    case ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND:{
-        m_mhptr->handlUserInformation();
-        break;
-    }
     case ENUM_MSG_TYPE_LOGOFF_RESPOND:{
         m_mhptr->handlLogoff();
         break;
@@ -375,8 +388,10 @@ void Client::handlMsg(PDU *&pdu)
 }
 
 void Client::seedMsg(PDU *pdu){
+    // QTcpSocket::write 会立即拷贝数据到内部写缓冲，因此可以马上 free。
     sorket.write((char*)pdu,pdu->uiTotalLen);
     free(pdu);
+    // 仅清空局部副本，调用方的指针不受影响
     pdu=nullptr;
 }
 
@@ -412,12 +427,16 @@ void Client::forceReLogin() {
 }
 
 void Client::recvmsg(){
+    // 追加本次读到的字节；循环尝试切出完整 PDU。
     m_pdulist.append(sorket.readAll());
+    // 条件保证头部 76 字节齐全后才读取 uiTotalLen（避免半包越界）。
     while (m_pdulist.size()>=(int)sizeof(PDU)) {
+        // 注意：pdu 直接指向 QByteArray 内部，不能在 handlMsg 前 remove/追加。
         PDU*pdu=(PDU*)m_pdulist.data();
         uint pdutotallen=pdu->uiTotalLen;
         if((uint)m_pdulist.size()>=pdutotallen){
             handlMsg(pdu);
+            // 处理完再移走整包；剩余的下一包字节留在缓冲中继续循环。
             m_pdulist.remove(0,pdu->uiTotalLen);
         }
         else break;
@@ -436,6 +455,7 @@ void Client::on_register_PB_clicked(){
         return ;
     }
     QByteArray captchaBytes=ui->randcode_LE->text().toUtf8();
+    // caData: [0..31]=用户名，[32..63]=MD5；caMsg: 验证码（含结尾 NUL）。
     PDU* pdu=mkPDU(captchaBytes.size()+1);
     pdu->uiType=ENUM_MSG_TYPE_REGIST_REQUEST;
     QByteArray passwordHash=passwordHashForProtocol(strpwd);
@@ -462,6 +482,7 @@ void Client::on_login_PB_clicked(){
         return;
     }
     QByteArray captchaBytes=captchaInput.toUtf8();
+    // caData: [0..31]=用户名，[32..63]=MD5。
     // REQ-EXT-SESSION-001 D1：验证码 NUL 之后追加 32 字节客户端 ID（零协议改动，老服务端按 uiMsgLen 忽略）
     QByteArray clientIdBytes=m_clientId.toUtf8();
     PDU* pdu=mkPDU(captchaBytes.size()+1+clientIdBytes.size());
@@ -497,7 +518,9 @@ void Client::resetCaptchaButton(){
     ui->pushButton->setEnabled(true);
 }
 
+// 验证码冷却状态机入口：sec 来自服务端；锁定与普通冷却共用同一倒计时。
 void Client::startCaptchaCooldown(int sec, bool locked){
+    // 服务端未给出有效秒数时使用本地默认值。
     if (sec <= 0) sec = locked ? 600 : 60;
     m_captchaCooldownSec=sec;
     m_captchaLocked=locked;
@@ -512,6 +535,7 @@ void Client::startCaptchaCooldown(int sec, bool locked){
 }
 
 void Client::onCaptchaCooldownTick(){
+    // 每秒递减；到 0 停止定时器并恢复交互。
     m_captchaCooldownSec--;
     if(m_captchaCooldownSec<=0){
         m_captchaCooldownTimer->stop();
@@ -549,6 +573,7 @@ void Client::sendLogoffRequest()
     }
 
     QByteArray passwordHash=passwordHashForProtocol(pwdInput);
+    // caData: [0..31]=当前登录名，[32..63]=MD5；服务端会再次校验密码。
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_LOGOFF_REQUEST;
     copyFixedField(pdu->caData,32,m_LoginName.toUtf8());
@@ -560,7 +585,9 @@ void Client::showLoadingAnimation(bool success){}
 
 // ===== 服务端存活检测 + 重连 =====
 void Client::onServerLost() {
+    // 去重：定时器与 disconnected 信号可能先后触发，只处理第一次。
     if (m_serverLostShown) return;
+    // 直到重连成功（connectsort）才复位
     m_serverLostShown = true;
     // REQ-EXT-TRANSFER-003 G7/C8②：心跳丢失（服务端假死）同样触发在途任务收敛，任务是"失败可重试"
     TransferManager::instance().onConnectionLost(QStringLiteral("与服务端断开连接，可重试"));

@@ -6,6 +6,10 @@
 #include <QString>
 #include <QTimer>
 
+// reclaimscheduler.h — 延迟删除的后台收割者：清理废弃 .part 与引用归零的物理对象。
+// 运行在主线程 QTimer 上，按拍切片以限制阻塞；删除前用条件状态迁移与复活方抢权互斥。
+// 配置文件为可执行文件同目录的 reclaim.cfg，缺失或非法值一律回退保守默认。
+
 // REQ-EXT-RECLAIM-001：周期清理调度器——延迟删除的收割者。
 //
 // 为什么必须有它：D5 之后"删"被有意推迟了。引用归零只标 pending_reclaim 而不物理删，
@@ -80,10 +84,12 @@ public:
         qint64 elapsedMs = 0;
     };
 
+    // 进程级单例（线程安全的函数内静态对象）。
     static ReclaimScheduler& instance();
 
     Config loadConfig() const;       // 读 reclaim.cfg；缺失或非法一律取保守默认
     void start();                    // 起心跳（可重复调用，第二次为空操作）
+    // 停心跳并丢弃进行中的轮次状态。
     void stop();
 
     // 同步跑完一轮，不依赖 QTimer——供人工验证与测试用。
@@ -111,13 +117,19 @@ private:
     QString stagingDir() const;
     QSet<QString> activeSessionStagingPaths() const;
 
+    // 心跳定时器（CoarseTimer，主线程）。
     QTimer m_timer;
     Config m_cfg;                    // start() 时快照，避免每拍都读配置文件
     Stats m_roundStats;              // 跨拍累积的本轮统计（一轮可能横跨多次心跳）
+    // 是否已启动（防止重复 connect/start）。
     bool m_started = false;
+    // 当前是否有横跨多拍的一轮在进行。
     bool m_roundActive = false;
+    // 本轮已处理条数（对 perRoundLimit 计数）。
     int m_roundProcessed = 0;
+    // 上一轮开始时间，用于轮次间隔判定。
     qint64 m_lastRoundStartMs = 0;
+    // 本轮开始时间，用于统计耗时。
     qint64 m_roundStartMs = 0;
     // 本轮已失败的条目，避免"最老的那条一直失败"把预算烧光、轮次永不结束。
     QSet<qint64> m_roundFailedObjects;

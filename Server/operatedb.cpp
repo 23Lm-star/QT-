@@ -17,6 +17,11 @@
 #include <QSqlError>
 #include <QVector>
 
+// OperateDB 实现：全部业务 SQL 集中在本文件。每条路径先向连接池借连接（RAII 自动归还），
+// 再执行预编译语句。多表写操作使用事务；并发敏感点用行锁（FOR UPDATE）或
+// LAST_INSERT_ID 原子分配版本/序号，避免"先读后写"竞态。
+// 返回值约定：布尔=false 表示失败；qint64<0 表示失败；字符串空表示未命中。
+
 namespace {
 // 生成 32 位 hex 随机盐（熵源为 OS 级密码学安全随机数）
 QString generatePasswordSalt()
@@ -40,20 +45,25 @@ QString applyPasswordSalt(const QString &clientHash, const QString &salt)
 }
 }
 
+// 单例由静态局部对象持有，连接池随进程退出统一关闭
 OperateDB::~OperateDB()
 {
 }
 
+// 进程内唯一实例；首次调用时线程安全构造
 OperateDB &OperateDB::instance()
 {
     static OperateDB s;
     return s;
 }
 
+// 无额外初始化：连接参数延迟到 connect() 时从 Server 配置读取
 OperateDB::OperateDB(QObject *parent) : QObject(parent)
 {
 }
 
+// 用 Server 的数据库配置初始化全局连接池，并立即做一次连通性探测。
+// 探测失败只记 critical 日志，不退出——由 main 的 schema 检查/业务调用决定后续行为。
 void OperateDB::connect()
 {
     Server& server = Server::getinstance();
@@ -94,6 +104,7 @@ bool OperateDB::checkSchemaVersion()
     if (q.next() && !q.value(0).isNull()) {
         version = q.value(0).toInt();
     }
+    // 总门槛取全部迁移版本的最大值：任一迁移缺失都会使库版本低于该值
     const int required = qMax(kFileAssetSchemaVersion,
                               qMax(kGroupSchemaVersion,
                                    qMax(kGroupMessageSchemaVersion,
@@ -420,6 +431,7 @@ qint64 OperateDB::createUploadSession(const QString &owner, const QString &paren
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return -1;
     QSqlQuery q(connection.database());
+    // 新会话状态固定 uploading；expires_at 默认 1 小时后
     q.prepare("INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,"
               "client_sha256,staging_path,confirmed_offset,status,expires_at,client_request_id) "
               "VALUES (?,?,?,?,?,?,?,'uploading',?,?)");
@@ -450,6 +462,7 @@ OperateDB::UploadSessionLookup OperateDB::lookupUploadSessionByRequestId(
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if (!connection.isValid()) return out;
     QSqlQuery q(connection.database());
+    // FOR UPDATE 锁住会话行，使并发同请求键的重试串行读取
     q.prepare("SELECT s.session_id,s.status,s.confirmed_offset,s.file_id,s.display_name,"
               "       uf.display_name,s.parent_path,s.expected_size,s.client_sha256 "
               "FROM upload_session s LEFT JOIN user_file uf ON uf.file_id=s.file_id "
@@ -556,6 +569,8 @@ qint64 OperateDB::insertCompletedUploadSession(const QString &owner, const QStri
     return q.lastInsertId().toLongLong();
 }
 
+// 更新已确认偏移；只有 status='uploading' 的行会命中。
+// 返回 SQL 是否执行成功——会话不存在/状态不符时影响 0 行也返回 true。
 bool OperateDB::updateUploadOffset(qint64 sessionId, qint64 confirmedOffset)
 {
     if(sessionId < 0) return false;
@@ -600,6 +615,9 @@ bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status, qin
     return q.exec();
 }
 
+// 注册：先查重再插入，两步非事务（并发同名可能由唯一键兜底失败）。
+// 客户端传的是密码哈希，服务端再加随机盐做一次 MD5；明文密码不落库。
+// 返回 true 仅表示 INSERT 成功。
 bool OperateDB::handleRegit(char *strname, char *strpwd)
 {
     if(strname==nullptr||strpwd==nullptr){
@@ -633,6 +651,8 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
     return q.exec();
 }
 
+// 创建安全外链：同 owner+path 已存在则复用（返回 true，不更新令牌/有效期）。
+// token_hash 唯一性由表约束保证；expire 显式格式化为 MySQL DATETIME。
 bool OperateDB::createShareLink(const QString &hash, const QString &owner, const QString &path, const QDateTime &expire)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -665,6 +685,7 @@ bool OperateDB::createShareLink(const QString &hash, const QString &owner, const
     return true;
 }
 
+// 按令牌哈希取链接信息；命中时回填 owner/路径/过期时间/撤销位，未命中返回 false
 bool OperateDB::getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -682,6 +703,7 @@ bool OperateDB::getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo)
     return false;
 }
 
+// 按 owner+精确路径取最新 token_hash；未命中返回空串（调用方据此判断"无链接"）
 QString OperateDB::getShareLinkByPath(const QString &owner, const QString &path)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -835,6 +857,9 @@ bool OperateDB::deleteFriendMessages(const QString &userA, const QString &userB)
     return ok;
 }
 
+// 登录：校验 md5(客户端哈希+盐) 后原子分配 login_version、写登录档案并置 online=1。
+// 返回 1 成功 / 0 系统失败（连接、事务、SQL）/ -1 用户名或密码错误。
+// 成功时 outVersion 为本次事务内分配的版本号；失败时保证为 0。
 int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId, quint64& outVersion)
 {
     outVersion = 0;
@@ -942,6 +967,7 @@ int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId,
     return 1;
 }
 
+// 下线：把 online 归零。执行失败不重试、不报错——启动期对账可清理残留
 void OperateDB::handleOffLine(const char *strname)
 {
     if(strname==nullptr){
@@ -961,6 +987,7 @@ void OperateDB::handleOffLine(const char *strname)
     q.exec();
 }
 
+// 查用户在线态：命中返回 online 列（0/1）；不存在返回 2；参数或连接失败返回 -1
 int OperateDB::handleFindUser(const char *userName)
 {
     if(userName==nullptr){
@@ -984,6 +1011,8 @@ int OperateDB::handleFindUser(const char *userName)
     return 2;
 }
 
+// 在线陌生人列表：排除自己，也排除任一方向已成好友的用户。
+// 连接失败返回空列表（与"确实没有在线用户"不可区分，调用方按空处理）。
 QStringList OperateDB::handleOnlineUsers(const QString &strname)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -1015,6 +1044,8 @@ QStringList OperateDB::handleOnlineUsers(const QString &strname)
     return ret;
 }
 
+// 加好友前置检查：只判断目标是否在线。返回 1 在线 / 0 不在线或不存在 /
+// -1 参数为空或连接不可用。usrname 当前未参与判定。
 int OperateDB::handleAddFriend(char *usrname, char *tarname)
 {
     if(usrname==nullptr||tarname==nullptr){
@@ -1037,6 +1068,8 @@ int OperateDB::handleAddFriend(char *usrname, char *tarname)
     return 0;
 }
 
+// 落库好友关系：只插入 (usrname -> tarname) 一个方向，重复插入由主键/唯一约束失败。
+// 返回 1 成功 / 0 INSERT 或提交失败 / -1 参数为空或连接不可用。
 int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
 {
     if(usrname==nullptr||tarname==nullptr){
@@ -1071,6 +1104,7 @@ int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
     return 1;
 }
 
+// 好友列表：UNION 合并两个方向并自动去重；连接失败返回空列表
 QStringList OperateDB::handleFlushFriend(const QString &strname)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -1095,6 +1129,7 @@ QStringList OperateDB::handleFlushFriend(const QString &strname)
     return ret;
 }
 
+// 删除好友：事务内删除双向记录，任一步失败即回滚（不会只删一半）
 bool OperateDB::handleDeleteFriend(char *userName, char *tarName)
 {
     if(userName==nullptr||tarName==nullptr){
@@ -1131,6 +1166,8 @@ bool OperateDB::handleDeleteFriend(char *userName, char *tarName)
     return true;
 }
 
+// 落库私聊消息：issuccess=1 表示接收方当时在线（可实时投递），0 表示留待其上线拉取。
+// 返回接收方是否在线；INSERT 本身失败只记日志，不影响返回值。
 bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString seedTime)
 {
     if(seedName==nullptr||revName==nullptr){
@@ -1163,6 +1200,9 @@ bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString 
     return ans;
 }
 
+// 拉取未送达私聊消息（issuccess=0）并在同一事务内置为已送达。
+// 返回扁平列表，每条消息依次为 msg、seed_time；事务/标记失败返回空列表，
+// 宁可下次重投也不重复下发。返回空也可能是确实没有消息。
 QStringList OperateDB::getchatMsg(char *seedName, char *revName)
 {
     QStringList ret;
@@ -1232,6 +1272,7 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName)
     return ret;
 }
 
+// 查询用户信息：命中回填 name 与 online 并返回 true；不存在或连接失败返回 false
 bool OperateDB::handleGetUserInfo(const char *userName, QString &outName, int &outOnline)
 {
     if(userName==nullptr){
@@ -1255,6 +1296,9 @@ bool OperateDB::handleGetUserInfo(const char *userName, QString &outName, int &o
     return true;
 }
 
+// 注销账户：密码校验通过后单事务删除消息、好友、用户行；
+// share_link/publish_links/login_record 的清理失败不回滚（表可能尚未迁移，视为成功）。
+// 返回 true 表示事务已提交。
 bool OperateDB::handleLogoff(const char* name, const char* pwd)
 {
     if(name==nullptr||pwd==nullptr){
@@ -1349,6 +1393,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     return true;
 }
 
+// 旧版公开链接：一条 INSERT，无查重；失败返回 false
 bool OperateDB::createPublishLink(const QString &code, const QString &path, const QString &creator)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -1362,6 +1407,7 @@ bool OperateDB::createPublishLink(const QString &code, const QString &path, cons
 }
 
 namespace {
+// 构造失败结果：清零群/版本/事件字段，避免调用方误读半成品状态
 OperateDB::GroupResult groupFailure(int code)
 {
     OperateDB::GroupResult result;
@@ -1372,12 +1418,15 @@ OperateDB::GroupResult groupFailure(int code)
     return result;
 }
 
+// 名称/幂等键校验：非空、不超列宽、不含 NUL 与 CR/LF/TAB（防止破坏协议与日志）
 bool groupIsValidName(const QString &value, int maxLength)
 {
     return !value.isEmpty() && value.size() <= maxLength && !value.contains(QChar('\0'))
             && !value.contains(QRegExp("[\\r\\n\\t]"));
 }
 
+// 取 actor 在群内的角色（owner/admin/member）；非 active 成员或 SQL 失败返回空串。
+// 调用方多以空串作为"无权限/非成员"的统一判据。
 QString groupRole(QSqlDatabase &db, quint64 groupId, const QString &actor)
 {
     QSqlQuery q(db);
@@ -1387,6 +1436,7 @@ QString groupRole(QSqlDatabase &db, quint64 groupId, const QString &actor)
     return q.exec() && q.next() ? q.value(0).toString() : QString();
 }
 
+// 群内全部 active 成员账号，用于事件广播名单（不含已退出/被移除者）
 QStringList groupActiveUsers(QSqlDatabase &db, quint64 groupId)
 {
     QStringList users;
@@ -1399,6 +1449,7 @@ QStringList groupActiveUsers(QSqlDatabase &db, quint64 groupId)
     return users;
 }
 
+// 群列表单行编码：group_id、group_name、status、role、version（顺序即协议契约）
 void groupAppendRecord(QByteArray &body, quint64 groupId, const QString &groupName,
                        const QString &status, const QString &role, quint64 version)
 {
@@ -1444,6 +1495,9 @@ bool groupAppendSystemMessage(QSqlDatabase &db, quint64 groupId, const QString &
 }
 }
 
+// 群操作总入口：先分流只读查询（建群/群列表/邀请/成员/摘要），其余写操作
+// 统一开事务并锁定 group_info 行，再按角色做授权与变更。
+// code=0 成功；负数为业务错误；写成功时 version 为提交后的群版本。
 OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &request,
                                                        const QString &actor)
 {
@@ -1475,6 +1529,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         return result;
     }
 
+    // ---- 只读分支：群列表（仅 active 成员，最近更新的群在前） ----
     if (request.operation == GroupList) {
         q.prepare("SELECT gi.group_id,gi.group_name,gi.status,gm.role,gi.version "
                   "FROM group_member gm JOIN group_info gi ON gi.group_id=gm.group_id "
@@ -1496,6 +1551,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         return result;
     }
 
+    // ---- 只读分支：我收到的、仍 pending 的邀请 ----
     if (request.operation == GroupQueryInvitations) {
         q.prepare("SELECT i.invitation_id,i.group_id,gi.group_name,i.inviter_name,i.status,"
                   "UNIX_TIMESTAMP(i.expires_at) FROM group_invitation i "
@@ -1586,6 +1642,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         return result;
     }
 
+    // ---- 写操作统一路径：行锁 group_info（串行化版本号），事务内完成鉴权与变更 ----
     if (!db.transaction()) return groupFailure(-1016);
     q.prepare("SELECT status,version FROM group_info WHERE group_id=? FOR UPDATE");
     q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
@@ -1643,6 +1700,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         return result;
     }
 
+    // 写操作共同前置：调用者必须是 active 成员，且群未解散；之后按角色细分授权
     const QString actorRole = groupRole(db, groupId, actor);
     if (actorRole.isEmpty()) { db.rollback(); return groupFailure(-1026); }
     if (groupStatus != "active") { db.rollback(); return groupFailure(-1027); }
@@ -1679,6 +1737,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
     GroupMessageRecord sysMsg;
     bool sysMsgPending = false;
     int sysCode = 0;
+    // 退出：群主不能直接退群（须先转让或解散）；仅 active 行被置为 left
     if (request.operation == GroupLeave) {
         if (actorRole == "owner") { db.rollback(); return groupFailure(-1036); }
         q.prepare("UPDATE group_member SET status='left',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active'");
@@ -1691,6 +1750,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         }
         sysMsgPending = true;
     } else if (request.operation == GroupRemoveMember) {
+        // 移除：owner/admin 可操作，但目标必须是普通 member（不能移除同级/群主）
         if (actorRole != "owner" && actorRole != "admin") { db.rollback(); return groupFailure(-1038); }
         q.prepare("SELECT role,status FROM group_member WHERE group_id=? AND user_name=? FOR UPDATE");
         q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
@@ -1705,11 +1765,13 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         }
         sysMsgPending = true;
     } else if (request.operation == GroupSetRole) {
+        // 设角色：仅 owner 可把他人设为 admin/member；SQL 里排除 role='owner' 防误改
         if (actorRole != "owner" || (request.role != "admin" && request.role != "member")) { db.rollback(); return groupFailure(-1041); }
         q.prepare("UPDATE group_member SET role=?,updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active' AND role<>'owner'");
         q.addBindValue(request.role); q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
         if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1042); }
     } else if (request.operation == GroupTransferOwner) {
+        // 转让：目标升 owner，原 owner 降 admin；两条 UPDATE 都必须命中 1 行，否则回滚
         if (actorRole != "owner") { db.rollback(); return groupFailure(-1043); }
         q.prepare("UPDATE group_member SET role='owner',updated_at=CURRENT_TIMESTAMP WHERE group_id=? AND user_name=? AND status='active' AND role<>'owner'");
         q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(request.targetName);
@@ -1718,6 +1780,7 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         q.addBindValue(QVariant::fromValue<qulonglong>(groupId)); q.addBindValue(actor);
         if (!q.exec() || q.numRowsAffected() != 1) { db.rollback(); return groupFailure(-1045); }
     } else if (request.operation == GroupDissolve) {
+        // 解散：仅 owner；只改 group_info.status，成员行保留供历史只读
         if (actorRole != "owner") { db.rollback(); return groupFailure(-1046); }
         q.prepare("UPDATE group_info SET status='dissolved' WHERE group_id=?");
         q.addBindValue(QVariant::fromValue<qulonglong>(groupId));

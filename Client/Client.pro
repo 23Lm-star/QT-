@@ -44,8 +44,7 @@ SOURCES += \
     reconnectdialog.cpp \
     transfertask.cpp \
     uploader.cpp \
-    simplecaptcha.cpp \
-    userinformation.cpp
+    simplecaptcha.cpp
 
 HEADERS += \
     chat.h \
@@ -66,8 +65,7 @@ HEADERS += \
     reconnectdialog.h \
     transfertask.h \
     uploader.h \
-    simplecaptcha.h \
-    userinformation.h
+    simplecaptcha.h
 
 FORMS += \
     chat.ui \
@@ -77,8 +75,7 @@ FORMS += \
     index.ui \
     onlineuser.ui \
     sharefile.ui \
-    sharelinkdialog.ui \
-    userinformation.ui
+    sharelinkdialog.ui
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

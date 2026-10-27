@@ -1,21 +1,33 @@
 #ifndef PROTOCOL_H
 #define PROTOCOL_H
 //PDU协议类型定义
+// 协议总览：所有消息是一个 PDU 头（76 字节 = 3×uint + char[64]）+ 柔性数组 caMsg。
+// 定长参数放 caData 的固定偏移，变长内容放 caMsg；以下所有 OFFSET 常量均为
+// 相对各自缓冲区（caData 或 caMsg）的字节偏移，两端必须逐字节一致。
+// 多字节整数按主机字节序直接 memcpy（局域网内同架构），群协议部分则显式小端。
 
 #include <QByteArray>
 #include <QtGlobal>
 
 typedef unsigned int uint;
 
+// ===== 上传续传/分块布局（caData 前 64 字节内的偏移） =====
 static const uint UPLOAD_RESUME_MAGIC = 0x5253554d; // "RSUM"
+// qint64 文件总大小
 static const int UPLOAD_FILE_SIZE_OFFSET = 32;
+// qint64 续传起点（与文件大小复用同一偏移）
 static const int UPLOAD_RESUME_OFFSET = 32;
+// u32 续传魔数
 static const int UPLOAD_RESUME_MAGIC_OFFSET = 40;
+// 分块数据：caMsg 内偏移
 static const int UPLOAD_CHUNK_OFFSET = 0;
+// ACK 中下一期望偏移（qint64）
 static const int UPLOAD_ACK_NEXT_OFFSET = 8;
+// ACK 中完成标志
 static const int UPLOAD_ACK_COMPLETE_OFFSET = 16;
 
 //消息类型的枚举值
+// 编号一旦发布不得复用：各扩展需求只在尾部追加。
 enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_MIN=0,
     ENUM_MSG_TYPE_REGIST_REQUEST,//注册请求 1
@@ -141,6 +153,7 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST = 107,   // 上传任务释放请求（暂停/取消共用）
     ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND = 108,   // 上传任务释放响应
 
+    // 哨兵上限，无实际消息含义
     ENUM_MSG_TYPE_MAX = 99999,
 };
 
@@ -201,40 +214,53 @@ struct PDU{//协议数据单元
     char caData[64];    //参数，数据长度小于参数长度就放到参数里
     char caMsg[];       //消息
 };
+// 头部固定 76 字节（3×4 + 64），接收端据此判断半包/粘包。
 //文件信息
 struct FileInfo{
+    // 文件名（不足补 0）
     char caName[32];
+    // 0=目录，1=文件
     uint uiType;
 };
 //消息
 struct Msg{
+    // 本条消息总长（含头部），用于批量消息步进
     uint totalLen;
+    // msg[] 实际长度
     uint msgLen;
+    // 发送时间字符串
     char Time[30];
+    // 消息正文（含结尾 NUL）
     char msg[];
 };
 
 //构建pdu协议对象的函数
 //返回pdu对象的地址
+// Client 侧用 malloc 分配、seedMsg 用 free 释放；失败直接 exit(1)。
 PDU* mkPDU(uint uiMsgLen=0);
 
 // 群协议公共信封长度：版本(2)+长度(2)+request_id(8)+group_id(8)。
 static const quint16 GROUP_PROTOCOL_VERSION = 1;
 static const quint16 GROUP_ENVELOPE_LENGTH = 20;
 
+// ===== 群协议序列化工具（显式小端，跨平台字节序稳定） =====
+// 追加 u16；容量检查在调用方，这里假定 out 足够。
 inline void groupAppendU16(QByteArray &out, quint16 value)
 {
     out.append(char(value & 0xff));
     out.append(char((value >> 8) & 0xff));
 }
+// 追加 u32（小端）。
 inline void groupAppendU32(QByteArray &out, quint32 value)
 {
     for (int i = 0; i < 4; ++i) out.append(char((value >> (8 * i)) & 0xff));
 }
+// 追加 u64（小端）。
 inline void groupAppendU64(QByteArray &out, quint64 value)
 {
     for (int i = 0; i < 8; ++i) out.append(char((value >> (8 * i)) & 0xff));
 }
+// 从 offset 读取 u16 并前移 offset；越界返回 false 且不移动。
 inline bool groupReadU16(const QByteArray &in, int &offset, quint16 &value)
 {
     if (offset < 0 || offset + 2 > in.size()) return false;
@@ -242,6 +268,7 @@ inline bool groupReadU16(const QByteArray &in, int &offset, quint16 &value)
     offset += 2;
     return true;
 }
+// 从 offset 读取 u32 并前移 offset；越界返回 false。
 inline bool groupReadU32(const QByteArray &in, int &offset, quint32 &value)
 {
     if (offset < 0 || offset + 4 > in.size()) return false;
@@ -250,6 +277,7 @@ inline bool groupReadU32(const QByteArray &in, int &offset, quint32 &value)
     offset += 4;
     return true;
 }
+// 从 offset 读取 u64 并前移 offset；越界返回 false。
 inline bool groupReadU64(const QByteArray &in, int &offset, quint64 &value)
 {
     if (offset < 0 || offset + 8 > in.size()) return false;
@@ -258,11 +286,13 @@ inline bool groupReadU64(const QByteArray &in, int &offset, quint64 &value)
     offset += 8;
     return true;
 }
+// 追加长度前缀字符串：u32 长度 + 原始字节（不带 NUL）。
 inline void groupAppendString(QByteArray &out, const QByteArray &value)
 {
     groupAppendU32(out, quint32(value.size()));
     out.append(value);
 }
+// 读取长度前缀字符串；长度越界（防恶意超长）返回 false。
 inline bool groupReadString(const QByteArray &in, int &offset, QByteArray &value)
 {
     quint32 length = 0;

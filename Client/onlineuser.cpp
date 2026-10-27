@@ -6,6 +6,7 @@
 #include <cstring>
 
 namespace {
+// 写入协议的定长字符串槽：先清零，最多拷 dstSize-1 字节以保留结尾 '\0'
 void copyFixedField(char *dst, int dstSize, const QByteArray &src)
 {
     memset(dst, 0, dstSize);
@@ -19,6 +20,7 @@ OnlineUser::OnlineUser(QWidget *parent) :
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
+    // 初始引导文案；列表刷新/单击/发送后会被覆盖
     ui->hintLabel->setText(QStringLiteral("单击选中，双击添加好友"));
 }
 
@@ -33,10 +35,12 @@ void OnlineUser::setHint(const QString &text)
 }
 
 void OnlineUser::updateOnlineUser( const QStringList &userNames){
+    // 全量替换：服务端每次回发当前在线快照
     //清理列表
     ui->listWidget->clear();
     //重新添加所有的在线用户
     ui->listWidget->addItems(userNames);
+    // 空列表给出明确提示，避免看起来像加载失败
     ui->hintLabel->setText(userNames.isEmpty()
             ? QStringLiteral("当前没有其他在线用户")
             : QStringLiteral("单击选中，双击添加好友"));
@@ -63,6 +67,7 @@ void OnlineUser::on_listWidget_itemDoubleClicked(QListWidgetItem *item)
     if(target.isEmpty()){
         return;
     }
+    // 客户端先行拦截“加自己”；其余合法性仍由服务端判定
     const QString myName=Client::getinstance().m_LoginName;
     if(target == myName){
         QMessageBox::information(this, QStringLiteral("提示"), QStringLiteral("不能添加自己为好友"));
@@ -75,6 +80,7 @@ void OnlineUser::on_listWidget_itemDoubleClicked(QListWidgetItem *item)
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_REQUEST;
+    // caData[0,32)=申请人；[32,64)=被添加者
     copyFixedField(pdu->caData,32,myName.toUtf8());
     copyFixedField(pdu->caData+32,32,target.toUtf8());
     Client::getinstance().seedMsg(pdu);

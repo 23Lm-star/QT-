@@ -1,3 +1,4 @@
+// 目录选择弹窗实现：列表项是服务端返回的 FileInfo 目录项，浏览状态仅为相对路径字符串。
 #include "folderselectdialog.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -7,6 +8,7 @@
 #include <QFileInfo>
 #include <QPixmap>
 
+// 纯代码构建：路径标签 + 目录列表 + 返回/进入/确定/取消
 FolderSelectDialog::FolderSelectDialog(QWidget *parent)
     : QDialog(parent)
 {
@@ -45,6 +47,7 @@ FolderSelectDialog::FolderSelectDialog(QWidget *parent)
     // 首次加载由 File::on_move_PB_clicked 在 connect 之后显式触发。
 }
 
+// 切换浏览目录：更新状态与标签，并请求外部发 LISTDIR（rel 为空表示用户根）
 void FolderSelectDialog::browse(const QString &rel)
 {
     m_browseRel = rel;
@@ -57,6 +60,7 @@ void FolderSelectDialog::updatePathLabel()
     m_pathLabel->setText(QString("当前目录：%1").arg(m_browseRel.isEmpty() ? "根目录" : m_browseRel));
 }
 
+// 解析 LISTDIR 响应：caMsg 为连续 FileInfo 数组，按 sizeof(FileInfo) 步长切分
 void FolderSelectDialog::handleListDir(PDU *pdu)
 {
     m_list->clear();
@@ -71,6 +75,7 @@ void FolderSelectDialog::handleListDir(PDU *pdu)
     }
 }
 
+// 双击：在浏览路径后追加子目录名
 void FolderSelectDialog::onItemDoubleClicked(QListWidgetItem *item)
 {
     if (!item) return;
@@ -86,6 +91,7 @@ void FolderSelectDialog::onEnterClicked()
     browse(m_browseRel.isEmpty() ? name : (m_browseRel + "/" + name));
 }
 
+// 返回上一级：截到最后一个 '/'；已在根目录则无动作
 void FolderSelectDialog::onUpClicked()
 {
     if (m_browseRel.isEmpty()) return; // 已在根目录

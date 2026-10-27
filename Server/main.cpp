@@ -4,6 +4,9 @@
 #include <QApplication>
 #include "operatedb.h"
 #include "reclaimscheduler.h"
+// 服务端启动顺序（失败即退出，避免半初始化状态）：
+// 配置/监听 → DB 连接池 → schema 版本 → 在线态对账 → 逻辑键归一化 → 存量迁移
+// → 回收调度器 → 进入事件循环；退出时先停调度器再销毁 QApplication。
 int main(int argc, char *argv[])
 {
     QApplication a(argc, argv);

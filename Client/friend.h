@@ -8,10 +8,15 @@
 #include <QTimer>
 #include <QStringList>
 #include "chat.h"
+
+// 好友页：好友列表的查询/删除/发起私聊，以及“所有在线用户”子窗口的入口。
+// 列表数据由 MsgHandler 回包后经 flushFriend_LW 缓存，真正写控件只在 rebuildFriendList；
+// 页面不可见时仅置脏标志，待 showEvent 再合并刷新（避免后台反复重绘）。
 namespace Ui {
 class Friend;
 }
 //好友类
+// 好友管理 + 私聊入口
 class Friend : public QWidget
 {
     Q_OBJECT
@@ -23,6 +28,7 @@ public:
     Chat* m_chat;
     //刷新好友接口函数->引导刷新好友
     void flushfriend();
+    // 返回好友列表控件（供外部/测试直接访问，正常刷新走 rebuildFriendList）
     QListWidget* getfile_LW();
     //刷新好友操作函数——仅接管数据，不直接写 QListWidget
     void flushFriend_LW(const QStringList& q);
@@ -30,6 +36,7 @@ public:
     ~Friend();
 
 protected:
+    // 页面重新可见时补做一次合并刷新（不可见期间只缓存数据）
     void showEvent(QShowEvent *event) override;
 
 private slots:

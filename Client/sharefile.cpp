@@ -1,3 +1,4 @@
+// 好友分享弹窗实现：接收人列表按「名字.状态」格式，展示时只保留名字。
 #include "sharefile.h"
 #include "ui_sharefile.h"
 #include "index.h"
@@ -14,6 +15,7 @@ ShareFile::~ShareFile()
     delete ui;
 }
 
+// 好友项文本形如 "用户名.在线状态"，这里截取第一个点之后的用户名部分
 void ShareFile::flusfriend()
 {
     ui->friendlist_LW->clear();
@@ -27,6 +29,7 @@ void ShareFile::flusfriend()
     }
 }
 
+// 全选：逐项 setSelected，不改变当前项
 void ShareFile::on_allchoose_PB_clicked()
 {
     for(int i=0;i<ui->friendlist_LW->count();i++){
@@ -41,6 +44,7 @@ void ShareFile::on_nochoose_PB_clicked()
     }
 }
 
+// 请求负载：caData = 发送人(32B) + 接收人数(4B)；caMsg = 每个接收人占 32B，末尾接文件完整路径
 void ShareFile::on_output_PB_clicked()
 {
     QString shareFileName=Index::getinstance().getFile()->m_strShareFileName;

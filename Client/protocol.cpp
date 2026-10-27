@@ -1,3 +1,5 @@
+// PDU 构造实现：一次 malloc 分配“头部 + 柔性数组”，全部字段清零。
+// caData 也清零，保证未使用的定长参数为 0（对端可依赖该默认值做版本兼容判断）。
 #include "protocol.h"
 #include <stdlib.h>
 #include <string.h>

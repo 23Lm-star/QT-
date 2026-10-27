@@ -18,17 +18,22 @@
 // 容器用 std::set 而非 QSet：本头文件要能在项目工具链下被独立编译成断言探针
 // （project-docs/evidence/REQ-EXT-GROUP-004/cursor_probe.cpp），只依赖 QtGlobal 的类型别名，
 // 不需要链接 Qt5Core，也不需要在运行期部署 Qt DLL。
+// 单条 seq 到达后对读游标的影响分类
 enum class ReadCursorVerdict {
     Advanced,   // A：正好接上前缀，游标推进（可能顺带消费缓冲区，一次跳多格）
     Buffered,   // B：超前到达（中间有洞），消息照渲染，游标绝不动
     Ignored     // C：重复/迟到（seq <= 游标），丢弃
 };
 
+// 一个群一份的会话级读状态；由 Client 按 group_id 持有，窗口只读写它
 class GroupChatState
 {
 public:
+    // 群已知最新序号（乐观推进，仅用于显示与判断是否需要补洞）
     quint64 waterSeq() const { return m_waterSeq; }
+    // 已连续读到的前缀末尾，也是上报给服务端的唯一锚点
     quint64 readCursor() const { return m_readCursor; }
+    // 服务端最近一次回认的已读位置（避免重复上报）
     quint64 confirmedSeq() const { return m_confirmedSeq; }
     bool anchored() const { return m_anchored; }        // 是否已从服务端取到过锚点
     int outOfOrderCount() const { return int(m_outOfOrderBuffer.size()); }
@@ -51,10 +56,15 @@ public:
     void clear();
 
 private:
+    // 水位：见过的最大 seq
     quint64 m_waterSeq = 0;
+    // 连续前缀末尾：允许上报的最大值
     quint64 m_readCursor = 0;
+    // 服务端已确认的游标
     quint64 m_confirmedSeq = 0;
+    // 是否已拿到过服务端权威锚点
     bool m_anchored = false;
+    // 超前到达、等洞补齐后再消费的 seq
     std::set<quint64> m_outOfOrderBuffer;
 };
 

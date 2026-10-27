@@ -1,9 +1,11 @@
+// 验证码控件实现：字符集剔除 0/O/1/I 等易混淆字符，生成即刷新显示。
 // captcha_simple.cpp
 #include "simplecaptcha.h"
 #include <QRandomGenerator>
 #include <QTime>
 #include <qboxlayout.h>
 
+// 构造：默认 4 位，初始化标签样式并生成首个验证码
 SimpleCaptcha::SimpleCaptcha(QWidget *parent)
     : QWidget(parent), m_codeLength(4)
 {
@@ -35,6 +37,7 @@ SimpleCaptcha::SimpleCaptcha(QWidget *parent)
     setLayout(layout);
 }
 
+// 重新生成并广播 captchaRefreshed
 void SimpleCaptcha::refreshCaptcha()
 {
     m_code = generateRandomCode();
@@ -42,6 +45,7 @@ void SimpleCaptcha::refreshCaptcha()
     emit captchaRefreshed();
 }
 
+// 长度夹在 [4,10]；仅在变化时刷新，避免无谓重生成
 void SimpleCaptcha::setCodeLength(int length)
 {
     int clamped = qBound(4, length, 10);
@@ -51,11 +55,13 @@ void SimpleCaptcha::setCodeLength(int length)
     }
 }
 
+// 校验：大小写不敏感（字符集本身为大写）
 bool SimpleCaptcha::verify(const QString &input) const
 {
     return m_code.compare(input, Qt::CaseInsensitive) == 0;
 }
 
+// 逐位从字符集均匀抽取；每字符独立生成
 QString SimpleCaptcha::generateRandomCode()
 {
     // 字符集：大写字母 + 数字（排除易混淆字符）

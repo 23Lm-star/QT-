@@ -1,3 +1,5 @@
+// 文件页实现：文件列表刷新、目录操作、上传/下载入队、分享链接与移动弹窗。
+// 列表数据与 UI 重建分离，避免连续响应时反复 clear/addItem 造成闪烁和开销。
 #include "logging.h"
 #include "client.h"
 #include "file.h"
@@ -26,6 +28,7 @@
 #include <QDialog>
 
 namespace {
+// 文件名白名单校验：非空、≤31 字节、无首尾空白/点、无 Windows 禁用字符与保留名
 bool isValidFileName(const QString &name)
 {
     QString trimmed=name.trimmed();
@@ -55,6 +58,7 @@ bool isValidFileName(const QString &name)
     return !reserved.contains(base);
 }
 
+// 把字符串写入定长字段：先清零，最多拷 dstSize-1 字节，保证 NUL 结尾
 void copyFixedField(char *dst, int dstSize, const QByteArray &src)
 {
     memset(dst, 0, dstSize);
@@ -62,6 +66,7 @@ void copyFixedField(char *dst, int dstSize, const QByteArray &src)
 }
 }
 
+// 构造：初始化 UI、路径、分享窗口，并以代码方式补挂「传输列表」「添加待传」按钮
 File::File(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::File)
@@ -195,6 +200,7 @@ void File::resetUserPath()
     qCDebug(lcCli)<<"创建用户今日目录:"<<QDate::currentDate().toString("yyyy-MM")<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
 }
 
+// 发送 FLUSHFILE：以当前路径为载荷（多留 1 字节 NUL），响应由 Client 路由回 updateCurrfile
 void File::flushfile()
 {
     int curPathLen=m_strCurPath.toUtf8().toStdString().size();//记录当前路径长度(utf8编码)
@@ -204,6 +210,7 @@ void File::flushfile()
     Client::getinstance().seedMsg(pdu);
 }
 
+// 接管服务端目录列表：释放旧条目、保存新列表，仅登记刷新需求（不立即重建控件）
 void File::updateCurrfile(QList<FileInfo *> qFileinfolist){
     // 步骤1：释放旧数据内存
     foreach(FileInfo* fileInfos,m_fileInfoList){
@@ -217,6 +224,7 @@ void File::updateCurrfile(QList<FileInfo *> qFileinfolist){
     scheduleUiRefresh();
 }
 
+// 真正的控件重建：按 uiType 选择目录/文件图标（0=目录，1=文件）
 void File::rebuildFileList(){
     ui->file_LW->clear();
     for(int i=0;i<m_fileInfoList.size();i++){
@@ -234,6 +242,7 @@ void File::rebuildFileList(){
     m_pendingUiRefresh=false;
 }
 
+// 合并刷新：页面不可见时推迟到 showEvent，已排队时不重复排；回调内再次校验
 void File::scheduleUiRefresh()
 {
     // 无待处理数据则跳过
@@ -262,6 +271,7 @@ void File::scheduleUiRefresh()
     });
 }
 
+// 页面重新可见：补做不可见期间积压的列表刷新
 void File::showEvent(QShowEvent *event){
     QWidget::showEvent(event);
     qCDebug(lcCli) << "[File] showEvent: 页面变为可见，pending=" << m_pendingUiRefresh;
@@ -274,6 +284,7 @@ void File::flushCurrLE()
     ui->currPath_LE->setText(m_strCurPath);
 }
 
+// 服务端/协议错误统一提示
 void File::errnoMsg(const QString &Msg)
 {
     QMessageBox::information(this,"提示",Msg);
@@ -300,6 +311,7 @@ void File::on_flush_PB_clicked()
     flushfile();
 }
 //删除文件/目录
+// 删除：确认后按列表缓存的 uiType 区分文件/目录，caMsg 为完整服务端路径
 void File::on_del_PB_clicked()
 {
      QListWidgetItem* fileName=ui->file_LW->currentItem();//获取到要删除的文件夹名称
@@ -329,6 +341,7 @@ void File::on_del_PB_clicked()
      Client::getinstance().seedMsg(pdu);
 }
 //进入当前文件/目录
+// 双击目录进入；双击文件无动作（uiType: 0=目录，1=文件）
 void File::on_file_LW_itemDoubleClicked(QListWidgetItem *item)
 {
     QListWidgetItem* triName = ui->file_LW->currentItem();
@@ -376,6 +389,7 @@ void File::on_back_PB_clicked()
     Client::getinstance().seedMsg(pdu);
 }
 
+// 重命名：caData 前 32 字节旧名、后 32 字节新名；caMsg = uiType + 当前目录
 void File::on_rename_PB_clicked()
 {
     QListWidgetItem* oldfileName=ui->file_LW->currentItem();
@@ -446,6 +460,7 @@ void File::on_move_PB_clicked()
     m_moveDlg = nullptr;
 }
 
+// 请求目录子项：caMsg 为以 NUL 结尾的相对路径，响应由 handleListDirRespond 交给弹窗
 void File::requestListDir(const QString &rel)
 {
     QByteArray relBytes = rel.toUtf8();
@@ -458,6 +473,7 @@ void File::requestListDir(const QString &rel)
     Client::getinstance().seedMsg(pdu);
 }
 
+// LISTDIR 响应仅在移动弹窗存活时转发（其他来源的目录请求不在此消费）
 void File::handleListDirRespond(PDU *pdu)
 {
     if(m_moveDlg){
@@ -574,6 +590,7 @@ void File::on_download_PB_clicked()
     TransferManager::instance().showPanel();
 }
 
+// 好友分享：先刷新好友列表，目录不可分享；弹窗已显示时仅更新文件名
 void File::on_share_PB_clicked()
 {
     QListWidgetItem* listWidgeti=ui->file_LW->currentItem();
@@ -679,6 +696,7 @@ void File::promptShareLinkRecovery(quint32 state, const QString &note)
     }
 }
 
+// 外链请求负载布局：相对路径 + NUL；可选动作区（动作 + NUL + 秒数）紧随其后
 void File::sendCreatePublishLink(const QString &relativePath, const QString &action, int seconds)
 {
     const QByteArray relBytes = relativePath.toUtf8();
@@ -699,6 +717,7 @@ void File::sendCreatePublishLink(const QString &relativePath, const QString &act
     Client::getinstance().seedMsg(pdu);
 }
 
+// 查询已有分享链接：caData 为登录名，caMsg 为文件相对路径
 void File::onGetShareLink() {
     QListWidgetItem *item = ui->file_LW->currentItem();
     if (!item) return;
@@ -711,6 +730,7 @@ void File::onGetShareLink() {
     Client::getinstance().seedMsg(pdu);
 }
 
+// 生成外链（无动作区 = 新建）；记录文件名供失败恢复弹窗计算相对路径
 void File::on_genlink_PB_clicked()
 {
     QListWidgetItem* item = ui->file_LW->currentItem();
@@ -734,6 +754,7 @@ void File::on_genlink_PB_clicked()
     sendCreatePublishLink(selectedFileRelativePath(item), QString(), 0);
 }
 
+// 通过外链取文件：接受完整 URL 或裸 token，只把 token 放进 RESOLVE 请求
 void File::on_fetchshare_PB_clicked()
 {
     QString text = ui->sharelink_LE->text().trimmed();

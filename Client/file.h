@@ -1,3 +1,5 @@
+// 文件页：浏览/新建/删除/重命名/移动服务端文件，上传与下载入口，
+// 分享链接的生成、解析与失效恢复，以及传输任务面板入口。
 #ifndef FILE_H
 #define FILE_H
 #include "protocol.h"
@@ -15,6 +17,7 @@ namespace Ui {
 class File;
 }
 //文件类:
+// 文件页主窗口；UI 数据与控件分离，列表刷新经 scheduleUiRefresh 合并调度
 class File : public QWidget
 {
     Q_OBJECT
@@ -23,10 +26,13 @@ public:
     QString m_strUserPath;//用户路径
     QString m_strCurPath;//当前路径
     QString m_strShareFileName;//分享文件名
+    // 本类持有条目所有权，刷新时先释放旧列表
     QList<FileInfo*>m_fileInfoList;//当前路径文件信息
+    // 好友分享弹窗（懒显示，常驻）
     ShareFile* m_shareFile;
     void flushfile();//刷新当前文件->引导刷新
     void updateCurrfile(QList<FileInfo*>qFileinfolist);//利用文件信息列表刷新文件信息
+    // 把 m_strCurPath 同步到路径输入框
     void flushCurrLE();
     //按当前登录身份重算用户根与当前路径（每次登录成功必须调用；未登录时空转）
     void resetUserPath();
@@ -56,28 +62,37 @@ private slots:
     void on_rename_PB_clicked();
 
     // 移动文件到目标目录
+    // 移动：弹目录选择框后发 MOVEFILE
     void on_move_PB_clicked();
+    // 向服务端请求目录子项（供移动弹窗浏览）
     void requestListDir(const QString &rel);
 
+    // 手动跳转：按路径框内容发 CHANGEDIR
     void on_inputPath_PB_clicked();
 
     // 新增：上传槽函数
+    // 上传入口：待传清单非空时批量入队，否则弹多选文件对话框
     void on_upload_PB_clicked();
 
     // 购物车上传：分多次把文件加入待传清单，点「上传文件」统一入队
     void onAddPendingUpload_clicked();
 
+    // 下载选中的普通文件（目录跳过）
     void on_download_PB_clicked();
 
+    // 打开好友分享弹窗
     void on_share_PB_clicked();
 
     // 新增：生成分享链接
+    // 生成分享链接（仅普通文件）：发 CREATE_PUBLINK
     void on_genlink_PB_clicked();
 
     // 新增：通过分享链接获取分享文件
+    // 通过分享链接（完整 URL 或纯 token）解析并获取文件
     void on_fetchshare_PB_clicked();
 
     // 新增：右键菜单
+    // 文件列表右键菜单（仅普通文件显示「获取分享链接」）
     void onFileListContextMenu(const QPoint &pos);
 
     // REQ-EXT-TRANSFER-001：打开文件级任务列表

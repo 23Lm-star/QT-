@@ -22,8 +22,11 @@ bool Server::loadconfig()
         return false;
     }
     QString s=QString(file.readAll());
+    // 必须按 CRLF 切分：下载/运行配置若被转成 LF，整个文件会变成一行，
+    // 后续按下标取值越界（Qt 会断言/崩溃），因此不要改成 split('\n')。
     QStringList lst=s.split("\r\n");
     //读取配置文件里面的Ip地址和端口号，还有文件路径
+    // 前 3 行是监听地址、端口、文件根目录，后续 5 行是 MySQL 连接参数。
     this->m_strlp=lst[0];
     this->m_usPort=lst[1].toUShort();
     this->filesPath=lst[2];
@@ -67,6 +70,7 @@ bool Server::initialize()
     return true;
 }
 
+// 单例入口：实例首次调用时构造，构造阶段不读取配置、不监听。
 Server &Server::getinstance()
 {
     static Server instance;

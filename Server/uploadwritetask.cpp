@@ -5,6 +5,9 @@
 #include <QFile>
 #include <QMetaObject>
 
+// uploadwritetask.cpp — 线程池写任务实现：定位写入 + 结果队列回主线程。
+// 不在任务里 open/close 文件，关闭成本与句柄竞争都留在会话侧。
+
 UploadWriteTask::UploadWriteTask(quint64 connectionId, quint64 transferId,
                                  const QSharedPointer<QFile> &file,
                                  qint64 offset, const QByteArray &data)
@@ -14,6 +17,7 @@ UploadWriteTask::UploadWriteTask(quint64 connectionId, quint64 transferId,
       m_offset(offset),
       m_data(data)
 {
+    // 由 QThreadPool 在 run() 返回后 delete，任务不得在其他地方手动释放。
     setAutoDelete(true);
 }
 
@@ -26,6 +30,7 @@ void UploadWriteTask::run()
             && m_file->write(m_data) == m_data.size()
             && m_file->flush();
 
+    // 队列连接跨线程投递：连接/会话状态只在主线程修改。
     QMetaObject::invokeMethod(&MyTcpServer::getinstance(), "handleUploadWriteFinished",
                               Qt::QueuedConnection,
                               Q_ARG(quint64, m_connectionId),

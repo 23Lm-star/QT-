@@ -2,20 +2,36 @@
 #define PROTOCOL_H
 //PDU协议类型定义
 
+// 本文件是客户端与服务端共享的线协议契约：
+// - PDU 定长头 + 柔性正文，caData[64] 按消息类型分区复用（不同请求/响应的字段偏移各自约定）；
+// - 所有多字节整数按本机小端逐字节写入（memcpy/groupAppendUxx），两端必须逐字节一致；
+// - 枚举只允许追加，旧编号不得改动，否则新旧端无法互通。
+
 #include <QByteArray>
 #include <QtGlobal>
 
 typedef unsigned int uint;
 
+// ===== 上传通道 caData / 响应的字段偏移（单位：字节，均相对 caData 起点） =====
+// 0x5253554d 是 "RSUM" 的小端顺序，用于识别带续传语义的新格式上传块。
 static const uint UPLOAD_RESUME_MAGIC = 0x5253554d; // "RSUM"
+// 29 请求：qint64 文件总大小
 static const int UPLOAD_FILE_SIZE_OFFSET = 32;
+// qint64 续传起点（与文件大小同区，按消息类型区分）
 static const int UPLOAD_RESUME_OFFSET = 32;
+// u32 魔数；31 请求与 32 响应共用此区
 static const int UPLOAD_RESUME_MAGIC_OFFSET = 40;
+// 31 请求：qint64 本块在文件中的绝对偏移
 static const int UPLOAD_CHUNK_OFFSET = 0;
+// 32 响应：qint64 服务端期望的下一偏移
 static const int UPLOAD_ACK_NEXT_OFFSET = 8;
+// 32 响应：bool 是否已收完整文件
 static const int UPLOAD_ACK_COMPLETE_OFFSET = 16;
 
 //消息类型的枚举值
+// 分组：1-57 基础账号/好友/聊天/文件/分享；58-87 群生命周期；88-96 群消息；
+// 97-98 秒传；99-106 群文件；107-108 传输任务释放。每类请求/响应成对相邻。
+// MIN/MAX 仅用于入口合法性判断（uiType > MIN && uiType < MAX）。
 enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_MIN=0,
     ENUM_MSG_TYPE_REGIST_REQUEST,//注册请求 1
@@ -200,6 +216,8 @@ static constexpr uint MAX_UPLOAD_DATA_CHUNK = 1024 * 1024;                    //
 static constexpr uint MAX_UPLOAD_DATA_PDU_SIZE = MAX_UPLOAD_DATA_CHUNK + 4096; // 31 整包上限 = 正文 + 头/余量
 static constexpr int  MAX_PENDING_INBOUND_BYTES = 1024 * 1024 + 8192;         // 每连接入站累积上界（≥ 单包上限 + 余量；原 256 KB）
 
+// struct PDU 为定长头（76 字节）+ 柔性数组，可整块 memcpy/直接 write 到 socket。
+// 注意 caMsg 声明为 char[]，sizeof(PDU) 不含正文；接收侧必须先按 uiTotalLen 校验边界再访问。
 struct PDU{//协议数据单元
     uint uiTotalLen;    //总长度
     uint uiMsgLen;      //柔性数组的长度(消息长度)
@@ -207,16 +225,24 @@ struct PDU{//协议数据单元
     char caData[64];    //参数，数据长度小于参数长度就放到参数里
     char caMsg[];       //消息
 };
+// 说明：24/59 等列表响应中按数组连续排布，caName 不保证以 NUL 结尾。
 //文件信息
 struct FileInfo{
+    //文件名（定长，客户端侧按实际长度截断）
     char caName[32];
+    //0=文件 1=目录
     uint uiType;
 };
+// 说明：聊天记录中的定长头 + 柔性正文。
 //消息
 struct Msg{
+    //本条记录总长度
     uint totalLen;
+    //正文长度
     uint msgLen;
+    //时间字符串
     char Time[30];
+    //正文
     char msg[];
 };
 
@@ -228,6 +254,8 @@ PDU* mkPDU(uint uiMsgLen=0);
 static const quint16 GROUP_PROTOCOL_VERSION = 1;
 static const quint16 GROUP_ENVELOPE_LENGTH = 20;
 
+// 群协议序列化辅助：显式按小端追加/读取，避免直接 memcpy 结构体带来的对齐与端序差异。
+// groupReadXxx 失败时不改变 value（除非已成功读出部分），offset 仅在成功时前进。
 inline void groupAppendU16(QByteArray &out, quint16 value)
 {
     out.append(char(value & 0xff));

@@ -12,6 +12,10 @@
 #include <QVBoxLayout>
 #include <cstring>
 
+// 群模块实现：UI 全部代码构建（无 .ui），请求统一加 20B 信封；
+// 回包按 uiType 分派：群操作走 handleResponse，聊天 89/92/94 走 handleMessageResponse，
+// 90 走 handleMessageEvent，群文件 100/104 走 handleFileResponse，均按 group_id 路由到子窗口。
+// 未打开对应子窗口时不渲染正文，只更新主页状态栏并触发未读摘要刷新。
 Group::Group(QWidget *parent)
     : QWidget(parent),
       m_createButton(new QPushButton(QStringLiteral("建群"), this)),
@@ -27,7 +31,9 @@ Group::Group(QWidget *parent)
       m_loaded(false)
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
+    // 邀请弹窗惰性创建：首次点“待处理邀请”时才构造
     m_invitationDialog = nullptr;
+    // 顶部工具栏：建群/刷新/群文件/待处理邀请
     auto *layout = new QVBoxLayout(this);
     auto *toolbar = new QHBoxLayout;
     toolbar->addWidget(m_createButton);
@@ -71,6 +77,7 @@ Group::Group(QWidget *parent)
     layout->addLayout(actionBar);
     layout->addWidget(m_statusLabel);
     layout->addWidget(m_groupList);
+    // 群列表条目：双击打开该群的聊天窗口
     // 邀请列表已移入「待处理邀请」弹窗（主人反馈：接受/拒绝应作用于弹窗内选中条目）
     connect(m_createButton, &QPushButton::clicked, this, &Group::createGroup);
     connect(m_refreshButton, &QPushButton::clicked, this, &Group::refreshGroups);
@@ -84,6 +91,7 @@ Group::Group(QWidget *parent)
 
 quint64 Group::selectedGroupId() const
 {
+    // group_id 以 qulonglong 存在条目的 Qt::UserRole
     const QListWidgetItem *item = m_groupList->currentItem();
     return item == nullptr ? 0 : item->data(Qt::UserRole).toULongLong();
 }
@@ -97,6 +105,7 @@ quint64 Group::selectedInvitationId() const
 void Group::showEvent(QShowEvent *event)
 {
     QWidget::showEvent(event);
+    // 首次可见才拉数据，之后由用户点“刷新”或事件驱动更新
     if (!m_loaded) {
         m_loaded = true;
         refreshGroups();
@@ -106,6 +115,7 @@ void Group::showEvent(QShowEvent *event)
 
 QByteArray Group::envelope(quint64 groupId, const QByteArray &body)
 {
+    // 固定头 20B：协议版本、信封长度、请求号、群号；请求号用于服务端幂等/关联
     QByteArray payload;
     groupAppendU16(payload, GROUP_PROTOCOL_VERSION);
     groupAppendU16(payload, GROUP_ENVELOPE_LENGTH);
@@ -117,6 +127,7 @@ QByteArray Group::envelope(quint64 groupId, const QByteArray &body)
 
 void Group::sendRequest(uint type, quint64 groupId, const QByteArray &body)
 {
+    // caMsg 承载整个信封；uiType 决定服务端分派
     const QByteArray payload = envelope(groupId, body);
     PDU *pdu = mkPDU(uint(payload.size()));
     pdu->uiType = type;
@@ -126,6 +137,7 @@ void Group::sendRequest(uint type, quint64 groupId, const QByteArray &body)
 
 void Group::createGroup()
 {
+    // 群名必填；正文为单个 groupAppendString 编码的 UTF-8 字符串
     bool ok = false;
     const QString name = QInputDialog::getText(this, QStringLiteral("建群"), QStringLiteral("群名称"),
                                                QLineEdit::Normal, QString(), &ok);
@@ -137,6 +149,7 @@ void Group::createGroup()
 
 void Group::refreshGroups()
 {
+    // 两个独立请求：群列表（95/列表响应）与未读摘要（96），回包各自更新 UI
     sendRequest(ENUM_MSG_TYPE_LIST_GROUPS_REQUEST);
     requestUnreadSummary();
 }
@@ -169,6 +182,7 @@ void Group::inviteMember()
         m_statusLabel->setText(QStringLiteral("请在「目标用户名」框输入对方用户名，再点邀请"));
         return;
     }
+    // 正文：目标用户名 + 客户端生成的幂等键（防止重复邀请）
     QByteArray body;
     groupAppendString(body, target.toUtf8());
     groupAppendString(body, QStringLiteral("client-%1").arg(QDateTime::currentMSecsSinceEpoch()).toUtf8());
@@ -393,6 +407,7 @@ void Group::handleResponse(PDU *pdu)
         return;
     }
     if (pdu->uiType == ENUM_MSG_TYPE_LIST_GROUPS_RESPOND) {
+        // 列表响应：count × {group_id, name, status, role, group_version}
         quint32 count = 0;
         if (!groupReadU32(payload, offset, count)) return;
         m_groupList->clear();
@@ -405,6 +420,7 @@ void Group::handleResponse(PDU *pdu)
             auto *item = new QListWidgetItem(QStringLiteral("%1  [%2] %3 (%4)")
                                              .arg(QString::fromUtf8(name)).arg(QString::fromUtf8(role))
                                              .arg(QString::fromUtf8(status)).arg(id), m_groupList);
+            // 条目数据角色：UserRole=群号、+1=群名、+2=不含徽标的基础文案
             item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(id));
             item->setData(Qt::UserRole + 1, QString::fromUtf8(name));   // 群名 → 聊天窗口标题
             item->setData(Qt::UserRole + 2, item->text());              // 基础文案（徽标在其上追加）
@@ -412,6 +428,7 @@ void Group::handleResponse(PDU *pdu)
         }
         m_statusLabel->setText(QStringLiteral("我的群聊：%1 个").arg(count));
     } else if (pdu->uiType == ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND) {
+        // 邀请响应：count × {invitation_id, group_id, group_name, inviter, status, expires_at}
         quint32 count = 0;
         if (!groupReadU32(payload, offset, count)) return;
         m_invitationList->clear();
@@ -430,6 +447,7 @@ void Group::handleResponse(PDU *pdu)
         }
         m_statusLabel->setText(QStringLiteral("待处理邀请：%1 个").arg(count));
     } else if (pdu->uiType == ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND) {
+        // 成员响应：count × {username, role, status}，本页直接用弹窗展示
         quint32 count = 0;
         if (!groupReadU32(payload, offset, count)) return;
         QStringList members;

@@ -1,3 +1,6 @@
+// 定长对象池：按 sizeof(T) 或指针宽度从 1MB 系统页块中顺序切分对象，
+// 供 span、SpanList 哨兵、ThreadCache、基数树节点等内部结构复用；
+// 本类自身不加锁，多线程共享同一实例时需由调用方用互斥锁保护。
 #pragma once
 
 #include"Common.h"
@@ -7,11 +10,13 @@ inline static void* SystemAlloc(size_t page);
 static void*& Next(void* obj);
 
 
+// 分配策略：优先复用已析构对象的空闲链，否则指针碰撞式切分当前页块；页块耗尽后再申请 1MB。
 //对象池,用于管理span等对象的创建和回收(类比于内存池的功能)
 template<class T>
 class ObjectPool{
 public:
 	//申请对象
+	// 取一个 T：必要时扩容页块，并在返回前用定位 new 构造对象（复用对象也会重新构造）。
 	T* New(){
 		T* object = nullptr;
 		//free的对象可以重复利用！
@@ -54,6 +59,7 @@ public:
 	}
 
 	//回收对象内存
+	// 归还 T：先显式析构，再把对象头插回空闲链；内存块仍归对象池所有，不还给系统。
 	void Delete(T* object){
 		//释放时可能T对象里开辟了空间，释放掉里面管理的动态空间
 		object->~T();
@@ -71,6 +77,7 @@ public:
 		//释放的对象用_FreeLIst下次New直接用
 		_FreeList = object;
 	}
+// 当前页块的游标与剩余字节；_FreeList 串起所有已析构、可复用的对象。
 private:
 	char* _Memory = nullptr;	 //大内存的起始地址
 	size_t _MemoryByte = 0;     //当前剩余内存字节数

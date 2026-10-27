@@ -3,6 +3,7 @@
 
 #include <QLoggingCategory>
 
+// 日志分类声明：按领域拆分，便于用 QT_LOGGING_RULES 单独开关（如 xmu.auth.debug=true）。
 // 决策 D1：C++ 标识符用 lcXxx，避免与 operatedb/databaseconnectionpool 局部变量 db 冲突；
 // 显示名（规则串里用的）保持 xmu.*，与需求文档一致。
 Q_DECLARE_LOGGING_CATEGORY(lcNet)   // 网络层：连接、收发、协议、好友/聊天转发

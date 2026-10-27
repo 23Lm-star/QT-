@@ -1,3 +1,5 @@
+// 客户端进程入口：初始化 QApplication、日志过滤与全局 QSS，
+// 然后取出 Client 单例显示登录窗口并进入事件循环。
 #include "logging.h"
 #include "client.h"
 #include "index.h"
@@ -15,6 +17,7 @@ int main(int argc, char *argv[])
     QLoggingCategory::setFilterRules(QStringLiteral("xmu.*.debug=false"));
 
     // 加载全局 QSS 炫酷主题
+    // 资源缺失不致命，只记录警告，界面用默认样式继续运行。
     QFile qssFile(":/style.qss");
     if (qssFile.open(QFile::ReadOnly)) {
         QString qssContent = QString::fromUtf8(qssFile.readAll());

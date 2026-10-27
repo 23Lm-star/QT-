@@ -1,9 +1,11 @@
+// 上传发送器实现：停等式分块发送，任意时刻至多一块在途。
 #include "protocol.h"
 #include "uploader.h"
 
 #include <QTimer>
 #include <cstring>
 
+// 仅记录参数，不做 IO；真正的打开与续传定位在 start()
 Uploader::Uploader(quint64 transferId, const QString &strUploadPath, qint64 resumeOffset, QObject *parent)
     : QObject(parent),
       strUploadPath(strUploadPath),
@@ -16,8 +18,10 @@ Uploader::Uploader(quint64 transferId, const QString &strUploadPath, qint64 resu
 {
 }
 
+// 初始化：打开源文件、按总大小定块长（1024 块、夹在 64KiB..1MiB）、seek 到续传点
 void Uploader::start()
 {
+    // 防重入
     if (m_active) {
         return;
     }
@@ -45,8 +49,10 @@ void Uploader::start()
     sendNextChunk();
 }
 
+// 32 应答处理：推进偏移；成功且未完成时用 singleShot(0) 让出事件循环再发下一块
 void Uploader::acknowledge(bool success, qint64 nextOffset, bool complete)
 {
+    // 迟到/重复应答直接忽略
     if (!m_active || !m_waitingAck) {
         return;
     }
@@ -67,6 +73,7 @@ void Uploader::acknowledge(bool success, qint64 nextOffset, bool complete)
     QTimer::singleShot(0, this, &Uploader::sendNextChunk);
 }
 
+// 读取 m_nextOffset 处的一块并发出 31；caData 携带块偏移、续传魔数与 transfer_id
 void Uploader::sendNextChunk()
 {
     if (!m_active || m_waitingAck) {
@@ -74,6 +81,7 @@ void Uploader::sendNextChunk()
     }
 
     const QByteArray chunk = m_file.read(m_chunkSize);
+    // 未收到 complete 就 EOF，说明服务端确认落后于本地读取
     if (chunk.isEmpty()) {
         emit errnoMsg("Upload file ended before server confirmation");
         finish(false);
@@ -91,6 +99,7 @@ void Uploader::sendNextChunk()
     emit seedMsg(pdu);
 }
 
+// 幂等收尾：置终态、关文件、发一次 finished；此后所有回调均落空
 void Uploader::finish(bool success)
 {
     if (m_finished) {

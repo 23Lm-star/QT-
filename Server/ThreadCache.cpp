@@ -1,3 +1,4 @@
+// ThreadCache 实现：线程本地快速路径，以及与 CentralCache 的批量换入换出。
 #include"ThreadCache.h"
 #include"CentralCache.h"
 #include<algorithm>
@@ -12,6 +13,7 @@ void* ThreadCache::Allocate(size_t size)
 {
 	//assert(size <= MaxBytes);
 	//������ ��Ͱ����
+	// RoundUp 得到档位大小，Index 得到桶下标；二者必须基于同一个 size 成对使用。
 	size_t align = SizeClass::RoundUp(size);
 	size_t index = SizeClass::Index(size);
 
@@ -34,10 +36,12 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size)
 {
 	//������CentralCache����(��������޵ͣ�С�������޸� [2,512])
 	//ͬʱ���ܳ��������������ڴ���������
+	// 批量上限取“按 256KB 折算的块数”与“本地自适应阈值”的较小值。
 	size_t batchNum = std::min(SizeClass::NumMoveSize(size), _FreeLists[index].MaxSize());
 	//�����������ڴ�����==�������������ֵ����������Ҫ������������
 	//����ʼ�㷨(��������ӵ��)
 	//ֻҪ��������������ޣ�����+1.��ֹ�̻߳�������ռ�ÿ����ڴ����
+	// 未触及 NumMoveSize 上限时阈值 +1，逐步摊薄 CentralCache 往返成本。
 	if (_FreeLists[index].MaxSize() == batchNum){
 		_FreeLists[index].MaxSize()++;
 	}
@@ -57,6 +61,7 @@ void* ThreadCache::FetchFromCentralCache(size_t index, size_t size)
 		return start;
 	}
 	else{
+		// start 留给调用者，Next(start) 到 end 的 ActualNum-1 块挂到本地桶。
 		//���뵽��һ�����ڴ�ȡ��һ��������,
 		//ʣ�µĹҵ�ThreadCache��Ӧ��_freeList��
 		_FreeLists[index].PushRange(Next(start), end, ActualNum - 1);//�ǵü������Լ�Ҫ�õ�һ��
@@ -71,6 +76,7 @@ void ThreadCache::Deallocate(void* ptr, size_t size)
 {
 	//���յ�_FreeList��Ӧindex��(ͷ��)
 	//size_t align = SizeClass::RoundUp(size);
+	// 释放不重新对齐：调用方传入的 size 与分配时一致，直接映射到同一桶。
 	size_t index = SizeClass::Index(size);
 	//��Ϊ֮ǰ�����ڴ��ʱ����Ƿ������֮����ڴ棬��˻��յ�ʱ��Ͳ���Ҫ����
 	_FreeLists[index].Push(ptr);
@@ -104,6 +110,7 @@ void ThreadCache::ListTooLong(FreeList& list, size_t size)
 	void* end = nullptr;//������������λ��
 	//list.PopRange(start, end, list.Size());
 	//ɾ��maxsize��С�Ŀ�
+	// 只摘 MaxSize 个而非全部：保留一部分本地块，避免刚归还又立刻补货。
 	list.PopRange(start, end, list.MaxSize());
 	//��Maxsize()��С���ڴ���������뵽���Ļ�������                 
 	CentralCache::GetInstance()->ReleaseListToSpans(start, size);

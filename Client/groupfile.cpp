@@ -12,7 +12,10 @@
 #include <QVBoxLayout>
 #include <cstring>
 
+// 群文件窗口实现：目录与删除是直接请求/响应；上传下载不在此做分块，
+// 统一交给 TransferManager 的全局传输队列，本窗口只负责选文件/选条目/展示进度入口。
 namespace {
+// 字节数转 B/KB/MB/GB/TB 的展示文本
 QString humanSize(quint64 bytes)
 {
     static const char *units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -23,6 +26,7 @@ QString humanSize(quint64 bytes)
                   : QStringLiteral("%1 %2").arg(v, 0, 'f', 1).arg(QLatin1String(units[u]));
 }
 
+// 毫秒时间戳转本地可读时间；0 表示缺省
 QString humanTime(quint64 ms)
 {
     if (ms == 0) return QStringLiteral("-");
@@ -46,6 +50,7 @@ GroupFile::GroupFile(quint64 groupId, const QString &groupName, QWidget *parent)
     setWindowTitle(QStringLiteral("群文件 - %1").arg(groupName));
     if (parent == nullptr) resize(1240, 840);   // REQ-UX-001 A5：面积 4 倍
 
+    // 顶部工具栏 + 状态栏 + 文件列表
     auto *layout = new QVBoxLayout(this);
     auto *toolbar = new QHBoxLayout;
     toolbar->addWidget(m_refreshButton);
@@ -76,6 +81,7 @@ GroupFile::GroupFile(quint64 groupId, const QString &groupName, QWidget *parent)
 
 QByteArray GroupFile::envelope(const QByteArray &body)
 {
+    // 固定头 20B：版本、信封长度、请求号、群号
     QByteArray payload;
     groupAppendU16(payload, GROUP_PROTOCOL_VERSION);
     groupAppendU16(payload, GROUP_ENVELOPE_LENGTH);
@@ -107,6 +113,7 @@ quint64 GroupFile::selectedGroupFileId() const
 
 void GroupFile::refresh()
 {
+    // 目录分页：从 offset=0 起取一页最大条数（当前窗口不做滚动翻页）
     QByteArray body;
     groupAppendU32(body, 0);                            // offset
     groupAppendU16(body, quint16(GROUP_FILE_MAX_LIST_LIMIT));  // limit
@@ -117,6 +124,7 @@ void GroupFile::refresh()
 // 购物车模式：待传清单非空时「上传」把清单统一入队；为空时走原多选对话框（一次可勾多个）。
 void GroupFile::uploadFile()
 {
+    // 分支一：购物车已有待传文件 → 逐个校验后统一入队，然后清空清单
     if (!m_pendingUploads.isEmpty()) {
         int enqueued = 0;
         for (const QString &path : m_pendingUploads) {
@@ -140,6 +148,7 @@ void GroupFile::uploadFile()
         setStatus(QStringLiteral("已加入传输任务 %1 个").arg(enqueued));
         return;
     }
+    // 分支二：清单为空 → 现场多选文件，直接入队
     const QStringList paths = QFileDialog::getOpenFileNames(this, QStringLiteral("选择要上传的文件"));
     if (paths.isEmpty()) return;
     int enqueued = 0;
@@ -209,6 +218,7 @@ void GroupFile::downloadSelected()
 
 void GroupFile::deleteSelected()
 {
+    // 删除仅对单选条目生效，需用户确认；权限由服务端最终判定
     const quint64 groupFileId = selectedGroupFileId();
     const QListWidgetItem *item = m_fileList->currentItem();
     if (groupFileId == 0 || item == nullptr) {
@@ -227,6 +237,7 @@ void GroupFile::deleteSelected()
 
 void GroupFile::onItemDoubleClicked(QListWidgetItem *)
 {
+    // 双击语义等同“下载选中项”
     downloadSelected();
 }
 
@@ -251,6 +262,7 @@ void GroupFile::handleResponse(PDU *pdu)
     }
 
     if (pdu->uiType == ENUM_MSG_TYPE_GROUP_FILE_LIST_RESPOND) {
+        // 100 列表体：count + total + count×{group_file_id,size,created_at,uploader,name}
         quint32 count = 0, total = 0;
         if (!groupReadU32(payload, offset, count) || !groupReadU32(payload, offset, total)) return;
         m_fileList->clear();
@@ -268,6 +280,7 @@ void GroupFile::handleResponse(PDU *pdu)
                                              .arg(humanSize(sizeBytes))
                                              .arg(QString::fromUtf8(uploader))
                                              .arg(humanTime(createdAtMs)), m_fileList);
+            // 条目角色：UserRole=group_file_id（下载/删除用）、+1=文件名（下载保存名）
             item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(groupFileId));
             item->setData(Qt::UserRole + 1, display);
         }

@@ -5,12 +5,17 @@
 #include "client.h"
 #include <QInputDialog>
 #include <qdebug.h>
+
+// 好友页实现：所有操作都走“构造 PDU → Client::seedMsg”的异步模型，
+// 结果回包由 MsgHandler 分发到 flushFriend_LW / 在线用户窗口等入口。
+// 列表项文本约定为“序号.用户名”，删除/私聊时按首个 '.' 截取真实用户名。
 Friend::Friend(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::Friend)
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
     ui->setupUi(this);
+    // 两个子窗口均以 Friend 为父对象，随本页一起销毁
     m_onlineUser=new OnlineUser;
     m_chat=new Chat;
 }
@@ -24,6 +29,7 @@ Friend::~Friend()
 
 void Friend::flushfriend()
 {
+    // 请求服务端回发完整好友列表；真正的 UI 更新在响应回调里完成
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST;
     Client::getinstance().seedMsg(pdu);
@@ -31,6 +37,7 @@ void Friend::flushfriend()
 
 QListWidget *Friend::getfile_LW()
 {
+    // 仅供需要直接操作控件的场景使用，数据刷新请优先走 flushFriend_LW
     return  ui->listWidget;
 }
 
@@ -90,6 +97,7 @@ void Friend::showEvent(QShowEvent *event)
 
 void Friend::on_findUser_PB_clicked()
 {
+    // 输入框取消时返回空串，直接放弃请求
     QString strname=QInputDialog::getText(this,"查找用户","用户名");
     qCDebug(lcCli)<<strname<<endl;
     if(strname==nullptr){
@@ -97,12 +105,14 @@ void Friend::on_findUser_PB_clicked()
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_findUser_REQUEST;
+    // caData 前 32 字节：待查找的用户名
     memcpy(pdu->caData,strname.toStdString().c_str(),32);
     Client::getinstance().seedMsg(pdu);
 }
 
 void Friend::on_onlineUser_PB_clicked()
 {
+    // 先展示窗口再异步拉取列表，回包后由 updateOnlineUser 填充
     if(m_onlineUser->isHidden()){
         m_onlineUser->show();
     }
@@ -122,6 +132,7 @@ void Friend::on_del_PB_clicked()
     if(!tar){
         return ;
     }
+    // 列表项形如“序号.用户名”，截掉首个 '.' 及之前的序号
     QString tarname=tar->text();
     int cnt=0;
     for(int i=0;i<tarname.size();i++){
@@ -131,6 +142,7 @@ void Friend::on_del_PB_clicked()
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_DELETEFRIEND_REQUEST;
+    // caData[0,32)=被删好友；[32,64)=发起删除的当前用户
     memcpy(pdu->caData,tarname.toStdString().c_str()+cnt+1,32);
     memcpy(pdu->caData+32,Client::getinstance().m_LoginName.toStdString().c_str(),32);
     Client::getinstance().seedMsg(pdu);
@@ -153,11 +165,13 @@ void Friend::on_chat_PB_clicked()
     }
     memcpy(pName,pitem->text().toStdString().c_str()+cnt+1,32);
     m_chat->m_strChatName=pName;//记录聊天对象
+    // 仅首次打开时拉取历史消息；窗口已显示则视为切换会话外的重复点击，直接忽略
     if(m_chat->isHidden()){
         m_chat->show();
         m_chat->setWindowTitle(m_chat->m_strChatName);
         PDU* pdu= mkPDU();
         pdu->uiType=ENUM_MSG_TYPE_GETCHATMSG_REQUEST;
+        // caData[0,32)=当前用户；[32,64)=聊天对象，服务端据此取双方历史记录
         memcpy(pdu->caData,Client::getinstance().m_LoginName.toStdString().c_str(),32);
         memcpy(pdu->caData+32,m_chat->m_strChatName.toStdString().c_str(),32);
         Client::getinstance().seedMsg(pdu);

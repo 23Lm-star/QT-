@@ -10,6 +10,9 @@
 #include <QVBoxLayout>
 #include <cstring>
 
+// 群聊窗口实现：发送为乐观渲染 + 89/90 确认；接收为 90 实时事件，
+// 断线/丢事件留下的 seq 洞通过 91/92 前向补拉修复；历史翻页走 mode=1。
+// 已读游标由 GroupChatState 统一维护，本文件只在窗口可见时推进并节流上报。
 namespace {
 // REQ-UX-001 A3：消息统一排版为「身份/时间行 + 正文行」，长文本由 QListWidget 换行显示；
 // 发送状态只出现在身份行，不再混进正文。
@@ -33,6 +36,7 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
       m_statusLabel(new QLabel(this))
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
+    // 独立顶层窗口（Qt::Window），由 Group 按 group_id 长期持有
     setWindowTitle(QStringLiteral("群聊 - %1").arg(groupName));
     resize(1120, 960);
     // REQ-UX-001 A3：长消息必须换行、不横向溢出、不省略
@@ -40,6 +44,7 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
     m_messageList->setTextElideMode(Qt::ElideNone);
     m_messageList->setSpacing(6);
     m_messageList->setUniformItemSizes(false);
+    // 垂直布局：消息列表在上，输入行 + 状态栏在下
     auto *layout = new QVBoxLayout(this);
     layout->addWidget(m_messageList);
     auto *row = new QHBoxLayout;
@@ -53,6 +58,7 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
     connect(m_input, &QLineEdit::returnPressed, this, &GroupChat::sendCurrent);
     connect(m_historyButton, &QPushButton::clicked, this, &GroupChat::loadOlder);
     connect(m_messageList, &QListWidget::itemDoubleClicked, this, &GroupChat::onItemDoubleClicked);
+    // 已读上报节流器：单次触发，窗口内的连续推进合并为一次网络请求
     m_readReportTimer = new QTimer(this);
     m_readReportTimer->setSingleShot(true);
     connect(m_readReportTimer, &QTimer::timeout, this, [this]() { flushReadReport(); });
@@ -103,6 +109,7 @@ void GroupChat::sendRequest(uint type, const QByteArray &body)
 
 void GroupChat::requestPull(quint8 mode, quint64 cursor, quint16 limit)
 {
+    // 正文：mode(1B) + cursor(8B) + limit(2B)
     QByteArray body;
     body.append(char(mode));
     groupAppendU64(body, cursor);
@@ -194,6 +201,7 @@ QListWidgetItem *GroupChat::insertMessage(quint64 seq, const QString &sender, qu
                                           quint64 createdAtMs, const QString &content)
 {
     if (seq != 0 && m_renderedSeqs.contains(seq)) return nullptr;
+    // 协议时间戳为毫秒；msgType=1 表示系统消息（居中灰色），其余为普通文本
     const QString time = QDateTime::fromMSecsSinceEpoch(qint64(createdAtMs)).toString(QStringLiteral("HH:mm:ss"));
     QListWidgetItem *item = new QListWidgetItem;
     if (msgType == 1) {
@@ -229,12 +237,14 @@ void GroupChat::renderOwnMessage(QListWidgetItem *item, const QString &state, co
 
 void GroupChat::sendCurrent()
 {
+    // 发送前本地校验：空消息不发；协议上限 2000 字节（UTF-8）
     const QString content = m_input->text();
     if (content.isEmpty()) return;
     if (content.toUtf8().size() > 2000) {
         m_statusLabel->setText(QStringLiteral("内容超过 2000 字节，未发送"));
         return;
     }
+    // 幂等键：同一 key 重发时服务端可去重；条目先以“发送中”状态乐观入列表
     const QString key = QUuid::createUuid().toString(QUuid::WithoutBraces);
     const QString time = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss"));
     QListWidgetItem *item = new QListWidgetItem(
@@ -255,6 +265,7 @@ void GroupChat::sendCurrent()
 
 void GroupChat::onItemDoubleClicked(QListWidgetItem *item)
 {
+    // 只有“发送失败”的条目可双击重试，复用原 clientMsgId
     if (item == nullptr || item->data(ROLE_STATE).toInt() != 2) return;
     const QString key = item->data(ROLE_CLIENT_KEY).toString();
     for (const PendingSend &pending : m_pending) {
@@ -289,6 +300,7 @@ void GroupChat::updateStatus()
 
 void GroupChat::handleMessageEvent(PDU *pdu)
 {
+    // 90 事件体：信封 + code + {group_id, seq, msg_id, sender, msg_type, created_at, content}
     if (pdu == nullptr || pdu->uiMsgLen < GROUP_ENVELOPE_LENGTH + 4) return;
     const QByteArray payload(pdu->caMsg, int(pdu->uiMsgLen));
     int offset = 0;
@@ -349,6 +361,7 @@ void GroupChat::handleResponse(PDU *pdu)
     Q_UNUSED(requestId);
 
     if (pdu->uiType == ENUM_MSG_TYPE_GROUP_SEND_MESSAGE_RESPOND) {
+        // 89 成功体：client_msg_id + seq + msg_id + created_at；失败时可能只回带 key
         QByteArray key;
         quint64 seq = 0, msgId = 0, createdAtMs = 0;
         const bool hasKey = groupReadString(payload, offset, key);
@@ -396,6 +409,8 @@ void GroupChat::handleResponse(PDU *pdu)
             m_statusLabel->setText(QStringLiteral("拉取失败：%1").arg(qint32(code)));
             return;
         }
+        // 92 响应体：mode(1B) + has_more(1B) + next_cursor + group_last_seq
+        //              + unread + count + count×{seq,msg_id,sender,msg_type,created_at,content}
         if (offset + 3 > payload.size()) return;
         const quint8 mode = quint8(payload.at(offset++));
         const bool hasMore = quint8(payload.at(offset++)) != 0;
@@ -415,6 +430,7 @@ void GroupChat::handleResponse(PDU *pdu)
                     || !groupReadString(payload, offset, record.content)) return;
             records.append(record);
         }
+        // 拉取结果同样是水位证据
         // 水位取 max 收敛。回带的未读数只作交叉校验（测试 S4 钉住它与"水位-游标"等价），
         // 客户端显示一律由会话状态推导，不引入第二个真相源。
         groupState().noteWater(groupLastSeq);
@@ -468,6 +484,7 @@ void GroupChat::handleResponse(PDU *pdu)
     }
 
     if (pdu->uiType == ENUM_MSG_TYPE_GROUP_READ_CONFIRM_RESPOND) {
+        // 94 回认服务端钳制后的有效游标（不会回退），用于抑制重复上报
         quint64 effective = 0;
         if (code == 0 && groupReadU64(payload, offset, effective)) {
             groupState().markConfirmed(effective);

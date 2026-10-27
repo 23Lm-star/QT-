@@ -1,3 +1,4 @@
+// 断线提示弹窗实现：模态但不阻塞事件循环，转圈由 QTimer 驱动。
 #include "reconnectdialog.h"
 #include <QVBoxLayout>
 #include <QLabel>
@@ -11,6 +12,7 @@
 const QStringList ReconnectDialog::s_spinnerFrames = QStringList()
     << "|" << "/" << "-" << "\\";
 
+// 纯代码布局：转圈标签、提示文字、重连按钮
 ReconnectDialog::ReconnectDialog(QWidget *parent)
     : QDialog(parent)
     , m_spinnerIdx(0)
@@ -55,6 +57,7 @@ void ReconnectDialog::closeEvent(QCloseEvent *event)
     QDialog::closeEvent(event);
 }
 
+// 仅在未运行时启动，重复 show 不会叠加定时器
 void ReconnectDialog::startSpinner()
 {
     if (!m_spinnerTimer->isActive())
@@ -66,12 +69,14 @@ void ReconnectDialog::stopSpinner()
     m_spinnerTimer->stop();
 }
 
+// 循环取下一帧（取模，不越界）
 void ReconnectDialog::onSpinnerTick()
 {
     m_spinnerIdx = (m_spinnerIdx + 1) % s_spinnerFrames.size();
     m_spinnerLabel->setText(s_spinnerFrames.at(m_spinnerIdx));
 }
 
+// 只发信号；重连由外部负责（弹窗不持有连接逻辑）
 void ReconnectDialog::onReconnectBtnClicked()
 {
     emit reconnectClicked();

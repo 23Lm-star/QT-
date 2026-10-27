@@ -1,3 +1,5 @@
+// 传输任务管理实现：调度、协议应答路由、断点续传护栏、快照持久化与任务面板。
+// 所有槽函数均在 GUI 线程执行；SHA-256 计算通过 QtConcurrent 移出 UI 线程。
 #include "transfertask.h"
 
 #include "client.h"
@@ -30,6 +32,7 @@
 
 // ===================== TransferManager =====================
 
+// 进程级单例，首次调用时构造（GUI 线程）
 TransferManager& TransferManager::instance()
 {
     static TransferManager mgr;
@@ -40,6 +43,7 @@ TransferManager::TransferManager()
 {
 }
 
+// wire transfer_id 单调递增；旧 id 在任务换 id 后立即从映射摘除，避免迟到响应串写
 quint64 TransferManager::allocId()
 {
     return m_nextId++;
@@ -50,6 +54,7 @@ quint64 TransferManager::allocId()
 // 续传点由协议决定（个人上传 97/30 回带 offset；下载续传点 = 本地分片物理大小，
 // REQ-EXT-TRANSFER-002 D9），落盘进度只会误导。
 
+// 生成按用户隔离的快照文件路径；用户名中的非字母数字/中文统一替换为下划线
 QString TransferManager::snapshotPath(const QString& user) const
 {
     QString safe;
@@ -62,6 +67,7 @@ QString TransferManager::snapshotPath(const QString& user) const
     return QDir(base).filePath(QStringLiteral("transfers_%1.json").arg(safe));
 }
 
+// 只落非终态任务（排队/计算摘要/传输中/暂停）；Done、Cancelled 不入快照
 void TransferManager::saveSnapshot()
 {
     // D-a：没有当前用户也不再静默丢写——以"最近一次有效登录名"兜底；两者皆无则明确告警。
@@ -238,6 +244,7 @@ quint64 TransferManager::stableKeyOf(quint64 transferId)
     return m_idToKey.value(transferId, 0);
 }
 
+// 返回升序稳定键；面板据此保证行顺序稳定
 QList<quint64> TransferManager::taskKeys() const
 {
     QList<quint64> keys = m_tasks.keys();
@@ -245,6 +252,7 @@ QList<quint64> TransferManager::taskKeys() const
     return keys;
 }
 
+// 个人上传入队：登记任务与 id 映射、落快照、触发调度；返回稳定行键
 quint64 TransferManager::enqueuePersonalUpload(const QString& localPath, const QString& dirPath, const QString& displayName)
 {
     Task t;
@@ -265,6 +273,7 @@ quint64 TransferManager::enqueuePersonalUpload(const QString& localPath, const Q
     return t.key;
 }
 
+// 群上传入队：摘要若调用方已提供则跳过后台计算（shaHex 非空）
 quint64 TransferManager::enqueueGroupUpload(quint64 groupId, const QString& localPath,
                                             const QString& displayName, const QByteArray& shaHex)
 {
@@ -287,6 +296,7 @@ quint64 TransferManager::enqueueGroupUpload(quint64 groupId, const QString& loca
     return t.key;
 }
 
+// 个人下载入队：serverPath 为服务端绝对路径，落盘位置在受理 41 后确定
 quint64 TransferManager::enqueuePersonalDownload(const QString& serverPath, const QString& displayName)
 {
     Task t;
@@ -305,6 +315,7 @@ quint64 TransferManager::enqueuePersonalDownload(const QString& serverPath, cons
     return t.key;
 }
 
+// 群下载入队：以 (groupId, groupFileId) 定位群文件
 quint64 TransferManager::enqueueGroupDownload(quint64 groupId, quint64 groupFileId, const QString& displayName)
 {
     Task t;
@@ -379,6 +390,7 @@ void TransferManager::startGroupHash(Task& t)
     emit tasksChanged();
 }
 
+// 群上传 INIT：负载为群信封 + request_id + group_id + 大小 + SHA + 文件名
 void TransferManager::sendGroupUploadInit(Task& t)
 {
     QByteArray payload;
@@ -416,6 +428,7 @@ void TransferManager::pumpFastcheck()
     }
 }
 
+// 后台摘要完成后回调：入单飞队列，由 pumpFastcheck 择机发 97
 void TransferManager::submitFastcheck(quint64 key, const QByteArray& shaHex)
 {
     Task* t = taskByKey(key);
@@ -458,6 +471,7 @@ void TransferManager::onConnectionRestored()
     pump();
 }
 
+// 外部失败入口（如摘要读取失败）：先清理单飞槽，再收敛任务
 void TransferManager::failTask(quint64 key, const QString& reason)
 {
     Task* t = taskByKey(key);
@@ -522,6 +536,7 @@ void TransferManager::onFastcheckRespond(PDU* pdu)
     pumpFastcheck();
 }
 
+// 个人上传 INIT（29）：caData 打包名字/大小/续传魔数/transfer_id，caMsg 为目标目录
 void TransferManager::sendPersonalUploadInit(Task& t)
 {
     const qint64 size = QFileInfo(t.localPath).size();
@@ -599,6 +614,8 @@ void TransferManager::startTask(Task& t)
     emit tasksChanged();
 }
 
+// 统一收尾：按方向归还名额、关闭句柄、摘 id 映射（防止迟到响应改写终态），
+// 状态落定后写快照并 pump 下一个排队任务。
 void TransferManager::finishTask(Task& t, State s, const QString& reason)
 {
     if (t.isUpload()) {
@@ -623,6 +640,7 @@ void TransferManager::finishTask(Task& t, State s, const QString& reason)
     pump();
 }
 
+// 关闭下载分片句柄但保留文件本身（失败/暂停均可续传）
 void TransferManager::closeRecv(Task& t)
 {
     if (t.recvFile) {
@@ -767,6 +785,7 @@ void TransferManager::onUploadInitRespond(PDU* pdu)
     emit tasksChanged();
 }
 
+// 32 应答：带续传魔数时读取服务端确认的下一偏移与完成标志，交给 Uploader 推进
 void TransferManager::onUploadDataRespond(PDU* pdu)
 {
     const quint64 id = transferIdOf(pdu);
@@ -786,6 +805,7 @@ void TransferManager::onUploadDataRespond(PDU* pdu)
     emit tasksChanged();
 }
 
+// 102 群上传 INIT 应答：校验群信封与版本；hit=秒传，nextOffset=服务端暂存续传点
 void TransferManager::onGroupUploadInitRespond(PDU* pdu)
 {
     const quint64 id = transferIdOf(pdu);
@@ -844,6 +864,7 @@ void TransferManager::onGroupUploadInitRespond(PDU* pdu)
     emit tasksChanged();
 }
 
+// 41 下载受理：核对服务端采纳的续传起点与文件大小，失败时不拼接损坏分片
 void TransferManager::onDownloadRespond(PDU* pdu)
 {
     const quint64 id = transferIdOf(pdu);
@@ -891,6 +912,7 @@ void TransferManager::onDownloadRespond(PDU* pdu)
     emit tasksChanged();
 }
 
+// 106 群下载受理：解析群信封中的大小/文件名，续传护栏与 41 同规则
 void TransferManager::onGroupDownloadRespond(PDU* pdu)
 {
     const quint64 id = transferIdOf(pdu);
@@ -961,6 +983,7 @@ void TransferManager::onGroupDownloadRespond(PDU* pdu)
     emit tasksChanged();
 }
 
+// 42 数据块：仅追加写入当前分片；未知 id / 句柄已关（暂停、失败后迟到）一律落空
 void TransferManager::onDownloadData(PDU* pdu)
 {
     const quint64 id = transferIdOf(pdu);
@@ -990,6 +1013,7 @@ void TransferManager::onDownloadFinish(PDU* pdu)
     finishTask(*t, success ? Done : Failed, success ? QString() : QStringLiteral("下载失败"));
 }
 
+// 发送 107（UPLOADFILE_ABORT）——暂停与取消共用，服务端只负责释放槽位
 void TransferManager::sendPause(quint64 id)
 {
     PDU* pdu = mkPDU();
@@ -1196,6 +1220,7 @@ void TransferManager::retry(quint64 key)
     resumeDownload(*t);   // C2：与"继续"同一路径——摘旧映射、起点 = 分片大小（失败重试不再从头）
 }
 
+// 懒创建并前置任务面板；面板仅在此时机构造，避免无传输时占用资源
 void TransferManager::showPanel()
 {
     if (m_panel == nullptr) {
@@ -1211,6 +1236,7 @@ void TransferManager::showPanel()
 
 // ===================== TransferTaskPanel =====================
 
+// 面板骨架：五列表格 + 四个控制按钮；所有按钮作用于当前选中行
 TransferTaskPanel::TransferTaskPanel(QWidget* parent)
     : QWidget(parent),
       m_table(new QTableWidget(this)),
@@ -1251,6 +1277,7 @@ TransferTaskPanel::TransferTaskPanel(QWidget* parent)
     refresh();
 }
 
+// 行键藏于第 0 列 UserRole，避免额外隐藏列
 quint64 TransferTaskPanel::selectedKey() const
 {
     const int row = m_table->currentRow();
@@ -1260,6 +1287,7 @@ quint64 TransferTaskPanel::selectedKey() const
     return item->data(Qt::UserRole).toULongLong();
 }
 
+// 全量重建表格；进度按 doneBytes/totalBytes 取整，totalBytes=0 的已完成下载显示 100%
 void TransferTaskPanel::refresh()
 {
     TransferManager& mgr = TransferManager::instance();

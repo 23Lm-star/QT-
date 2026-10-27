@@ -9,9 +9,12 @@
 //    - Server: mkPDU() 用 memalloc → 必须用 memfree() 释放
 // 2. 禁止跨进程/跨策略释放 PDU
 // 3. 接收缓冲区中的原始字节不由 seedMsg() 释放
+// 构造一个服务端 PDU：整块内存一次分配（头 + 正文），清零后写入长度字段。
+// 调用方负责最终用 memfree() 释放；分配失败直接 exit(1)，属于进程级不可恢复错误。
 PDU *mkPDU(uint uiMsgLen)
 {
     uint uitotallen = sizeof(PDU) + uiMsgLen;
+    // 必须使用服务端内存池（memalloc），与后续 sendAndRelease/seedMsg 的 memfree 配对。
     PDU* pdu = (PDU*)memalloc(uitotallen);
     if(pdu == nullptr){
         exit(1);

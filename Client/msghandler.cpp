@@ -1,3 +1,6 @@
+// 业务响应处理实现：读取 PDU 的 caData/caMsg，更新界面或回送新 PDU。
+// 约定：ret 等整型字段直接 memcpy 前 4 字节；字符串字段为定长数组，读取时
+// 先补 NUL 再构造 QString。所有弹窗/界面操作都在 GUI 线程。
 #include "logging.h"
 #include "client.h"
 #include "msghandler.h"
@@ -10,11 +13,11 @@
 #include <QFileInfo>
 #include <QTimer>
 #include "index.h"
-#include "userinformation.h"
 MsgHandler::MsgHandler()
 {
 }
 
+// 注册响应：caData[0..3]=ret，[32..63]=登录名。
 void MsgHandler::handlrigist(){
     int ret;
     memcpy(&ret,this->pdu->caData,sizeof(ret));
@@ -40,11 +43,13 @@ void MsgHandler::handlrigist(){
         return;
     }
     if(ret){
+        // 非零即成功：延迟 1.5s 让动画走完，再提示并本地创建用户目录。
         Client::getinstance().showLoadingAnimation(true);
         QString name=QString(rigistName);
         QTimer::singleShot(1500,[name](){
             QMessageBox::information(&Client::getinstance(),"提示","注册成功");
             Client::getinstance().flus();
+            // 本地也建一份目录（服务端存储根同步），失败无提示、不阻断流程。
             QDir dir;
             dir.mkdir(QString("%1").arg(Client::getinstance().m_strRootPath));
             dir.mkdir(QString("%1/%2").arg(Client::getinstance().m_strRootPath).arg(name));
@@ -55,6 +60,8 @@ void MsgHandler::handlrigist(){
     }
 }
 
+// 登录响应：ret=1 成功（caData[32..63]=登录名），-1 账号/密码错误；
+// 验证码错误/过期/锁定的处理与注册响应一致。成功时立即返回名字。
 QString MsgHandler::handllogin()
 {
     int ret;
@@ -77,6 +84,7 @@ QString MsgHandler::handllogin()
         return QString();
     }
     if(ret==1){
+        // 成功：先同步取名字返回，UI 切换延后 1.5s。
         Client::getinstance().showLoadingAnimation(true);
         char lName[32]={'\0'};
         memcpy(lName,pdu->caData+32,sizeof(lName));
@@ -158,6 +166,7 @@ void MsgHandler::handlAddFriend()
     }
 }
 //同意添加好友
+// 请求方名字在 caData[0..31]；同意回执按“我/对方”顺序各占 32 字节。
 void MsgHandler::handlAddFriendAgree(const QString &myName)
 {
     char seedName[32]={'\0'};
@@ -173,6 +182,7 @@ void MsgHandler::handlAddFriendAgree(const QString &myName)
     Client::getinstance().sorket.write((char*)pdu,pdu->uiTotalLen);
 }
 
+// 好友列表：caMsg 是 32 字节定长用户名数组，数量 = uiMsgLen/32。
 void MsgHandler::handlFlushFriend()
 {
     int leng=pdu->uiMsgLen/32;//柔性数组长度
@@ -199,6 +209,7 @@ void MsgHandler::handlDeleteFriend()
 
 
 //聊天
+// 收到的是单条聊天消息：caData 前 32 字节为发送者，caMsg 为一个 Msg 结构。
 void MsgHandler::chat()
 {
     char seedName[32]={'\0'};
@@ -249,6 +260,7 @@ void MsgHandler::mkdir()
     }
 }
 
+// 删除响应：成功不本地改列表，而是重新请求 FLUSHFILE（以服务端为准）。
 void MsgHandler::deldir()
 {
     bool ret=0;
@@ -256,6 +268,7 @@ void MsgHandler::deldir()
     qCDebug(lcCli)<<"删除文件结果"<<ret<<endl;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","删除文件夹成功");
+        // 注意：局部 pdu 覆盖成员指针，避免误用刚处理完的响应。
         PDU* pdu=mkPDU(Index::getinstance().getFile()->m_strCurPath.size()+1);
         pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
         memcpy(pdu->caMsg,Index::getinstance().getFile()->m_strCurPath.toStdString().c_str(),Index::getinstance().getFile()->m_strCurPath.size());
@@ -266,6 +279,7 @@ void MsgHandler::deldir()
     }
 }
 
+// 切换目录响应：成功时 caMsg 为服务端确认后的相对路径。
 void MsgHandler::changedir()
 {
     bool ret=0;
@@ -331,6 +345,8 @@ void MsgHandler::sharefilefinsh()
     }
 }
 
+// 文件列表响应：caMsg 为连续的 FileInfo（caName[32] + uiType）。
+// 这里为每条记录 new 一个副本，所有权随列表交给文件页刷新函数。
 void MsgHandler::flushfile()
 {
     QList<FileInfo*>qFileinfolist;
@@ -355,6 +371,7 @@ void MsgHandler::handleResolvePublishLink(PDU* pdu)
         return;
     }
     // 服务端已把文件复制到其【用户目录/分享链接/】下，这里解析返回的相对路径并提示
+    // 响应体是 JSON 文本；这里只做最小字符串查找，避免为一个字段引入 JSON 依赖。
     QString json = QString::fromUtf8(pdu->caMsg);
     QString savedPath;
     const QString key = "\"saved_path\":\"";
@@ -391,6 +408,7 @@ void MsgHandler::handlfinduser(){
     }
 }
 
+// 验证码响应：caData[0..3]=status，[4..7]=服务端剩余秒数；成功时 caMsg=验证码文本。
 void MsgHandler::handleCaptcha(){
     int status;
     memcpy(&status, pdu->caData, sizeof(status));
@@ -417,6 +435,7 @@ void MsgHandler::handleCaptcha(){
     }
 }
 
+// 移动文件响应：caData[0]=结果，[32..63]=被移动文件名（用于提示）。
 void MsgHandler::handlMoveFile()
 {
     bool ret=false;
@@ -431,41 +450,6 @@ void MsgHandler::handlMoveFile()
     else {
         QMessageBox::information(&Index::getinstance(),"提示","文件移动失败");
     }
-}
-
-void MsgHandler::handlUserInformation()
-{
-    int resultCode=0;
-    int online=0;
-    memcpy(&resultCode,pdu->caData,sizeof(resultCode));
-    memcpy(&online,pdu->caData+sizeof(int),sizeof(online));
-
-    char userName[32]={'\0'};
-    memcpy(userName,pdu->caData+32,32);
-
-    qCDebug(lcCli)<<"handlUserInformation result:"<<resultCode<<"online:"<<online<<"name:"<<QString::fromUtf8(userName);
-
-    if(resultCode!=0){
-        QMessageBox::information(&Index::getinstance(),"提示","用户信息获取失败");
-        return;
-    }
-
-    //构建最小信息列表，仅填充用户名和在线状态，其余显示"未设置/暂无资料"
-    QStringList msg;
-    msg.append(QString::fromUtf8(userName));       //0: 用户名
-    msg.append("未设置");                            //1: 昵称
-    msg.append("0");                                //2: 年龄
-    msg.append("0");                                //3: 性别
-    msg.append("未设置");                            //4: 省
-    msg.append("未设置");                            //5: 市
-    msg.append("未设置");                            //6: 县
-    msg.append("未设置");                            //7: 职业
-    msg.append("未设置");                            //8-11: 学校
-    msg.append("未设置");
-    msg.append("未设置");
-    msg.append("未设置");
-    msg.append(online ? "在线" : "离线");            //12: 使用签名字段显示在线状态
-    UserInformation::getinstance().fluMsg(msg);
 }
 
 void MsgHandler::handlLogoff()
@@ -508,6 +492,7 @@ void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
     // 需要根据当前上下文打开对话框
     // 假设 Index 有当前选中的文件路径
     QString filePath = Index::getinstance().getFile()->m_strCurPath + "/" + Index::getinstance().getFile()->m_strShareFileName;
+    // 模态展示后延迟销毁：exec 返回时仍处于本函数栈内，deleteLater 更安全。
     ShareLinkDialog *dlg = new ShareLinkDialog(filePath, &Index::getinstance());
     dlg->setLink(link);
     dlg->exec();

@@ -21,6 +21,7 @@ class GroupChatState;
 // REQ-EXT-GROUP-004：本窗口只是"会话级群读状态"的读写者，自己不再持有游标。
 // 上报锚点恒为「已连续拿到的最长前缀的末尾」，绝不是已渲染的最大 seq——
 // 实时投递会丢（服务端出站队列满即丢弃），报最大会让洞内消息被永久判为已读。
+// 单群聊天窗口：消息列表 + 输入框 + 状态栏
 class GroupChat : public QWidget
 {
     Q_OBJECT
@@ -39,13 +40,18 @@ protected:
     void hideEvent(QHideEvent *event) override;
 
 private slots:
+    // 发送输入框内容（乐观入列表，失败可重试）
     void sendCurrent();
+    // 加载更早消息（91 mode=1）
     void loadOlder();
+    // 双击条目：仅对“发送失败”的消息重发
     void onItemDoubleClicked(QListWidgetItem *item);
 
 private:
+    // 统一请求出口（自动加 20B 信封）
     void sendRequest(uint type, const QByteArray &body = QByteArray());
     QByteArray envelope(const QByteArray &body);
+    // 拉取消息：mode=0 前向补洞（seq>cursor 升序），mode=1 后向翻页（seq<=cursor）
     void requestPull(quint8 mode, quint64 cursor, quint16 limit);
     GroupChatState &groupState();                  // Client 持有的会话级群读状态
     void onMessageArrived(quint64 seq);      // 唯一推进入口（实时/自己消息/拉取共用）
@@ -59,14 +65,22 @@ private:
     // REQ-UX-001 A3：自己的消息统一"身份/时间行 + 正文行"右对齐重绘
     void renderOwnMessage(QListWidgetItem *item, const QString &state, const QString &content);
 
+    // 本窗口所属群（信封里恒用此值）
     quint64 m_groupId;
+    // 窗口标题显示用
     QString m_groupName;
+    // 消息列表（每条含身份/时间行 + 正文行）
     QListWidget *m_messageList;
+    // 输入框；回车等同点发送
     QLineEdit *m_input;
     QPushButton *m_sendButton;
+    // “加载更早”：后向翻页
     QPushButton *m_historyButton;
+    // 总条数/未读提示
     QLabel *m_statusLabel;
+    // 信封请求号自增源
     quint64 m_requestId = 0;
+    // 本次显示是否已请求过 96 摘要（防重复）
     bool m_summaryRequested = false;
     // 渲染去重：seq 全局唯一，90 与 92 同源
     QHash<quint64, bool> m_renderedSeqs;
@@ -76,7 +90,9 @@ private:
     int m_catchupBatches = 0;      // 前向补齐批次计数（上限防长历史全量拉）
     static const int MAX_CATCHUP_BATCHES = 20;
     static const int READ_REPORT_THROTTLE_MS = 400;
+    // 乐观发送中的消息：clientMsgId 用于 89/90 回包配对，item 用于就地改状态
     struct PendingSend { QString clientMsgId; QString content; QListWidgetItem *item; };
+    // 未确认发送（失败后可双击重试）
     QList<PendingSend> m_pending;
     // 列表项数据角色
     static const int ROLE_SEQ = Qt::UserRole;          // quint64 seq

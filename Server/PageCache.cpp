@@ -1,3 +1,5 @@
+// PageCache 实现：页级分配、按页数分桶、相邻 span 合并与页映射维护。
+// 所有公开入口都假定调用方已持有 _mtx（GetMutex）。
 #include"PageCache.h"
 
 PageCache PageCache::_PCIns;
@@ -12,6 +14,7 @@ PageCache PageCache::_PCIns;
 span* PageCache::NewSpan(size_t k){
 	//如果申请的页数超过了PageCache的管理最大页数
 	//assert(k > 0 && k < MaxPage);
+	// 超过最大桶（128 页）的请求不切分、不入桶，直接向系统申请整块内存。
 	if (k > MaxPage - 1){
 		//直接去系统申请内存
 		void* ptr= SystemAlloc(k);
@@ -29,12 +32,14 @@ span* PageCache::NewSpan(size_t k){
 	}
 
 	//如果占有K页大小的span存在
+	// 优先命中页数完全相等的空闲桶，直接从桶头摘取。
 	if (!_PageList[k].Empty()){
 		//分配一个span出来
 		span* NewSpan = _PageList[k].EraseFront();
 
 		//统计分出去的页号与span*的映射：为了PageCache回收能快速找到对应的span
 		//这里不进行统计大对象申请释放时没存就会报错(BUG)
+		// 该 span 覆盖的每一页都要登记映射，MapObjectToSpan 才能命中任意块地址。
 		for (Page_t i = NewSpan->Page_Adder; i < NewSpan->Page_Adder + k; i++){
 			//_PageToSpan[i] = NewSpan;
 			_PageToSpan.set(i, NewSpan);
@@ -42,10 +47,12 @@ span* PageCache::NewSpan(size_t k){
 		return NewSpan;
 	}
 	//往下找大span进行切分
+	// 精确桶为空时，向上寻找更大的空闲 span 进行切分。
 	for (size_t i = k + 1; i < MaxPage; i++)
 	{
 		if (!_PageList[i].Empty())
 		{
+			// 从大 span 头部切出 k 页，剩余部分改写页号与页数后放回对应桶。
 			//BigSpan要切k页NewSpan带出来给CentralCache
 			//1、先将首个span从spanlist中切下来
 			span* BigSpan = _PageList[i].EraseFront();
@@ -61,10 +68,12 @@ span* PageCache::NewSpan(size_t k){
 			_PageList[BigSpan->_n].InsertFront(BigSpan);
 
 			//4、统计分出去的页号与span*的映射
+			// 为切出的新 span 逐页登记映射。
 			for (Page_t i = NewSpan->Page_Adder; i < NewSpan->Page_Adder + k; i++){
 				//_PageToSpan[i] = NewSpan;
 				_PageToSpan.set(i, NewSpan);
 			}
+			// 剩余 span 只需登记首尾页：回收合并时通过这些边界页找到邻居。
 			//5、将BigSpan内部剩下的页的 左右 进行和span的映射:为了回收回来的span进行合并
 			//_PageToSpan[BigSpan->Page_Adder] = BigSpan;
 			//注意存右位置要减1
@@ -76,6 +85,7 @@ span* PageCache::NewSpan(size_t k){
 	}
 
 	//找不到要向堆申请(分配可以分配的最大页数)
+	// 所有桶都空：向系统申请最大桶（128 页）入桶，再递归走一次分配逻辑完成切分。
 	void* ptr = SystemAlloc(MaxPage - 1);
 	//span* BigSpan = new span;
 	span* BigSpan = _pool.New();
@@ -92,6 +102,7 @@ span* PageCache::NewSpan(size_t k){
 /// </summary>
 /// <param name="obj">需要进行回收的内存地址</param>
 /// <returns> 回收的内存 对应的 span* </returns>
+// 地址右移 PageShift 即页号；分配时已为该页登记 span，因此正常路径不会为空。
 span* PageCache::MapObjectToSpan(void* obj){
 	//.get()方法取出的是值的地址
 	span* FindSpan = (span*)_PageToSpan.get((Page_t)obj >> PageShift);
@@ -100,9 +111,11 @@ span* PageCache::MapObjectToSpan(void* obj){
 }
 
 //回收内存到PageCache中进行合并操作
+// 仅由 CentralCache 在 UseCount 归零且已从桶摘除后调用，此时 span 内不再有借用块。
 void PageCache::ReleaseSpanToPageCache(span* Span){
 	assert(Span!=nullptr);
 	//如果要回收的span的所占页数大小超过了PageCache的MaxPage范围-->直接回收给系统
+	// 超过桶上限的大 span 不参与合并，直接归还系统并回收 span 节点。
 	if (Span->_n > MaxPage - 1){
 		//系统申请的用系统调用释放(将Span的页号切换成首地址)
 		SystemFree((void*)(Span->Page_Adder << PageShift));
@@ -113,6 +126,7 @@ void PageCache::ReleaseSpanToPageCache(span* Span){
 
 	//回收回来的span要与没有被分配给CentralCache/ThreadCache的span进行合并，解决内存碎片问题
 	//左合并
+	// 向前合并：查前邻页对应的 span；仅当它空闲（_IsUse=false）且合并后不越界时才合并，随后删除旧节点。
 	while (1){
 		//计算span的存储首页的前一页的span*(左span)
 		//auto tmp = _PageToSpan.find(Span->Page_Adder - 1);
@@ -138,6 +152,7 @@ void PageCache::ReleaseSpanToPageCache(span* Span){
 		_pool.Delete(tmp);	
 	}
 	//右合并
+	// 向后合并：查 Span->Page_Adder + _n 页，即紧邻的后一页。
 	while (1){
 		//寻找Span的右页的下一个页对应的span
 		span* tmp = (span*)_PageToSpan.get(Span->Page_Adder + Span->_n);
@@ -159,6 +174,7 @@ void PageCache::ReleaseSpanToPageCache(span* Span){
 		_pool.Delete(tmp);
 	}
 	//执行大Span的相关操作
+	// 标记为空闲，按最终页数入桶，并刷新首尾页映射指向合并后的 span。
 	Span->_IsUse = false;
 	//将合并之后的span插入到它对应的页数桶当中去准备分配
 	_PageList[Span->_n].InsertFront(Span);

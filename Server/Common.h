@@ -1,3 +1,6 @@
+// 内存池公共设施：大小类常量、系统页分配、自由链表、span 与 span 链表。
+// 三级结构：ThreadCache（线程本地）-> CentralCache（全局分桶）-> PageCache（页级），
+// 不大于 256KB 的对象走三级缓存，更大的请求直接按 8KB 页向系统申请。
 #pragma once
 
 #include<iostream>
@@ -18,14 +21,19 @@
 using std::cout;
 using std::endl;
 
+// 桶总数：128B 以内 16 档 + 三个区间各 56 档 + 256KB 区间 24 档。
 static const size_t MaxFreeLists = 208;//���������������(������ֵ)
+// 小对象上限：超过该值不再切块，直接走 PageCache 页分配。
 static const size_t MaxBytes = 256 * 1024;//(��������ֽ���)
+// 页桶下标范围 1..128；0 号桶保留不用。
 static const size_t MaxPage = 129;//span�������ҳ��-1
+// 一页 2^13 = 8KB；页号与地址之间通过移位互换。
 static const size_t PageShift = 13;//�趨һҳ��СΪ2^13(8K)
 
 //����ҳ����������Page_t
 //_WIN64ֻ��64λ�����_WIN32���ж���
 #ifdef _WIN64 //���л���64λ
+	// 页号类型：地址右移 PageShift 得到；64 位下页号可达 2^51。
 	typedef unsigned long long Page_t;
 #elif _WIN32 //���л���32λ
 	typedef size_t Page_t;
@@ -77,12 +85,14 @@ static const size_t PageShift = 13;//�趨һҳ��СΪ2^13(8K)
 	}
 
 //��ȡ����ǰ��ַ�� ǰ8���ֽ� ��ָ��
+// 自由链表后继：复用对象的前 sizeof(void*) 字节存放下一节点地址。
 static void*& Next(void* obj){
 	return *(void**)obj;
 }
 
 
 //������������
+// 单链表自由链表：头插/头删 O(1)；_size 用于判断是否需要批量归还。
 class FreeList{
 public:
 	//ͷ�������ڴ��
@@ -143,12 +153,14 @@ public:
 
 private:
 	void* _FreeList=nullptr;
+	// 每次向 CentralCache 补货的批量上限，随补货成功自适应增长。
 	size_t _MaxSize = 1;//������CentralCacle����ĸ���/���������������ɵ�����ڴ�����
 	size_t _size = 0;//��ǰ_FreeList���ӵ��ڴ�����
 };
 
 //�ڴ湤���ࣺ
 //���������ڴ����,����Ͱ��������
+// 大小类映射：把任意请求字节数规整到固定档位，并映射到唯一的桶下标。
 class SizeClass{
 public:
 	// ��������
@@ -193,6 +205,7 @@ public:
 	}
 
 	//������ + Ͱ�Ķ�����(+8��+16��+128...)->��ϣͰ����
+	// 档位公式：ceil(bytes / 2^AlignIndex) - 1；AlignIndex 即对齐字节数的 log2。
 	static inline size_t _Index(size_t bytes, size_t AlignIndex)//��2��ָ������
 {
 		//        -1Ҳ��Ϊ����8�����λ���ֲ���    ֻʣ���λ     
@@ -200,6 +213,7 @@ public:
 	}
 
 	//ӳ���ϣͰ���±�
+	// 按区间选择对齐位移，返回值贯穿三级缓存，作为桶/自由链表下标。
 	static inline size_t Index(size_t bytes){
 		//�Ż���
 		if (bytes <= 128){
@@ -224,6 +238,7 @@ public:
 	}
 
 	// ������CentralCache��ȡ���ٸ�
+	// 每次向 CentralCache 领取的块数：256KB/size，并夹在 [2,512] 之间。
 	static size_t NumMoveSize(size_t size){
 		assert(size <= MaxBytes);
 		size_t num = MaxBytes / size;
@@ -239,6 +254,7 @@ public:
 	}
 
 	// ����һ����ϵͳ��ȡ����ҳ(1ҳ8KB)
+	// 批量块总字节数右移得到页数（向下取整），至少分配 1 页。
 	static size_t NumMovePage(size_t size){
 		//����size����Ҫ������ٸ�size��С���ڴ��
 		size_t num = NumMoveSize(size);
@@ -253,22 +269,27 @@ public:
 };
 
 //�ڴ��Ļ�����λ������һ��ҳ�������ڴ�
+// span：一组连续页的元数据，同时用作 CentralCache/PageCache 链表节点。
 struct span{
+	// 起始页号（页号 = 地址 >> PageShift），不是地址本身。
 	Page_t Page_Adder = 0;//�������ڴ����ʼҳ��(��ַ)
 	size_t _n = 0;//ҳ������
 	//ǰ��span��ָ��
 	span* _prev=nullptr;
 	span* _next=nullptr;
 
+	// 已借给 ThreadCache 且尚未归还的块数；归零表示该 span 可整体回收。
 	size_t _UseCount = 0;//ThreadCache���˶��ٸ�С���ڴ�
 	void* _FreeList = nullptr;//span���ŵ�һ��һ���ڴ����׵�ַ(ҳ�Ŀ�������)
 
+	// true 表示 span 正被 CentralCache 使用；PageCache 合并邻居时会跳过这种 span。
 	bool _IsUse = false;//��PageCache�����Ƿ��CentralCache��(span�Ƿ����ڱ�ʹ��)
 	//�����ڴ�����
 	size_t _FreeKnowSize = 0;
 };
 
 //��span��֯����(һ��ѭ������,����_head����ڵ�)
+// span 环形双向链表：_head 为哨兵节点，空表时指向自身；每个桶自带一把互斥锁。
 class SpanList{
 public:
 	SpanList(){//����span��������������span�ڵ�
@@ -336,5 +357,6 @@ private:
 	std::mutex _mtx;//Ͱ�� ÿ��thread����ͬһͰ(ͬһ��Ͱ��¼����һ��spanlist)��Ҫ����
 
 	//span����(�ظ��ˣ�û���õ�)
+	// 所有 SpanList 共用的哨兵对象池；静态成员只有这一份，定义在 CentralCache.cpp。
 	static ObjectPool<span> _SpanPool;//staticʹ��ʱ�ȶ���
 };

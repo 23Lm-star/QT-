@@ -5,11 +5,16 @@
 #include <QByteArray>
 #include <QDateTime>
 #include <QStringList>
+
+// OperateDB：服务端 MySQL 访问的单例入口（用户/好友/消息/分享链接/上传会话/群组/群消息/群文件）。
+// 每项操作从全局连接池取一条连接，作用域结束自动归还；失败用返回值/空值表达，不抛异常。
+// 只有 SQL 或连接异常写日志；业务性失败（用户名不存在、密码错等）由调用方按返回码判定。
 //数据库操作类
 class OperateDB : public QObject
 {
     Q_OBJECT
 public:
+    // 销毁单例；连接池在 DatabaseConnectionPool 析构时统一关闭
     ~OperateDB();
     //管理/维护一个数据库的连接
     void connect();
@@ -51,6 +56,7 @@ public:
         // REQ-EXT-GROUP-002：群消息（发送/拉取/已读/未读）
         GroupSendMessage, GroupPullMessages, GroupReadConfirm, GroupUnreadSummary
     };
+    // 群操作入参：字段按 operation 取用，其余保持默认值（0/空串即"未提供"）
     struct GroupRequest {
         GroupOperation operation;
         quint64 groupId;             // 群标识
@@ -69,13 +75,18 @@ public:
     };
     // REQ-EXT-GROUP-002：需要在线广播（PDU 90）的群消息记录
     struct GroupMessageRecord {
+        // 群内单调序号（group_info.last_seq 分配）
         quint64 seq = 0;
+        // group_message 自增主键
         quint64 msgId = 0;
+        // 发送者账号；系统消息为触发者
         QString sender;
         quint8 msgType = 0;          // 0 文本 / 1 系统
+        // 服务端落库时间（毫秒，取 MySQL created_at）
         quint64 createdAtMs = 0;
         QString content;
     };
+    // 群操作统一结果：code=0 成功；responseBody 已按协议编码，调用方无需再拼字段
     struct GroupResult {
         int code;                    // 0 成功，负数为业务错误
         QByteArray responseBody;     // 已编码的响应业务字段
@@ -95,6 +106,7 @@ public:
     // 权限事实源与 GROUP-001/002 同源：group_info.status + group_member.status='active'。
     // 全部判定在服务端、每请求即时执行（退出/被移除即时失权），客户端不自报身份、不缓存授权。
     enum GroupFileOperation { GroupFileList = 1, GroupFileUploadInit, GroupFileDelete, GroupFileDownload };
+    // 群文件入参/出参合体：出参字段仅在命中或 Download 时被填写
     struct GroupFileRequest {
         GroupFileOperation operation = GroupFileList;
         quint64 groupId = 0;         // 信封 group_id（目标群）
@@ -109,6 +121,7 @@ public:
         qint64 objectId = -1;        // 命中/Download：物理对象
         qint64 sizeBytes = -1;       // Download：文件大小
     };
+    // 群文件结果：hit 只对 UploadInit 有意义（true 表示零正文秒传）
     struct GroupFileResult {
         int code = -2000;            // 0 成功，负数为业务错误
         QByteArray responseBody;     // List/Download 的业务体（不含信封与 code）
@@ -125,47 +138,71 @@ public:
     //main 在 checkSchemaVersion 后、migrateLegacyFiles 前调用。
     void normalizeLogicKeys();
     //执行注册用户操作函数
+    // 注册新用户：用户名已存在直接失败；成功时生成随机盐并以 md5(客户端哈希+盐) 落库
     bool handleRegit(char* strname,char*strpwd);
     //登录用户
     // REQ-EXT-SESSION-001：clientId=登录携带的客户端唯一标识（可空）；成功(ret==1)时
     // outVersion=本次登录在事务内原子分配的用户域版本号
     int handleLogin(char*strname,char*strpwd,const QString& clientId,quint64& outVersion);
     //下线
+    // 断线时把 online 置 0；SQL 失败静默（启动期 reconcileOnlineFlags 兜底）
     void handleOffLine(const char* strname);
     //查找用户
+    // 返回 online（0 离线/1 在线）；用户不存在返回 2；参数或连接失败返回 -1
     int handleFindUser(const char* userName);
     //获取所有用户
+    // 返回在线、非自己且尚未成为好友的用户名（用于陌生人列表）
     QStringList handleOnlineUsers(const QString& strname);
     //添加好友操作，查找
+    // 目标在线返回 1，离线/不存在返回 0，参数或连接失败返回 -1
     int handleAddFriend(char* usrname,char* tarname);
     //添加好友操作，添加
+    // 单条 INSERT，只写一个方向；双向关系由调用方对调参数再调一次
     int handleAddFriendFin(char* usrname,char* tarname);
     //刷新好友操作，
+    // 返回与 strname 相关的双向好友名（UNION 去重）
     QStringList handleFlushFriend(const QString&strname);
     //删除好友操作
+    // 事务内删除两个方向的好友行
     bool handleDeleteFriend(char*userName,char*tarName);
     //记录聊天消息信息
+    // 写入私聊消息；issuccess 记录接收方当时是否在线；返回接收方是否在线
     bool seedchatMsg(char*seedName,char *revName,QString msg,QString seedTime);
     //获取聊天信息
+    // 事务内 SELECT ... FOR UPDATE 未送达消息并标记 issuccess=1；
+    // 返回扁平列表（每行依次为 msg、seed_time）；标记失败时返回空列表以便重投
     QStringList getchatMsg(char*seedName,char *revName);
     //获取用户信息
+    // 按名查询，命中时回填规范用户名与 online 标志
     bool handleGetUserInfo(const char* userName, QString& outName, int& outOnline);
     //注销/删除用户账户
+    // 校验密码后单事务级联删除消息、好友、用户及分享/外链/登录档案；
+    // 后三类清理失败不回滚（表可能尚未迁移）
     bool handleLogoff(const char* name, const char* pwd);
     //分享链接操作
+    // 写入短码外链记录（publish_links），失败返回 false
     bool createPublishLink(const QString &code, const QString &path, const QString &creator);
+    // 短码查文件路径；未命中或连接失败返回空串
     QString getFilePathByCode(const QString &code);
     
     // 新增：安全外链分享操作（BUG-ARC-PUBLINK-001）
+    // token_hash 为随机令牌的哈希；同 owner+path 已有记录时直接复用，返回 true
     bool createShareLink(const QString &hash, const QString &owner, const QString &path, const QDateTime &expire);
+    // 分享链接行：路径为相对 owner 根目录的逻辑键，expire_time 到点即失效
     struct ShareLinkInfo {
+        // 链接创建者
         QString ownerName;
+        // 相对 owner 根的逻辑路径
         QString relativePath;
+        // 过期时间（库内为秒精度 DATETIME）
         QDateTime expireTime;
+        // 是否已作废
         bool revoked;
         QString tokenHash;      // REQ-EXT-SHARE-001：按路径取信息时回带，供复用/续期拼链接
     };
+    // 按 token 哈希精确查找；未命中返回 false 且不改 outInfo
     bool getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo);
+    // 按 owner+path 取最新一行的 token_hash；未命中/连接失败返回空串
     QString getShareLinkByPath(const QString &owner, const QString &path);
     // REQ-EXT-SHARE-001：按 owner+path 取最新一行的完整信息（含 token_hash）
     bool getShareLinkInfoByPath(const QString &owner, const QString &path, ShareLinkInfo &outInfo);
@@ -175,7 +212,9 @@ public:
     bool removeShareLinkExact(const QString &owner, const QString &path);
 
     // 跨功能联动维护（文件删除/重命名/移动 → 分享链接记录一致性）
+    // 删除 path 自身及其子路径（path/%）的全部链接记录
     bool deleteShareLinkByPath(const QString &owner, const QString &path);
+    // 把 oldPath 自身与其子路径整体平移到 newPath（两条 UPDATE，任一失败返回 false）
     bool updateShareLinkPath(const QString &owner, const QString &oldPath, const QString &newPath);
     // 删除好友时清理双方私聊记录
     bool deleteFriendMessages(const QString &userA, const QString &userB);
@@ -188,6 +227,7 @@ public:
                                const QString &clientSha256, const QString &stagingPath,
                                qint64 confirmedOffset, int ttlSec,
                                const QString &clientRequestId = QString());
+    // 持久化断点；仅 status='uploading' 的行会被更新，返回 SQL 是否执行成功
     bool updateUploadOffset(qint64 sessionId, qint64 confirmedOffset);
     // 完成/失败：写 status（done|failed|expired|verifying）；fileId>=0 时同写 file_id，
     // 使"已完成会话"能被请求级幂等短路直接命中（无需回退到内容预检查）。

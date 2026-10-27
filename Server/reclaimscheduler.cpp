@@ -15,6 +15,10 @@
 
 #include <algorithm>
 
+// reclaimscheduler.cpp — 两条收割线（待回收对象、废弃暂存）的切片式实现。
+// 每拍只处理 perTick 条；对象线按“抢权 → unlink → 摘引用/删记录”同步完成，
+// 暂存线按 mtime + 活跃会话判定后直接删除。所有磁盘删除都受路径白名单校验。
+
 namespace {
 // 路径比较一律 cleanPath + 小写：Windows 盘符大小写与分隔符都可能不一致，
 // 拿原串比会让"活跃会话在用"的判定静默失效（那是会误删续传现场的）。
@@ -24,6 +28,7 @@ QString normKey(const QString& p)
 }
 }   // namespace
 
+// 函数内静态对象保证单例且线程安全。
 ReclaimScheduler& ReclaimScheduler::instance()
 {
     static ReclaimScheduler inst;
@@ -35,6 +40,7 @@ ReclaimScheduler::ReclaimScheduler(QObject* parent)
 {
 }
 
+// 解析简单的 key=value 配置；#/; 开头为注释。任何非法值都不放大删除力度。
 ReclaimScheduler::Config ReclaimScheduler::loadConfig() const
 {
     Config c;    // 出来就是保守默认：1 小时一轮、每拍 20 条、暂存 6 小时、宽限 6 小时
@@ -98,6 +104,7 @@ void ReclaimScheduler::start()
                     << "dry_run=" << m_cfg.dryRun;
 }
 
+// 停止心跳；进行中的轮次状态一并丢弃，重新 start() 会从新一轮开始。
 void ReclaimScheduler::stop()
 {
     m_timer.stop();
@@ -145,6 +152,7 @@ void ReclaimScheduler::onTick()
     }
 }
 
+// 同步跑完整一轮：循环切片直到预算耗尽或无候选，供测试/人工验证使用。
 ReclaimScheduler::Stats ReclaimScheduler::runRound(const Config& cfg)
 {
     Stats st;
@@ -366,6 +374,7 @@ int ReclaimScheduler::harvestReclaimObjects(const Config& cfg, int budget, Stats
     return consumed;
 }
 
+// 暂存线：列 .staging/*.part，按 mtime 最老优先，跳过 TTL 未到、被活跃会话引用或本轮已失败的文件。
 int ReclaimScheduler::harvestStagingFiles(const Config& cfg, int budget, Stats& st)
 {
     if (budget <= 0 || cfg.stagingTtlHours <= 0) return 0;
@@ -405,6 +414,7 @@ int ReclaimScheduler::harvestStagingFiles(const Config& cfg, int budget, Stats& 
     return consumed;
 }
 
+// 收集 uploading/verifying 会话的暂存路径（统一 normKey 归一后比较）。
 QSet<QString> ReclaimScheduler::activeSessionStagingPaths() const
 {
     QSet<QString> out;
@@ -425,11 +435,13 @@ QSet<QString> ReclaimScheduler::activeSessionStagingPaths() const
     return out;
 }
 
+// 暂存目录固定为 filesys 根下的扁平 .staging。
 QString ReclaimScheduler::stagingDir() const
 {
     return QDir(Server::getinstance().filesPath).absoluteFilePath(".staging");
 }
 
+// 校验 storage_path 并转绝对路径：拒绝空值、objects_tmp 占位、绝对路径、含 ".." 或越出 objects/ 的路径。
 QString ReclaimScheduler::safeObjectAbsPath(const QString& rel) const
 {
     if (rel.isEmpty()) return QString();
