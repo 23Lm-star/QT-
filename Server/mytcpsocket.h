@@ -1,6 +1,7 @@
 #ifndef MYTCPSOCKET_H
 #define MYTCPSOCKET_H
-#include <QTcpSocket>
+#include <QSslSocket>
+#include <QSslConfiguration>
 #include <QObject>
 #include <QFile>
 #include <QTimer>
@@ -10,11 +11,13 @@
 #include "msghandler.h"
 // 每个实例对应一条客户端 TCP 连接，归属 MyTcpServer 所在的事件循环线程
 // （Qt 父子/信号槽保证槽函数在该线程执行；msghandler 因此无需加锁）。
+// REQ-EXT-TLS-001：基类改 QSslSocket。明文端口实例从不发起加密，行为等同 QTcpSocket；
+// TLS 端口实例由 setTlsMode(true) 登记，握手完成（encrypted）前 recvmsg 不做 PDU 解析。
 // 职责：粘包/半包解析（recvmsg）、PDU 分派（handlMsg）、上传写盘与下载分块流、
 // 认证/会话版本校验，以及断线时的在线态与资源清理。
 // 所有权：连接由 MyTcpServer::incomingConnection 创建，断开后经 removeSocket 用 deleteLater 销毁。
 //进行一个客户端连接的类
-class MyTcpSocket : public QTcpSocket
+class MyTcpSocket : public QSslSocket
 {
     Q_OBJECT
 public:
@@ -22,6 +25,12 @@ public:
     MyTcpSocket();
     // 释放未完成的下载文件句柄与 MsgHandler；不写数据库（下线写由 clientOffLine 负责）。
     ~MyTcpSocket();
+    // REQ-EXT-TLS-001：TLS 端口连接登记（须在 setSocketDescriptor 后调用）；
+    // tls=true 时发起握手并挂接 encrypted 后处理，握手完成前不解析 PDU。
+    void setTlsMode(bool tls);
+    // 从 exe 目录 certs/server.{crt,key} 构建服务端 TLS 配置（D4 固定目录约定）。
+    // 证书缺失或解析失败返回 isNull 配置，调用方据此跳过 TLS 监听并在日志说明。
+    static QSslConfiguration buildTlsConfig();
 public:
     //用来处理客户端PDU请求 的对象 指针
     MsgHandler* m_MsgHandler;
@@ -120,6 +129,8 @@ private:
     bool m_outboundPumpScheduled = false;
     // 因队列满被丢弃的实时投递计数（审计用）
     quint64 m_outboundDropCount = 0;
+    // REQ-EXT-TLS-001：本连接是否来自 TLS 端口（握手完成前禁止 PDU 解析）
+    bool m_tlsMode = false;
 private slots:
     // 下载调度 tick：背压允许时只发一块，然后重新调度。
     void sendNextChunk();
@@ -135,6 +146,8 @@ public slots:
                                    const QString& shaHex, qint64 sizeBytes);
     void recvmsg();//接收信息引起的槽函数
     void clientOffLine();//客户端登录下线断开连接的槽函数
+    // REQ-EXT-TLS-001：TLS 握手完成入口——把等待期已到达的字节转入正常 PDU 解析。
+    void onTlsEncrypted();
 
 };
 

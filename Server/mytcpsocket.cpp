@@ -17,6 +17,11 @@
 #include <QFile>
 #include <QDateTime>
 #include <QThreadPool>
+#include <QCoreApplication>
+#include <QBuffer>
+#include <QSslCertificate>
+#include <QSslKey>
+#include <QSslConfiguration>
 #include <cstring>
 
 // REQ-EXT-TRANSFER-003 D6：上传进度落库节流阈值（字节数 / 毫秒，满足其一即落库）
@@ -40,6 +45,63 @@ MyTcpSocket::MyTcpSocket()
     m_reapTimer=new QTimer(this);
     connect(m_reapTimer,&QTimer::timeout,this,&MyTcpSocket::onReapTimeout);
     m_reapTimer->start(15000);
+}
+
+// REQ-EXT-TLS-001：TLS 端口连接登记。明文端口永不调用，行为与 QTcpSocket 一致。
+void MyTcpSocket::setTlsMode(bool tls)
+{
+    m_tlsMode = tls;
+    if (!tls) return;
+    connect(this, &QSslSocket::encrypted, this, &MyTcpSocket::onTlsEncrypted);
+    connect(this, QOverload<const QList<QSslError>&>::of(&QSslSocket::sslErrors),
+            this, [this](const QList<QSslError> &errors) {
+        // 服务端不校验对端证书（单向 TLS），但要留痕：握手期证书错误必然导致连接终止。
+        qCWarning(lcNet) << "[TLS] sslErrors from" << peerAddress().toString()
+                         << ':' << errors.value(0).errorString();
+    });
+    setSslConfiguration(MyTcpSocket::buildTlsConfig());
+    startServerEncryption();
+}
+
+// 握手完成：readyRead 在等待期只会送握手字节（Qt 内部消费），业务首包若与握手同到
+// 会在 encrypted 后紧跟一次 readyRead；这里只标记状态并立即尝试消化已在缓冲中的数据。
+void MyTcpSocket::onTlsEncrypted()
+{
+    qCDebug(lcNet) << "[TLS] handshake complete from" << peerAddress().toString();
+    recvmsg();
+}
+
+// certs/ 固定目录约定（D4）：相对 exe 目录，不进取舍配置、不编进资源。
+QSslConfiguration MyTcpSocket::buildTlsConfig()
+{
+    QSslConfiguration cfg;
+    const QString dir = QCoreApplication::applicationDirPath() + "/certs";
+    QFile cf(dir + "/server.crt");
+    if (!cf.open(QIODevice::ReadOnly)) {
+        qCCritical(lcNet) << "[TLS] 打开证书失败:" << cf.fileName() << "，TLS 端口不启用";
+        return QSslConfiguration();
+    }
+    cfg.setLocalCertificate(QSslCertificate(cf.readAll()));
+    cf.close();
+    QFile kf(dir + "/server.key");
+    if (!kf.open(QIODevice::ReadOnly)) {
+        qCCritical(lcNet) << "[TLS] 打开私钥失败:" << kf.fileName() << "，TLS 端口不启用";
+        return QSslConfiguration();
+    }
+    QByteArray keyPem = kf.readAll();
+    kf.close();
+    QBuffer kb(&keyPem);
+    kb.open(QIODevice::ReadOnly);
+    cfg.setPrivateKey(QSslKey(&kb, QSsl::Rsa, QSsl::Pem, QSsl::PrivateKey));
+    if (cfg.localCertificate().isNull() || cfg.privateKey().isNull()) {
+        qCCritical(lcNet) << "[TLS] certs/ 内容无法解析（证书或私钥为空），TLS 端口不启用";
+        return QSslConfiguration();
+    }
+    cfg.setPeerVerifyMode(QSslSocket::VerifyNone);   // 单向 TLS：不启用 mTLS（D3）
+    // 业务规则 7：Qt 5.14 的 QSslConfiguration 只能整体指定协议，取 TlsV1_2
+    // （机内 OpenSSL 1.1.1w 后端即满足 >=1.2 且不给 SSLv3/TLS1.0/1.1 升级的机会）。
+    cfg.setProtocol(QSsl::TlsV1_2);
+    return cfg;
 }
 
 // 销毁路径：正常断线时 clientOffLine 已清空下载流，这里兜底处理未走断线信号的残留。
@@ -704,6 +766,9 @@ void MyTcpSocket::sendNextChunk()
 //接收客户端消息
 void MyTcpSocket::recvmsg(){
     m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
+    // REQ-EXT-TLS-001 业务规则 5：TLS 连接握手完成前不解析 PDU。
+    // 等待期的 readyRead 只携带握手字节，交给 Qt 的 SSL 状态机消费即可。
+    if (m_tlsMode && !isEncrypted()) return;
     // TCP 是字节流：一次 readyRead 可能拿到多个 PDU，也可能只有半个，统一追加到缓存。
     QByteArray dpui=this->readAll();
     this->m_dpulist.append(dpui);

@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QTcpServer>
+#include <QSslConfiguration>
 #include <QMutex>
 #include <QHash>
 #include <QStringList>
@@ -25,6 +26,11 @@ public:
     //进行信号监听
     // 新连接入口：创建 MyTcpSocket、分配连接号并登记到连接表（锁内）。
     void incomingConnection(qintptr handle) override;
+    // REQ-EXT-TLS-001 D1：在 主端口+1 上启动 TLS 监听（双端口共存，5000 明文语义不变）。
+    // 配置无效（certs 缺失/解析失败）时不监听并返回 false；成功返回 true。
+    // 由 Server::initialize 在明文监听成功后调用；僵尸清扫定时器只在单例上运行，
+    // TLS 监听实例复用同一连接表与广播路由。
+    bool startTlsListener(const QSslConfiguration &cfg);
     //移除已经和客户端断开连接的socket对象
     // 先从表内摘除，再 deleteLater（不在槽函数栈内直接析构自己）。
     void removeSocket(MyTcpSocket* m);
@@ -64,6 +70,13 @@ public slots:
                                    bool ok, const QString& shaHex, qint64 sizeBytes);
 private:
     MyTcpServer();
+    // REQ-EXT-TLS-001：TLS 监听实例（非单例；仅 its incomingConnection 走 TLS 模式）。
+    // 单例的清扫定时器负责僵尸回收，监听实例不重复起定时器。
+    static MyTcpServer *s_tlsListener;
+    // 本实例是否以 TLS 模式接受连接（仅 s_tlsListener 为 true）。
+    bool m_isTlsListener = false;
+    // TLS 监听器共享的服务端证书配置（含本地证书与私钥）。
+    QSslConfiguration m_tlsCfg;
     //记录所有已经建立连接的 socket对象 链表
     // 仅由主线程修改；跨函数遍历/快照时须持有下面的互斥量。
     QList<MyTcpSocket*>tcpsocketlist;

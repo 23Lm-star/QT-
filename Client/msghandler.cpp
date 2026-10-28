@@ -180,6 +180,11 @@ void MsgHandler::handlAddFriendAgree(const QString &myName)
     pdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_RESPOND;
     memcpy(pdu->caData,myName.toStdString().c_str(),sizeof(myName.toStdString()));
     memcpy(pdu->caData+32,&seedName,sizeof (seedName));
+    // REQ-EXT-TLS-001 业务规则 5：TLS 握手完成前不发 PDU，直接丢弃该尽力发送请求（重连后可再发）。
+    if (Client::getinstance().tlsPending()) {
+        free(pdu);
+        return;
+    }
     Client::getinstance().sorket.write((char*)pdu,pdu->uiTotalLen);
 }
 
