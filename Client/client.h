@@ -12,6 +12,7 @@
 #include <QHash>
 #include <QWidget>
 #include <QSslSocket>
+#include "tlspinning.h"
 #include <QTime>
 #include <QtGlobal>
 #include <QPropertyAnimation>

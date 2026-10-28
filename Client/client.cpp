@@ -410,7 +410,7 @@ void Client::handlMsg(PDU *&pdu)
 }
 
 void Client::seedMsg(PDU *pdu){
-    if (tlsPending()) {                                 // REQ-EXT-TLS-001 业务规则 5
+    if (tlsPending()) {                                 // REQ-EXT-TLS-001 业务规则 5（同一谓词）
         free(pdu);
         return;
     }
@@ -426,23 +426,17 @@ void Client::seedMsg(PDU *pdu){
 void Client::startConnection()
 {
     m_tlsMode = false;
-    const QString crtPath = QCoreApplication::applicationDirPath() + "/certs/server.crt";
-    QFile cf(crtPath);
-    if (cf.open(QIODevice::ReadOnly)) {
-        const QSslCertificate crt(cf.readAll());
-        cf.close();
-        if (!crt.isNull()) {
-            QSslConfiguration cfg = sorket.sslConfiguration();
-            cfg.setCaCertificates(QList<QSslCertificate>() << crt);   // pinning：只信这一张
-            cfg.setProtocol(QSsl::TlsV1_2);                           // 业务规则 7：最低 TLS1.2
-            sorket.setSslConfiguration(cfg);
-            // Qt 5.14 的校验名是 QSslSocket 属性（不在 QSslConfiguration 上）
-            sorket.setPeerVerifyName("tlsserver");                    // 与证书 CN/SAN 一致
-            m_tlsMode = true;
-            qCInfo(lcCli) << "[TLS] 以 TLS 连接" << m_strlp << ":" << int(m_usPort) + 1;
-            sorket.connectToHostEncrypted(m_strlp, m_usPort + 1);
-            return;
-        }
+    const QSslCertificate crt = tls::loadPinnedCert();   // D4：certs/server.crt 固定目录
+    if (!crt.isNull()) {
+        sorket.setSslConfiguration(tls::buildPinnedConfig(crt));   // pinning + TLS1.2
+        // Qt 5.14 的校验名是 QSslSocket 属性（不在 QSslConfiguration 上）
+        sorket.setPeerVerifyName(tls::kVerifyName);                // 与证书 CN/SAN 一致
+        m_tlsMode = true;
+        qCInfo(lcCli) << "[TLS] 以 TLS 连接" << m_strlp << ":" << int(m_usPort) + 1;
+        sorket.connectToHostEncrypted(m_strlp, m_usPort + 1);
+        return;
+    }
+    if (QFile::exists(tls::certDirPath() + "/server.crt")) {
         qCWarning(lcCli) << "[TLS] server.crt 无法解析，回退明文连接";
     }
     sorket.connectToHost(QHostAddress(this->m_strlp), this->m_usPort);
@@ -485,7 +479,7 @@ void Client::forceReLogin() {
 }
 
 void Client::recvmsg(){
-    if (m_tlsMode && !sorket.isEncrypted()) return;   // REQ-EXT-TLS-001 业务规则 5
+    if (tls::pduWriteBlocked(m_tlsMode, sorket.isEncrypted())) return;   // REQ-EXT-TLS-001 业务规则 5
     // 追加本次读到的字节；循环尝试切出完整 PDU。
     m_pdulist.append(sorket.readAll());
     // 条件保证头部 76 字节齐全后才读取 uiTotalLen（避免半包越界）。

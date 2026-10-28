@@ -46,7 +46,8 @@ SOURCES += \
     transfertask.cpp \
     messagestore.cpp \
     uploader.cpp \
-    simplecaptcha.cpp
+    simplecaptcha.cpp \
+    tlspinning.cpp
 
 HEADERS += \
     chat.h \
@@ -69,7 +70,8 @@ HEADERS += \
     transfertask.h \
     messagestore.h \
     uploader.h \
-    simplecaptcha.h
+    simplecaptcha.h \
+    tlspinning.h
 
 FORMS += \
     chat.ui \
