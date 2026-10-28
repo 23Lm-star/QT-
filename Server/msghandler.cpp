@@ -504,13 +504,25 @@ PDU *MsgHandler::chat()
     memcpy(msg,pdu_msg->msg,pdu_msg->msgLen);
     memcpy(currTime,pdu_msg->Time,30);
     qCDebug(lcNet)<<"接收到的msg"<<QString(msg)<<" 时间为"<<QString(currTime)<<endl;
-    bool ret= OperateDB::instance().seedchatMsg(seedName,tarName,QString(msg),QString(currTime));
+    bool stored=false;
+    bool ret= OperateDB::instance().seedchatMsg(seedName,tarName,QString(msg),QString(currTime),&stored);
     qCDebug(lcNet)<<"char ret"<<ret<<endl;
     if(ret){
-        MyTcpServer::getinstance().reseed(tarName,pdu);//转发给接收人
+        MyTcpServer::getinstance().reseed(tarName,pdu);//转发给接收人（报文与改前逐字节一致）
     }
-    // 私聊回复走接收人连接，发送方本次请求无响应 PDU。
-    return nullptr;
+    // REQ-CLI-MSGSTORE-001：给发送方回一条 16 应答。编号 16 早已在两端 protocol.h 定义、
+    // 此前服务端从未生成，本次只是把它用起来：客户端据此确认「服务端已入库」，
+    // 才把自发消息写进本地存储。布局：caData[0,32)=对方名，[32)=bool 入库结果；
+    // caMsg 原样回带本次请求的 Msg（时间串+正文），作为客户端匹配待发条目的键。
+    // 旧客户端与网页端收到未注册的 16 会静默忽略，无兼容风险。
+    PDU* ack = mkPDU(pdu->uiMsgLen);
+    ack->uiType = ENUM_MSG_TYPE_CHAT_RESPOND;
+    memcpy(ack->caData, tarName, 32);
+    memcpy(ack->caData + 32, &stored, sizeof(stored));
+    if (pdu->uiMsgLen > 0) {
+        memcpy(ack->caMsg, pdu->caMsg, size_t(pdu->uiMsgLen));
+    }
+    return ack;
 }
 //创建目录
 // REQ-FS-003: 统一路径沙箱校验实现（唯一实现，所有入口复用）

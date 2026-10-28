@@ -13,6 +13,7 @@
 ## 当前快照
 
 - 当前代码可定位到：注册/登录/注销、验证码与冷却、密码加盐及旧账号升级、唯一有效登录；好友与私聊；群生命周期、群文本、阅读游标与群文件；逻辑文件资产、秒传、去重、引用回收；多文件有限并发、上传下载暂停/继续/取消、传输快照；应用内分享链接创建/解析/查询/续期/重新生成。
+- 2026-10-27 新增（REQ-CLI-MSGSTORE-001，分支 `codex/req-cli-msgstore-001` 已实现，**尚未提交合并**）：桌面客户端把收到的群/私聊消息与发送成功的消息存到本机（`AppLocalDataLocation` 下群、私聊各一个 SQLite 库，库内按 `user` 列隔离，明文），只记录本地水位及之前的序号，越界消息留在内存等补洞（系统事件只占号不落库，否则水位之后永久停写）；群聊与私聊窗口各有「清空本地记录」按钮；服务端为私聊发送方新增 16 入库应答（协议编号与 `protocol.h` 未变）。验收状态：群聊侧 GUI 已通过，私聊侧最后一轮界面修复按未复验记录，详见 PRD 与 [归档记录](docs/archive/REQ-CLI-MSGSTORE-001/记录.md)。
 - 上述是代码和历史集成记录所支持的能力范围，**不是本轮验收通过声明**。基线业务规则与依据见 [PRD 当前能力](PRD.md#当前能力与业务基线)。
 - 接手时主分支为 `master`，提交短标识 `ebabb0c`，相对本地记录的远端领先 12 个提交；工作区已有 81 个修改文件和 3 个删除文件。这些是迁移前状态，未进行提交、清理或业务修改。
 - 本轮验证仅覆盖治理迁移、文档链接、遗留事项登记和文件完整性。未执行构建、数据库测试或图形界面验收，不能沿用旧报告宣布当前业务通过。
@@ -119,6 +120,9 @@ npm --prefix web/frontend run dev     # 打开 http://127.0.0.1:5173/
 | 上传连续性与吞吐 | `project-docs/evidence/REQ-EXT-TRANSFER-003/verify.py` |
 | 服务端复算异步化（REQ-EXT-PERF-002，含 256MiB 响应性探针） | `project-docs/evidence/REQ-EXT-PERF-002/perf002_e2e.py` |
 | 分享链接生命周期 | `project-docs/evidence/REQ-EXT-SHARE-001/verify.py` |
+| 本地消息存储层（无网络无数据库，g++ 编译产品源码断言） | `project-docs/evidence/REQ-CLI-MSGSTORE-001/verify.py` |
+| 私聊 16 入库应答与离线补发 | `project-docs/evidence/REQ-CLI-MSGSTORE-001/chat16_e2e.py` |
+| 群+私聊完整功能场景回归（协议层） | `project-docs/evidence/REQ-CLI-MSGSTORE-001/scenario_e2e.py` |
 | 注销后同名重注册登录 | `project-docs/evidence/REQ-EXT-SESSION-001/relogoff_login_e2e.py` |
 | 启动期在线态对账 | `project-docs/evidence/REQ-EXT-SESSION-001/reconcile_online_e2e.py` |
 
@@ -140,7 +144,7 @@ npm --prefix web/frontend run dev     # 打开 http://127.0.0.1:5173/
 
 数据流：界面操作 → 客户端协议封装 → TCP → 服务端会话鉴权和请求处理 → MySQL / 文件存储 → 应答、消息广播或传输确认 → 客户端更新。`file_object`（物理内容对象）与 `user_file`（用户逻辑条目）分离；群、分享和个人文件复用授权与文件资产边界。内存管理含线程缓存、中央缓存、页缓存与基数树；数据库连接池采用 RAII（作用域管理资源）方式。
 
-兼容边界：两端协议编号保持一致，只允许追加，不重排旧编号。服务端在线态对账依赖单实例管理同一库；多实例共享库尚未支持。TLS（传输加密）、强密码派生、无密码会话恢复及动态/乱序分片等仍在 TODO，不因旧路线图提出过就视为已实现。
+兼容边界：两端协议编号保持一致，只允许追加，不重排旧编号。编号 16（私聊入库应答）此前已在两端定义但服务端从不生成，REQ-CLI-MSGSTORE-001 起改为真正回带给发送方；旧客户端与网页端会静默忽略它，两端 `protocol.h` 未改动。服务端在线态对账依赖单实例管理同一库；多实例共享库尚未支持。TLS（传输加密）、强密码派生、无密码会话恢复及动态/乱序分片等仍在 TODO，不因旧路线图提出过就视为已实现。
 
 ## 变更与许可证
 

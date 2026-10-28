@@ -271,8 +271,19 @@ sender_ok = got and got[0][1][:31].split(b"\0")[0].decode() == A
 check("X2b", "B 收到的转发报文发送人=服务端actor(非伪造名)", sender_ok, f"sender={got[0][1][:31].split(chr(0).encode())[0] if got else 'NONE'}")
 
 print("=== X3 伪造注销用户名删不掉他人账号（验收2/危险面） ===")
-r = ca.ask(pdu(T_LOGOFF, dat=creds(V, "wrongpwd")))
-check("X3a", "A 会话发注销V：按actor=A校验且密码错→被拒", r and r[0][0] == T_LOGOFF_R and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+# REQ-CLI-MSGSTORE-001 之后，A 这条连接上先前那次 T_CHAT 会多回一条 16 入库应答；
+# 本套件原先按“下一个包”取响应，会把 16 当成注销响应读走。改为按类型取注销响应，
+# 断言本身不变（仍要求响应是注销响应且结论为拒绝）。
+ca.sock.sendall(pdu(T_LOGOFF, dat=creds(V, "wrongpwd")))
+lor = None
+_deadline = time.time() + 4.0
+while lor is None and time.time() < _deadline:
+    ca._pump(0.5)
+    for _p in ca.packets():
+        if _p[0] == T_LOGOFF_R:
+            lor = _p
+            break
+check("X3a", "A 会话发注销V：按actor=A校验且密码错→被拒", lor is not None and not bf(lor[1]), f"ret={bf(lor[1]) if lor else 'NORESP'}")
 cv, ret = login_conn(V)
 check("X3b", "V 账号仍存活可登录", ret == 1, f"ret={ret}")
 cv.close()

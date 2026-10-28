@@ -1168,7 +1168,7 @@ bool OperateDB::handleDeleteFriend(char *userName, char *tarName)
 
 // 落库私聊消息：issuccess=1 表示接收方当时在线（可实时投递），0 表示留待其上线拉取。
 // 返回接收方是否在线；INSERT 本身失败只记日志，不影响返回值。
-bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString seedTime)
+bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString seedTime, bool *storedOut)
 {
     if(seedName==nullptr||revName==nullptr){
         return 0;
@@ -1197,6 +1197,7 @@ bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString 
     q.addBindValue(seedTime);
     bool execRet=q.exec();
     qCDebug(lcDb)<<"chat msg insert:"<<execRet;
+    if(storedOut != nullptr)*storedOut = execRet;      // 16 应答的入库结果口径
     return ans;
 }
 
