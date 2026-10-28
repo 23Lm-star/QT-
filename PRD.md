@@ -320,3 +320,5 @@
 2026-10-28｜REQ-CLI-MSGBND-001 合并进 master（5198801）：私聊正文 2000 字节上限与两端边界校验落地，服务端超限直接拒绝；`message_info.msg` 列宽迁移已在隔离测试库执行，部署顺序要求服务端与迁移先于客户端/网页上线。GUI 经主人确认不再人工复验，按未验证记录；X3a 与 TRANSFER-003 S-03b 两处陈旧断言留在 TODO。
 
 2026-10-28｜立项 REQ-EXT-TLS-001 桌面端↔服务端 TLS 加密：人工窗口一确认全部决定点——D1 双端口共存（5000 明文不变 + 新 TLS 端口，公网强制收敛随 M6）；D2 网关链路留明文；D3 自签证书+客户端 pinning、不做 mTLS；D4 `dist/certs/` 固定目录约定、配置格式不变；D6 既有套件走明文端口零改动 + 新增 TLS 专项套件。环境 spike 前置：本机 Qt 无 TLS 后端，`supportsSsl` 打通前视为阻塞。
+
+2026-10-28｜REQ-EXT-TLS-001 实施推进（分支 `codex/req-ext-tls-001`，3 笔提交：功能/测试/文档）：spike 实测 `supportsSsl=1`（OpenSSL 1.1.1w 由 system32 提供，非 Qt 目录）；服务端 TLS 监听主端口+1、证书走 `dist/certs/`、握手完成前不解析 PDU；客户端 `QSslSocket`+pinning、`sslErrors` 一律拒绝。TLS 专项 5/5、boundary_e2e 13/13、TRANSFER-002 25/26（唯一失败与 TLS 无关）、32MiB 回环吞吐实测 TLS≈明文 45%。未验证：抓包、产品客户端拒错证书、TLS 断连×重连、全量回归、GUI。

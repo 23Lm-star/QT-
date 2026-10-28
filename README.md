@@ -127,6 +127,7 @@ npm --prefix web/frontend run dev     # 打开 http://127.0.0.1:5173/
 | 私聊正文边界（无网络无数据库，g++ 编译 `Server/protocol.cpp` 断言 + 两端一致性） | `project-docs/evidence/REQ-CLI-MSGBND-001/verify.py` |
 | 私聊超长/畸形报文与进程存活（需先执行 `Server/migrate_msgbnd_001_widen_msg.sql`） | `project-docs/evidence/REQ-CLI-MSGBND-001/boundary_e2e.py` |
 | 服务端 TLS 端口（需先运行 `Server/make_tls_certs.ps1` 生成 `dist/certs/`；含证书缺失降级用例） | `project-docs/evidence/REQ-EXT-TLS-001/tls_e2e.py` |
+| 明文/TLS 下载吞吐对比（同上前置） | `project-docs/evidence/REQ-EXT-TLS-001/tls_throughput.py` |
 | 注销后同名重注册登录 | `project-docs/evidence/REQ-EXT-SESSION-001/relogoff_login_e2e.py` |
 | 启动期在线态对账 | `project-docs/evidence/REQ-EXT-SESSION-001/reconcile_online_e2e.py` |
 
