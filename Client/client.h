@@ -5,6 +5,7 @@
 // - recvmsg() 负责从字节流中拆出完整 PDU（处理粘包/半包），再按消息类型分发。
 // - 登录成功后隐藏本窗口，显示 Index 主界面；重连后强制回到登录页。
 #include "groupchatstate.h"
+#include "messagestore.h"
 #include "msghandler.h"
 #include "protocol.h"
 #include "reconnectdialog.h"
@@ -95,6 +96,10 @@ public:
     // 清空全部群的已读游标/水位（登录切换、重连、注销时调用）。
     void resetGroupStates() { m_groupStates.clear(); }
 
+    // REQ-CLI-MSGSTORE-001：接收消息的本地存储（群一库、私聊一库，库内按 user 列隔离）。
+    // 登录成功时 open，注销时 removeUser；库不可用时所有调用都是安全的空操作。
+    MessageStore &msgStore() { return m_msgStore; }
+
     // 退出前落盘未完成传输快照，并释放 ui。
     ~Client();
 public slots:
@@ -133,6 +138,7 @@ private:
     // 由 setupUi 创建，析构时 delete
     Ui::Client *ui;
     QHash<quint64, GroupChatState> m_groupStates;   // REQ-EXT-GROUP-004：group_id → 群读状态
+    MessageStore m_msgStore;                        // REQ-CLI-MSGSTORE-001：本地消息库
     // 30s 周期心跳，parent=this 自动释放
     QTimer* m_heartbeatTimer;
     // 服务端存活检测相关

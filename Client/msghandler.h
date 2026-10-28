@@ -37,6 +37,8 @@ public:
     void chat();
     // 处理离线消息批量响应：caMsg 连续排布多个 Msg，按 totalLen 步进解析。
     void getcharmsg();
+    // REQ-CLI-MSGSTORE-001：服务端 16 私聊入库应答（只决定自发消息是否落本地库，不改界面语义）
+    void handleChatAck();
     // 处理建目录响应，成功则刷新文件列表。
     void mkdir();
     // 处理删除响应：成功则重新请求当前目录列表（异常时名称为“文件夹”）。

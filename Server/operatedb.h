@@ -167,7 +167,10 @@ public:
     bool handleDeleteFriend(char*userName,char*tarName);
     //记录聊天消息信息
     // 写入私聊消息；issuccess 记录接收方当时是否在线；返回接收方是否在线
-    bool seedchatMsg(char*seedName,char *revName,QString msg,QString seedTime);
+    // 返回值=接收方当时是否在线（沿用改前语义，决定要不要实时转发）；
+    // storedOut 带回 INSERT 是否成功——REQ-CLI-MSGSTORE-001 的 16 应答以它为准，
+    // 「发送成功」指服务端已入库，与对方在不在线无关。可不传（其它调用方不受影响）。
+    bool seedchatMsg(char*seedName,char *revName,QString msg,QString seedTime,bool *storedOut=nullptr);
     //获取聊天信息
     // 事务内 SELECT ... FOR UPDATE 未送达消息并标记 issuccess=1；
     // 返回扁平列表（每行依次为 msg、seed_time）；标记失败时返回空列表以便重投

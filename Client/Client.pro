@@ -1,4 +1,4 @@
-QT       += core gui network concurrent
+QT       += core gui network concurrent sql
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -43,6 +43,7 @@ SOURCES += \
     folderselectdialog.cpp \
     reconnectdialog.cpp \
     transfertask.cpp \
+    messagestore.cpp \
     uploader.cpp \
     simplecaptcha.cpp
 
@@ -64,6 +65,7 @@ HEADERS += \
     folderselectdialog.h \
     reconnectdialog.h \
     transfertask.h \
+    messagestore.h \
     uploader.h \
     simplecaptcha.h
 

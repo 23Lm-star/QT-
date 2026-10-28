@@ -35,6 +35,34 @@
          </property>
         </widget>
        </item>
+
+      </layout>
+     </item>
+     <item>
+      <layout class="QHBoxLayout" name="toolLayout">
+       <item>
+        <widget class="QPushButton" name="clear_PB">
+         <property name="text">
+          <string>清空本地记录</string>
+         </property>
+         <property name="toolTip">
+          <string>只删除本机保存的聊天记录，不影响服务端与其它设备</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="toolSpacer">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>40</width>
+           <height>20</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
       </layout>
      </item>
     </layout>

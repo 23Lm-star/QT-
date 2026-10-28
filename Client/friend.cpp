@@ -169,6 +169,10 @@ void Friend::on_chat_PB_clicked()
     if(m_chat->isHidden()){
         m_chat->show();
         m_chat->setWindowTitle(m_chat->m_strChatName);
+        // REQ-CLI-MSGSTORE-001：先把本机存过的历史灌进窗口，再发 17 取离线补发；
+        // 两条路径都按「时间+正文」去重，同一条消息不会显示两遍
+        m_chat->loadLocalHistory(pName);
+        m_chat->beginHistoryRequest(m_chat->m_strChatName);   // 18 的归属按发请求时的会话定
         PDU* pdu= mkPDU();
         pdu->uiType=ENUM_MSG_TYPE_GETCHATMSG_REQUEST;
         // caData[0,32)=当前用户；[32,64)=聊天对象，服务端据此取双方历史记录

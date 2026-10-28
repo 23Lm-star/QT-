@@ -3,6 +3,7 @@
 #include "client.h"
 
 #include <QDateTime>
+#include <QMessageBox>
 #include <QHBoxLayout>
 #include <QHideEvent>
 #include <QTimer>
@@ -33,6 +34,7 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
       m_input(new QLineEdit(this)),
       m_sendButton(new QPushButton(QStringLiteral("发送"), this)),
       m_historyButton(new QPushButton(QStringLiteral("加载更早"), this)),
+      m_clearButton(new QPushButton(QStringLiteral("清空本地记录"), this)),
       m_statusLabel(new QLabel(this))
 {
     setAttribute(Qt::WA_StyledBackground, true);   // QSS 背景在 QWidget 子类上必须显式开启
@@ -51,12 +53,20 @@ GroupChat::GroupChat(quint64 groupId, const QString &groupName, QWidget *parent)
     m_input->setPlaceholderText(QStringLiteral("输入消息，回车发送"));
     row->addWidget(m_input);
     row->addWidget(m_sendButton);
-    row->addWidget(m_historyButton);
+    row->addStretch(1);
     layout->addLayout(row);
+    // 「加载更早」与「清空本地记录」单独一行：四个控件挤在输入行里，
+    // 高 DPI 缩放（QSS 字号 21px + padding 24px）会把按钮压到看不见。
+    auto *toolRow = new QHBoxLayout;
+    toolRow->addWidget(m_historyButton);
+    toolRow->addWidget(m_clearButton);
+    toolRow->addStretch(1);
+    layout->addLayout(toolRow);
     layout->addWidget(m_statusLabel);
     connect(m_sendButton, &QPushButton::clicked, this, &GroupChat::sendCurrent);
     connect(m_input, &QLineEdit::returnPressed, this, &GroupChat::sendCurrent);
     connect(m_historyButton, &QPushButton::clicked, this, &GroupChat::loadOlder);
+    connect(m_clearButton, &QPushButton::clicked, this, &GroupChat::clearLocalRecords);
     connect(m_messageList, &QListWidget::itemDoubleClicked, this, &GroupChat::onItemDoubleClicked);
     // 已读上报节流器：单次触发，窗口内的连续推进合并为一次网络请求
     m_readReportTimer = new QTimer(this);
@@ -70,6 +80,9 @@ void GroupChat::showEvent(QShowEvent *event)
     QWidget::showEvent(event);
     // 每次显示都是一次新的"观看会话"：补齐批次额度重置，按当前锚点补齐隐藏期间落下的消息
     m_catchupBatches = 0;
+    // REQ-CLI-MSGSTORE-001：先灌本地历史，再按服务端锚点播种水位，最后才让补齐跑起来
+    loadLocalHistory();
+    ensureWaterSeeded();
     updateStatus();
     maybeCatchUp();
 }
@@ -84,6 +97,7 @@ void GroupChat::hideEvent(QHideEvent *event)
 
 void GroupChat::onAnchorUpdated()
 {
+    ensureWaterSeeded();        // 锚点比首显晚到时同样要播种
     maybeCatchUp();
 }
 
@@ -219,6 +233,9 @@ QListWidgetItem *GroupChat::insertMessage(quint64 seq, const QString &sender, qu
     item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(seq));
     m_messageList->addItem(item);
     markRendered(seq);
+    // REQ-CLI-MSGSTORE-001：渲染即暂存，接得上水位的当场落库，接不上的留在内存等补洞
+    stageForStore(seq, sender, msgType, createdAtMs, content, 0);
+    flushStorable();
     return item;
 }
 
@@ -335,6 +352,9 @@ void GroupChat::handleMessageEvent(PDU *pdu)
                 pending.item->setData(ROLE_SEQ, QVariant::fromValue<qulonglong>(seq));
                 renderOwnMessage(pending.item, QStringLiteral("已送达"), text);
                 pending.item->setData(ROLE_STATE, 1);
+                // REQ-CLI-MSGSTORE-001：90 先于 89 到达时，自己的消息同样按发送方向落库
+                stageForStore(seq, senderName, msgType, createdAtMs, text, 1);
+                flushStorable();
                 onMessageArrived(seq);
                 return;
             }
@@ -392,6 +412,10 @@ void GroupChat::handleResponse(PDU *pdu)
                 renderOwnMessage(pending.item, QStringLiteral("已发送"), pending.content);
                 pending.item->setData(ROLE_STATE, 1);
                 markRendered(seq);
+                // REQ-CLI-MSGSTORE-001：89 即「服务端已持久化」，只有这里确认成功才按发送方向落库
+                stageForStore(seq, Client::getinstance().m_LoginName, 0, createdAtMs,
+                              pending.content, 1);
+                flushStorable();
                 onMessageArrived(seq);   // 自己的消息同样占用序号通道，缺的正是它接上前缀
             } else if (state == 1) {
                 renderOwnMessage(pending.item, QStringLiteral("已发送"), pending.content);
@@ -492,4 +516,112 @@ void GroupChat::handleResponse(PDU *pdu)
         updateStatus();
         return;
     }
+}
+
+// ===================== REQ-CLI-MSGSTORE-001：本地存储接线 =====================
+
+QString GroupChat::storeKey() const
+{
+    return QString::number(m_groupId);
+}
+
+void GroupChat::stageForStore(quint64 seq, const QString &sender, quint8 msgType,
+                              quint64 createdAtMs, const QString &content, quint8 direction)
+{
+    if (seq == 0) return;
+    if (msgType != 0) {
+        // 系统提示、群文件等不入库的事件仍占着序号：占号让水位能跨过它继续前进
+        m_storeStaging.reserve(seq);
+        return;
+    }
+    StoredMessage msg;
+    msg.seq = seq;
+    msg.convKey = storeKey();
+    msg.sender = sender;
+    msg.direction = direction;
+    msg.createdAtMs = qint64(createdAtMs);
+    msg.content = content;
+    m_storeStaging.insert(msg);
+}
+
+void GroupChat::flushStorable()
+{
+    MessageStore &store = Client::getinstance().msgStore();
+    if (m_storeStaging.isEmpty()) return;
+    // 先收上限：库不可用时下面不落库，暂存项也不能无界增长
+    m_storeStaging.capTo(store.available(MsgStoreKind::Group)
+                         ? store.keepLimit() : STAGING_CAP_WHEN_UNAVAILABLE);
+    if (!store.available(MsgStoreKind::Group)) return;
+    const QString key = storeKey();
+    // 只取接得上水位的连续段（洞留在队列里），逐条落库
+    const QList<MessageStaging::Staged> ready =
+        m_storeStaging.takeContiguousAbove(store.waterSeq(MsgStoreKind::Group, key));
+    for (const MessageStaging::Staged &item : ready) {
+        bool advanced = false;
+        if (!item.storable) {
+            // 占号条目：只推水位，不写消息行
+            advanced = store.advanceWater(MsgStoreKind::Group, key, item.msg.seq);
+        } else {
+            const MessageStore::AppendResult r =
+                store.append(MsgStoreKind::Group, key, item.msg.seq, item.msg.sender,
+                             item.msg.direction, item.msg.createdAtMs, item.msg.content);
+            advanced = (r == MessageStore::AppendResult::Stored
+                        || r == MessageStore::AppendResult::Duplicate);
+        }
+        if (!advanced) {
+            // 写失败放回去，下次推进再试：静默丢消息会让本地库与界面长期不一致
+            if (item.storable) m_storeStaging.insert(item.msg);
+            else m_storeStaging.reserve(item.msg.seq);
+            break;
+        }
+    }
+}
+
+void GroupChat::loadLocalHistory()
+{
+    if (m_localLoaded) return;
+    m_localLoaded = true;
+    MessageStore &store = Client::getinstance().msgStore();
+    if (!store.available(MsgStoreKind::Group)) return;
+    const QList<StoredMessage> rows =
+        store.loadRecent(MsgStoreKind::Group, storeKey(), store.keepLimit());
+    for (const StoredMessage &row : rows)
+        insertMessage(row.seq, row.sender, 0, quint64(row.createdAtMs), row.content);
+    m_storeStaging.clear();     // 已在库里的行不必再走暂存
+    if (!rows.isEmpty()) m_messageList->scrollToBottom();
+}
+
+void GroupChat::ensureWaterSeeded()
+{
+    MessageStore &store = Client::getinstance().msgStore();
+    if (!store.available(MsgStoreKind::Group) || !groupState().anchored()) return;
+    const QString key = storeKey();
+    if (store.waterSeq(MsgStoreKind::Group, key) != 0) return;   // 本机存过就不播种
+    const quint64 anchor = groupState().readCursor();
+    if (anchor > 0) store.seedWater(MsgStoreKind::Group, key, anchor);
+}
+
+void GroupChat::clearLocalRecords()
+{
+    MessageStore &store = Client::getinstance().msgStore();
+    if (!store.available(MsgStoreKind::Group)) {
+        m_statusLabel->setText(QStringLiteral("本机没有可清空的群聊记录"));
+        return;
+    }
+    const QMessageBox::StandardButton answer = QMessageBox::question(
+        this, QStringLiteral("清空本地记录"),
+        QStringLiteral("只删除本机保存的该群聊天记录，不影响服务端与其它设备。\n"
+                       "清空后点“加载更早”仍会从服务端取回更早的消息。\n确定清空？"),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (answer != QMessageBox::Yes) return;
+    if (!store.clearConversation(MsgStoreKind::Group, storeKey())) {
+        m_statusLabel->setText(QStringLiteral("清空失败：%1").arg(store.lastError()));
+        return;
+    }
+    m_messageList->clear();
+    m_renderedSeqs.clear();
+    m_storeStaging.clear();
+    m_firstSeq = 0;
+    m_localLoaded = true;       // 清完不再回灌本地历史
+    updateStatus();
 }

@@ -18,7 +18,14 @@
 - [x] 【已修｜外链取文件与对象存储】（2026-10-25，REQ-WEB-001 M5b）54 外链解析原只认物理实体：`Server/msghandler.cpp` 的 resolvePublishLink 用 `QFileInfo(srcPath).exists()/isFile()` 判定、`QFile::copy` 复制；REQ-EXT-FILE-001 之后上传、好友分享接收、群文件都只有逻辑条目（内容在 `filesys/objects/<sha2>/<oid>`），用户路径无物理文件 → 55 恒 ok=false。已按用户批准修复：条目优先 `FileObjectStore::attachExistingObject`（零复制，同名同对象幂等、不同对象 `(n)`）+ 旧物理文件复制回退 + 归一后限定分享人根内；重建 `dist/Server.exe`，分享 e2e 32/32、REQ-EXT-SHARE-001 25/25。证据：[变更记录](docs/changes/REQ-WEB-001/记录.md) M5b 节。
 - [ ] 【缺陷｜服务端主线程大文件复制】REQ-EXT-FILE-001 T6 存量迁移转正走 `commitUpload(copyOnly=true)`，整文件 `QFile::copy` 在服务端主线程执行，大文件迁移期间阻塞所有连接（与 REQ-EXT-PERF-002 已修的复算阻塞同类）。位置：`Server/fileobjectstore.cpp` commitUpload、`Server/operatedb.cpp` 迁移调用点。修复方向：复制移入 QThreadPool 后回主线程落条目；先确认存量迁移在当前的实际触发频率再排期。来源：REQ-EXT-PERF-002 方案共审（2026-10-27），本轮不实施。
 
+- [ ] 【验证缺口｜私聊界面最后一轮修复未复验】REQ-CLI-MSGSTORE-001 收尾时用户确认不再复验：私聊自发消息的乐观显示、私聊窗口「清空本地记录」独立成行、群窗口「加载更早」按钮行修复，均只有编译与链接证据，没有 GUI 证据。下次动到私聊界面时顺路验掉，别当作已通过。
+- [ ] 【验证缺口｜私聊 16 的 `ret=0` 分支】服务端私聊入库失败时 16 回 `ret=false`、客户端不入库这条路径没有动态验证：隔离测试库里缺少不侵入产品的 INSERT 故障注入手段。要做需要给测试留可断库的口子，或改为断言代码路径的静态检查。
+- [ ] 【想法｜私聊历史按游标翻页】私聊 17 是消费式离线补发（只回未送达给本人的行、取后标记已送达），没有按游标翻页拉历史的能力，因此私聊窗口放不了「加载更早」，本地库被清空后也无法从服务端重新拉回完整历史。补齐需要新增协议命令 + 服务端查询能力（数据库与协议变更）。2026-10-27 用户决定本次不做。
+
 ## 测试与验证缺口
+
+- [ ] 【缺陷｜服务端私聊长消息定长拷贝】`Server/msghandler.cpp chat()` 用 `char msg[120]` 无钳制 `memcpy` 报文里的 `msgLen`，客户端私聊输入没有长度上限，超长私聊会打爆服务端栈缓冲（2026-10-27 REQ-CLI-MSGSTORE-001 期间发现，属存量面，群入口早已自带 2000 字节校验）。本次只把客户端接收侧钳制到 109 字节（超长在本地显示与入库被截断），服务端侧未改，需要单独立项决定是拒绝还是分片存储。
+- [ ] 【验证缺口｜GROUP-002 p8d】`REQ-EXT-GROUP-002/verify.py` 的 `p8d_group001_lifecycle_regression` 依赖 `build/evidence/req-ext-group-001-independent-8757ad6/group_e2e.py`，该历史 harness 不在仓库里，2026-10-27 跑该套件时这项固定失败（37/38）。要么把 harness 入库，要么把该检查并入本仓库内已有的群套件。
 
 - [ ] 【测试缺口｜D-008】服务端测试宿主在创建进程失败时可能未关闭已打开的日志句柄；旧记录为低严重度暂不修。位置：`project-docs/evidence/_harness/server_ctl.py`；先模拟进程启动失败和同进程重试，再按决定处理。本轮未复现。
 - [ ] 【测试缺口｜D-015】历史整批套件曾在准备用户时全部失败，单跑恢复，根因没有复现闭环。再次出现先保留端口占用、旧进程、数据库错误及失败用例，不能只用重跑通过宣告故障解决。

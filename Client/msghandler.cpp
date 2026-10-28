@@ -212,19 +212,20 @@ void MsgHandler::handlDeleteFriend()
 // 收到的是单条聊天消息：caData 前 32 字节为发送者，caMsg 为一个 Msg 结构。
 void MsgHandler::chat()
 {
-    char seedName[32]={'\0'};
+    char seedName[32]={' '};
     memcpy(seedName,pdu->caData,32);
     Msg* pdu_Msg=(Msg*)pdu->caMsg;
-    char msg[110]={'\0'};
-    memcpy(msg,pdu_Msg->msg,pdu_Msg->msgLen);
-    char currtime[30]={'\0'};
+    char msg[110]={' '};
+    const int capped = qBound(0, int(pdu_Msg->msgLen), 109);
+    memcpy(msg,pdu_Msg->msg,size_t(capped));
+    char currtime[31]={' '};
     memcpy(currtime,pdu_Msg->Time,30);
-    Index::getinstance().getFriend()->m_chat->updateShow_TE(QString("%1:%2 发送时间:%3").arg(seedName).arg(msg).arg(currtime));
-    Index::getinstance().getFriend()->m_chat->m_strChatName=seedName;
-    if(Index::getinstance().getFriend()->m_chat->isHidden()){
-        Index::getinstance().getFriend()->m_chat->show();
-        Index::getinstance().getFriend()->m_chat->setWindowTitle(seedName);
-    }
+    // REQ-CLI-MSGSTORE-001：渲染与落库统一交给 Chat，按「原文时间+正文」去重，
+    // 本地已灌入的历史不会因这条实时消息再显示一遍、再存一遍。
+    // 会话归属以报文里的发送者为准（改前用窗口当前对象，切好友时会把消息记到别人名下）。
+    Chat* chat = Index::getinstance().getFriend()->m_chat;
+    chat->m_strChatName = seedName;
+    chat->receivePeerMessage(QString(seedName), QString::fromUtf8(msg), QString::fromUtf8(currtime));
 }
 //获取所有未读消息
 void MsgHandler::getcharmsg()
@@ -242,8 +243,13 @@ void MsgHandler::getcharmsg()
             qCDebug(lcCli)<<"getmsg msg:"<<QString(msg)<<" currTime:"<<QString(currTime)<<"  ";
             dis+=respdu_Msg->totalLen;
         }
-        // 更新界面
-        Index::getinstance().getFriend()->m_chat->updateShow_TEs(Msglist);
+        // REQ-CLI-MSGSTORE-001：18 是消费式离线补发（服务端只回未送达给本人的行，
+        // 取后标记已送达），方向恒为接收；逐条走 receivePeerMessage 完成去重、渲染与落库
+        Chat* chat = Index::getinstance().getFriend()->m_chat;
+        // 归属以发请求时记录的会话为准（响应体里没有对方名）
+        const QString peer = chat->historyPeer().isEmpty() ? chat->m_strChatName : chat->historyPeer();
+        for (int i = 0; i + 1 < Msglist.size(); i += 2)
+            chat->receivePeerMessage(peer, Msglist.at(i), Msglist.at(i + 1));
 }
 //创建目录
 void MsgHandler::mkdir()
@@ -459,6 +465,8 @@ void MsgHandler::handlLogoff()
     qCDebug(lcCli)<<"handlLogoff result:"<<ret;
     if(ret){
         QMessageBox::information(&Index::getinstance(),"提示","账户已成功注销，即将返回登录界面。");
+        // REQ-CLI-MSGSTORE-001：账号注销后本地消息（含水位）一并清除，同名重注册不复用
+        Client::getinstance().msgStore().removeUser();
         // 关闭主界面，返回登录界面
         Index::getinstance().hide();
         Client::getinstance().show();
@@ -469,6 +477,30 @@ void MsgHandler::handlLogoff()
     else {
         QMessageBox::information(&Index::getinstance(),"提示","注销失败：密码错误或用户不存在。");
     }
+}
+
+
+// REQ-CLI-MSGSTORE-001：服务端 16 应答（发送方专属）。
+// 布局：caData[0,32)=对方名，[32)=bool 服务端入库结果；caMsg 原样回带本次发送的 Msg。
+// 只有 stored=true 才把自发消息写进本地存储；报文不完整时按「结果未知」丢弃，不写库。
+void MsgHandler::handleChatAck()
+{
+    if (pdu->uiMsgLen < sizeof(Msg)) return;
+    char peerName[33] = {' '};
+    memcpy(peerName, pdu->caData, 32);
+    bool stored = false;
+    memcpy(&stored, pdu->caData + 32, sizeof(stored));
+
+    Msg* pdu_Msg = (Msg*)pdu->caMsg;
+    char currtime[31] = {' '};
+    memcpy(currtime, pdu_Msg->Time, 30);
+    // 正文长度取自报文，必须钳制到本地缓冲：这是网络边界，不沿用改前的无钳制写法
+    const int capped = qBound(0, int(pdu_Msg->msgLen), 109);
+    char msg[110] = {' '};
+    memcpy(msg, pdu_Msg->msg, size_t(capped));
+
+    Index::getinstance().getFriend()->m_chat->handleSendAck(
+        QString::fromUtf8(peerName), QString::fromUtf8(msg), QString::fromUtf8(currtime), stored);
 }
 
 void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {

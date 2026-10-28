@@ -216,6 +216,9 @@ void Client::handlMsg(PDU *&pdu)
         if (!loginName.isEmpty()) m_LoginName = loginName;
         // 按用户载入未完成传输快照（切用户会先落盘上一个用户的内存任务）
         TransferManager::instance().setCurrentUser(m_LoginName);
+        // REQ-CLI-MSGSTORE-001：本地消息库随登录就位；打开失败只意味着本次不落盘，不影响登录
+        if (!m_msgStore.open(m_LoginName))
+            qCWarning(lcCli) << "[msgstore] 本地消息库打开失败，本轮消息仅内存展示:" << m_msgStore.lastError();
         // REQ-EXT-TRANSFER-003 G7/C7：重连登录后恢复调度（不依赖 setCurrentUser 的提前返回——同用户重连会提前返回）
         TransferManager::instance().onConnectionRestored();
         m_loggedIn = true;   // 登录过才监控断开，避免登录界面误报
@@ -251,6 +254,11 @@ void Client::handlMsg(PDU *&pdu)
     }
     case ENUM_MSG_TYPE_GETCHATMSG_RESPOND:{
         m_mhptr->getcharmsg();
+        break;
+    }
+    // REQ-CLI-MSGSTORE-001：16 私聊入库应答，仅决定自发消息是否写进本地存储
+    case ENUM_MSG_TYPE_CHAT_RESPOND:{
+        m_mhptr->handleChatAck();
         break;
     }
     case ENUM_MSG_TYPE_MKDIR_RESPOND:{
