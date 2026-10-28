@@ -4,6 +4,7 @@
 #include "logging.h"
 #include "client.h"
 #include "msghandler.h"
+#include "chatbounds.h"
 #include <QString>
 #include <QMessageBox>
 #include <qmessagebox.h>

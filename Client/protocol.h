@@ -7,7 +7,6 @@
 // 多字节整数按主机字节序直接 memcpy（局域网内同架构），群协议部分则显式小端。
 
 #include <QByteArray>
-#include <QString>
 #include <QtGlobal>
 
 typedef unsigned int uint;
@@ -239,33 +238,6 @@ struct Msg{
 //返回pdu对象的地址
 // Client 侧用 malloc 分配、seedMsg 用 free 释放；失败直接 exit(1)。
 PDU* mkPDU(uint uiMsgLen=0);
-
-// ===== REQ-CLI-MSGBND-001 私聊正文边界（两端同值，服务端为权威） =====
-// 正文上限按 UTF-8 字节数计，不含协议要求的结尾 '\0'。这是业务规则，不进任何结构体布局。
-static const uint CHAT_MAX_BODY_BYTES = 2000;
-// Msg 记录正文的实际字节偏移：totalLen(4) + msgLen(4) + Time[30] = 38。
-// sizeof(Msg) 因 4 字节对齐为 40，尾部 2 字节填充由 mkPDU 的清零保证。
-static const uint CHAT_MSG_BODY_OFFSET = 38;
-
-// 裁掉尾部不完整的 UTF-8 序列：按字节长度钳制时宁可少显示最后一个码点，
-// 也不让 QString::fromUtf8 产出替换字符。
-QByteArray utf8TrimIncomplete(const QByteArray &utf8);
-
-// 宽松读一条 Msg（接收端显示与落库用）：uiMsgLen 不足一条记录头时返回 false；
-// 声明的 msgLen 越出报文实际携带的字节时按实际长度钳制，并裁到最后一个完整码点；
-// Time 按 30 字节定长字段的内容取，不依赖缓冲区自带终止符。
-bool readChatMsg(const char *caMsg, uint uiMsgLen, QByteArray *body, QString *timeText);
-
-// 严格读一条 Msg（服务端权威校验用）：报文不足一条记录头、正文为空、
-// msgLen 越出报文实际携带的字节、或正文超过 maxBody 时返回 false；
-// why 回填原因，只含长度不含正文明文。
-bool checkChatMsgStrict(const char *caMsg, uint uiMsgLen, uint maxBody,
-                        QByteArray *body, QString *timeText, QString *why);
-
-// 18 响应里连续 Msg 记录的步进校验：返回本条记录占用的字节数；
-// 不足一条记录头、totalLen 非法、msgLen 与 totalLen 矛盾或记录越出报文时返回 0，
-// 表示解析到此为止（与网页端 parseMsgRecords 的“畸形即止”同口径）。
-uint chatMsgRecordStride(const char *caMsg, uint uiMsgLen, uint offset);
 
 // 群协议公共信封长度：版本(2)+长度(2)+request_id(8)+group_id(8)。
 static const quint16 GROUP_PROTOCOL_VERSION = 1;

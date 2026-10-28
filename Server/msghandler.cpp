@@ -8,6 +8,7 @@
 #include "fileobjectstore.h"
 #include "staginghashtask.h"
 #include "memalloc.h"
+#include "chatbounds.h"
 #include <QByteArray>
 
 #include <QFile>

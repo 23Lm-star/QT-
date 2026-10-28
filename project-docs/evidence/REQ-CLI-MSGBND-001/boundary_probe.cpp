@@ -1,20 +1,13 @@
 // REQ-CLI-MSGBND-001 私聊正文边界纯函数探针（无网络、无数据库、无界面）。
-// 编译的是产品实现 Server/protocol.cpp，不是复制的等价实现。
+// 编译的是产品实现 Server/chatbounds.cpp，不是复制的等价实现。
 //
 // 用例只断言返回值、长度与解码结果：越界读不会稳定崩在这里，
 // 「畸形报文把服务端进程打死」这类后果由同目录 boundary_e2e.py 用进程存活断言覆盖。
-#include "Server/protocol.h"
+#include "Server/chatbounds.h"
 
 #include <QByteArray>
 #include <QString>
 #include <cstdio>
-
-// 探针不使用产品内存池：Server/protocol.cpp 的 mkPDU 引用 MemAlloc::allocate/deallocate，
-// 这里给一对最小实现只为让被测的正文边界函数能单独编译链接，不替代任何被测代码。
-namespace MemAlloc {
-void *allocate(size_t size) { return ::malloc(size); }
-void deallocate(void *ptr) { ::free(ptr); }
-}
 
 
 static int g_failed = 0;

@@ -2,6 +2,7 @@
 #include "chat.h"
 #include "client.h"
 #include "protocol.h"
+#include "chatbounds.h"
 #include "ui_chat.h"
 
 #include <QMessageBox>

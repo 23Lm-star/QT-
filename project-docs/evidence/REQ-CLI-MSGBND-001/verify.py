@@ -3,12 +3,11 @@
 """REQ-CLI-MSGBND-001 私聊正文边界验证入口（无服务端、无 MySQL、无界面）。
 
 做法与 REQ-CLI-MSGSTORE-001 一致：用项目工具链（MinGW g++ + Qt 5.14.2 头/库）直接编译
-产品实现 `Server/protocol.cpp` 与断言探针 `boundary_probe.cpp`，探针编译的是被测函数本体。
-内存池 `MemAlloc` 由探针内的最小 stub 顶替（探针不分配 PDU），不影响被测代码。
+产品实现 `Server/chatbounds.cpp` 与断言探针 `boundary_probe.cpp`，探针编译的是被测函数本体。
 
 另加两项两端一致性检查（协议头是兼容边界，只改一端就是事故）：
-  C1  两端 protocol.h 的 CHAT_MAX_BODY_BYTES / CHAT_MSG_BODY_OFFSET 数值必须相同
-  C2  两端 protocol.cpp 的本需求实现区块必须逐字相同
+  C1  两端 chatbounds.h 的 CHAT_MAX_BODY_BYTES / CHAT_MSG_BODY_OFFSET 数值必须相同
+  C2  两端 chatbounds.cpp 的本需求实现区块必须逐字相同
 
 真实服务端行为（畸形报文是否打爆进程、超限是否既不入库也不转发）由同目录
 boundary_e2e.py 覆盖，本入口不替代它。
@@ -29,10 +28,10 @@ ROOT = HERE.parents[2]
 GXX = 'C:/Qt/Tools/mingw730_64/bin/g++.exe'
 QT = 'C:/Qt/5.14.2/mingw73_64'
 PROBE_SRC = HERE / 'boundary_probe.cpp'
-PROTO_SRC = ROOT / 'Server' / 'protocol.cpp'
-PROTO_HDR = ROOT / 'Server' / 'protocol.h'
-CLI_HDR = ROOT / 'Client' / 'protocol.h'
-CLI_SRC = ROOT / 'Client' / 'protocol.cpp'
+BOUNDS_SRC = ROOT / 'Server' / 'chatbounds.cpp'
+BOUNDS_HDR = ROOT / 'Server' / 'chatbounds.h'
+CLI_BOUNDS_HDR = ROOT / 'Client' / 'chatbounds.h'
+CLI_BOUNDS_SRC = ROOT / 'Client' / 'chatbounds.cpp'
 OUT_EXE = ROOT / 'build' / 'probe' / 'msgbnd001_probe.exe'
 
 MARKER = '// ===== REQ-CLI-MSGBND-001'
@@ -85,7 +84,7 @@ def fail_hard(reason, tail=''):
 
 
 def build():
-    missing = [str(p) for p in (PROBE_SRC, PROTO_SRC, PROTO_HDR) if not p.exists()]
+    missing = [str(p) for p in (PROBE_SRC, BOUNDS_SRC, BOUNDS_HDR) if not p.exists()]
     if missing:
         return f'缺少源码文件: {", ".join(missing)}'
     if not Path(GXX).exists():
@@ -97,7 +96,7 @@ def build():
         '-I', str(ROOT),
         '-I', f'{QT}/include', '-I', f'{QT}/include/QtCore',
         '-I', f'{QT}/mkspecs/win32-g++',
-        str(PROBE_SRC), str(PROTO_SRC),
+        str(PROBE_SRC), str(BOUNDS_SRC),
         '-L', f'{QT}/lib', '-lQt5Core',
         '-o', str(OUT_EXE),
     ]
@@ -124,16 +123,16 @@ def block_of(path):
 
 def consistency_checks(seen):
     """C1 常量同值、C2 实现区块逐字相同。结果按同一格式并入计账。"""
-    srv_h, cli_h = CONST.findall(PROTO_HDR.read_text(encoding='utf-8')), \
-        CONST.findall(CLI_HDR.read_text(encoding='utf-8'))
+    srv_h, cli_h = CONST.findall(BOUNDS_HDR.read_text(encoding='utf-8')), \
+        CONST.findall(CLI_BOUNDS_HDR.read_text(encoding='utf-8'))
     check('C1_both_ends_same_constants', srv_h == cli_h and len(srv_h) == 2,
           f'server={srv_h} client={cli_h}')
 
-    sb, cb = block_of(PROTO_SRC), block_of(CLI_SRC)
+    sb, cb = block_of(BOUNDS_SRC), block_of(CLI_BOUNDS_SRC)
     check('C2_both_ends_identical_block',
           sb is not None and cb is not None and sb == cb,
-          'server/client 区块缺失' if sb is None or cb is None
-          else ('一致' if sb == cb else '两端实现区块不一致'))
+          '两端 chatbounds.cpp 区块缺失' if sb is None or cb is None
+          else ('一致' if sb == cb else '两端 chatbounds.cpp 实现区块不一致'))
 
 
 def check(id_, ok, detail=''):
@@ -161,7 +160,7 @@ def main():
     if not seen:
         return fail_hard(f'探针没有产出任何断言行（退出码 {ran.returncode}）', out)
 
-    print('--- 正文边界断言（产品实现 Server/protocol.cpp） ---')
+    print('--- 正文边界断言（产品实现 Server/chatbounds.cpp） ---')
     bad = []
     for pid in PROBE_IDS:
         if pid not in seen:
