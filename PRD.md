@@ -261,7 +261,7 @@
 
 ## REQ-EXT-TLS-001｜桌面端↔服务端通信 TLS 加密
 
-- 状态：实施中（2026-10-28 立项，人工窗口一确认全部决定点 D1~D6，分支 `codex/req-ext-tls-001`）。实施顺序第一步为环境 spike（Qt 5.14.2 MinGW 无 TLS 后端，`supportsSsl` 打通前视为阻塞）。需求分析与决定点全文见 [需求总结报告](docs/changes/REQ-EXT-TLS-001/需求总结报告.md)。来自 TODO【想法｜安全扩展，EXP-SEC-01/02】的 TLS 部分；强密码派生与凭据配置不随本需求，继续留在 TODO。
+- 状态：实施中（2026-10-28 立项，人工窗口一确认全部决定点 D1~D6，分支 `codex/req-ext-tls-001`）。环境 spike 已通过：本机 `supportsSsl=1`，OpenSSL 1.1.1w 运行库由 `C:\WINDOWS\system32` 提供（部署机缺失时须随 `dist/` 附带）。服务端 TLS 端口、客户端 `QSslSocket`+pinning、证书脚本与 TLS 专项套件已落地；全量回归已跑完（无 TLS 引入回归）。剩余未验证：TLS 二（抓包）、TLS 三（产品客户端拒错证书）、TLS 五（TLS 断连×重连）、人工九（GUI）。过程与证据见 [变更记录](docs/changes/REQ-EXT-TLS-001/需求总结报告.md)。来自 TODO【想法｜安全扩展，EXP-SEC-01/02】的 TLS 部分；强密码派生与凭据配置不随本需求，继续留在 TODO。
 - 问题与目标：密码、会话凭据与全部业务数据当前经明文 TCP（5000）传输，同网段可被嗅探与篡改。目标是把桌面客户端（Qt）↔服务端（Qt）的长连接升级为 TLS 加密通道，保证机密性与完整性；TLS 只替换传输层，PDU 字节布局、协议编号与两端 `protocol.h` 零改动。
 - 已确认决定点（2026-10-28 用户确认，全部采纳建议）：
   - D1 共存策略：开发期双端口——5000 保持明文语义不变（既有套件、网页网关、旧客户端可用），服务端另监听 TLS 端口；公网路径强制 TLS 的收敛随 REQ-WEB-001 M6 生产化处理。
@@ -297,7 +297,7 @@
 
 ### 最终结论
 
-未验收，未实施。环境前置未打通（本机 Qt 5.14.2 mingw73_64 `plugins/` 无 TLS 后端、无 OpenSSL DLL）前，本需求全部实现项视为被阻塞。
+未验收。实现与自动验证已就绪（TLS 专项 5/5、22 套件全量回归无 TLS 引入回归、吞吐实测 TLS≈明文 45%）；环境前置已实测打通（`supportsSsl=1`，OpenSSL 运行库来自 system32，部署机缺失需随 `dist/` 附带）。未验收原因：TLS 二（抓包无明文）、TLS 三（产品客户端拒错证书）、TLS 五（TLS 断连×重连）与人工九（GUI）尚未执行。
 
 ## 业务变更记录
 
@@ -322,3 +322,5 @@
 2026-10-28｜立项 REQ-EXT-TLS-001 桌面端↔服务端 TLS 加密：人工窗口一确认全部决定点——D1 双端口共存（5000 明文不变 + 新 TLS 端口，公网强制收敛随 M6）；D2 网关链路留明文；D3 自签证书+客户端 pinning、不做 mTLS；D4 `dist/certs/` 固定目录约定、配置格式不变；D6 既有套件走明文端口零改动 + 新增 TLS 专项套件。环境 spike 前置：本机 Qt 无 TLS 后端，`supportsSsl` 打通前视为阻塞。
 
 2026-10-28｜REQ-EXT-TLS-001 实施推进（分支 `codex/req-ext-tls-001`，3 笔提交：功能/测试/文档）：spike 实测 `supportsSsl=1`（OpenSSL 1.1.1w 由 system32 提供，非 Qt 目录）；服务端 TLS 监听主端口+1、证书走 `dist/certs/`、握手完成前不解析 PDU；客户端 `QSslSocket`+pinning、`sslErrors` 一律拒绝。TLS 专项 5/5、boundary_e2e 13/13、TRANSFER-002 25/26（唯一失败与 TLS 无关）、32MiB 回环吞吐实测 TLS≈明文 45%。未验证：抓包、产品客户端拒错证书、TLS 断连×重连、全量回归、GUI。
+
+2026-10-28｜REQ-EXT-TLS-001 全量回归完成：README 登记 22 个套件明文端口串行全部执行，20 个全过；其余为已知非 TLS 项（TRANSFER-002 T2-11a 待单独归因、X3a 与 S-03b 两处陈旧断言仍在 TODO、GROUP-002 p8d 依赖缺失历史 harness）。**无 TLS 引入的回归**。仍未验证：抓包无明文（TLS 二）、产品客户端拒错证书（TLS 三）、TLS 断连×重连（TLS 五）、GUI 人工九。
