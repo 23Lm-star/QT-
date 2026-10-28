@@ -132,14 +132,16 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   ok('多记录历史解析（含畸形截断容错）');
 }
 
-// 9) 私聊正文长度上限 109 字节（桌面端 char[110] 兼容），超限抛错、边界内放行。
+// 9) 私聊正文长度上限 2000 字节（REQ-CLI-MSGBND-001，与服务端权威校验同值），超限抛错、边界内放行。
 {
-  assert.strictEqual(chat.MAX_CHAT_BODY_BYTES, 109);
+  assert.strictEqual(chat.MAX_CHAT_BODY_BYTES, 2000);
   // 未连接时 sendChat 会在长度校验后抛"未连接"——超限必须先抛长度错误。
-  assert.throws(() => chat.sendChat('a', 'b', 'x'.repeat(110)), /过长/);
-  assert.throws(() => chat.sendChat('a', 'b', '中'.repeat(37)), /过长/); // 37*3=111 > 109
+  assert.throws(() => chat.sendChat('a', 'b', 'x'.repeat(2001)), /过长/);
+  assert.throws(() => chat.sendChat('a', 'b', '中'.repeat(667)), /过长/); // 667*3=2001 > 2000
   assert.throws(() => chat.sendChat('a', 'b', ''), /不能为空/);
-  ok('私聊正文 109 字节上限与空消息拦截');
+  assert.throws(() => chat.sendChat('a', 'b', 'x'.repeat(2000)), /未连接/);   // 恰好 2000 放行到发送环节
+  assert.throws(() => chat.sendChat('a', 'b', '中'.repeat(666)), /未连接/);   // 1998 字节放行
+  ok('私聊正文 2000 字节上限与空消息拦截');
 }
 
 // 10) 名字数组解析（在线列表 8 / 好友列表 12 的 N×32 布局）。

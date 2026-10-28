@@ -498,15 +498,26 @@ PDU *MsgHandler::chat()
     char tarName[32]={'\0'};//接收人
     memcpy(seedName,pdu->caData,32);
     memcpy(tarName,pdu->caData+32,32);
-    char msg[120]={'\0'};//发送信息
-    char currTime[30]={'\0'};//发送时间
-    Msg* pdu_msg=(Msg*)pdu->caMsg;
-    memcpy(msg,pdu_msg->msg,pdu_msg->msgLen);
-    memcpy(currTime,pdu_msg->Time,30);
-    qCDebug(lcNet)<<"接收到的msg"<<QString(msg)<<" 时间为"<<QString(currTime)<<endl;
+    // REQ-CLI-MSGBND-001：正文长度是网络边界上的外部输入，先按严格口径校验再取用。
+    // 改前写法把报文里的 msgLen 原样 memcpy 进 char[120]，超长私聊直接打爆服务端栈，
+    // 且 msgLen 从未与 pdu->uiMsgLen 交叉校验，小报文声明大长度还能越界读。
+    // 现在超限/畸形一律拒绝：不入库、不转发，16 只回入库结果 false，连接保持。
+    QByteArray body;
+    QString currTime;
+    QString why;
+    bool ret=false;
     bool stored=false;
-    bool ret= OperateDB::instance().seedchatMsg(seedName,tarName,QString(msg),QString(currTime),&stored);
-    qCDebug(lcNet)<<"char ret"<<ret<<endl;
+    if(checkChatMsgStrict(pdu->caMsg, pdu->uiMsgLen, CHAT_MAX_BODY_BYTES, &body, &currTime, &why)){
+        const QString msg=QString::fromUtf8(body);
+        qCDebug(lcNet)<<"接收到的msg"<<msg<<" 时间为"<<currTime<<endl;
+        ret= OperateDB::instance().seedchatMsg(seedName,tarName,msg,currTime,&stored);
+        qCDebug(lcNet)<<"char ret"<<ret<<endl;
+    }
+    else{
+        // 只记长度与原因，不落正文明文
+        qCWarning(lcNet)<<"[chat] 私聊正文拒绝 conn="<<m_connId<<" uiMsgLen="<<pdu->uiMsgLen
+                        <<" 原因="<<why;
+    }
     if(ret){
         MyTcpServer::getinstance().reseed(tarName,pdu);//转发给接收人（报文与改前逐字节一致）
     }
@@ -2063,10 +2074,14 @@ PDU *MsgHandler::chatmsg()
     respdu->uiType=ENUM_MSG_TYPE_GETCHATMSG_RESPOND;
     for(int i=0,dis=0;i<Msglist.size();i+=2){
         Msg* filei=(Msg*)(respdu->caMsg+dis);
-        filei->totalLen=sizeof(Msg)+Msglist[i].toUtf8().size()+1;
-        filei->msgLen=Msglist[i].toUtf8().size()+1;
-        memcpy(filei->Time,Msglist[i+1].toUtf8().toStdString().c_str(),30);
-        memcpy(filei->msg,Msglist[i].toUtf8().toStdString().c_str(),filei->msgLen);
+        const QByteArray content=Msglist[i].toUtf8();
+        const QByteArray timeBytes=Msglist[i+1].toUtf8();
+        filei->totalLen=sizeof(Msg)+content.size()+1;
+        filei->msgLen=content.size()+1;
+        // REQ-CLI-MSGBND-001：定长字段按实际内容拷贝，不足 30 字节的余量由 mkPDU 的清零补齐。
+        // 改前固定 memcpy(...,30) 在库内时间串短于 30 字节时会越出源缓冲读。
+        memcpy(filei->Time,timeBytes.constData(),qMin(timeBytes.size(),30));
+        memcpy(filei->msg,content.constData(),filei->msgLen);
         qCDebug(lcNet)<<"filei->msg "<<filei->msg<<" filei->Time"<<filei->Time<<",";
         dis+=filei->totalLen;
     }

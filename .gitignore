@@ -82,6 +82,10 @@ Desktop.ini
 # REQ-CLI-MSGSTORE-001 同理：存储层断言探针直接编译产品源码 Client/messagestore.cpp，
 # 被同目录 verify.py 调用，不入库则套件在别的检出上无法复现。仍只放行这一个文件名。
 !/project-docs/evidence/**/store_probe.cpp
+# REQ-CLI-MSGBND-001 同理：正文边界探针直接编译产品源码 Server/protocol.cpp（畸形报文与
+# 码点裁剪无法由 socket 套件断言到函数级），被同目录 verify.py 调用，不入库则套件在别的
+# 检出上无法复现。仍只放行这一个文件名。
+!/project-docs/evidence/**/boundary_probe.cpp
 /project-docs/evidence/**/*.out
 /project-docs/evidence/**/*.sql
 /project-docs/evidence/**/*.sh

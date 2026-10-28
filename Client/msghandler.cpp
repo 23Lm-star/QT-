@@ -212,36 +212,34 @@ void MsgHandler::handlDeleteFriend()
 // 收到的是单条聊天消息：caData 前 32 字节为发送者，caMsg 为一个 Msg 结构。
 void MsgHandler::chat()
 {
-    char seedName[32]={' '};
+    char seedName[32]={'\0'};
     memcpy(seedName,pdu->caData,32);
-    Msg* pdu_Msg=(Msg*)pdu->caMsg;
-    char msg[110]={' '};
-    const int capped = qBound(0, int(pdu_Msg->msgLen), 109);
-    memcpy(msg,pdu_Msg->msg,size_t(capped));
-    char currtime[31]={' '};
-    memcpy(currtime,pdu_Msg->Time,30);
-    // REQ-CLI-MSGSTORE-001：渲染与落库统一交给 Chat，按「原文时间+正文」去重，
-    // 本地已灌入的历史不会因这条实时消息再显示一遍、再存一遍。
-    // 会话归属以报文里的发送者为准（改前用窗口当前对象，切好友时会把消息记到别人名下）。
+    // REQ-CLI-MSGBND-001：改前按报文里的 msgLen 把正文拷进 char[110]，拷贝长度完全由对端决定；
+    // 现在按报文实际携带的字节取用，声明越界时钳制并裁到最后一个完整码点。
+    QByteArray body;
+    QString currtime;
+    if (!readChatMsg(pdu->caMsg, pdu->uiMsgLen, &body, &currtime)) return;
+    // REQ-CLI-MSGSTORE-001：渲染与落库统一交给 Chat
     Chat* chat = Index::getinstance().getFriend()->m_chat;
     chat->m_strChatName = seedName;
-    chat->receivePeerMessage(QString(seedName), QString::fromUtf8(msg), QString::fromUtf8(currtime));
+    chat->receivePeerMessage(QString(seedName), QString::fromUtf8(body), currtime);
 }
 //获取所有未读消息
 void MsgHandler::getcharmsg()
 {
         QStringList Msglist;
-        //记录偏移还有是否还有位置没有读取
-        for(int dis=0;dis<pdu->uiMsgLen;){
-            Msg* respdu_Msg=(Msg*)(pdu->caMsg+dis);
-            char msg[110]={'\0'};
-            char currTime[30]={'\0'};
-            memcpy(msg,respdu_Msg->msg,respdu_Msg->msgLen);
-            memcpy(currTime,respdu_Msg->Time,30);
-            Msglist.append(QString(msg));
-            Msglist.append(QString(currTime));
-            qCDebug(lcCli)<<"getmsg msg:"<<QString(msg)<<" currTime:"<<QString(currTime)<<"  ";
-            dis+=respdu_Msg->totalLen;
+        // REQ-CLI-MSGBND-001：连续 Msg 记录改为按 stride 步进并逐条校验。改前直接用报文里的
+        // totalLen 推进（不校验是否越出报文，totalLen==0 即死循环），正文还拷进无钳制的 char[110]。
+        for(uint dis=0; dis<pdu->uiMsgLen; ){
+            const uint stride=chatMsgRecordStride(pdu->caMsg, pdu->uiMsgLen, dis);
+            if(stride==0) break;                        // 畸形即止，与网页端 parseMsgRecords 同口径
+            QByteArray body;
+            QString currTime;
+            if(!readChatMsg(pdu->caMsg+dis, stride, &body, &currTime)) break;
+            Msglist.append(QString::fromUtf8(body));
+            Msglist.append(currTime);
+            qCDebug(lcCli)<<"getmsg msg:"<<QString::fromUtf8(body)<<" currTime:"<<currTime<<"  ";
+            dis+=stride;
         }
         // REQ-CLI-MSGSTORE-001：18 是消费式离线补发（服务端只回未送达给本人的行，
         // 取后标记已送达），方向恒为接收；逐条走 receivePeerMessage 完成去重、渲染与落库
@@ -486,21 +484,18 @@ void MsgHandler::handlLogoff()
 void MsgHandler::handleChatAck()
 {
     if (pdu->uiMsgLen < sizeof(Msg)) return;
-    char peerName[33] = {' '};
+    char peerName[33] = {'\0'};
     memcpy(peerName, pdu->caData, 32);
     bool stored = false;
     memcpy(&stored, pdu->caData + 32, sizeof(stored));
 
-    Msg* pdu_Msg = (Msg*)pdu->caMsg;
-    char currtime[31] = {' '};
-    memcpy(currtime, pdu_Msg->Time, 30);
-    // 正文长度取自报文，必须钳制到本地缓冲：这是网络边界，不沿用改前的无钳制写法
-    const int capped = qBound(0, int(pdu_Msg->msgLen), 109);
-    char msg[110] = {' '};
-    memcpy(msg, pdu_Msg->msg, size_t(capped));
-
+    // REQ-CLI-MSGBND-001：正文与时间统一走 readChatMsg：按报文实际携带的字节取，
+    // 声明越界时钳制并裁到完整码点。旧写法钳到 109 字节是迁就定长缓冲的历史惯怛。
+    QByteArray body;
+    QString currtime;
+    if (!readChatMsg(pdu->caMsg, pdu->uiMsgLen, &body, &currtime)) return;
     Index::getinstance().getFriend()->m_chat->handleSendAck(
-        QString::fromUtf8(peerName), QString::fromUtf8(msg), QString::fromUtf8(currtime), stored);
+        QString::fromUtf8(peerName), QString::fromUtf8(body), currtime, stored);
 }
 
 void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
