@@ -46,6 +46,7 @@ SOURCES += \
     mytcpsocket.cpp \
     operatedb.cpp \
     protocol.cpp \
+    chatbounds.cpp \
     reclaimscheduler.cpp \
     resumableuploadsession.cpp \
     server.cpp \
@@ -67,6 +68,7 @@ HEADERS += \
     mytcpsocket.h \
     operatedb.h \
     protocol.h \
+    chatbounds.h \
     reclaimscheduler.h \
     resumableuploadsession.h \
     server.h \

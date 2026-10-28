@@ -13,9 +13,9 @@ export const MSG_STRUCT_SIZE = 40;   // sizeof(Msg)：4+4+30 → 4 对齐后 40
 export const MSG_TIME_OFFSET = 8;
 export const MSG_TIME_SIZE = 30;
 export const MSG_BODY_OFFSET = 38;   // 柔性数组 msg 的实际偏移
-// 正文安全上限：桌面端接收缓冲 char[110] 且无长度校验（memcpy msgLen 字节），
-// msgLen=正文+1 ≤ 110 → 正文 ≤ 109 字节，网页端发送侧强制此限，避免打爆桌面端。
-export const MAX_CHAT_BODY_BYTES = 109;
+// 正文上限（UTF-8 字节，不含结尾 NUL）：REQ-CLI-MSGBND-001 定为业务规则，与服务端权威校验同值。
+// 旧值 109 是为了迁就桌面端 char[110] 定长接收缓冲，桌面端改为按报文实际长度取用后不再需要。
+export const MAX_CHAT_BODY_BYTES = 2000;
 
 // Qt QDateTime::currentDateTime().toString() 默认格式。
 export function formatQtDateTime(d = new Date()) {
@@ -60,7 +60,7 @@ export function parseMsgRecords(caMsg, uiMsgLen) {
 export function sendChat(from, to, text, net = getNet()) {
   if (!text) throw new Error('消息不能为空');
   if (utf8Length(text) > MAX_CHAT_BODY_BYTES) {
-    throw new Error(`消息过长：${utf8Length(text)} 字节，上限 ${MAX_CHAT_BODY_BYTES} 字节（与桌面端兼容）`);
+    throw new Error(`消息过长：${utf8Length(text)} 字节，上限 ${MAX_CHAT_BODY_BYTES} 字节`);
   }
   const caData = new Uint8Array(64);
   writeFixedStringNul(caData, 0, 32, from);

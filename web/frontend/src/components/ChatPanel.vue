@@ -54,8 +54,8 @@ function onKeydown(e) {
     <footer class="input-bar">
       <span v-if="error" class="err">{{ error }}</span>
       <div class="input-row">
-        <input v-model="input" type="text" placeholder="输入消息，Enter 发送（≤109 字节，与桌面端兼容）"
-               maxlength="120" @keydown="onKeydown" />
+        <input v-model="input" type="text" placeholder="输入消息，Enter 发送（正文上限 2000 字节）"
+               maxlength="2000" @keydown="onKeydown" />
         <button class="send" @click="onSend">发送</button>
       </div>
     </footer>

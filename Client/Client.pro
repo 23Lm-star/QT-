@@ -38,6 +38,7 @@ SOURCES += \
     msghandler.cpp \
     onlineuser.cpp \
     protocol.cpp \
+    chatbounds.cpp \
     sharefile.cpp \
     sharelinkdialog.cpp \
     folderselectdialog.cpp \
@@ -60,6 +61,7 @@ HEADERS += \
     msghandler.h \
     onlineuser.h \
     protocol.h \
+    chatbounds.h \
     sharefile.h \
     sharelinkdialog.h \
     folderselectdialog.h \

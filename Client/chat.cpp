@@ -2,6 +2,7 @@
 #include "chat.h"
 #include "client.h"
 #include "protocol.h"
+#include "chatbounds.h"
 #include "ui_chat.h"
 
 #include <QMessageBox>
@@ -36,10 +37,19 @@ void Chat::on_output_PB_clicked(){
     if(msg.isEmpty()){
         return;
     }
+    // REQ-CLI-MSGBND-001：正文上限 2000 字节（UTF-8），与服务端权威校验同值。
+    // 超限提示并阻止发送、不改写用户内容（截断只用于接收端的防御性钳制），输入框保持原样便于修改。
+    const QByteArray bodyBytes = msg.toUtf8();
+    if ((uint)bodyBytes.size() > CHAT_MAX_BODY_BYTES) {
+        QMessageBox::information(this, QStringLiteral("提示"),
+            QStringLiteral("消息过长：%1 字节，上限 %2 字节，请缩减内容后重发。")
+                .arg(bodyBytes.size()).arg(int(CHAT_MAX_BODY_BYTES)));
+        return;
+    }
     //清空消息发送框
     ui->output_LE->clear();
     // 总长 = Msg 定长头 + 正文（含结尾 '\0'），用作 mkPDU 的柔性数组长度
-    uint Msglen=sizeof(Msg)+msg.toUtf8().toStdString().size()+1;
+    uint Msglen=sizeof(Msg)+bodyBytes.size()+1;
     PDU* pdu=mkPDU(Msglen);//构建一个Msg大小还有一个消息的柔性数组大小
     pdu->uiType=ENUM_MSG_TYPE_CHAT_REQUEST;
     //现将发送人和接收人的用户名记录下来
@@ -49,13 +59,16 @@ void Chat::on_output_PB_clicked(){
     //构造一条消息（消息本体+发送时间）
     Msg* pdu_msg=(Msg*)pdu->caMsg;
     pdu_msg->totalLen=Msglen;//消息总长度（+消息本体长度+1）
-    pdu_msg->msgLen=msg.toUtf8().toStdString().size()+1;
+    pdu_msg->msgLen=bodyBytes.size()+1;
     qCDebug(lcCli)<<"pdu_msg->totalLen"<<pdu_msg->totalLen<<" pdu_msg->msgLen"<<pdu_msg->msgLen<<" ";
     // Time 为 30 字节定长字段，存放格式化的本地时间字符串
     // REQ-CLI-MSGSTORE-001：时间串只取一次——16 应答要按「对方+时间+正文」匹配待发条目，
     // 这里再取一次会跨秒，导致自发消息永远认不出来、永远不落库
-    memcpy(pdu_msg->Time,currtime.toStdString().c_str(),30);
-    memcpy(pdu_msg->msg,msg.toUtf8().toStdString().c_str(),pdu_msg->msgLen);
+    // REQ-CLI-MSGBND-001：按实际内容拷贝，不足 30 字节的余量由 mkPDU 的清零补齐；
+    // 改前固定拷 30 字节会越出短于 30 字节的源缓冲读。
+    const QByteArray timeBytes = currtime.toUtf8();
+    memcpy(pdu_msg->Time, timeBytes.constData(), size_t(qMin(timeBytes.size(), 30)));
+    memcpy(pdu_msg->msg,bodyBytes.constData(),pdu_msg->msgLen);
     qCDebug(lcCli)<<"发送msg"<<pdu_msg->msg<<" time:"<<pdu_msg->Time<<" ";
     qCDebug(lcCli)<<"报文长度为:"<<pdu->uiTotalLen<<" msgLen:"<<pdu->uiMsgLen<<endl;
     // REQ-CLI-MSGSTORE-001：改前自发消息只在窗口里根本不显示（要等下次进会话才从
