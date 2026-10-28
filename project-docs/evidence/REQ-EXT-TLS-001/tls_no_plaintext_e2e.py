@@ -7,27 +7,20 @@
 
   R1 明文中继：客户端 →(明文) 中继(127.0.0.1:15000) →(明文) 服务端 5000。
      中继→服务端这一段 = 真实链路字节，其中应能读到私聊正文标记与口令摘要（证明可嗅探）。
-  R2/R3 TLS 直连：客户端 →(TLS) 服务端 5001。
-     判据取「服务端自己吐出的链路统计」：服务端日志记录各方向首块字节类型，
-     TLS 端口上应当只见握手记录（0x16）与加密数据记录（0x17），绝不出现业务标记字节。
-     为不侵入产品代码，本用例改用同一判据的可达实现：服务端 5001 的入口在握手完成前
-     必然拒绝裸 PDU（tls_e2e.py 的 T3 已证明），因此只要证明「TLS 会话业务成功」且
-     「同一段业务字节在明文链路上可读、在 TLS 链路上不可读」即可——后者用 R1 的对照
-     加 R2 的 TLS 记录层观测达成。
+  R2 TLS 直连业务成功：同一登录+私聊序列经客户端 →(TLS) 服务端 5001 完成，
+     协商版本 >= TLS1.2 —— 证明「加密不是摆设，业务确实跑在这条链路上」。
+  R3 形态对照：明文端口首帧首字节是帧长 0x4c(=76) 且得到应答；同一序号帧经 5001
+     不可能以该形态被读取（5001 上跑的是 TLS 记录层，协商到 ECDHE-RSA-AES256-GCM-SHA384）。
+  R4 带标记的完整明文帧直发 5001：不得产生任何业务应答字节（服务存活、进程不崩），
+     与 R1「同一帧在明文链路会得到应答」形成对照 —— 即明文业务字节在 TLS 端口不被解析。
+  R5 篡改判定：TLS 客户端经「只转不终止」的篡改中继连 5001，握手与首个请求正常，
+     此后每个密文块末字节被翻转；篡改后的会话必须拿不到任何有效业务应答
+     （TLS 记录鉴权失败 → 告警或断连），且服务端仍存活、新会话照常可用。
+     中继不做 TLS 终止——否则篡改的是明文段，测不到记录层完整性。
 
-  R2 观测方式：中继放在 TLS 客户端与服务端之间不可行（中继会终止 TLS），
-     改为对 5001 端口做「链路侧只观测不转发」的 TLS 记录解析：
-     由测试自己充当 TLS 客户端，记录 socket 发送侧的原始记录字节（Python ssl 不暴露），
-     因此这里改用可判定的等价事实：同一登录+私聊序列经 5001 完成后，
-     把 5001 收到的前若干字节与明文链路对照——由服务端 TLS 端口对裸 PDU 的拒绝行为
-     （T3，已自动化）+ 本用例 R1 的可读性 + 下面 R4 的密文长度分布共同支撑。
-
-  R4 密文形态判定：对 5001 发起 TLS 握手后中断（不发业务），链路首字节必须是 0x16 握手，
-     而不是明文 PDU 首字节 0x4c（76=帧头长度）；与 R1 的首字节形成直接对照。
-
-结论口径：R1 证明明文链路可被任何观察方读取业务内容；R2 证明 TLS 链路业务成功；
-T3（tls_e2e.py）证明 TLS 端口无法按明文 PDU 解析；R4 证明 TLS 链路首字节是握手记录而非
-明文帧头。四条合起来即「TLS 链路上不暴露业务明文」。
+结论口径：R1 证明明文链路可被任何同网段观察方读取业务内容；R2+R3+R4 证明同样的业务
+字节经 TLS 链路既不被明文解析也不可读；R5 证明篡改会被拒而非静默解析。
+合起来即 PRD「TLS 二」的两半句：链路无明文可见 + 篡改即断连。
 
 前置：dist/Server.exe（含 TLS 改造）+ dist/certs/server.{crt,key} + MySQL + relay_certs/（自动）。
 用法：py -3.13 -X utf8 project-docs/evidence/REQ-EXT-TLS-001/tls_no_plaintext_e2e.py
@@ -55,7 +48,7 @@ sys.path.insert(0, str(ROOT / 'project-docs' / 'evidence' / '_harness'))
 import server_ctl  # noqa: E402
 
 HOST, PLAIN_PORT, TLS_PORT = '127.0.0.1', 5000, 5001
-RELAY_PORT, RELAY_TARGET = 15000, 5000
+RELAY_PORT, RELAY_TARGET, TAMPER_PORT = 15000, 5000, 15002
 HDR = 76
 USER = 'tlsrelay'
 PWD = '123456'
@@ -192,6 +185,60 @@ class PlainTap(threading.Thread):
                     pass
             if f:
                 f.close()
+
+
+class TamperTap(threading.Thread):
+    """TLS 透传中继；arm() 后翻转「下一个客户端→服务端字节块」的末字节 = 篡改一条记录。
+
+    中继不做 TLS 终止——否则篡改的是明文段，测不到记录层完整性。
+    只改客户端方向：服务端应答误伤会让"是否被解析"无法判读。
+    """
+
+    def __init__(self, port, target_port):
+        super().__init__(daemon=True)
+        self.port, self.target_port = port, target_port
+        self.arm_flag = threading.Event()
+        self.ready = threading.Event()
+        self.corrupted = 0
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind((HOST, port))
+        self.srv.listen(2)
+
+    def run(self):
+        self.ready.set()
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            try:
+                t = socket.create_connection((HOST, self.target_port), timeout=10)
+            except OSError:
+                c.close()
+                continue
+            threading.Thread(target=self._copy, args=(c, t, True), daemon=True).start()
+            threading.Thread(target=self._copy, args=(t, c, False), daemon=True).start()
+
+    def _copy(self, src, dst, to_server):
+        try:
+            while True:
+                d = src.recv(65536)
+                if not d:
+                    break
+                if to_server and self.arm_flag.is_set():
+                    self.arm_flag.clear()
+                    d = d[:-1] + bytes([d[-1] ^ 0xFF])
+                    self.corrupted += 1
+                dst.sendall(d)
+        except OSError:
+            pass
+        finally:
+            for s in (src, dst):
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
 
 def chat_body(marker):
@@ -344,6 +391,88 @@ def main():
                   'response=%r server_alive=%s' % (echoed[:16], alive))
         finally:
             ctl2.stop()
+
+    # R5 篡改记录 → 连接报错断开，绝不静默解析（TLS 二后半句判据）
+    #    手法：Python TLS 客户端经「篡改中继」连服务端 5001；先让握手与一次正常请求通过，
+    #    再打开篡改开关（此后每个字节块翻转末字节），发第二条请求。
+    #    合格：篡改后的会话拿不到任何有效业务应答（TLS 记录鉴权失败 → 告警/断连），
+    #    且服务端仍存活、新会话照常可用。
+    try:
+        ctl3 = server_ctl.ServerCtl(str(EXE), str(DIST))
+        if not ctl3.start():
+            raise RuntimeError('server restart failed: %s' % ctl3.last_error)
+        tap = TamperTap(TAMPER_PORT, TLS_PORT)
+        tap.start()
+        tap.ready.wait()
+        time.sleep(.3)
+        ctx = ssl.create_default_context()
+        ctx.load_verify_locations(cafile=str(CERTS / 'server.crt'))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        s = ctx.wrap_socket(socket.create_connection((HOST, TAMPER_PORT), timeout=10),
+                            server_hostname='tlsserver')
+        c = Conn(s)
+        # 1) 篡改前基线：发 44 必须拿到 45（中继此刻纯透传）
+        c.s.sendall(pdu(T_CAP))
+        ok_before = len(c.collect(T_CAP_R, 1, 6)) > 0
+
+        # 2) 篡改一条记录：被篡改的那条请求不得产生有效业务应答
+        tap.arm_flag.set()
+        c.s.sendall(pdu(T_CAP))
+        tamper_resp, closed, saw_error = False, False, ''
+        try:
+            c.s.settimeout(4)
+            data = c.s.recv(65536)
+            if data == b'':
+                closed = True
+            tamper_resp = any(f[0] == T_CAP_R for f in unpack(data)[0])
+        except ssl.SSLError as e:
+            saw_error, closed = 'SSLError:%s' % e, True
+        except socket.timeout:
+            saw_error = 'timeout'
+        except OSError as e:
+            saw_error, closed = type(e).__name__, True
+
+        # 3) 同一会话再发一条干净记录：会话是否被判失效（不接受"篡改记录被跳过、会话照用"）
+        clean_resp, closed2 = False, False
+        if not closed:
+            try:
+                c.s.sendall(pdu(T_CAP))
+                c.s.settimeout(4)
+                d2 = c.s.recv(65536)
+                if d2 == b'':
+                    closed2 = True
+                clean_resp = any(f[0] == T_CAP_R for f in unpack(d2)[0])
+            except ssl.SSLError as e:
+                saw_error = saw_error + ' / SSLError:%s' % e
+                closed2 = True
+            except socket.timeout:
+                pass
+            except OSError:
+                closed2 = True
+        try:
+            c.close()
+        except OSError:
+            pass
+
+        # 4) 服务端存活 + 新会话可用（篡改不能拖垮进程或污染后续连接）
+        fresh = session_via_tls(marker + '_AFTER')
+        # 判据：篡改记录不被静默解析（无有效应答）；且会话失效——表现为断开/报错，
+        #       或后续干净记录也不再被应答（服务端已放弃该流，只是没主动 FIN）。
+        session_dead = closed or closed2 or saw_error in ('SSLError',) or not clean_resp
+        check('R5-tamper-not-silently-parsed',
+              tap.corrupted == 1 and ok_before and not tamper_resp and not clean_resp and fresh[0],
+              'corrupted=%d before=%s tamper_resp=%s clean_resp=%s closed=%s/%s err=%r '
+              'session_after=%s' % (tap.corrupted, ok_before, tamper_resp, clean_resp,
+                                    closed, closed2, saw_error, fresh[0]))
+        print('NOTE R5 断连形态（事实记录，不改判据）：closed=%s/%s error=%r 会话判死=%s'
+              % (closed, closed2, saw_error, session_dead))
+    except Exception as e:
+        check('R5-tamper-not-silently-parsed', False, repr(e))
+    finally:
+        try:
+            ctl3.stop()
+        except Exception:
+            pass
 
     fails = [l for l, ok in results if not ok]
     print('SUMMARY %d/%d passed%s' % (len(results) - len(fails), len(results),
