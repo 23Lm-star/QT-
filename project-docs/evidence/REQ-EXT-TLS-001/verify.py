@@ -41,6 +41,7 @@ MINGW = Path(r'C:/Qt/Tools/mingw730_64')
 OPENSSL = Path(r'C:/Program Files/Git/mingw64/bin/openssl.exe')
 
 EXPECTED = ['T3-e-rule-shape', 'T3-e-single-anchor', 'T3-f-write-gate',
+            'T6-a-tlsport-derivation', 'T6-b-kicknotice-gate',
             'T3-a-happy', 'T3-b-rogue-rejected', 'T3-c-name-mismatch',
             'T3-d-expired-rejected', 'T5-a-abort-converges', 'T5-b-server-alive-after-abort',
             'X1-stub-resumes-after-abort']

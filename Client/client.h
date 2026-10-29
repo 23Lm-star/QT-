@@ -35,6 +35,8 @@ public:
     bool m_tlsMode = false;
     // REQ-EXT-TLS-001：TLS 连接已建立 TCP 但握手未完成（此期间禁止写出 PDU）。
     bool tlsPending() const { return m_tlsMode && !sorket.isEncrypted(); }
+    // D-1：本次断线的服务端可见原因，决定要不要弹「账号可能已在其他设备登录」。
+    tls::DisconnectCause m_disconnectCause = tls::DisconnectCause::Other;
     //连接的服务器的ip地址和端口号
     QString m_strlp;
     quint16 m_usPort;

@@ -4,6 +4,9 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++11 utf8_source
 
+# REQ-EXT-TLS-001：TLS/pinning 规则与桌面端共用同一编译单元，规则只有一份
+INCLUDEPATH += $$PWD/../Client
+
 # console: 必须有。缺省时 MinGW 目标按 GUI 子系统链接（-Wl,-subsystem,windows），进程没有
 # stdout/stderr，Qt 的 qDebug/qWarning 全部走 OutputDebugString —— 服务端运行日志既进不了
 # 重定向文件也进不了管道，套件（group-002 p7_slow_conn_dropped）无法断言丢包日志。
@@ -37,6 +40,7 @@ DEFINES += QT_DEPRECATED_WARNINGS
 #DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 SOURCES += \
+    ../Client/tlspinning.cpp \
     databaseconnectionpool.cpp \
     fileobjectstore.cpp \
     logging.cpp \

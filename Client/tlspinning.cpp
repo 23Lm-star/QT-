@@ -38,4 +38,16 @@ bool pduWriteBlocked(bool tlsMode, bool encrypted)
     return tlsMode && !encrypted;   // 业务规则 5
 }
 
+bool showKickNotice(bool loggedIn, DisconnectCause cause)
+{
+    return loggedIn && cause != DisconnectCause::TlsRejected;   // D-1
+}
+
+bool nextTlsPort(quint16 plainPort, quint16 *tlsPort)
+{
+    if (plainPort == 0 || plainPort == 65535) return false;     // S-1：溢出与 0 都不接受
+    if (tlsPort) *tlsPort = static_cast<quint16>(plainPort + 1);
+    return true;
+}
+
 } // namespace tls

@@ -112,6 +112,7 @@ Client::Client(QWidget *parent)
         // 业务规则 2：禁止 ignoreSslErrors 放行——证书不符即断连并提示（pinning 语义）。
         qCCritical(lcCli) << "[TLS] 证书校验失败:" << errors.value(0).errorString();
         m_tlsMode = false;   // 防止断连前再走 connectsort 发报文
+        m_disconnectCause = tls::DisconnectCause::TlsRejected;   // D-1：断连原因先落定
         sorket.abort();
         QMessageBox::critical(this, QStringLiteral("安全连接失败"),
             QString::fromUtf8("服务器证书校验未通过，已拒绝连接。\n%1")
@@ -426,14 +427,21 @@ void Client::seedMsg(PDU *pdu){
 void Client::startConnection()
 {
     m_tlsMode = false;
+    m_disconnectCause = tls::DisconnectCause::Other;   // D-1：新一轮连接重新认定原因
+    quint16 tlsPort = 0;
+    if (!tls::nextTlsPort(m_usPort, &tlsPort)) {
+        qCCritical(lcCli) << "[TLS] 配置端口" << m_usPort << "无法派生 TLS 端口（+1 越界或为 0），回退明文";
+        sorket.connectToHost(QHostAddress(this->m_strlp), this->m_usPort);
+        return;
+    }
     const QSslCertificate crt = tls::loadPinnedCert();   // D4：certs/server.crt 固定目录
     if (!crt.isNull()) {
         sorket.setSslConfiguration(tls::buildPinnedConfig(crt));   // pinning + TLS1.2
         // Qt 5.14 的校验名是 QSslSocket 属性（不在 QSslConfiguration 上）
         sorket.setPeerVerifyName(tls::kVerifyName);                // 与证书 CN/SAN 一致
         m_tlsMode = true;
-        qCInfo(lcCli) << "[TLS] 以 TLS 连接" << m_strlp << ":" << int(m_usPort) + 1;
-        sorket.connectToHostEncrypted(m_strlp, m_usPort + 1);
+        qCInfo(lcCli) << "[TLS] 以 TLS 连接" << m_strlp << ":" << tlsPort;
+        sorket.connectToHostEncrypted(m_strlp, tlsPort);
         return;
     }
     if (QFile::exists(tls::certDirPath() + "/server.crt")) {
@@ -657,8 +665,11 @@ void Client::onSocketDisconnected() {
     TransferManager::instance().onConnectionLost(QStringLiteral("与服务端断开连接，可重试"));
     // 已登录才弹窗（未登录在登录界面，连接失败不应弹重连窗口）
     if (m_loggedIn && !m_serverLostShown) {
-        // REQ-EXT-SESSION-001：被服务端版本校验切断时的提示（零协议，仅文案）；后续流程复用既有重连窗口
-        QMessageBox::information(this,"连接已关闭","连接被服务端关闭，账号可能已在其他设备登录。重新连接后请重新登录。");
+        // D-1：证书被拒已有「安全连接失败」对话框，这里不再叠加互踢文案；重连窗照常给出
+        if (tls::showKickNotice(m_loggedIn, m_disconnectCause)) {
+            // REQ-EXT-SESSION-001：被服务端版本校验切断时的提示（零协议，仅文案）
+            QMessageBox::information(this,"连接已关闭","连接被服务端关闭，账号可能已在其他设备登录。重新连接后请重新登录。");
+        }
         onServerLost();
     }
 }
