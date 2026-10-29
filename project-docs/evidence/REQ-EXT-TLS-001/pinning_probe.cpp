@@ -167,6 +167,25 @@ int main(int argc, char **argv)
                tls::pduWriteBlocked(true, false)).arg(tls::pduWriteBlocked(true, true))
                .arg(tls::pduWriteBlocked(false, false)));
 
+    // ---- T6-a / T6-b：D-1 与 S-1 两条规则的真值表（同编译产品实现）----
+    {
+        quint16 p = 0;
+        const bool normal = tls::nextTlsPort(5000, &p) && p == 5001;
+        quint16 untouched = 12345;
+        const bool overflowRefused = !tls::nextTlsPort(65535, &untouched) && untouched == 12345;
+        const bool zeroRefused = !tls::nextTlsPort(0, nullptr);
+        report("T6-a-tlsport-derivation", normal && overflowRefused && zeroRefused,
+               QString("5000→%1 ok=%2 / 65535 拒绝且不改写出参=%3 / 0 拒绝=%4")
+                   .arg(p).arg(normal).arg(overflowRefused).arg(zeroRefused));
+
+        const bool kickWhenLoggedIn = tls::showKickNotice(true, tls::DisconnectCause::Other);
+        const bool suppressedOnTlsReject = !tls::showKickNotice(true, tls::DisconnectCause::TlsRejected);
+        const bool silentWhenLoggedOut = !tls::showKickNotice(false, tls::DisconnectCause::Other);
+        report("T6-b-kicknotice-gate", kickWhenLoggedIn && suppressedOnTlsReject && silentWhenLoggedOut,
+               QString("登录+其它原因仍提示=%1 / TLS 被拒不再弹互踢文案=%2 / 未登录静默=%3")
+                   .arg(kickWhenLoggedIn).arg(suppressedOnTlsReject).arg(silentWhenLoggedOut));
+    }
+
     // ---- T3-a → T3-b → T3-c → T3-d → T5-a → T5-b 串行接力 ----
     new Attempt(pinned, tls::kVerifyName, okPort, 3000, [&](Attempt *a) {
         report("T3-a-happy", a->encrypted,

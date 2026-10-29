@@ -28,6 +28,20 @@ QSslConfiguration buildPinnedConfig(const QSslCertificate &cert);
 // mode/encrypted 的语义与 Client::connectsort/seedMsg、MyTcpSocket::recvmsg 守卫一致。
 bool pduWriteBlocked(bool tlsMode, bool encrypted);
 
+// 断线原因（D-1 修复引入）：区分「TLS 信任失败」与「其它/对端关闭」。
+// Qt 的 disconnected 信号不带原因，不记录就会把证书被拒说成被互踢。
+enum class DisconnectCause { Other, TlsRejected };
+
+// D-1：是否弹「连接被服务端关闭，账号可能已在其他设备登录」这条提示。
+// TLS 信任失败已有「安全连接失败」对话框，再叠一条互踢文案会把用户引向错误处置
+// （去查是不是别人登录，而真实问题是证书）。重连窗保持原样：修好证书后可直接点重连。
+// 调用点已保证 loggedIn 与去重，这里仍把 loggedIn 纳入真值表，使规则本身完整可断言。
+bool showKickNotice(bool loggedIn, DisconnectCause cause);
+
+// S-1：TLS 端口 = 明文主端口 + 1（D1 双端口共存）。plainPort 为 65535 时返回 false，
+// 两端一律拒绝启用 TLS 并记日志——不能让服务端 listen(0) 随机挑端口还打出「启动成功」。
+bool nextTlsPort(quint16 plainPort, quint16 *tlsPort);
+
 } // namespace tls
 
 #endif // TLSPINNING_H

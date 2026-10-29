@@ -1,6 +1,7 @@
 #include "logging.h"
 #include "mytcpserver.h"
 #include "mytcpsocket.h"
+#include "tlspinning.h"   // Server.pro 跨目录引用 Client/tlspinning.cpp：pinning/TLS 端口规则只有一份
 #include "server.h"
 #include "protocol.h"
 #include "memalloc.h"
@@ -58,7 +59,14 @@ bool MyTcpServer::startTlsListener(const QSslConfiguration &cfg)
     listener->m_isTlsListener = true;
     listener->m_tlsCfg = cfg;
     MyTcpServer &master = MyTcpServer::getinstance();
-    const quint16 tlsPort = master.serverPort() + 1;
+    quint16 tlsPort = 0;
+    // S-1：主端口 65535 时 +1 会回绕到 0，listen(0) 会随机挑端口却照样打「启动成功」——直接拒绝
+    if (!tls::nextTlsPort(master.serverPort(), &tlsPort)) {
+        qCCritical(lcNet) << "[TLS] 主端口" << master.serverPort()
+                          << "无法派生 TLS 端口（+1 越界或为 0），TLS 端口不启用（明文端口不受影响）";
+        delete listener;
+        return false;
+    }
     if (!listener->listen(master.serverAddress(), tlsPort)) {
         qCCritical(lcNet) << "[TLS] TLS 端口监听失败:" << listener->errorString()
                           << "端口" << tlsPort << "（明文端口不受影响）";
