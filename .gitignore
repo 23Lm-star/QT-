@@ -86,6 +86,8 @@ Desktop.ini
 # 码点裁剪无法由 socket 套件断言到函数级），被同目录 verify.py 调用，不入库则套件在别的
 # 检出上无法复现。仍只放行这一个文件名。
 !/project-docs/evidence/**/boundary_probe.cpp
+# REQ-EXT-TLS-001 同理：TLS 三/TLS 五 探针直接编译产品 Source Client/tlspinning.cpp（pinning 规则的唯一落点），被同目录 verify.py 调用；不入库则在别的检出上无法复现。仍只放行这一个文件名，不放行 *.cpp
+!/project-docs/evidence/**/pinning_probe.cpp
 /project-docs/evidence/**/*.out
 /project-docs/evidence/**/*.sql
 /project-docs/evidence/**/*.sh
@@ -158,3 +160,11 @@ web/**/node_modules/
 web/frontend/dist/
 web/**/.vite/
 web/**/*.local
+
+# REQ-EXT-TLS-001: TLS private keys / certs never tracked (dist/ already ignored; this guards stray copies)
+*.key
+*.crt
+
+# REQ-EXT-TLS-001: relay 取证的临时证书与链路 dump 不入库
+project-docs/evidence/REQ-EXT-TLS-001/relay_certs/
+project-docs/evidence/REQ-EXT-TLS-001/relay_dumps/

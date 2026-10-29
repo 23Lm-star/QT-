@@ -9,6 +9,8 @@
 #include <QTextStream>
 #include <QCoreApplication>
 #include <QSet>
+#include <QSslKey>
+#include <QSslCertificate>
 // 连接管理实现。所有槽函数运行在主线程；对连接表的遍历一律先加锁取快照，
 // 出锁后再执行可能触发重入（abort → disconnected → clientOffLine → removeSocket）的操作。
 MyTcpServer::MyTcpServer(){
@@ -31,10 +33,44 @@ MyTcpServer::MyTcpServer(){
     }
 
     // 周期扫描由父对象 this 托管，随单例析构自动停止。
-    m_sweepTimer = new QTimer(this);
-    connect(m_sweepTimer, &QTimer::timeout, this, &MyTcpServer::onSweepTimeout);
-    m_sweepTimer->start(30000);   // 每 30s 扫描一次僵尸连接
+    // REQ-EXT-TLS-001：TLS 监听实例（第二个 MyTcpServer）不重复起清扫定时器——
+    // 连接表是全进程共享的，单例每 30s 扫一遍已覆盖两类连接。
+    static bool s_firstInstanceDone = false;
+    if (!s_firstInstanceDone) {
+        m_sweepTimer = new QTimer(this);
+        connect(m_sweepTimer, &QTimer::timeout, this, &MyTcpServer::onSweepTimeout);
+        m_sweepTimer->start(30000);   // 每 30s 扫描一次僵尸连接
+        s_firstInstanceDone = true;
+    }
 }
+
+// REQ-EXT-TLS-001 D1：TLS 监听器。端口 = 明文主端口 + 1（配置格式不加行，D4 已确认）。
+bool MyTcpServer::startTlsListener(const QSslConfiguration &cfg)
+{
+    if (s_tlsListener) return false;                 // 只允许启动一次
+    if (cfg.isNull() || cfg.localCertificate().isNull() || cfg.privateKey().isNull()) {
+        qCCritical(lcNet) << "[TLS] 配置无效，TLS 端口不启用（明文端口不受影响）";
+        return false;
+    }
+    // MyTcpServer 的私有构造在静态成员函数内可直接调用（C++ 访问控制按类而非按实例）。
+    // 不释放：监听器与进程同寿命，退出时无需有序销毁（与单例同一策略）。
+    MyTcpServer *listener = new MyTcpServer();
+    listener->m_isTlsListener = true;
+    listener->m_tlsCfg = cfg;
+    MyTcpServer &master = MyTcpServer::getinstance();
+    const quint16 tlsPort = master.serverPort() + 1;
+    if (!listener->listen(master.serverAddress(), tlsPort)) {
+        qCCritical(lcNet) << "[TLS] TLS 端口监听失败:" << listener->errorString()
+                          << "端口" << tlsPort << "（明文端口不受影响）";
+        delete listener;
+        return false;
+    }
+    s_tlsListener = listener;
+    qCDebug(lcNet) << "[TLS] TLS 端口启动成功，监听" << tlsPort;
+    return true;
+}
+
+MyTcpServer *MyTcpServer::s_tlsListener = nullptr;
 //连接新客户端，并且创建新的tcpsocket用来连接新客户端
 void MyTcpServer::incomingConnection(qintptr handle)
 {
@@ -43,6 +79,9 @@ void MyTcpServer::incomingConnection(qintptr handle)
     // 新对象无父对象：生命周期由连接表 + removeSocket(deleteLater) 管理。
     MyTcpSocket * m_tcpSocket=new MyTcpSocket;
     m_tcpSocket->setSocketDescriptor(handle);
+    // REQ-EXT-TLS-001：TLS 监听实例接受的连接先登记 TLS 模式再进入连接表，
+    // 保证握手完成前该连接不会被当作 PDU 流解析（见 MyTcpSocket::recvmsg 守卫）。
+    if (m_isTlsListener) m_tcpSocket->setTlsMode(true);
     {
         QMutexLocker locker(&m_tcpsocketlistMutex);
         m_tcpSocket->m_connectionId=++m_nextConnectionId;

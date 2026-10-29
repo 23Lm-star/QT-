@@ -11,6 +11,9 @@
 #include <string.h>
 #include <QByteArray>
 #include <QFile>
+#include <QSslSocket>
+#include <QSslConfiguration>
+#include <QSslCertificate>
 #include <QString>
 #include <QDebug>
 #include <QMessageBox>
@@ -99,11 +102,22 @@ Client::Client(QWidget *parent)
     connect(m_reconnectDlg, &ReconnectDialog::reconnectClicked,
             this, &Client::onReconnectRequested);
 
-    // 异步连接（立即返回）；成功后进入 connectsort。
-    sorket.connectToHost(QHostAddress(this->m_strlp),this->m_usPort);
+    // 异步连接（立即返回）；成功后进入 connectsort。REQ-EXT-TLS-001：连接发起收敛到 startConnection。
     connect(&sorket,&QTcpSocket::connected,this,&Client::connectsort);
     connect(&sorket,&QTcpSocket::readyRead,this,&Client::recvmsg);
     connect(&sorket,&QTcpSocket::disconnected,this,&Client::onSocketDisconnected);
+    connect(&sorket,&QSslSocket::encrypted,this,&Client::connectsort);
+    connect(&sorket,QOverload<const QList<QSslError>&>::of(&QSslSocket::sslErrors),
+            this,[this](const QList<QSslError> &errors){
+        // 业务规则 2：禁止 ignoreSslErrors 放行——证书不符即断连并提示（pinning 语义）。
+        qCCritical(lcCli) << "[TLS] 证书校验失败:" << errors.value(0).errorString();
+        m_tlsMode = false;   // 防止断连前再走 connectsort 发报文
+        sorket.abort();
+        QMessageBox::critical(this, QStringLiteral("安全连接失败"),
+            QString::fromUtf8("服务器证书校验未通过，已拒绝连接。\n%1")
+                .arg(errors.value(0).errorString()));
+    });
+    startConnection();
 }
 
 Client::~Client(){
@@ -396,6 +410,10 @@ void Client::handlMsg(PDU *&pdu)
 }
 
 void Client::seedMsg(PDU *pdu){
+    if (tlsPending()) {                                 // REQ-EXT-TLS-001 业务规则 5（同一谓词）
+        free(pdu);
+        return;
+    }
     // QTcpSocket::write 会立即拷贝数据到内部写缓冲，因此可以马上 free。
     sorket.write((char*)pdu,pdu->uiTotalLen);
     free(pdu);
@@ -403,7 +421,33 @@ void Client::seedMsg(PDU *pdu){
     pdu=nullptr;
 }
 
+// REQ-EXT-TLS-001：certs/server.crt 在位则走 TLS（端口=配置端口+1，pinning 该证书，
+// 校验名 tlsserver 与证书 CN 一致）；不在位则保持明文原语义。
+void Client::startConnection()
+{
+    m_tlsMode = false;
+    const QSslCertificate crt = tls::loadPinnedCert();   // D4：certs/server.crt 固定目录
+    if (!crt.isNull()) {
+        sorket.setSslConfiguration(tls::buildPinnedConfig(crt));   // pinning + TLS1.2
+        // Qt 5.14 的校验名是 QSslSocket 属性（不在 QSslConfiguration 上）
+        sorket.setPeerVerifyName(tls::kVerifyName);                // 与证书 CN/SAN 一致
+        m_tlsMode = true;
+        qCInfo(lcCli) << "[TLS] 以 TLS 连接" << m_strlp << ":" << int(m_usPort) + 1;
+        sorket.connectToHostEncrypted(m_strlp, m_usPort + 1);
+        return;
+    }
+    if (QFile::exists(tls::certDirPath() + "/server.crt")) {
+        qCWarning(lcCli) << "[TLS] server.crt 无法解析，回退明文连接";
+    }
+    sorket.connectToHost(QHostAddress(this->m_strlp), this->m_usPort);
+}
+
 void Client::connectsort(){
+    // TLS 连接：TCP 刚连通时只开始握手，业务动作等 encrypted 二次进入本槽。
+    if (m_tlsMode && !sorket.isEncrypted()) {
+        qCDebug(lcCli) << "[TLS] TCP 已连通，等待握手完成";
+        return;
+    }
     qCDebug(lcCli)<<"服务器连接成功"<<endl;
     // 区分"首次连接"与"断线后重连"：重连弹窗可见过说明这是一次重连
     bool wasReconnect = (m_reconnectDlg && m_reconnectDlg->isVisible());
@@ -435,6 +479,7 @@ void Client::forceReLogin() {
 }
 
 void Client::recvmsg(){
+    if (tls::pduWriteBlocked(m_tlsMode, sorket.isEncrypted())) return;   // REQ-EXT-TLS-001 业务规则 5
     // 追加本次读到的字节；循环尝试切出完整 PDU。
     m_pdulist.append(sorket.readAll());
     // 条件保证头部 76 字节齐全后才读取 uiTotalLen（避免半包越界）。
@@ -624,5 +669,5 @@ void Client::onReconnectRequested() {
         sorket.disconnectFromHost();
     }
     m_lastPongMs = QDateTime::currentMSecsSinceEpoch(); // 重置，避免重连过程中立即再判失联
-    sorket.connectToHost(QHostAddress(m_strlp), m_usPort);
+    startConnection();
 }

@@ -11,7 +11,8 @@
 #include "reconnectdialog.h"
 #include <QHash>
 #include <QWidget>
-#include <QTcpSocket>
+#include <QSslSocket>
+#include "tlspinning.h"
 #include <QTime>
 #include <QtGlobal>
 #include <QPropertyAnimation>
@@ -27,9 +28,13 @@ class Client : public QWidget {
 
 public:
 
-    //处理和服务器的交互和连接的对象 （QTcpSocket类）
+    //处理和服务器的交互和连接的对象 （REQ-EXT-TLS-001 起为 QSslSocket；明文连接行为不变）
     // 必须留在 GUI 线程：readyRead/disconnected 槽都直接操作控件。
-    QTcpSocket sorket;
+    QSslSocket sorket;
+    // REQ-EXT-TLS-001：true=本次连接走 TLS，握手完成前不收发 PDU。
+    bool m_tlsMode = false;
+    // REQ-EXT-TLS-001：TLS 连接已建立 TCP 但握手未完成（此期间禁止写出 PDU）。
+    bool tlsPending() const { return m_tlsMode && !sorket.isEncrypted(); }
     //连接的服务器的ip地址和端口号
     QString m_strlp;
     quint16 m_usPort;
@@ -108,6 +113,8 @@ public slots:
     //连接服务器的函数
     // QTcpSocket::connected 槽：重连成功时关闭重连窗并强制重新登录。
     void connectsort();
+    // REQ-EXT-TLS-001：按 certs/server.crt 在位与否选择 TLS(主端口+1) 或明文(原端口) 发起连接。
+    void startConnection();
     //接受服务器信息调用槽函数
     // QTcpSocket::readyRead 槽：累积字节并按 uiTotalLen 切出完整 PDU（粘包/半包处理）。
     void recvmsg();

@@ -3,6 +3,7 @@
 #include <QFile>
 #include <QDebug>
 #include <QTcpServer>
+#include <QSslConfiguration>
 #include "mytcpserver.h"
 Server::Server(QWidget *parent)
     : QWidget(parent)
@@ -67,6 +68,16 @@ bool Server::initialize()
         return false;
     }
     qCDebug(lcApp) << "Server::initialize - 服务端启动成功，监听" << m_strlp << ":" << m_usPort;
+    // REQ-EXT-TLS-001 D1：明文监听成功后再尝试启动 TLS 端口（主端口+1）。
+    // 证书缺失或解析失败只记日志、不影响明文端口——开发/测试环境按 D6 继续走 5000。
+    {
+        QSslConfiguration tlsCfg = MyTcpSocket::buildTlsConfig();
+        if (tlsCfg.isNull()) {
+            qCWarning(lcApp) << "Server::initialize - certs/ 不可用，TLS 端口未启用";
+        } else if (!MyTcpServer::getinstance().startTlsListener(tlsCfg)) {
+            qCWarning(lcApp) << "Server::initialize - TLS 端口启动失败，明文端口不受影响";
+        }
+    }
     return true;
 }
 
