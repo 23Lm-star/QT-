@@ -1,5 +1,6 @@
 ﻿#include "logging.h"
 #include "msghandler.h"
+#include "captchaimage.h"
 #include "QDebug"
 #include "operatedb.h"
 #include "mytcpserver.h"
@@ -155,6 +156,15 @@ PDU *MsgHandler::logoff(bool &revoked)
         QDir dir(userDir);
         if(dir.exists()){
             bool removed=dir.removeRecursively();
+            if(!removed){
+                // REQ-AUDIT-001 R3：删不掉就移出用户根，避免同名重注册看到前账号的目录残留。
+                const QString quarantine=QString("%1/.deleted").arg(Server::getinstance().filesPath);
+                QDir().mkpath(quarantine);
+                const QString target=QString("%1/%2-%3").arg(quarantine).arg(actor)
+                        .arg(QDateTime::currentMSecsSinceEpoch());
+                const bool moved=QDir().rename(userDir,target);
+                qCWarning(lcAuth)<<"logoff: 用户目录删除失败，隔离结果:"<<moved<<" dir:"<<userDir;
+            }
             qCDebug(lcAuth)<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
         }
         revoked=true;
@@ -208,6 +218,15 @@ bool MsgHandler::logicPathInActorRoot(const QString &path) const
     return p == r || p.startsWith(r + "/");
 }
 
+namespace {
+// REQ-AUDIT-001 R8：直连套件自动化登录需要可读答案；默认关闭，仅测试部署显式开启。
+bool captchaTextEchoForTests()
+{
+    static const bool enabled = qEnvironmentVariableIsSet("CLOUDDISK_CAPTCHA_TEXT_FOR_TESTS");
+    return enabled;
+}
+}
+
 PDU *MsgHandler::captcha()
 {
     QDateTime now = QDateTime::currentDateTime();
@@ -231,14 +250,32 @@ PDU *MsgHandler::captcha()
         m_captchaNextAllowed = now.addSecs(CAPTCHA_COOLDOWN_SEC);
         remaining = CAPTCHA_COOLDOWN_SEC;   // 成功时回传正常冷却时长
         status = 0;
-        qCDebug(lcAuth) << "生成验证码:" << m_captchaCode << "过期时间:" << m_captchaExpiry;
+        // REQ-AUDIT-001 R8：文本答案只留在本连接状态里，不进日志、不回传
+        qCDebug(lcAuth) << "生成验证码（图片，文本不外发）过期时间:" << m_captchaExpiry;
     }
 
     PDU* respdu;
     if (status == 0) {
-        QByteArray codeBytes = m_captchaCode.toUtf8();
-        respdu = mkPDU(codeBytes.size() + 1);
-        memcpy(respdu->caMsg, codeBytes.constData(), codeBytes.size() + 1);
+        // REQ-AUDIT-001 R8：测试专用旁路——仅当部署机显式设置
+        // CLOUDDISK_CAPTCHA_TEXT_FOR_TESTS 时仍回传文本（现有直连套件据此自动登录）。
+        // 默认关闭；生产/公网部署不得设置。图片与文本二选一，不回传两套答案。
+        if(captchaTextEchoForTests()){
+            const QByteArray codeBytes = m_captchaCode.toUtf8();
+            respdu = mkPDU(uint(codeBytes.size() + 1));
+            memcpy(respdu->caMsg, codeBytes.constData(), size_t(codeBytes.size() + 1));
+        } else {
+            // 载荷为 PNG；客户端按 PNG 魔数识别，不新增协议常量或布局字段
+            const QByteArray png = CaptchaImage::renderPng(m_captchaCode);
+            if (png.isEmpty()) {
+                qCWarning(lcAuth) << "验证码图片渲染失败，按服务不可用处理";
+                status = -1;
+                remaining = 0;
+                respdu = mkPDU();
+            } else {
+                respdu = mkPDU(uint(png.size()));
+                memcpy(respdu->caMsg, png.constData(), size_t(png.size()));
+            }
+        }
     } else {
         respdu = mkPDU();
     }
@@ -508,10 +545,11 @@ PDU *MsgHandler::chat()
     QString why;
     bool ret=false;
     bool stored=false;
+    qint64 msgId=-1;
     if(checkChatMsgStrict(pdu->caMsg, pdu->uiMsgLen, CHAT_MAX_BODY_BYTES, &body, &currTime, &why)){
         const QString msg=QString::fromUtf8(body);
         qCDebug(lcNet)<<"接收到的msg"<<msg<<" 时间为"<<currTime<<endl;
-        ret= OperateDB::instance().seedchatMsg(seedName,tarName,msg,currTime,&stored);
+        ret= OperateDB::instance().seedchatMsg(seedName,tarName,msg,currTime,&stored,&msgId);
         qCDebug(lcNet)<<"char ret"<<ret<<endl;
     }
     else{
@@ -519,8 +557,14 @@ PDU *MsgHandler::chat()
         qCWarning(lcNet)<<"[chat] 私聊正文拒绝 conn="<<m_connId<<" uiMsgLen="<<pdu->uiMsgLen
                         <<" 原因="<<why;
     }
-    if(ret){
-        MyTcpServer::getinstance().reseed(tarName,pdu);//转发给接收人（报文与改前逐字节一致）
+    // REQ-AUDIT-001 R1：只有真正写出成功才标记已送达；找不到连接或写失败则保持待送达，
+    // 由接收方下次 17 拉取重投（宁可重复，不能丢）。
+    if(ret && msgId>=0 && stored){
+        if(MyTcpServer::getinstance().reseed(tarName,pdu)){
+            QVector<qlonglong> delivered;
+            delivered.append(msgId);
+            OperateDB::instance().markChatDelivered(delivered);
+        }
     }
     // REQ-CLI-MSGSTORE-001：给发送方回一条 16 应答。编号 16 早已在两端 protocol.h 定义、
     // 此前服务端从未生成，本次只是把它用起来：客户端据此确认「服务端已入库」，
@@ -613,13 +657,22 @@ PDU *MsgHandler::deldir(const QString& loginName)
         const QFileInfo delInfo(delFilePath);
         const QString delParent = FileObjectStore::normalizeParent(loginName, delInfo.absolutePath());
         const QString delName = delInfo.fileName();
+        // REQ-AUDIT-001 R7：链接清理随条目操作同事务，先算相对路径再进门
+        QString shareRel;
+        {
+            const QString userRoot = QDir(Server::getinstance().filesPath).absoluteFilePath(loginName);
+            const QString rel = QDir(userRoot).relativeFilePath(delInfo.absoluteFilePath());
+            if(!rel.startsWith("..") && !rel.startsWith('/') && !rel.isEmpty()){
+                shareRel = rel;
+            }
+        }
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, delParent, delName);
         if(e.valid()){
             if(e.isDir){
-                ans = FileObjectStore::instance().releaseSubtree(e.fileId, loginName);
+                ans = FileObjectStore::instance().releaseSubtree(e.fileId, loginName, shareRel);
             } else {
-                ans = FileObjectStore::instance().releaseEntry(e.fileId, loginName);
+                ans = FileObjectStore::instance().releaseEntry(e.fileId, loginName, shareRel);
             }
         } else if(delFileType==0){
             // REQ-MIG-001：文件一律经逻辑条目释放；此分支只剩"无条目的残留物理目录"回收。
@@ -628,22 +681,10 @@ PDU *MsgHandler::deldir(const QString& loginName)
             ans=dir.removeRecursively();
             if(ans){
                 QString relErr;
-                if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr)){
+                if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr, shareRel)){
                     qCWarning(lcFs)<<"[deldir] 子树条目级联软删失败 conn="<<m_connId<<":"<<relErr;
                 }
             }
-        }
-    }
-
-    // 跨功能联动：删除成功后，清理该文件（或目录下所有文件）对应的分享链接记录
-    if(ans){
-        // owner 直接使用登录名；relPath 以用户根目录为基准取相对路径，
-        // 避免相对 filesPath 反推时把 filesys 误判为 owner 段
-        QString userRoot = QDir(Server::getinstance().filesPath).absoluteFilePath(loginName);
-        QString relPath = QDir(userRoot).relativeFilePath(QFileInfo(delFilePath).absoluteFilePath());
-        if(!relPath.startsWith("..") && !relPath.startsWith("/") && !relPath.isEmpty()){
-            OperateDB::instance().deleteShareLinkByPath(loginName, relPath);
-            qCDebug(lcFs) << "[deldir] 已联动清理分享链接: owner=" << loginName << " relPath=" << relPath;
         }
     }
 
@@ -781,6 +822,23 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         // REQ-EXT-FILE-001 D5：条目优先。有条目→只动逻辑键（目录条目级联子树，同事务），
         // 目录物理实体若存在则同步改名防幽灵；无条目目录走物理改名+条目级联，无条目文件一律拒绝。
         const QString renParent = FileObjectStore::normalizeParent(loginName, dirPath);
+        // REQ-AUDIT-001 R7：链接平移与条目改名同一事务——先算出旧/新相对路径
+        QString shareRelDir = dirPath;
+        {
+            const QString userRootRel = QDir(Server::getinstance().filesPath).filePath(loginName);
+            const QString userRootAbs = QDir(Server::getinstance().filesPath).absoluteFilePath(loginName);
+            if (shareRelDir.startsWith(userRootRel)) {
+                shareRelDir = shareRelDir.mid(userRootRel.length());
+                if (shareRelDir.startsWith('/')) shareRelDir = shareRelDir.mid(1);
+            } else {
+                shareRelDir = QDir(userRootAbs).relativeFilePath(QFileInfo(dirPath).absoluteFilePath());
+            }
+            if (shareRelDir.startsWith("..") || shareRelDir.startsWith('/') || shareRelDir == ".") {
+                shareRelDir.clear();
+            }
+        }
+        const QString oldShareRel = shareRelDir.isEmpty() ? oldName : shareRelDir + "/" + oldName;
+        const QString newShareRel = shareRelDir.isEmpty() ? newName : shareRelDir + "/" + newName;
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, renParent, oldName);
         // REQ-EXT-SEC-002：类型权威=服务端（条目 is_dir 优先，无条目查物理）；客户端声明只做对照告警
@@ -809,7 +867,8 @@ PDU *MsgHandler::renamefile(const QString& loginName)
                 qCWarning(lcFs)<<"[renamefile] 拒绝：目标名已被物理实体占用 conn="<<m_connId<<":"<<newFilePath;
             } else {
                 QString relErr;
-                ret = FileObjectStore::instance().relocateEntry(e.fileId, loginName, renParent, newName, relErr);
+                ret = FileObjectStore::instance().relocateEntry(e.fileId, loginName, renParent, newName,
+                                                                relErr, oldShareRel, newShareRel);
                 if(!ret){
                     qCWarning(lcFs)<<"[renamefile] 条目改名失败 conn="<<m_connId<<":"<<relErr;
                 } else if(oldPhys.exists()){
@@ -831,7 +890,8 @@ PDU *MsgHandler::renamefile(const QString& loginName)
             ret=dir.rename(oldFilePath,newFilePath);
             if(ret){
                 QString casErr;
-                if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr)){
+                if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr,
+                                                                  oldShareRel, newShareRel)){
                     qCWarning(lcFs)<<"[renamefile] 旧目录改名条目级联失败 conn="<<m_connId<<":"<<casErr;
                 }
             }
@@ -842,35 +902,6 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         }
     }
     qCDebug(lcFs)<<"rename ret"<<ret<<endl;
-
-    // 跨功能联动：重命名成功后，平移该文件的分享链接 relative_path
-    if(ret){
-        // owner 直接使用登录名；relDir 以用户根目录为基准取相对路径，
-        // 避免相对 filesPath 反推时把 filesys 误判为 owner 段
-        // dirPath 已在重命名前取得（校验对象即此目录）
-        // relDir：去掉"用户根目录"前缀得到相对路径。
-        // 直接字符串剥离，避免 relativeFilePath 在 CWD 不一致时算出 ".." 开头，
-        // 从而被下方守卫跳过整段联动（即重命名未关联 share_link 的根因）。
-        QString userRootRel = QDir(Server::getinstance().filesPath).filePath(loginName); // 如 ./filesys/wcy
-        QString relDir = dirPath;
-        if (relDir.startsWith(userRootRel)) {
-            relDir = relDir.mid(userRootRel.length());
-            if (relDir.startsWith('/')) relDir = relDir.mid(1);
-        } else {
-            // 兜底：dirPath 非预期格式时退回 relativeFilePath 计算
-            relDir = QDir(QDir(Server::getinstance().filesPath).absoluteFilePath(loginName))
-                         .relativeFilePath(QFileInfo(dirPath).absoluteFilePath());
-        }
-        if(!relDir.startsWith("..") && !relDir.startsWith("/")){
-            QString oldRel = relDir.isEmpty() ? oldName
-                                             : relDir + "/" + oldName;
-            QString newRel = relDir.isEmpty() ? newName
-                                             : relDir + "/" + newName;
-            OperateDB::instance().updateShareLinkPath(loginName, oldRel, newRel);
-            qCDebug(lcFs) << "[renamefile] 已联动更新分享链接: owner=" << loginName
-                     << " oldRel=" << oldRel << " newRel=" << newRel;
-        }
-    }
 
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_RENAMEFILE_RESPOND;
@@ -1092,8 +1123,11 @@ PDU *MsgHandler::movefile(const QString& loginName)
                 finalName=QString("%1(%2)%3").arg(base).arg(n).arg(ext);
             }
             QString relErr;
+            // REQ-AUDIT-001 R7：链接平移与条目移动同一事务
+            const QString newShareRel = dstRel.isEmpty() ? finalName : (dstRel + "/" + finalName);
             ret = FileObjectStore::instance().relocateEntry(mvEntry.fileId, loginName,
-                                                            dstNorm, finalName, relErr);
+                                                            dstNorm, finalName, relErr,
+                                                            srcRel, newShareRel);
             if(!ret){
                 qCWarning(lcFs)<<"movefile 条目移动失败 conn="<<m_connId<<":"<<relErr;
             } else {
@@ -1120,14 +1154,6 @@ PDU *MsgHandler::movefile(const QString& loginName)
     qCDebug(lcFs)<<"movefile src:"<<srcPath<<"dst:"<<dstPath<<"ret:"<<ret;
 
     const QString echoName = entryMoved ? entryFinalName : fileName;
-
-    // 跨功能联动：移动成功后，平移该文件的分享链接 relative_path
-    if(ret){
-        QString newRel = dstRel.isEmpty() ? echoName : (dstRel + "/" + echoName);
-        OperateDB::instance().updateShareLinkPath(loginName, srcRel, newRel);
-        qCDebug(lcFs) << "[movefile] 已联动更新分享链接: owner=" << loginName
-                 << " oldRel=" << srcRel << " newRel=" << newRel;
-    }
 
     // 响应：caData[0]=ret；caData+32 回显服务端最终文件名（重名时可能带 (n) 后缀）。
     PDU* respdu=mkPDU();
@@ -1613,24 +1639,28 @@ PDU *MsgHandler::uploadfilefastcheck()
     if (!handled) {
         const qint64 objectId = FileObjectStore::instance().findObjectBySha(shaHex, fileSize);
         if (objectId >= 0) {
+            // REQ-AUDIT-001 R9：条目 + 引用计数 + 完成态会话行同一事务（不再二次插入）
+            qint64 sid = -1;
             const FileObjectStore::AttachResult ar = FileObjectStore::instance().attachExistingObject(
-                        m_actorName, parent, displayName, objectId, fileSize);
-            if (ar.ok) {
-                qint64 sid = OperateDB::instance().insertCompletedUploadSession(
-                            m_actorName, parent, ar.displayName, fileSize, shaHex, reqId, ar.fileId);
-                if (sid < 0) {
-                    // 同请求键并发登记冲突：回读既有行（条目已落，不回滚）
-                    const OperateDB::UploadSessionLookup ex =
-                            OperateDB::instance().lookupUploadSessionByRequestId(m_actorName, reqId);
-                    sid = ex.found ? ex.sessionId : -1;
-                    qCWarning(lcFs) << "[fastcheck] 命中登记幂等行失败，回读既有会话 conn=" << m_connId;
-                }
+                        m_actorName, parent, displayName, objectId, fileSize, reqId, &sid);
+            if (ar.ok && sid >= 0) {
                 ret = true; hit = true; fileId = ar.fileId; sessionId = sid;
                 finalName = ar.displayName.toUtf8();
                 qCDebug(lcFs) << "[fastcheck] 命中 fileId=" << ar.fileId << " objId=" << objectId
-                              << " 幂等=" << ar.idempotent << " conn=" << m_connId;
+                              << " sessionId=" << sid << " 幂等=" << ar.idempotent << " conn=" << m_connId;
             } else {
-                qCWarning(lcFs) << "[fastcheck] 条目安置失败 conn=" << m_connId << " 原因=" << ar.error;
+                // 同请求键并发冲突（uk_req）等：本次事务已整体回滚，回读赢家的幂等行。
+                const OperateDB::UploadSessionLookup ex =
+                        OperateDB::instance().lookupUploadSessionByRequestId(m_actorName, reqId);
+                if (ex.found && ex.sessionId >= 0 && ex.fileId >= 0) {
+                    ret = true; hit = true; fileId = ex.fileId; sessionId = ex.sessionId;
+                    finalName = ex.displayName.toUtf8();
+                    qCDebug(lcFs) << "[fastcheck] 幂等回读既有会话 sessionId=" << ex.sessionId
+                                  << " fileId=" << ex.fileId << " conn=" << m_connId;
+                } else {
+                    qCWarning(lcFs) << "[fastcheck] 条目/会话登记失败 conn=" << m_connId
+                                    << " 原因=" << (ar.ok ? QStringLiteral("会话登记失败") : ar.error);
+                }
             }
         } else {
             // 未命中：不建对象、不建条目，只登记暂存会话（后续走既有分块 PDU，零改动）
@@ -1991,7 +2021,9 @@ PDU *MsgHandler::chatmsg()
     char revName[32]={'\0'};
     memcpy(revName,pdu->caData,32);
     memcpy(seedName,pdu->caData+32,32);
-    QStringList Msglist= OperateDB::instance().getchatMsg(seedName,revName);
+    QVector<qlonglong> ids;
+    QStringList Msglist= OperateDB::instance().getchatMsg(seedName,revName,&ids);
+    m_pendingDeliveredIds=ids;   // R2：连接层写出成功后确认
     qCDebug(lcNet)<<"chatmsg msglist.size"<<Msglist.size()<<" ";
     int Msgtotallen=0;
     for(int i=0;i<Msglist.size();i+=2){
@@ -2014,6 +2046,17 @@ PDU *MsgHandler::chatmsg()
         dis+=filei->totalLen;
     }
     return respdu;
+}
+
+// REQ-AUDIT-001 R2：18 响应已成功写出 → 把本批未送达消息置为已送达。
+// 未被调用（写失败/断线）时消息保持 issuccess=0，下次拉取重投。
+void MsgHandler::confirmChatDelivered()
+{
+    if(m_pendingDeliveredIds.isEmpty()){
+        return;
+    }
+    OperateDB::instance().markChatDelivered(m_pendingDeliveredIds);
+    m_pendingDeliveredIds.clear();
 }
 
 //获取用户信息
@@ -2066,6 +2109,47 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
         renewSeconds = PUBLINK_RENEW_DEFAULT_SECONDS;
     }
 
+    // ===== REQ-AUDIT-001 R5：创建/续期/重新生成的前置授权门 =====
+    // 解析侧已按 owner 根校验来源；创建侧必须同源，否则会产生越界或指向不存在对象的
+    // 无效记录与对外死链。只允许：本人用户根内、真实存在、非目录的条目。
+    {
+        bool pathOk = !relativePath.isEmpty()
+                && relativePath.toUtf8().size() <= 480
+                && !relativePath.contains(QChar('\0'))
+                && !relativePath.startsWith(QLatin1Char('/'))
+                && !relativePath.contains(QLatin1Char(':'));
+        // 拒绝 "." / ".." 段：share_link 必须保存规范相对路径，否则 R7 的链接平移匹配不到
+        if(pathOk){
+            const QStringList segs = relativePath.split(QLatin1Char('/'), Qt::SkipEmptyParts);
+            for(const QString& seg : segs){
+                if(seg == QLatin1String(".") || seg == QLatin1String("..")){ pathOk = false; break; }
+            }
+        }
+        if(pathOk){
+            const QString userRoot = QDir(Server::getinstance().filesPath).absoluteFilePath(ownerName);
+            const QString absPath = QDir(userRoot).absoluteFilePath(relativePath);
+            pathOk = logicPathInActorRoot(absPath);
+            if(pathOk){
+                const QFileInfo fi(absPath);
+                const QString parent = FileObjectStore::normalizeParent(ownerName, fi.absolutePath());
+                const FileObjectStore::EntryInfo e =
+                        FileObjectStore::instance().entryByPath(ownerName, parent, fi.fileName());
+                pathOk = e.valid() && !e.isDir;
+            }
+        }
+        if(!pathOk){
+            qCWarning(lcFs) << "[createPublishLink] 拒绝：路径非法/不存在/非文件 conn=" << m_connId
+                            << " owner=" << ownerName;
+            PDU* respdu = mkPDU(128);
+            respdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND;
+            bool ok = false;
+            const quint32 state = PUBLINK_STATE_VALID;
+            memcpy(respdu->caData, &ok, sizeof(ok));
+            memcpy(respdu->caData + PUBLINK_STATE_OFFSET, &state, sizeof(state));
+            return respdu;
+        }
+    }
+
     OperateDB::ShareLinkInfo existing;
     const bool hasExisting = OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, existing);
     quint32 state = PUBLINK_STATE_VALID;
@@ -2078,17 +2162,16 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
     QString linkValue;
     bool ok = false;
     if(action == PUBLINK_ACTION_NEW){
-        // 重新生成：先作废旧行（旧链接立即失效），再建新 token——"重新获取"要能换掉泄露出去的旧链接
-        if(hasExisting && !OperateDB::instance().removeShareLinkExact(ownerName, relativePath)){
-            qCWarning(lcFs) << "[createPublishLink] 作废旧链接失败，放弃重新生成 owner=" << ownerName;
+        // 重新生成：REQ-AUDIT-001 R6——作废旧行与写入新 token 同一事务，
+        // 插入失败时旧链接保持有效（不再出现"旧链接已作废、新链接没建"）。
+        const QString token = ShareLinkService::generateToken();
+        ok = OperateDB::instance().replaceShareLink(ShareLinkService::hashToken(token), ownerName,
+                                                    relativePath, ShareLinkService::defaultExpireTime());
+        if(ok){
+            linkValue = token;
+            state = PUBLINK_STATE_VALID;
         } else {
-            const QString token = ShareLinkService::generateToken();
-            ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName,
-                                                       relativePath, ShareLinkService::defaultExpireTime());
-            if(ok){
-                linkValue = token;
-                state = PUBLINK_STATE_VALID;
-            }
+            qCWarning(lcFs) << "[createPublishLink] 重新生成失败（旧链接保留）owner=" << ownerName;
         }
     } else if(action == PUBLINK_ACTION_RENEW){
         if(!hasExisting){

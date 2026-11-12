@@ -10,6 +10,8 @@
 #include "transfertask.h"
 #include <string.h>
 #include <QByteArray>
+#include <QPixmap>
+#include <QBoxLayout>
 #include <QFile>
 #include <QSslSocket>
 #include <QSslConfiguration>
@@ -571,8 +573,32 @@ void Client::on_pushButton_clicked(){
     seedMsg(pdu);
 }
 
-void Client::updateCaptchaDisplay(const QString& code){
-    ui->randcode_LE->setPlaceholderText(code);
+// REQ-AUDIT-001 R8：服务端只下发 PNG。图片放在"验证码"文字之后的独立标签里，
+// 不改动原标签文字（用户要求：不要盖住"验证码"这三个字）。
+void Client::updateCaptchaImage(const QByteArray& png){
+    QPixmap pixmap;
+    if(!pixmap.loadFromData(png, "PNG") || pixmap.isNull()){
+        if(m_captchaImageLabel != nullptr){
+            m_captchaImageLabel->clear();
+        }
+        ui->randcode->setToolTip("验证码图片解析失败，请重新获取");
+        return;
+    }
+    if(m_captchaImageLabel == nullptr){
+        m_captchaImageLabel = new QLabel(ui->captchaLayout->parentWidget());
+        m_captchaImageLabel->setObjectName("captchaImageLabel");
+        m_captchaImageLabel->setToolTip("请按图片输入验证码");
+        m_captchaImageLabel->setAlignment(Qt::AlignCenter);
+        // 图片插在 captchaLayout 中"验证码"标签之后（grid 里的第 2 行横向布局）
+        QBoxLayout* lay = qobject_cast<QBoxLayout*>(ui->captchaLayout);
+        if(lay != nullptr){
+            const int idx = lay->indexOf(ui->randcode);
+            lay->insertWidget(idx >= 0 ? idx + 1 : 0, m_captchaImageLabel);
+        }
+    }
+    // 高度收敛到 36px：行内还要放输入框与按钮，避免把布局撑出窗口
+    m_captchaImageLabel->setPixmap(pixmap.scaledToHeight(36, Qt::SmoothTransformation));
+    m_captchaImageLabel->setVisible(true);
 }
 
 void Client::resetCaptchaButton(){

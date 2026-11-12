@@ -56,7 +56,9 @@ public:
     // 分派单个完整 PDU；返回的 PDU 由调用方 seedMsg 发送并释放（见下方所有权规则）。
     PDU* handlMsg(PDU* pdu);
     // 发送响应并 memfree（所有权转移给本方法）；respdu 为 nullptr 时无操作。
-    void seedMsg(PDU* respdu);
+    // REQ-AUDIT-001 R2：返回是否真正交给套接字写出（nullptr 或 write 报错为 false），
+    // 供 18 响应在成功后确认私聊已送达。
+    bool seedMsg(PDU* respdu);
 
     // ===== REQ-EXT-TRANSFER-001：per-transfer 流式分块下载（单调度环 + 单定时器，§4.1） =====
     static const int DOWNLOAD_CHUNK_SIZE = 65536; // 64KB

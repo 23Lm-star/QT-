@@ -51,6 +51,7 @@ SOURCES += \
     operatedb.cpp \
     protocol.cpp \
     chatbounds.cpp \
+    captchaimage.cpp \
     reclaimscheduler.cpp \
     resumableuploadsession.cpp \
     server.cpp \
@@ -73,6 +74,7 @@ HEADERS += \
     operatedb.h \
     protocol.h \
     chatbounds.h \
+    captchaimage.h \
     reclaimscheduler.h \
     resumableuploadsession.h \
     server.h \

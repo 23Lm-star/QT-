@@ -33,6 +33,8 @@ import pymysql  # noqa: E402
 HOST, PORT, HDR, PWD = "127.0.0.1", 5000, 76, "123456"
 T_CAP, T_CAP_R, T_REG, T_REG_R, T_LOGIN, T_LOGIN_R = 44, 45, 1, 2, 3, 4
 T_CPL, T_CPL_R, T_RES, T_RES_R, T_QUERY, T_QUERY_R = 52, 53, 54, 55, 56, 57
+T_UP_INIT, T_UP_INIT_R, T_UP_DATA, T_UP_DATA_R = 29, 30, 31, 32
+UPLOAD_MAGIC = 0x5253554d   # "RSUM"
 
 OWNER, OTHER = "sh1user", "sh1other"
 REL = "sh1.bin"
@@ -51,6 +53,40 @@ def check(label, cond, detail=""):
 
 def f32(s):
     return s.encode()[:31].ljust(32, b"\0")
+
+
+def u32(v):
+    return struct.pack("<I", v)
+
+
+def u64(v):
+    return struct.pack("<Q", v)
+
+
+def upload_file(c, name, data, tid=901):
+    """REQ-MIG-001 后文件只存在于逻辑条目：夹具必须走真实上传路径，不能再写物理文件。"""
+    dat = bytearray(64)
+    dat[0:32] = f32(name)
+    dat[32:40] = struct.pack("<q", len(data))
+    dat[40:44] = u32(UPLOAD_MAGIC)
+    dat[48:56] = u64(tid)
+    r = c.ask(pdu(T_UP_INIT, msg=("./filesys/" + OWNER).encode(), dat=bytes(dat)), T_UP_INIT_R)
+    assert r and r[0][1][0], "29 init rejected"
+    d = bytearray(64)
+    d[0:8] = struct.pack("<q", 0)
+    d[40:44] = u32(UPLOAD_MAGIC)
+    d[48:56] = u64(tid)
+    r = c.ask(pdu(T_UP_DATA, msg=data, dat=bytes(d)), T_UP_DATA_R, timeout=30)
+    assert r and r[0][1][0], "31 upload rejected"
+
+
+def entry_exists(owner, saved_path):
+    name = saved_path.rsplit("/", 1)[-1] if saved_path else ""
+    if not name:
+        return False
+    return q1("SELECT COUNT(*) FROM user_file WHERE owner_name=%s "
+              "AND parent_path='/分享链接/' AND display_name=%s AND status='active'",
+              (owner, name))[0] > 0
 
 
 def pdu(t, msg=b"", dat=b""):
@@ -234,9 +270,9 @@ try:
         shutil.rmtree(FS / u, ignore_errors=True)
         register(u)
     (FS / OWNER).mkdir(parents=True, exist_ok=True)
-    (FS / OWNER / REL).write_text("SHARE-001-CONTENT")
 
     c = login(OWNER)
+    upload_file(c, REL, b"SHARE-001-CONTENT")   # 逻辑条目夹具（REQ-MIG-001 后唯一可分享形态）
     check("A0 夹具就绪（登录成功、无历史链接）", c is not None and row() is None)
 
     # ---------------- 旧语义 + 状态字 ----------------
@@ -257,8 +293,9 @@ try:
           e1 is True and s1 == ST_VALID and token_of(link1q) == row()[0], "state=%s" % s1)
 
     ok, saved = resolve(c, tok1)
-    f = landed(saved)
-    check("A5 有效链接可解析落地", ok is True and f is not None and f.is_file(), "ok=%s %s" % (ok, saved))
+    check("A5 有效链接可解析落地（目标落为逻辑条目）",
+          ok is True and saved and entry_exists(OWNER, landed(saved).name if landed(saved) else ""),
+          "ok=%s %s" % (ok, saved))
 
     exec_sql("UPDATE share_link SET expire_time=%s WHERE owner_name=%s AND relative_path=%s",
              ((datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"), OWNER, REL))
@@ -304,8 +341,9 @@ try:
     ok, _ = resolve(c, old_hash)
     check("C4 旧链接立即失效（解析被拒）", ok is False, "ok=%s" % ok)
     ok, saved = resolve(c, new_tok)
-    f = landed(saved)
-    check("C5 新链接可解析落地", ok is True and f is not None and f.is_file(), "ok=%s %s" % (ok, saved))
+    check("C5 新链接可解析落地（目标落为逻辑条目）",
+          ok is True and saved and entry_exists(OWNER, landed(saved).name if landed(saved) else ""),
+          "ok=%s %s" % (ok, saved))
 
     e4, s4, link4 = query(c, REL)
     check("C6 重新生成后查询回到 VALID 且指向新 hash",

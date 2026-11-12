@@ -73,7 +73,10 @@ public:
     // 当前为空实现（预留的加载动画钩子）。
     void showLoadingAnimation(bool success);
     // 把服务端下发的验证码显示为输入框占位提示。
-    void updateCaptchaDisplay(const QString& code);
+    // REQ-AUDIT-001 R8：验证码改为图片，文本答案不再下发到客户端
+    void updateCaptchaImage(const QByteArray& png);
+    // 图片展示控件：懒创建，插入到"验证码"文字标签之后，不覆盖标签文字
+    QLabel* m_captchaImageLabel = nullptr;
     // 冷却结束/解锁后恢复“获取验证码”按钮。
     void resetCaptchaButton();
 

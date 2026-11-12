@@ -93,8 +93,8 @@ bool OperateDB::checkSchemaVersion()
         qCCritical(lcDb) << "[checkSchemaVersion] 读取 schema_version 失败（表不存在？）:"
                          << q.lastError().text()
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql "
-                            "与 migrate_ext_reclaim_001.sql";
+                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
+                            "migrate_ext_reclaim_001.sql 与 migrate_friend_req_001.sql";
         return false;
     }
     int version = 0;
@@ -106,12 +106,13 @@ bool OperateDB::checkSchemaVersion()
                               qMax(kGroupSchemaVersion,
                                    qMax(kGroupMessageSchemaVersion,
                                         qMax(kFastUploadSchemaVersion,
-                                             qMax(kGroupFileSchemaVersion, kReclaimSchemaVersion)))));
+                                             qMax(kGroupFileSchemaVersion,
+                                                  qMax(kReclaimSchemaVersion, kFriendRequestSchemaVersion))))));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql "
-                            "与 migrate_ext_reclaim_001.sql";
+                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
+                            "migrate_ext_reclaim_001.sql 与 migrate_friend_req_001.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -515,13 +516,61 @@ bool OperateDB::removeShareLinkExact(const QString &owner, const QString &path)
     return true;
 }
 
+// REQ-AUDIT-001 R6：作废旧链接 + 写入新链接同一事务。
+// 任一步失败整体回滚，旧链接保持可用（对齐"重新生成要么换掉、要么保持原样"）。
+bool OperateDB::replaceShareLink(const QString &hash, const QString &owner, const QString &path,
+                                 const QDateTime &expire)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()) return false;
+    QSqlDatabase db = connection.database();
+    if(!db.transaction()){
+        qCWarning(lcDb) << "[replaceShareLink] 事务开启失败:" << db.lastError().text();
+        return false;
+    }
+    QSqlQuery del(db);
+    del.prepare("DELETE FROM share_link WHERE owner_name = ? AND relative_path = ?");
+    del.addBindValue(owner);
+    del.addBindValue(path);
+    if(!del.exec()){
+        qCWarning(lcDb) << "[replaceShareLink] 作废旧链接失败:" << del.lastError().text();
+        db.rollback();
+        return false;
+    }
+    QSqlQuery ins(db);
+    ins.prepare("INSERT INTO share_link (token_hash, owner_name, relative_path, expire_time) VALUES (?, ?, ?, ?)");
+    ins.addBindValue(hash);
+    ins.addBindValue(owner);
+    ins.addBindValue(path);
+    ins.addBindValue(expire.toString("yyyy-MM-dd HH:mm:ss"));
+    if(!ins.exec()){
+        qCWarning(lcDb) << "[replaceShareLink] 写入新链接失败（已回滚，旧链接保留）:" << ins.lastError().text()
+                        << " owner=" << owner;
+        db.rollback();
+        return false;
+    }
+    if(!db.commit()){
+        qCWarning(lcDb) << "[replaceShareLink] 提交失败:" << db.lastError().text();
+        db.rollback();
+        return false;
+    }
+    return true;
+}
+
 // 跨功能联动：删除文件/目录时，清理对应的分享链接记录
 // path 为相对 owner 根目录的路径；若为目录则同时清理其下所有文件（前缀匹配）
 bool OperateDB::deleteShareLinkByPath(const QString &owner, const QString &path)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
-    QSqlQuery q(connection.database());
+    QSqlDatabase db = connection.database();
+    return deleteShareLinkByPathTx(db, owner, path);
+}
+
+// REQ-AUDIT-001 R7：事务内删除（精确路径 + 子路径前缀）
+bool OperateDB::deleteShareLinkByPathTx(QSqlDatabase &db, const QString &owner, const QString &path)
+{
+    QSqlQuery q(db);
     q.prepare("DELETE FROM share_link WHERE owner_name = ? AND (relative_path = ? OR relative_path LIKE ?)");
     q.addBindValue(owner);
     q.addBindValue(path);
@@ -543,7 +592,21 @@ bool OperateDB::updateShareLinkPath(const QString &owner, const QString &oldPath
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
     QSqlDatabase db = connection.database();
+    // REQ-AUDIT-001 R7：两条 UPDATE 必须同事务，否则目录平移可能只成功一半。
+    if(!db.transaction()) return false;
+    const bool ok = updateShareLinkPathTx(db, owner, oldPath, newPath);
+    if(ok && db.commit()){
+        return true;
+    }
+    db.rollback();
+    return false;
+}
 
+// REQ-AUDIT-001 R7：事务内平移（调用方负责提交/回滚）
+bool OperateDB::updateShareLinkPathTx(QSqlDatabase &db, const QString &owner,
+                                      const QString &oldPath, const QString &newPath)
+{
+    if(oldPath == newPath) return true;
     // 1) 文件自身：relative_path = oldPath → newPath
     QSqlQuery q1(db);
     q1.prepare("UPDATE share_link SET relative_path = ? WHERE owner_name = ? AND relative_path = ?");
@@ -766,12 +829,19 @@ QStringList OperateDB::handleOnlineUsers(const QString &strname)
     return ret;
 }
 
-// 加好友前置检查：只判断目标是否在线。返回 1 在线 / 0 不在线或不存在 /
-// -1 参数为空或连接不可用。usrname 当前未参与判定。
+// 加好友前置检查：判断目标是否在线；在线时把 (请求方, 目标) 落为待处理邀请。
+// REQ-AUDIT-001 R4：接受阶段必须命中这条 pending 行，请求方以库内记录为准，
+// 客户端随后提交的"请求方"字段不再决定关系方向。
+// 返回 1 在线（已登记邀请）/ 0 不在线或不存在 / -1 参数为空或连接不可用。
 int OperateDB::handleAddFriend(char *usrname, char *tarname)
 {
     if(usrname==nullptr||tarname==nullptr){
         return -1;
+    }
+    const QString requester = QString::fromUtf8(usrname);
+    const QString target = QString::fromUtf8(tarname);
+    if(requester.isEmpty() || target.isEmpty() || requester==target){
+        return 0;
     }
 
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -782,20 +852,37 @@ int OperateDB::handleAddFriend(char *usrname, char *tarname)
     QSqlQuery q(db);
 
     q.prepare("select * from user_info where name = ? and online = 1");
-    q.addBindValue(QString::fromUtf8(tarname));
+    q.addBindValue(target);
     q.exec();
-    if(q.next()){
-        return 1;
+    if(!q.next()){
+        return 0;
     }
-    return 0;
+    // 幂等：同一对请求方/目标只保留一条 pending；重复请求不重复登记，也不刷新时间。
+    q.prepare("INSERT IGNORE INTO friend_request(requester_name,target_name,status) "
+              "VALUES(?,?,'pending')");
+    q.addBindValue(requester);
+    q.addBindValue(target);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"addfriend: 邀请登记失败:"<<q.lastError().text()
+                       <<" requester="<<requester<<" target="<<target;
+        // 登记失败不能放行（否则接受阶段必然失败），按"不在线/不可用"回 0
+        return 0;
+    }
+    return 1;
 }
 
-// 落库好友关系：只插入 (usrname -> tarname) 一个方向，重复插入由主键/唯一约束失败。
-// 返回 1 成功 / 0 INSERT 或提交失败 / -1 参数为空或连接不可用。
+// 接受好友：REQ-AUDIT-001 R4——同一事务内校验待处理邀请并写入双向关系。
+// usrname=请求方（由调用方从 PDU 取，仅作查询键），tarname=接受方（连接身份）。
+// 返回 1 成功 / 0 无待处理邀请或写入失败 / -1 参数为空或连接不可用。
 int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
 {
     if(usrname==nullptr||tarname==nullptr){
         return -1;
+    }
+    const QString requester = QString::fromUtf8(usrname);
+    const QString accepter = QString::fromUtf8(tarname);
+    if(requester.isEmpty() || accepter.isEmpty() || requester==accepter){
+        return 0;
     }
 
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -803,26 +890,51 @@ int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
         return -1;
     }
     QSqlDatabase db = connection.database();
-    
-    // 开启事务
-    db.transaction();
+    if(!db.transaction()){
+        qCWarning(lcDb)<<"addfriendFin: 事务开启失败:"<<db.lastError().text();
+        return 0;
+    }
+
     QSqlQuery q(db);
-
-    // 使用两个名字字段存储好友关系
-    q.prepare("INSERT INTO friend (name, friendName) VALUES (?, ?)");
-    q.addBindValue(QString::fromUtf8(usrname));
-    q.addBindValue(QString::fromUtf8(tarname));
-    if(!q.exec()) {
+    q.prepare("SELECT id FROM friend_request WHERE requester_name=? AND target_name=? "
+              "AND status='pending' FOR UPDATE");
+    q.addBindValue(requester);
+    q.addBindValue(accepter);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"addfriendFin: 查询邀请失败:"<<q.lastError().text();
         db.rollback();
         return 0;
     }
+    if(!q.next()){
+        // 无待处理邀请：伪造的接受（含客户端声称的请求方）一律拒绝
+        db.rollback();
+        qCWarning(lcDb)<<"addfriendFin: 拒绝：无待处理邀请 requester="<<requester<<" accepter="<<accepter;
+        return 0;
+    }
+    const qlonglong requestId = q.value(0).toLongLong();
+    q.finish();
 
-    if(!db.commit()) {
+    // 双向关系同一事务写入；已存在的行保持幂等
+    q.prepare("INSERT IGNORE INTO friend (name, friendName) VALUES (?, ?)");
+    q.addBindValue(requester);
+    q.addBindValue(accepter);
+    if(!q.exec()){ qCWarning(lcDb)<<"addfriendFin: 写请求方向失败:"<<q.lastError().text(); db.rollback(); return 0; }
+
+    q.prepare("INSERT IGNORE INTO friend (name, friendName) VALUES (?, ?)");
+    q.addBindValue(accepter);
+    q.addBindValue(requester);
+    if(!q.exec()){ qCWarning(lcDb)<<"addfriendFin: 写接受方向失败:"<<q.lastError().text(); db.rollback(); return 0; }
+
+    q.prepare("UPDATE friend_request SET status='accepted', handled_at=NOW() WHERE id=?");
+    q.addBindValue(requestId);
+    if(!q.exec()){ qCWarning(lcDb)<<"addfriendFin: 更新邀请状态失败:"<<q.lastError().text(); db.rollback(); return 0; }
+
+    if(!db.commit()){
+        qCWarning(lcDb)<<"addfriendFin: 提交失败:"<<db.lastError().text();
         db.rollback();
         return 0;
     }
-    
-    qCDebug(lcDb)<<"AddFriendFin:"<<QString::fromUtf8(usrname)<<"<->"<<QString::fromUtf8(tarname);
+    qCDebug(lcDb)<<"addfriendFin:"<<requester<<"<->"<<accepter;
     return 1;
 }
 
@@ -888,10 +1000,13 @@ bool OperateDB::handleDeleteFriend(char *userName, char *tarName)
     return true;
 }
 
-// 落库私聊消息：issuccess=1 表示接收方当时在线（可实时投递），0 表示留待其上线拉取。
-// 返回接收方是否在线；INSERT 本身失败只记日志，不影响返回值。
-bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString seedTime, bool *storedOut)
+// 落库私聊消息：REQ-AUDIT-001 R1/R2 起 issuccess 恒写 0（待送达），由实时转发或
+// 离线补发真正写出成功后调用 markChatDelivered 置 1。返回接收方是否在线。
+// INSERT 失败只记日志并回带 storedOut=false，不影响返回值。
+bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString seedTime, bool *storedOut, qint64 *idOut)
 {
+    if(storedOut != nullptr)*storedOut = false;
+    if(idOut != nullptr)*idOut = -1;
     if(seedName==nullptr||revName==nullptr){
         return 0;
     }
@@ -915,20 +1030,22 @@ bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString 
     q.addBindValue(QString::fromUtf8(seedName));
     q.addBindValue(QString::fromUtf8(revName));
     q.addBindValue(msg);
-    q.addBindValue(ans ? 1 : 0);
+    q.addBindValue(0);                                  // R1/R2：待送达，写出成功后才置 1
     q.addBindValue(seedTime);
     bool execRet=q.exec();
     qCDebug(lcDb)<<"chat msg insert:"<<execRet;
     if(storedOut != nullptr)*storedOut = execRet;      // 16 应答的入库结果口径
+    if(execRet && idOut != nullptr)*idOut = q.lastInsertId().toLongLong();
     return ans;
 }
 
-// 拉取未送达私聊消息（issuccess=0）并在同一事务内置为已送达。
-// 返回扁平列表，每条消息依次为 msg、seed_time；事务/标记失败返回空列表，
-// 宁可下次重投也不重复下发。返回空也可能是确实没有消息。
-QStringList OperateDB::getchatMsg(char *seedName, char *revName)
+// 拉取未送达私聊消息（issuccess=0），只读不标记（REQ-AUDIT-001 R2）。
+// 返回扁平列表，每条消息依次为 msg、seed_time；idOut 回带对应主键（供写出成功后标记）。
+// 返回空也可能是确实没有消息。按主键升序＝接收顺序。
+QStringList OperateDB::getchatMsg(char *seedName, char *revName, QVector<qlonglong> *idOut)
 {
     QStringList ret;
+    if(idOut != nullptr) idOut->clear();
     if(seedName==nullptr||revName==nullptr){
         return ret;
     }
@@ -939,60 +1056,49 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName)
     }
     QSqlDatabase db = connection.database();
 
-    // 单次事务内完成"读取未送达 + 标记已送达"：并发拉取不会重复读到同一批行。
-    if(!db.transaction()){
-        qCWarning(lcDb)<<"getchatMsg begin transaction failed:"<<db.lastError().text();
-        return ret;
-    }
-
-    // FOR UPDATE：锁定本次将返回的行，使并发拉取在读到相同行之前被串行化。
     QSqlQuery q(db);
     q.prepare("select id,msg,seed_time from message_info "
-              "where seed_name = ? and rev_name = ? and issuccess = 0 for update");
+              "where seed_name = ? and rev_name = ? and issuccess = 0 order by id asc");
     q.addBindValue(QString::fromUtf8(seedName));
     q.addBindValue(QString::fromUtf8(revName));
     qCDebug(lcDb)<<"getchatMsg for:"<<QString::fromUtf8(seedName)<<"->"<<QString::fromUtf8(revName);
     if(!q.exec()){
         qCWarning(lcDb)<<"getchatMsg select failed:"<<q.lastError().text();
-        db.rollback();
         return ret;
     }
-    QVector<qlonglong> ids;
     while(q.next()){
-        ids.append(q.value(0).toLongLong());
+        if(idOut != nullptr) idOut->append(q.value(0).toLongLong());
         ret.append(q.value(1).toString());   // msg
         ret.append(q.value(2).toString());   // seed_time
     }
-    q.finish();   // 结束迭代，避免结果集状态影响后续语句
-
-    if(!ids.isEmpty()){
-        QStringList placeholders;
-        for(int i=0;i<ids.size();++i){
-            placeholders.append(QStringLiteral("?"));
-        }
-        // 独立 QSqlQuery，仅按本次返回的主键更新，并保留 issuccess=0 条件：
-        // 只标记"确实已返回"的行，事务提交前并发到达的新行不会被误标。
-        QSqlQuery upd(db);
-        upd.prepare(QStringLiteral("update message_info set issuccess = 1 "
-                                   "where id in (%1) and issuccess = 0")
-                        .arg(placeholders.join(QLatin1Char(','))));
-        for(int i=0;i<ids.size();++i){
-            upd.addBindValue(ids.at(i));
-        }
-        if(!upd.exec()){
-            qCWarning(lcDb)<<"getchatMsg update issuccess=1 failed:"<<upd.lastError().text();
-            db.rollback();
-            return QStringList();   // 未能标记已送达则不返回，宁可下次重投也不重复下发
-        }
-        qCDebug(lcDb)<<"getchatMsg update issuccess=1 rows:"<<upd.numRowsAffected();
-    }
-
-    if(!db.commit()){
-        qCWarning(lcDb)<<"getchatMsg commit failed:"<<db.lastError().text();
-        db.rollback();
-        return QStringList();
-    }
     return ret;
+}
+
+// 标记已送达：只更新仍为未送达的行，重复调用无副作用。
+bool OperateDB::markChatDelivered(const QVector<qlonglong> &ids)
+{
+    if(ids.isEmpty()){
+        return true;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return false;
+    }
+    QStringList placeholders;
+    for(int i=0;i<ids.size();++i){
+        placeholders.append(QStringLiteral("?"));
+    }
+    QSqlQuery q(connection.database());
+    q.prepare(QStringLiteral("update message_info set issuccess = 1 "
+                             "where id in (%1) and issuccess = 0").arg(placeholders.join(QLatin1Char(','))));
+    for(int i=0;i<ids.size();++i){
+        q.addBindValue(ids.at(i));
+    }
+    if(!q.exec()){
+        qCWarning(lcDb)<<"markChatDelivered failed:"<<q.lastError().text();
+        return false;
+    }
+    return true;
 }
 
 // 查询用户信息：命中回填 name 与 online 并返回 true；不存在或连接失败返回 false
@@ -1104,6 +1210,97 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     if(!q.exec()){
         qCDebug(lcDb)<<"logoff: warning - failed to delete login_records (might be empty):"<<QString::fromUtf8(name);
         // 不回滚，视为成功
+    }
+
+    // ===== REQ-AUDIT-001 R3：账号资产级联清理（与本事务同一提交） =====
+    // 目标：同名重注册不得看到/继承任何前账号资产。顺序：先收集受影响对象，再删引用，
+    // 最后按"表内真相"重算引用计数（与回收调度器同口径），归零置 pending_reclaim。
+    const QString ownerName = QString::fromUtf8(name);
+    QList<qint64> affectedObjects;
+    {
+        QSqlQuery oq(db);
+        oq.prepare("SELECT DISTINCT object_id FROM user_file WHERE owner_name=? AND object_id IS NOT NULL");
+        oq.addBindValue(ownerName);
+        if(!oq.exec()){ qCWarning(lcDb)<<"logoff: collect user_file objects failed:"<<oq.lastError().text(); db.rollback(); return false; }
+        while(oq.next()) affectedObjects.append(oq.value(0).toLongLong());
+
+        oq.prepare("SELECT DISTINCT object_id FROM group_file WHERE uploader_name=? AND object_id IS NOT NULL");
+        oq.addBindValue(ownerName);
+        if(!oq.exec()){ qCWarning(lcDb)<<"logoff: collect group_file objects failed:"<<oq.lastError().text(); db.rollback(); return false; }
+        while(oq.next()){
+            const qint64 oid = oq.value(0).toLongLong();
+            if(!affectedObjects.contains(oid)) affectedObjects.append(oid);
+        }
+    }
+
+    // 群：本人为群主的 active 群 → 解散；其余本人 active 成员行 → left（保留历史只读）
+    q.prepare("UPDATE group_info gi JOIN group_member gm ON gm.group_id=gi.group_id "
+              "SET gi.status='dissolved', gi.updated_at=CURRENT_TIMESTAMP "
+              "WHERE gm.user_name=? AND gm.role='owner' AND gm.status='active' AND gi.status='active'");
+    q.addBindValue(ownerName);
+    if(!q.exec()){ qCWarning(lcDb)<<"logoff: dissolve owned groups failed:"<<q.lastError().text(); db.rollback(); return false; }
+
+    q.prepare("UPDATE group_member SET status='left', updated_at=CURRENT_TIMESTAMP "
+              "WHERE user_name=? AND status='active'");
+    q.addBindValue(ownerName);
+    if(!q.exec()){ qCWarning(lcDb)<<"logoff: leave groups failed:"<<q.lastError().text(); db.rollback(); return false; }
+
+    // 待处理邀请：本人收到的与本人发出的
+    q.prepare("DELETE FROM group_invitation WHERE (target_name=? OR inviter_name=?) AND status='pending'");
+    q.addBindValue(ownerName);
+    q.addBindValue(ownerName);
+    if(!q.exec()){ qCWarning(lcDb)<<"logoff: delete group invitations failed:"<<q.lastError().text(); db.rollback(); return false; }
+
+    // 文件：删除本人个人条目与本人上传的群文件；内容对象只减引用，由回收调度器按宽限期清理
+    q.prepare("DELETE FROM user_file WHERE owner_name=?");
+    q.addBindValue(ownerName);
+    if(!q.exec()){ qCWarning(lcDb)<<"logoff: delete user_file failed:"<<q.lastError().text(); db.rollback(); return false; }
+
+    q.prepare("DELETE FROM group_file WHERE uploader_name=?");
+    q.addBindValue(ownerName);
+    if(!q.exec()){ qCWarning(lcDb)<<"logoff: delete group_file failed:"<<q.lastError().text(); db.rollback(); return false; }
+
+    q.prepare("DELETE FROM upload_session WHERE owner_name=?");
+    q.addBindValue(ownerName);
+    if(!q.exec()){
+        // upload_session 未迁移的旧库：不阻断注销（其余资产已清理）
+        qCDebug(lcDb)<<"logoff: warning - failed to delete upload_session:"<<q.lastError().text();
+    }
+
+    // 待处理好友邀请（REQ-AUDIT-001 R4）：表未迁移时不阻断注销
+    q.prepare("DELETE FROM friend_request WHERE requester_name=? OR target_name=?");
+    q.addBindValue(ownerName);
+    q.addBindValue(ownerName);
+    if(!q.exec()){
+        qCDebug(lcDb)<<"logoff: warning - failed to delete friend_request:"<<q.lastError().text();
+    }
+
+    // 按表内真相重算受影响对象的引用计数（active 个人条目 ∪ active 群文件）
+    for(qint64 oid : affectedObjects){
+        QSqlQuery fo(db);
+        fo.prepare("SELECT refcount,status FROM file_object WHERE object_id=? FOR UPDATE");
+        fo.addBindValue(oid);
+        if(!fo.exec() || !fo.next()){ continue; }   // 对象已不存在：跳过
+        if(fo.value(1).toString() == QLatin1String("reclaiming")){
+            continue;                               // 调度器已抢删除权：不复活、不重算
+        }
+        QSqlQuery cnt(db);
+        cnt.prepare("SELECT (SELECT COUNT(*) FROM user_file WHERE object_id=? AND status='active')"
+                    " + (SELECT COUNT(*) FROM group_file WHERE object_id=? AND status='active')");
+        cnt.addBindValue(oid);
+        cnt.addBindValue(oid);
+        if(!cnt.exec() || !cnt.next()){ qCWarning(lcDb)<<"logoff: recount object failed:"<<cnt.lastError().text(); db.rollback(); return false; }
+        const int refs = cnt.value(0).toInt();
+        QSqlQuery up(db);
+        up.prepare("UPDATE file_object SET refcount=?, status=?, reclaim_at=? WHERE object_id=?");
+        up.addBindValue(refs);
+        up.addBindValue(refs <= 0 ? QStringLiteral("pending_reclaim") : QStringLiteral("ready"));
+        // 显式格式化为 MySQL DATETIME 字符串（QMYSQL 直接绑 QDateTime 会带 'T'，严格模式拒收）
+        up.addBindValue(refs <= 0
+                        ? QVariant(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"))
+                        : QVariant(QVariant::String));
+        up.addBindValue(oid);
+        if(!up.exec()){ qCWarning(lcDb)<<"logoff: update object refcount failed:"<<up.lastError().text(); db.rollback(); return false; }
     }
 
     if(!db.commit()){
