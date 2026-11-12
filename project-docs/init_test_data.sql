@@ -10,7 +10,7 @@ CREATE TABLE user_info (
     name VARCHAR(32) UNIQUE NOT NULL,
     pwd VARCHAR(32) NOT NULL,
     online INT DEFAULT 0,
-    salt VARCHAR(32) NOT NULL DEFAULT '',
+    salt VARCHAR(32) NOT NULL,
     login_version BIGINT NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -32,11 +32,13 @@ CREATE TABLE friend (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 插入测试用户（注意：pwd 字段存储的是服务端加盐后的 32 字符 hex 串，不是明文！）
--- salt='' 表示迁移前老数据，按裸 MD5 比对；下方种子数据 salt 为空，登录成功后会自动补盐升级
--- 123456 的 MD5 哈希 = e10adc3949ba59abbe56e057f20f883e
-INSERT INTO user_info (name, pwd, online) VALUES ('tester', 'e10adc3949ba59abbe56e057f20f883e', 1);
-INSERT INTO user_info (name, pwd, online) VALUES ('friend1', 'e10adc3949ba59abbe56e057f20f883e', 1);
-INSERT INTO user_info (name, pwd, online) VALUES ('friend2', 'e10adc3949ba59abbe56e057f20f883e', 0);
+-- REQ-MIG-001 起无空盐分支：pwd = md5(客户端MD5 + salt)；缺 salt 的账号无法登录
+-- 123456 的 MD5 = e10adc3949ba59abbe56e057f20f883e；种子盐固定 0123456789abcdef0123456789abcdef
+-- 加盐后 pwd = 8cd647f4cec7bdfe190aee5399a6a638
+INSERT INTO user_info (name, pwd, salt, online) VALUES
+ ('tester',  '8cd647f4cec7bdfe190aee5399a6a638', '0123456789abcdef0123456789abcdef', 1),
+ ('friend1', '8cd647f4cec7bdfe190aee5399a6a638', '0123456789abcdef0123456789abcdef', 1),
+ ('friend2', '8cd647f4cec7bdfe190aee5399a6a638', '0123456789abcdef0123456789abcdef', 0);
 
 -- 建立好友关系 (name-friendName)
 INSERT INTO friend (name, friendName) VALUES ('tester', 'friend1');

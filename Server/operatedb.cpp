@@ -34,12 +34,9 @@ QString generatePasswordSalt()
                                  QCryptographicHash::Sha256).toHex().left(32));
 }
 
-// salt 为空表示迁移前的老数据：保持裸哈希原值比对（登录成功后由调用方补盐升级）
+// 统一加盐摘要：md5(客户端哈希+盐)；REQ-MIG-001 起不再存在空盐老数据分支
 QString applyPasswordSalt(const QString &clientHash, const QString &salt)
 {
-    if (salt.isEmpty()) {
-        return clientHash;
-    }
     return QString::fromLatin1(
         QCryptographicHash::hash((clientHash + salt).toUtf8(), QCryptographicHash::Md5).toHex());
 }
@@ -877,7 +874,7 @@ int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId,
     QString nameParam = QString::fromUtf8(strname);
     const QString clientHash = QString::fromUtf8(strpwd);
 
-    // 按用户名取存储哈希与盐（salt 为空 = 迁移前老数据）
+    // 按用户名取存储哈希与盐
     q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
     q.addBindValue(nameParam);
     qCDebug(lcDb)<<"login select for:"<<nameParam;
@@ -891,24 +888,10 @@ int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId,
     }
     const QString storedPwd = q.value(0).toString();
     const QString salt = q.value(1).toString();
-    QString effectiveHash = applyPasswordSalt(clientHash, salt);
+    const QString effectiveHash = applyPasswordSalt(clientHash, salt);
     if(effectiveHash != storedPwd){
         qCWarning(lcDb)<<"user name or password not found";
         return -1;
-    }
-
-    // 老用户登录成功 → 自动补盐升级（条件更新，不覆盖并发下已写入的新盐）
-    if(salt.isEmpty()){
-        QSqlQuery upgrade(db);
-        const QString newSalt = generatePasswordSalt();
-        const QString newHash = applyPasswordSalt(clientHash, newSalt);
-        upgrade.prepare("UPDATE user_info SET pwd = ?, salt = ? WHERE name = ? AND salt = ''");
-        upgrade.addBindValue(newHash);
-        upgrade.addBindValue(newSalt);
-        upgrade.addBindValue(nameParam);
-        if(upgrade.exec() && upgrade.numRowsAffected() > 0){
-            effectiveHash = newHash;
-        }
     }
 
     // ===== REQ-EXT-SESSION-001：登录版本原子分配 + 登录档案 + 在线置位，同一事务 =====
@@ -1315,7 +1298,7 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
     db.transaction();
     QSqlQuery q(db);
 
-    // 1. 按用户名取哈希与盐后校验密码（salt 为空 = 迁移前老数据，按裸哈希比对）
+    // 1. 按用户名取哈希与盐后校验密码
     q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
     q.addBindValue(QString::fromUtf8(name));
     if(!q.exec() || !q.next()){

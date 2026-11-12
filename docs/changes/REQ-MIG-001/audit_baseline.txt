@@ -1,0 +1,29 @@
+[1] 空盐账号: 0 个
+    （无）
+[2] file_migration_map 非 mapped 行: 1 条（其中 failed=0）
+    skipped_name_conflict	filesys/e2eop1/a.txt	file_id=7359	object_id=1002248
+    旧机器绝对路径行（键归一遗留）: 0 条
+[3] 非 canonical 逻辑键: 0 行（user_file/upload_session）
+[4] 未映射旧物理文件（filesys/<user>/ 下不在 file_migration_map）: 0 个
+[5] user_file active 且无对象（回退条目）: 6 行
+    缺失对象: 1002101 objects/ae/1002101
+    缺失对象: 1002146 objects/53/1002146
+    缺失对象: 1002147 objects/f9/1002147
+    缺失对象: 1002148 objects/d3/1002148
+    缺失对象: 1002152 objects/86/1002152
+    缺失对象: 1002153 objects/ab/1002153
+    缺失对象: 1002155 objects/0a/1002155
+    缺失对象: 1002156 objects/e3/1002156
+    缺失对象: 1002157 objects/d9/1002157
+    缺失对象: 1002158 objects/15/1002158
+    缺失对象: 1002160 objects/74/1002160
+    缺失对象: 1002161 objects/32/1002161
+    缺失对象: 1002162 objects/55/1002162
+    缺失对象: 1002163 objects/00/1002163
+    缺失对象: 1002164 objects/3c/1002164
+    缺失对象: 1002165 objects/36/1002165
+    缺失对象: 1002166 objects/d8/1002166
+    缺失对象: 1002167 objects/95/1002167
+    缺失对象: 1002168 objects/63/1002168
+    缺失对象: 1002169 objects/ca/1002169
+    file_object 物理对象盘上缺失: 72 个
