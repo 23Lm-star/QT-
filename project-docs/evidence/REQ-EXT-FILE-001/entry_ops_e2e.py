@@ -180,51 +180,25 @@ ca.ask(pdu(T_MKDIR, msg=f"./filesys/{OP}".encode(), dat=f32("mvd")))
 check("K1", "MKDIR mvd 建目录条目",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='mvd' AND is_dir=1 AND status='active'") == "1")
 base = os.path.join(FS, OP)
-os.makedirs(os.path.join(base, "legdir"), exist_ok=True)
-open(os.path.join(base, "a.txt"), "wb").write(C1)            # 同名不同内容→(1)+skipped_name_conflict
-open(os.path.join(base, "legacyL1.txt"), "wb").write(C1)     # 正常映射
-open(os.path.join(base, "legdir", "l2.txt"), "wb").write(C3) # 子目录映射
-ca.close(); cb.close()
-
-# ---------- 2. 起服#2：启动迁移 ----------
-stop_server()
-check("S2", "Server#2 启动（触发 T6 迁移）", start_server())
-pLegacy = (base + "/legacyL1.txt").replace("\\", "/")
-pConflict = (base + "/a.txt").replace("\\", "/")
-pDeep = (base + "/legdir/l2.txt").replace("\\", "/")
-# F-3/D5 修复：old_path 为跨树确定相对键 "filesys/<user>/..."（design §2），不再存机器绝对路径
-kLegacy = f"filesys/{OP}/legacyL1.txt"
-kConflict = f"filesys/{OP}/a.txt"
-kDeep = f"filesys/{OP}/legdir/l2.txt"
-check("M1", "legacyL1 映射 mapped",
-      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{kLegacy}'", "mapped"))
-check("M2", "a.txt 冲突→skipped_name_conflict",
-      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{kConflict}'", "skipped_name_conflict"))
-check("M3", "a(1).txt 条目落定→对象shaC1",
+# REQ-MIG-001：存量迁移管线已下线，旧物理文件不再被扫入条目；
+# 本套件改为用正常上传建立条目，覆盖同一批条目操作断言。
+ca.ask(pdu(T_MKDIR, msg=f"./filesys/{OP}".encode(), dat=f32("legdir")))
+check("K2", "MKDIR legdir 建目录条目",
+      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='legdir' AND is_dir=1 AND status='active'") == "1")
+check("U3", "上传 legacyL1.txt(C1) 成功", upload(ca, f"./filesys/{OP}", "legacyL1.txt", C1))
+check("U4", "上传 legdir/l2.txt(C3) 成功", upload(ca, f"./filesys/{OP}/legdir", "l2.txt", C3))
+check("E1", "条目 legacyL1.txt→对象shaC1",
       sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
-          f"WHERE uf.owner_name='{OP}' AND uf.display_name='a(1).txt' AND uf.status='active' AND fo.sha256='{SHA(C1)}'") == "1")
-check("M4", "深层 legdir/l2.txt 映射+mapped",
-      wait_sql(f"SELECT status FROM file_migration_map WHERE old_path='{kDeep}'", "mapped"))
-check("M5", "旧文件零删除（验收5）",
-      all(os.path.isfile(x) for x in (pLegacy.replace("/", os.sep),
-                                       pConflict.replace("/", os.sep),
-                                       pDeep.replace("/", os.sep))))
-check("M6", "对象 shaC1 refcount=2",
-      sql(f"SELECT refcount FROM file_object WHERE sha256='{SHA(C1)}'") == "2")
-nMap = sql("SELECT COUNT(*) FROM file_migration_map WHERE old_path LIKE "
-           f"'%filesys/{OP}/%'")
-nEnt = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND status='active'")
-
-# ---------- 3. 起服#3：重跑幂等 ----------
-stop_server()
-check("S3", "Server#3 启动（迁移重跑）", start_server())
-time.sleep(2.5)
-check("I1", "重跑映射行数不变（幂等）",
-      sql("SELECT COUNT(*) FROM file_migration_map WHERE old_path LIKE "
-          f"'%filesys/{OP}/%'") == nMap, f"before={nMap}")
-check("I2", "重跑条目行数不变",
-      sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND status='active'") == nEnt,
-      f"before={nEnt}")
+          f"WHERE uf.owner_name='{OP}' AND uf.display_name='legacyL1.txt' AND uf.status='active' AND fo.sha256='{SHA(C1)}'") == "1")
+check("E2", "深层条目 legdir/l2.txt 键 /legdir/ 且对象shaC3",
+      sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
+          f"WHERE uf.owner_name='{OP}' AND uf.display_name='l2.txt' AND uf.parent_path='/legdir/' "
+          f"AND uf.status='active' AND fo.sha256='{SHA(C3)}'") == "1")
+check("E3", "文件不落用户物理路径（对象存储）",
+      not os.path.isfile(os.path.join(base, "legacyL1.txt")))
+check("E4", "对象 shaC1 refcount=1（仅个人条目引用）",
+      sql(f"SELECT refcount FROM file_object WHERE sha256='{SHA(C1)}'") == "1")
+ca.close(); cb.close()
 
 # ---------- 4. 条目操作：rename / move / 目录改名回退 / 删除 ----------
 ca, ret = login_conn(OP)
@@ -236,8 +210,8 @@ check("N1", "rename 条目 legacyL1→renamed1", r and r[0][0] == T_RENAME_R and
 check("N2", "改名后条目同对象 oid 不变",
       sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
           f"WHERE uf.owner_name='{OP}' AND uf.display_name='renamed1.txt' AND fo.sha256='{SHA(C1)}' AND uf.status='active'") == "1")
-check("N3", "物理实体同步改名（防幽灵）",
-      os.path.isfile(os.path.join(base, "renamed1.txt")) and not os.path.isfile(os.path.join(base, "legacyL1.txt")))
+check("N3", "文件保持对象存储，用户路径无物理实体",
+      not os.path.isfile(os.path.join(base, "renamed1.txt")) and not os.path.isfile(os.path.join(base, "legacyL1.txt")))
 fl = flush_names(ca, rootP)
 check("N4", "flushfile 显示 renamed1.txt", "renamed1.txt" in fl, f"names={fl}")
 mvdat = f32("l2.txt")
@@ -248,12 +222,6 @@ check("MV2", "条目 parent_path=/mvd/（owner 相对逻辑键，跨树确定）
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='l2.txt' "
           f"AND parent_path='/mvd/' AND status='active'") == "1")
 ren2 = struct.pack("<I", 0) + f"{rootP}".encode()
-r = ca.ask(pdu(T_RENAME, msg=ren2, dat=f32("legdir") + f32("legdir2")))
-check("MV3", "未建条目旧目录物理改名回退", r and r[0][0] == T_RENAME_R and r[0][1][0] != 0
-      and os.path.isdir(os.path.join(base, "legdir2")) and not os.path.isdir(os.path.join(base, "legdir")))
-r = ca.ask(pdu(T_DEL, msg=f"{rootP}/legdir2".encode(), dat=struct.pack("<I", 0)))
-check("MV4", "deldir 旧目录物理删除+级联空操作", r and r[0][1][0] != 0
-      and not os.path.isdir(os.path.join(base, "legdir2")))
 
 # ---------- 4b. F-4 回归：条目优先 deldir 深度≥2 子树软删 + 目录行引用计数正确 ----------
 ca.ask(pdu(T_MKDIR, msg=f"{rootP}".encode(), dat=f32("nd1")))
@@ -288,8 +256,8 @@ check("SH2", "接收者条目引用同一对象(shaC1)",
           f"WHERE uf.owner_name='{RC}' AND uf.display_name='renamed1.txt' AND fo.sha256='{SHA(C1)}' AND uf.status='active'") == "1")
 check("SH3", "接收者根内无物理复制（D2 红利）",
       not os.path.isfile(os.path.join(FS, RC, "renamed1.txt")))
-check("SH4", "shaC1 refcount=3",
-      wait_sql(f"SELECT refcount FROM file_object WHERE sha256='{SHA(C1)}'", "3"))
+check("SH4", "shaC1 refcount=2（个人+接收者引用）",
+      wait_sql(f"SELECT refcount FROM file_object WHERE sha256='{SHA(C1)}'", "2"))
 cb.sock.sendall(pdu(T_DOWN, msg=f"./filesys/{RC}/renamed1.txt".encode(), dat=f32("renamed1.txt")))
 r = recv_until(cb, T_DOWN_R)
 check("SH5", "接收者可下载条目", r and r[1][0] != 0, f"pkt={r[:2] if r else None}")

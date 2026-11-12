@@ -126,9 +126,9 @@ open(os.path.join(base, "esc2.txt"), "wb").write(C2)      # A6：被移动对象
 # ---------- 2. rename：A1 未知 fileType 谎报 → 现在真改名 ----------
 r = ca.ask(pdu(T_RENAME, msg=struct.pack("<I", 7) + rootP.encode(),
                 dat=f32("leg1.txt") + f32("leg1r.txt")))
-check("A1", "未建条目文件+谎报 fileType=7 → 服务端推导为文件，实际改名成功（改前谎报成功不动）",
-      ren_ret(r) and os.path.isfile(os.path.join(base, "leg1r.txt"))
-      and not os.path.isfile(os.path.join(base, "leg1.txt")))
+check("A1", "REQ-MIG-001：未建条目文件改名 → 拒绝（旧物理文件兼容已下线），文件原样保留",
+      not ren_ret(r) and os.path.isfile(os.path.join(base, "leg1.txt"))
+      and not os.path.isfile(os.path.join(base, "leg1r.txt")))
 
 # ---------- 3. rename：A2 同名幂等（改前服务端命中自身条目误报"目标名已占用"） ----------
 r = ca.ask(pdu(T_RENAME, msg=struct.pack("<I", 1) + rootP.encode(),
@@ -170,8 +170,8 @@ check("A5", "move 错位声称名 → 条目按派生名 m1.txt 落 /d2/，无 e
 
 # ---------- 7. move：A6 声称名 "../" 且未建条目 → 不逃逸（改前 dstPath 逃出 dstDir） ----------
 r = ca.ask(pdu(T_MOVE, msg=b"esc2.txt\0\0", dat=f32("../escape.txt")))
-check("A6", "move 未迁移物理文件+声称名 ../escape.txt → 留在用户根内，filesys 层无逃逸文件",
-      mv_pkt(r) and r[0][1][0] != 0
+check("A6", "REQ-MIG-001：move 未建条目文件 → 拒绝且不落任何目标（旧物理文件移动已下线）",
+      mv_pkt(r) and r[0][1][0] == 0
       and os.path.isfile(os.path.join(base, "esc2.txt"))
       and not os.path.exists(os.path.join(FS, "escape.txt")))
 
@@ -187,8 +187,9 @@ if r and r[0][0] == T_FLUSH_R:
     m = r[0][2]
     for i in range(len(m) // 36):
         names.append(m[i * 36:i * 36 + 32].split(b"\0")[0].decode("utf-8", "replace"))
-check("V1", "根目录视图含 e1b/e2/ghost/d1ren/d2/esc2，不含被拒的改名",
-      all(x in names for x in ("e1b.txt", "e2.txt", "ghost.txt", "d1ren", "d2", "esc2.txt")),
+check("V1", "根目录视图只列条目：含 e1b/e2/d1ren/d2，不含无条目的物理文件",
+      all(x in names for x in ("e1b.txt", "e2.txt", "d1ren", "d2"))
+      and not any(x in names for x in ("ghost.txt", "esc2.txt", "leg1.txt", "leg1r.txt")),
       f"names={names}")
 ca.close()
 _SRV.stop()

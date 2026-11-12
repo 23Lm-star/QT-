@@ -881,8 +881,8 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
     return r.ok ? r.fileId : -1;
 }
 
-// 旧目录物理改名后的条目级联；oldDir/newDir 均为 '/' 结尾的逻辑键。
-// 无匹配条目视为成功（未迁移旧树）。
+// 目录物理残留改名后的条目级联；oldDir/newDir 均为 '/' 结尾的逻辑键。
+// 无匹配条目视为成功（目录条目缺失时的兜底，空操作）。
 bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldDirRaw,
                                        const QString& newDirRaw, QString& err)
 {
@@ -917,7 +917,7 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
             if (!u.exec()) { err = u.lastError().text(); ok = false; break; }
             ok = true;
         }
-        if (ids.isEmpty()) ok = true;   // 空操作（未迁移旧树无条目）
+        if (ids.isEmpty()) ok = true;   // 空操作（目录条目缺失兜底）
         if (!ok) break;
         ok = db.commit();
     } while (false);

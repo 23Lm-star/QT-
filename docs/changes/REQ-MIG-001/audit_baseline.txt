@@ -1,0 +1,8 @@
+[1] 空盐账号: 0 个
+    （无）
+[2] file_migration_map 非 mapped 行: 0 条
+    旧机器绝对路径行（键归一遗留）: 0 条
+[3] 非 canonical 逻辑键: 0 行（user_file/upload_session）
+[4] 未映射旧物理文件（filesys/<user>/ 下不在 file_migration_map）: 0 个
+[5] user_file active 且无对象（回退条目）: 0 行
+    file_object 物理对象盘上缺失: 0 个
