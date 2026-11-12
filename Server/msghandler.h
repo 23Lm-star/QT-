@@ -15,6 +15,7 @@
 #include <QPair>
 #include <QMap>
 #include <QHash>
+#include <QVector>
 
 //用于作为 服务器处理客户端请求 的类
 class MsgHandler
@@ -125,6 +126,10 @@ public:
     // 下载校验：只解析/校验目标并回元数据，正文由 MyTcpSocket 流式发送。
     PDU* downloadfile();
     PDU* chatmsg();//获取聊天消息
+    // REQ-AUDIT-001 R2：本次 18 响应携带的未送达主键——由连接层在写出成功后确认，
+    // 写出失败/断线则不调用，消息保持待送达等下次重投。
+    QVector<qlonglong> m_pendingDeliveredIds;
+    void confirmChatDelivered();
     // 取验证码：成功则生成新码并从 caMsg 返回，锁定/冷却中只回状态码与剩余秒数。
     PDU* captcha();//验证码生成
     // 从固定字符表随机生成 length 位验证码（依赖 MsgHandler 构造时的 qrand 播种）。

@@ -1,9 +1,11 @@
 #include "logging.h"
 #include "fileobjectstore.h"
 #include "databaseconnectionpool.h"
+#include "operatedb.h"
 #include "server.h"
 
 #include <QCryptographicHash>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -470,7 +472,7 @@ bool FileObjectStore::refObject(qint64 objectId)
 
 // 单条目软删：先按 (file_id, owner) 锁行确认归属与 active，再减对象引用。
 // 任一步失败整体回滚，保证条目状态与 refcount 一致。
-bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner)
+bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner, const QString& shareRelPath)
 {
     if (fileId < 0 || owner.isEmpty()) return false;
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
@@ -500,6 +502,9 @@ bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner)
             q.addBindValue(oid);
             if (!q.exec()) break;                   // 归零→待回收（验收3），绝不删物理文件（D3）
         }
+        // REQ-AUDIT-001 R7：链接清理与条目软删同一事务
+        if (!shareRelPath.isEmpty()
+                && !OperateDB::deleteShareLinkByPathTx(db, owner, shareRelPath)) break;
         ok = db.commit();
     } while (false);
     if (!ok) {
@@ -510,7 +515,7 @@ bool FileObjectStore::releaseEntry(qint64 fileId, const QString& owner)
 }
 
 // 目录软删：在内存中用逻辑键前缀匹配收集整棵子树，避免 SQL LIKE 通配歧义。
-bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
+bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner, const QString& shareRelPath)
 {
     if (dirFileId < 0 || owner.isEmpty()) return false;
     PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
@@ -569,6 +574,9 @@ bool FileObjectStore::releaseSubtree(qint64 dirFileId, const QString& owner)
             ok = true;
         }
         if (!ok) break;
+        // REQ-AUDIT-001 R7：链接清理与子树软删同一事务
+        if (!shareRelPath.isEmpty()
+                && !OperateDB::deleteShareLinkByPathTx(db, owner, shareRelPath)) { ok = false; break; }
         ok = db.commit();
     } while (false);
     if (!ok) {
@@ -631,7 +639,8 @@ FileObjectStore::EntryInfo FileObjectStore::entryByPath(
 // 改名/移动只改逻辑键；目录则同事务把后代 parent_path 的前缀整体平移。
 bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
                                     const QString& newRawParent, const QString& newDisplayName,
-                                    QString& err)
+                                    QString& err, const QString& oldShareRel,
+                                    const QString& newShareRel)
 {
     err.clear();
     const QString newParent = normalizeParent(owner, newRawParent);
@@ -706,6 +715,11 @@ bool FileObjectStore::relocateEntry(qint64 fileId, const QString& owner,
         q.addBindValue(fileId);
         q.addBindValue(owner);
         if (!q.exec() || q.numRowsAffected() != 1) { err = "更新失败"; break; }
+        // REQ-AUDIT-001 R7：链接平移与条目改名同一事务
+        if (!oldShareRel.isEmpty() && !newShareRel.isEmpty()
+                && !OperateDB::updateShareLinkPathTx(db, owner, oldShareRel, newShareRel)) {
+            err = "分享链接平移失败"; break;
+        }
         ok = db.commit();
     } while (false);
     if (!ok) db.rollback();
@@ -766,12 +780,41 @@ bool FileObjectStore::insertDirEntry(const QString& owner, const QString& rawPar
 // REQ-EXT-FILE-002 §2.1：commitUpload 去掉"哈希+rename"两段后的同名安置+条目+计数事务，
 // 供秒传命中分支复用——不复制物理文件、不读客户端路径。与 attachEntry 共用同一实现。
 // expectedSize < 0 = 不校验对象大小。
+namespace {
+// REQ-AUDIT-001 R9：完成态会话登记（在调用方已开启的事务内执行，与条目/引用计数同提交）
+qint64 insertCompletedSessionTx(QSqlDatabase& db, const QString& owner, const QString& parent,
+                                const QString& displayName, qint64 size, const QString& sha,
+                                const QString& requestId, qint64 fileId)
+{
+    QSqlQuery q(db);
+    q.prepare("INSERT INTO upload_session (owner_name,parent_path,display_name,expected_size,"
+              "client_sha256,staging_path,confirmed_offset,status,expires_at,client_request_id,file_id) "
+              "VALUES (?,?,?,?,?,'',?,'done',?,?,?)");
+    q.addBindValue(owner);
+    q.addBindValue(parent);
+    q.addBindValue(displayName);
+    q.addBindValue(size);
+    q.addBindValue(sha.isEmpty() ? QVariant() : QVariant(sha));
+    q.addBindValue(size);
+    q.addBindValue(QDateTime::currentDateTime().addSecs(3600).toString("yyyy-MM-dd HH:mm:ss"));
+    q.addBindValue(requestId);
+    q.addBindValue(fileId);
+    if (!q.exec()) {
+        qCWarning(lcFs) << "[attachExistingObject] 完成态会话登记失败:" << q.lastError().text();
+        return -1;
+    }
+    return q.lastInsertId().toLongLong();
+}
+} // namespace
+
 FileObjectStore::AttachResult FileObjectStore::attachExistingObject(
         const QString& owner, const QString& rawParent, const QString& wantedName,
-        qint64 objectId, qint64 expectedSize)
+        qint64 objectId, qint64 expectedSize, const QString& clientRequestId,
+        qint64* sessionIdOut)
 {
     AttachResult r;
     r.displayName = wantedName;
+    if (sessionIdOut != nullptr) *sessionIdOut = -1;
     const QString parent = normalizeParent(owner, rawParent);
     if (owner.isEmpty() || parent.isEmpty() || parent.size() > kMaxParentChars
         || wantedName.isEmpty() || objectId < 0) {
@@ -833,6 +876,14 @@ FileObjectStore::AttachResult FileObjectStore::attachExistingObject(
                 if (rowObj == objectId) {          // 幂等：同(位置,对象)已存在，不重复计数
                     r.fileId = rowId;
                     r.idempotent = true;
+                    // R9：幂等命中也要有完成态会话行（同事务，失败即整体回滚）
+                    if (!clientRequestId.isEmpty()) {
+                        const qint64 sid = insertCompletedSessionTx(db, owner, parent, finalName,
+                                                                    expectedSize >= 0 ? expectedSize : 0,
+                                                                    QString(), clientRequestId, r.fileId);
+                        if (sid < 0) { r.error = "完成态会话登记失败"; break; }
+                        if (sessionIdOut != nullptr) *sessionIdOut = sid;
+                    }
                     done = true;
                     break;
                 }
@@ -863,6 +914,14 @@ FileObjectStore::AttachResult FileObjectStore::attachExistingObject(
         q.addBindValue(objectId);
         if (!q.exec()) { r.error = q.lastError().text(); break; }
         if (q.numRowsAffected() != 1) { r.error = "对象已进入回收，请重新上传"; break; }
+        // R9：条目、引用计数、完成态会话行同一事务
+        if (!clientRequestId.isEmpty()) {
+            const qint64 sid = insertCompletedSessionTx(db, owner, parent, finalName,
+                                                        expectedSize >= 0 ? expectedSize : -1,
+                                                        QString(), clientRequestId, r.fileId);
+            if (sid < 0) { r.error = "完成态会话登记失败"; break; }
+            if (sessionIdOut != nullptr) *sessionIdOut = sid;
+        }
         done = true;
     } while (false);
 
@@ -884,7 +943,8 @@ qint64 FileObjectStore::attachEntry(const QString& owner, const QString& rawPare
 // 目录物理残留改名后的条目级联；oldDir/newDir 均为 '/' 结尾的逻辑键。
 // 无匹配条目视为成功（目录条目缺失时的兜底，空操作）。
 bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldDirRaw,
-                                       const QString& newDirRaw, QString& err)
+                                       const QString& newDirRaw, QString& err,
+                                       const QString& oldShareRel, const QString& newShareRel)
 {
     err.clear();
     const QString oldDir = normalizeParent(owner, oldDirRaw);
@@ -919,6 +979,12 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
         }
         if (ids.isEmpty()) ok = true;   // 空操作（目录条目缺失兜底）
         if (!ok) break;
+        // REQ-AUDIT-001 R7：链接平移与条目级联同一事务
+        if (!oldShareRel.isEmpty() && !newShareRel.isEmpty()) {
+            if (!OperateDB::updateShareLinkPathTx(db, owner, oldShareRel, newShareRel)) {
+                err = "分享链接平移失败"; ok = false; break;
+            }
+        }
         ok = db.commit();
     } while (false);
     if (!ok) db.rollback();
@@ -926,7 +992,8 @@ bool FileObjectStore::renameEntriesDir(const QString& owner, const QString& oldD
 }
 
 // 旧目录物理删除后的条目软删；dir 为 '/' 结尾逻辑键，空匹配直接提交成功。
-bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& dirRaw, QString& err)
+bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& dirRaw, QString& err,
+                                           const QString& shareRelPath)
 {
     err.clear();
     const QString dir = normalizeParent(owner, dirRaw);
@@ -947,7 +1014,14 @@ bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& 
             const QString p = q.value(2).toString();
             if (p.startsWith(dir)) { ids.append(q.value(0).toLongLong()); objs.append(q.value(1)); }
         }
-        if (ids.isEmpty()) { ok = db.commit(); break; }   // 空操作
+        if (ids.isEmpty()) {
+            // REQ-AUDIT-001 R7：即使没有条目，也要在同一事务内清掉该路径的链接记录
+            if (!shareRelPath.isEmpty()
+                    && !OperateDB::deleteShareLinkByPathTx(db, owner, shareRelPath)) {
+                err = "分享链接清理失败"; break;
+            }
+            ok = db.commit(); break;   // 空操作
+        }
         for (int i = 0; i < ids.size(); ++i) {
             q.prepare("UPDATE user_file SET status='deleted' WHERE file_id=?");
             q.addBindValue(ids[i]);
@@ -962,6 +1036,11 @@ bool FileObjectStore::releaseSubtreeByPath(const QString& owner, const QString& 
             ok = true;
         }
         if (!ok) break;
+        // REQ-AUDIT-001 R7：链接清理与条目软删同一事务
+        if (!shareRelPath.isEmpty()
+                && !OperateDB::deleteShareLinkByPathTx(db, owner, shareRelPath)) {
+            err = "分享链接清理失败"; ok = false; break;
+        }
         ok = db.commit();
     } while (false);
     if (!ok) db.rollback();

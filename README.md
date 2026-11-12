@@ -101,7 +101,9 @@ npm --prefix web/frontend run dev     # 打开 http://127.0.0.1:5173/
 
 ## 验证入口
 
-原登记的 17 个回归套件如下，入口文件原地保留。运行前完成构建和运行库部署，准备隔离 MySQL 测试库、配置与所需迁移，并确保 TCP 5000 没有无关服务。套件会创建/修改测试用户及文件，只能串行运行；不要在真实用户数据环境直接执行。
+原登记的 17 个回归套件如下，入口文件原地保留。运行前完成构建和运行库部署，准备隔离 MySQL 测试库、配置与所需迁移（含 `Server/migrate_friend_req_001.sql`），并确保 TCP 5000 没有无关服务。套件会创建/修改测试用户及文件，只能串行运行；不要在真实用户数据环境直接执行。
+
+REQ-AUDIT-001 起验证码默认下发 PNG 图片，直连套件无法识读答案：运行下列套件前必须设置环境变量 `CLOUDDISK_CAPTCHA_TEXT_FOR_TESTS=1`（服务端在该变量存在时回传文本答案，仅测试机使用；生产/公网部署不得设置）。
 
 每条用 `py -3.13 -X utf8 <入口文件>` 运行，检查实际退出码、失败断言和最终汇总；失败即停止归因，不用后来一次通过覆盖前面的失败。旧登记文件随历史管线归档，本表是当前命令入口；本轮未运行这些业务测试。
 
@@ -134,6 +136,7 @@ npm --prefix web/frontend run dev     # 打开 http://127.0.0.1:5173/
 | 客户端 TLS 规则探针（无网络无数据库，g++ 编译 `Client/tlspinning.cpp` + 三个 Python TLS 桩） | `project-docs/evidence/REQ-EXT-TLS-001/verify.py` |
 | 注销后同名重注册登录 | `project-docs/evidence/REQ-EXT-SESSION-001/relogoff_login_e2e.py` |
 | 启动期在线态对账 | `project-docs/evidence/REQ-EXT-SESSION-001/reconcile_online_e2e.py` |
+| 审计整改（投递/注销/好友/外链/文件一致性/验证码/秒传，REQ-AUDIT-001） | `project-docs/evidence/REQ-AUDIT-001/verify.py` |
 
 另有 `project-docs/evidence/REQ-EXT-RECLAIM-001/reclaim_e2e.py`（物理对象与临时上传回收），历史未纳入常规登记，先处理 [D-022](TODO.md#测试与验证缺口)。上传会话无网络单元测试和稳定的统一运行入口见 [PRD](PRD.md#需求索引)。
 

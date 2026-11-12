@@ -91,12 +91,20 @@ public:
     // REQ-EXT-FILE-002 §2.1：指向既有对象的条目安置（复用 commitUpload 步骤 2/3/4，同事务）。
     // 不读客户端路径、不复制物理文件、不传输正文；pending_reclaim 对象复用即置回 ready。
     // expectedSize < 0 = 不校验对象大小。
+    // REQ-AUDIT-001 R9：clientRequestId 非空时，在同一事务内再登记完成态上传会话行
+    // （status='done'，file_id=本次条目），sessionIdOut 回带 session_id。
+    // 会话登记失败 → 整体回滚（不出现"条目已建、会话缺失"）；同键冲突由调用方回读幂等行。
     AttachResult attachExistingObject(const QString& owner, const QString& parentPath,
                                       const QString& wantedName, qint64 objectId,
-                                      qint64 expectedSize = -1);
+                                      qint64 expectedSize = -1,
+                                      const QString& clientRequestId = QString(),
+                                      qint64* sessionIdOut = nullptr);
 
     // 删除条目（软删）并释放引用；对象引用归零 → pending_reclaim。
-    bool releaseEntry(qint64 fileId, const QString& owner);
+    // REQ-AUDIT-001 R7：shareRelPath 非空时，在同一事务内删除该相对路径（含子路径）的
+    // share_link 记录；链接维护失败 → 整体回滚（不再"文件已删、链接仍可解析"）。
+    bool releaseEntry(qint64 fileId, const QString& owner,
+                      const QString& shareRelPath = QString());
 
     // REQ-EXT-GROUP-003：群文件引用安置（对象存在性 + 个人根条目 + 群目录条目 + 引用计数，
     // 同一事务）。createUserEntry=true：在 owner 个人根建/复活条目（秒传命中路径）；
@@ -128,12 +136,16 @@ public:
                           const QString& displayName) const;
 
     // 目录软删：递归释放 parent 及子树全部文件条目（同事务）。
-    bool releaseSubtree(qint64 dirFileId, const QString& owner);
+    bool releaseSubtree(qint64 dirFileId, const QString& owner,
+                        const QString& shareRelPath = QString());
 
     // 条目改名/移动：只动逻辑键，引用不变；目录行同事务级联子树 parent_path。
+    // REQ-AUDIT-001 R7：oldShareRel/newShareRel 非空时，同一事务内平移 share_link。
     bool relocateEntry(qint64 fileId, const QString& owner,
                        const QString& newParentPath, const QString& newDisplayName,
-                       QString& err);
+                       QString& err,
+                       const QString& oldShareRel = QString(),
+                       const QString& newShareRel = QString());
 
     // REQ-EXT-FILE-001 D5/T3：目录条目（is_dir=1，object_id NULL）。
     // 同名 active 目录条目=幂等成功；同名 active 文件=失败。
@@ -147,10 +159,13 @@ public:
 
     // 旧目录物理改名/移动后的条目级联（parent_path 前缀平移；无条目则空操作）。
     bool renameEntriesDir(const QString& owner, const QString& oldDirPath,
-                          const QString& newDirPath, QString& err);
+                          const QString& newDirPath, QString& err,
+                          const QString& oldShareRel = QString(),
+                          const QString& newShareRel = QString());
 
     // 旧目录物理删除后的子树条目软删+减引用（无条目则空操作，成功返回）。
-    bool releaseSubtreeByPath(const QString& owner, const QString& dirPath, QString& err);
+    bool releaseSubtreeByPath(const QString& owner, const QString& dirPath, QString& err,
+                              const QString& shareRelPath = QString());
 
     // REQ-EXT-FILE-001 F-3/D5 修复：owner 相对规范逻辑键。
     // 接受 PDU 相对路径、本树绝对路径、既有逻辑键（幂等）三形态，归一为

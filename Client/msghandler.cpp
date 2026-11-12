@@ -426,11 +426,10 @@ void MsgHandler::handleCaptcha(){
     memcpy(&remaining, pdu->caData + 4, sizeof(remaining));
 
     if (status == 0) {
-        // 成功：更新显示并启动正常冷却（倒计时由服务端下发秒数驱动）
-        QByteArray codeBytes(pdu->caMsg, pdu->uiMsgLen);
-        QString code = QString::fromUtf8(codeBytes).trimmed();
-        qCDebug(lcCli) << "收到服务端验证码:" << code;
-        Client::getinstance().updateCaptchaDisplay(code);
+        // 成功：REQ-AUDIT-001 R8——载荷是 PNG 图片，文本答案只在服务端
+        const QByteArray png(pdu->caMsg, pdu->uiMsgLen);
+        qCDebug(lcCli) << "收到服务端验证码图片，字节数:" << png.size();
+        Client::getinstance().updateCaptchaImage(png);
         Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
     } else if (status == -5) {
         // 冷却中：禁止获取，按服务端剩余秒数倒计时

@@ -14,6 +14,8 @@ PWD = '123456'
 T_REG, T_REG_R, T_LOGIN, T_LOGIN_R, T_CAP, T_CAP_R = 1, 2, 3, 4, 44, 45
 T_CHAT = 15
 T_CPL, T_CPL_R, T_RES, T_RES_R = 52, 53, 54, 55
+T_UP_INIT, T_UP_INIT_R, T_UP_DATA, T_UP_DATA_R = 29, 30, 31, 32
+UPLOAD_MAGIC = 0x5253554d
 # GROUP-001
 T_CREATE, T_CREATE_R = 60, 61
 T_INVITE, T_INVITE_R = 62, 63
@@ -601,17 +603,42 @@ check('p8b_one_to_one_offline_row', row is not None and row[0] == 0, f'issuccess
 m2 = cap_login('g2m2')
 # c) 文件分享外链全流程（F-1 场景回归）：建文件→生成两次链接→他人解析第二次链接→落盘
 fsroot = DIST / 'filesys'   # 部署运行形态：服务端 cwd=dist，其 ./filesys 即 dist/filesys
+# REQ-AUDIT-001：p8c 自清夹具，避免上一轮残留的过期 share_link 让本用例随运行次数漂移
+with db_conn() as _c:
+    with _c.cursor() as _cur:
+        _cur.execute("DELETE FROM share_link WHERE owner_name='g2m1' AND relative_path='g2p8.bin'")
+        _cur.execute("DELETE FROM user_file WHERE owner_name='g2out'")
 (fsroot / 'g2m1').mkdir(parents=True, exist_ok=True)
-(fsroot / 'g2m1' / 'g2p8.bin').write_text('G2-P8-CONTENT')   # 发布者 m1 本人根
-r = m1.ask(pdu(T_CPL, msg=b'g2p8.bin'), T_CPL_R)
-link = r[0][2].split(b'\0')[0].decode() if r and r[0][0] == T_CPL_R else ''
-rr = m1.ask(pdu(T_CPL, msg=b'g2p8.bin'), T_CPL_R)
-link2 = rr[0][2].split(b'\0')[0].decode() if rr and rr[0][0] == T_CPL_R else ''
-res = out.ask(pdu(T_RES, msg=link2.split('cloud-disk://share/')[-1].encode()), T_RES_R)
-res_ok = bool(res) and res[0][1][0] != 0
-landed = list((fsroot / 'g2out' / '分享链接').glob('g2p8.bin')) if (fsroot / 'g2out' / '分享链接').is_dir() else []
-check('p8c_publish_link_flow', bool(link) and bool(link2) and res_ok and bool(landed),
-      f'res_ok={res_ok} landed={[p.name for p in landed]}')
+# REQ-AUDIT-001 R5：外链源必须是真实逻辑条目（REQ-MIG-001 后不再有物理文件回退）→ 走真实上传
+_up = bytearray(64)
+_up[0:32] = f32('g2p8.bin')
+_up[32:40] = struct.pack('<q', len(b'G2-P8-CONTENT'))
+_up[40:44] = struct.pack('<I', UPLOAD_MAGIC)
+_up[48:56] = struct.pack('<Q', 901)
+_init = m1.ask(pdu(T_UP_INIT, msg=b'./filesys/g2m1', dat=bytes(_up)), T_UP_INIT_R)
+assert _init and _init[0][1][0], 'p8c upload init rejected'
+_up2 = bytearray(64)
+_up2[0:8] = struct.pack('<q', 0)
+_up2[40:44] = struct.pack('<I', UPLOAD_MAGIC)
+_up2[48:56] = struct.pack('<Q', 901)
+m1.ask(pdu(T_UP_DATA, msg=b'G2-P8-CONTENT', dat=bytes(_up2)), T_UP_DATA_R, timeout=30)
+def _pick(pkts, typ):
+    for _p in (pkts or []):
+        if _p[0] == typ:
+            return _p
+    return None
+
+
+_r = _pick(m1.ask(pdu(T_CPL, msg=b'g2p8.bin'), T_CPL_R), T_CPL_R)
+link = _r[2].split(b'\0')[0].decode() if _r else ''
+_rr = _pick(m1.ask(pdu(T_CPL, msg=b'g2p8.bin'), T_CPL_R), T_CPL_R)
+link2 = _rr[2].split(b'\0')[0].decode() if _rr else ''
+_res = _pick(out.ask(pdu(T_RES, msg=link2.split('cloud-disk://share/')[-1].encode()), T_RES_R), T_RES_R)
+res_ok = bool(_res) and _res[1][0] != 0
+landed = db_one("SELECT COUNT(*) FROM user_file WHERE owner_name='g2out' "
+                 "AND parent_path='/分享链接/' AND display_name='g2p8.bin' AND status='active'")
+check('p8c_publish_link_flow', bool(link) and bool(link2) and res_ok and landed and landed[0] > 0,
+      f'res_ok={res_ok} link={link[-12:]} link2={link2[-12:]} landed_rows={landed[0] if landed else None}')
 # d) GROUP-001 生命周期整链（既有 harness 原样重跑）
 ge = ROOT / 'build' / 'evidence' / 'req-ext-group-001-independent-8757ad6' / 'group_e2e.py'
 if ge.exists():

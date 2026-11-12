@@ -30,7 +30,7 @@ export const useAuthStore = defineStore('auth', {
     lastClose: null,     // {code,reason,text,at} 最近一次断线原因，供主界面显示
     loggedIn: false,
     loginName: '',
-    captchaCode: '',
+    captchaImage: '',
     captchaCooldown: 0,
     message: '',
     messageType: 'info', // info | error | success
@@ -90,7 +90,7 @@ export const useAuthStore = defineStore('auth', {
       try {
         const r = await account.requestCaptcha(net);
         if (r.status === 0) {
-          this.captchaCode = r.code;
+          this.captchaImage = r.image;
           this.captchaCooldown = r.remaining > 0 ? r.remaining : 60;
           this._setMsg('验证码已获取', 'success');
         } else if (r.status === -5) {
@@ -143,7 +143,7 @@ export const useAuthStore = defineStore('auth', {
     logout() {
       this.loggedIn = false;
       this.loginName = '';
-      this.captchaCode = '';
+      this.captchaImage = '';
       this.lastClose = null;
       try { net && net.close(); } catch { /* ignore */ }
       this.connectState = 'closed';

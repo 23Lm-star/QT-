@@ -834,7 +834,11 @@ void MyTcpSocket::recvmsg(){
                         <<"pdu->caData+32"<<pdu->caData+32<<" "
                         <<"pdu->caMsg"<<pdu->caMsg<<endl;
                 PDU* respdu=handlMsg(pdu);
-                seedMsg(respdu);
+                // REQ-AUDIT-001 R2：18 只在写出成功后确认已送达；失败则保持待送达重投。
+                const bool sent=seedMsg(respdu);
+                if(sent && pdu->uiType==ENUM_MSG_TYPE_GETCHATMSG_REQUEST && m_MsgHandler!=nullptr){
+                    m_MsgHandler->confirmChatDelivered();
+                }
                 m_dpulist.remove(0,pdu->uiTotalLen);
             }
             else break;
@@ -1044,12 +1048,12 @@ void MyTcpSocket::sendAndRelease(PDU* pdu)
 // 发送 PDU 给客户端。pdu 必须由 Server 端 mkPDU() (memalloc) 分配。
 // 发送完成后调用 memfree(pdu) 释放。
 // 调用方不得在 seedMsg 返回后再访问 pdu。
-//给客户端发送respdu消息
-void MyTcpSocket::seedMsg(PDU *respdu){
+// REQ-AUDIT-001 R2：返回是否成功交给套接字写出（write>=0）；失败时调用方不得标记已送达。
+bool MyTcpSocket::seedMsg(PDU *respdu){
     if(respdu==nullptr){
-        return;
+        return false;
     }
-    this->write((char*)respdu,respdu->uiTotalLen);
+    const bool written = this->write((char*)respdu,respdu->uiTotalLen) >= 0;
     qCDebug(lcNet)<<"响应信息 已发送:"<<" "
             <<"respdu->uiTotalLen"<<respdu->uiTotalLen<<" "
             <<"respdu->uiMsgLen"<<respdu->uiMsgLen<<" "
@@ -1061,4 +1065,5 @@ void MyTcpSocket::seedMsg(PDU *respdu){
             <<endl;
     memfree(respdu);
     respdu=nullptr;
+    return written;
 }

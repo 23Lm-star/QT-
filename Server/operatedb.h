@@ -5,6 +5,9 @@
 #include <QByteArray>
 #include <QDateTime>
 #include <QStringList>
+#include <QVector>
+
+class QSqlDatabase;
 
 // OperateDB：服务端 MySQL 访问的单例入口（用户/好友/消息/分享链接/上传会话/群组/群消息/群文件）。
 // 每项操作从全局连接池取一条连接，作用域结束自动归还；失败用返回值/空值表达，不抛异常。
@@ -36,6 +39,9 @@ public:
     // 必须有独立版本号：调度器与 4 处引用归零打标都直接写 reclaim_at，
     // 未执行本迁移的库若靠旧版本号蒙过启动检查，会在第一次释放文件时 SQL 报错。
     static const int kReclaimSchemaVersion = 2026100701;
+    // REQ-AUDIT-001 R4：好友邀请持久化（friend_request 表）。
+    // 接受好友必须命中该表里的 pending 行，请求方由服务端保存，客户端字段不作授权依据。
+    static const int kFriendRequestSchemaVersion = 2026111201;
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
@@ -147,10 +153,11 @@ public:
     // 返回在线、非自己且尚未成为好友的用户名（用于陌生人列表）
     QStringList handleOnlineUsers(const QString& strname);
     //添加好友操作，查找
-    // 目标在线返回 1，离线/不存在返回 0，参数或连接失败返回 -1
+    // REQ-AUDIT-001 R4：目标在线返回 1 并登记 (请求方,目标) 待处理邀请；离线/不存在返回 0；
+    // 参数或连接失败返回 -1
     int handleAddFriend(char* usrname,char* tarname);
     //添加好友操作，添加
-    // 单条 INSERT，只写一个方向；双向关系由调用方对调参数再调一次
+    // REQ-AUDIT-001 R4：同一事务内校验 pending 邀请并写入双向关系；无邀请返回 0
     int handleAddFriendFin(char* usrname,char* tarname);
     //刷新好友操作，
     // 返回与 strname 相关的双向好友名（UNION 去重）
@@ -158,16 +165,21 @@ public:
     //删除好友操作
     // 事务内删除两个方向的好友行
     bool handleDeleteFriend(char*userName,char*tarName);
-    //记录聊天消息信息
-    // 写入私聊消息；issuccess 记录接收方当时是否在线；返回接收方是否在线
+    // 记录聊天消息信息
+    // REQ-AUDIT-001 R1/R2：入库一律写 issuccess=0（待送达），由真正写出成功的一方
+    // 调 markChatDelivered 置 1——「在线」不再等同于「已送达」。
     // 返回值=接收方当时是否在线（沿用改前语义，决定要不要实时转发）；
     // storedOut 带回 INSERT 是否成功——REQ-CLI-MSGSTORE-001 的 16 应答以它为准，
-    // 「发送成功」指服务端已入库，与对方在不在线无关。可不传（其它调用方不受影响）。
-    bool seedchatMsg(char*seedName,char *revName,QString msg,QString seedTime,bool *storedOut=nullptr);
+    // 「发送成功」指服务端已入库，与对方在不在线无关。
+    // idOut 回带新行主键，供实时转发写出成功后精确标记。
+    bool seedchatMsg(char*seedName,char *revName,QString msg,QString seedTime,bool *storedOut=nullptr,
+                     qint64 *idOut=nullptr);
     //获取聊天信息
-    // 事务内 SELECT ... FOR UPDATE 未送达消息并标记 issuccess=1；
-    // 返回扁平列表（每行依次为 msg、seed_time）；标记失败时返回空列表以便重投
-    QStringList getchatMsg(char*seedName,char *revName);
+    // REQ-AUDIT-001 R2：只读不标记；未送达消息在响应真正写出后由 markChatDelivered 置 1。
+    // 返回扁平列表（每行依次为 msg、seed_time），按主键升序＝接收顺序；idOut 回带对应主键。
+    QStringList getchatMsg(char*seedName,char *revName,QVector<qlonglong>* idOut=nullptr);
+    // REQ-AUDIT-001 R1/R2：把指定消息标记为已送达（幂等，只更新仍为未送达的行）
+    bool markChatDelivered(const QVector<qlonglong> &ids);
     //获取用户信息
     // 按名查询，命中时回填规范用户名与 online 标志
     bool handleGetUserInfo(const char* userName, QString& outName, int& outOnline);
@@ -206,12 +218,22 @@ public:
     bool renewShareLink(const QString &owner, const QString &path, const QDateTime &newExpire);
     // REQ-EXT-SHARE-001：重新生成前作废旧行（精确路径，不含子路径）
     bool removeShareLinkExact(const QString &owner, const QString &path);
+    // REQ-AUDIT-001 R6：作废旧链接 + 写入新令牌在同一事务内完成。
+    // 插入失败时整体回滚，旧链接保持有效——不出现"旧链接已作废、新链接没建"。
+    bool replaceShareLink(const QString &hash, const QString &owner, const QString &path,
+                          const QDateTime &expire);
 
     // 跨功能联动维护（文件删除/重命名/移动 → 分享链接记录一致性）
     // 删除 path 自身及其子路径（path/%）的全部链接记录
     bool deleteShareLinkByPath(const QString &owner, const QString &path);
     // 把 oldPath 自身与其子路径整体平移到 newPath（两条 UPDATE，任一失败返回 false）
     bool updateShareLinkPath(const QString &owner, const QString &oldPath, const QString &newPath);
+    // REQ-AUDIT-001 R7：事务内版本——供 FileObjectStore 在"条目变更"同一事务里维护
+    // share_link，使文件删除/重命名/移动与链接记录不再出现部分成功。
+    // db 必须处于调用方已开启的事务中；失败由调用方回滚。
+    static bool deleteShareLinkByPathTx(QSqlDatabase &db, const QString &owner, const QString &path);
+    static bool updateShareLinkPathTx(QSqlDatabase &db, const QString &owner,
+                                      const QString &oldPath, const QString &newPath);
     // 删除好友时清理双方私聊记录
     bool deleteFriendMessages(const QString &userA, const QString &userB);
 

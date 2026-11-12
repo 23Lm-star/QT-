@@ -35,11 +35,23 @@ export async function requestCaptcha(net) {
   const resp = await net.request(T.CAPTCHA_REQUEST, T.CAPTCHA_RESPOND);
   const status = readI32(resp.caData, 0);
   const remaining = readI32(resp.caData, 4);
+  // REQ-AUDIT-001 R8：默认载荷是 PNG 图片（文本答案只在服务端）。
+  // 仅当部署显式开启测试旁路（服务端回文本）时，才同时回带 code 供自动化套件使用。
+  let image = '';
   let code = '';
   if (status === CaptchaStatus.OK && resp.uiMsgLen > 0) {
-    code = readFixedString(resp.caMsg, 0, resp.uiMsgLen).trim();
+    const bytes = new Uint8Array(resp.caMsg, 0, resp.uiMsgLen);
+    const isPng = bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50
+      && bytes[2] === 0x4e && bytes[3] === 0x47;
+    if (isPng) {
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      image = `data:image/png;base64,${btoa(binary)}`;
+    } else {
+      code = readFixedString(resp.caMsg, 0, resp.uiMsgLen).trim();
+    }
   }
-  return { status, remaining, code };
+  return { status, remaining, image, code };
 }
 
 // 登录请求(3)：caMsg = 验证码 + NUL + 32B clientId。

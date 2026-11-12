@@ -180,17 +180,19 @@ void MyTcpServer::sendAddFriendAndRelease(char *tarname, PDU *pdu)
     memfree(pdu);
 }
 //给客户端转发pdu消息
-void MyTcpServer::reseed(char *tarname, PDU *pdu){
+// REQ-AUDIT-001 R1：true = 找到目标连接且 write() 未报错。仅代表已写入本机发送缓冲，
+// 因此调用方的"已送达"语义是 at-least-once（宁可重投，不可丢）。
+bool MyTcpServer::reseed(char *tarname, PDU *pdu){
     if(tarname==nullptr||pdu==nullptr){
-        return;
+        return false;
     }
     QMutexLocker locker(&m_tcpsocketlistMutex);
     for(int i=0;i<tcpsocketlist.size();i++){
         if(strcmp(tcpsocketlist[i]->m_strLoginName.toStdString().c_str(),tarname)==0){
-            tcpsocketlist[i]->write((char*)pdu,pdu->uiTotalLen);
-            break;
+            return tcpsocketlist[i]->write((char*)pdu,pdu->uiTotalLen) >= 0;
         }
     }
+    return false;
 }
 
 void MyTcpServer::sendGroupEvent(const QStringList& users, PDU *pdu)

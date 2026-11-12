@@ -18,8 +18,8 @@ function startCooldownTick() {
     if (auth.captchaCooldown <= 0 && cooldownTimer) { clearInterval(cooldownTimer); cooldownTimer = null; }
   }, 1000);
 }
-// 服务端下发验证码后回填（等价桌面端 placeholder 回显）。
-watch(() => auth.captchaCode, (v) => { if (v) { captcha.value = v; startCooldownTick(); } });
+// REQ-AUDIT-001 R8：服务端只下发图片，输入框保持空由用户按图填写。
+watch(() => auth.captchaImage, (v) => { if (v) startCooldownTick(); });
 watch(() => auth.captchaCooldown, (v) => { if (v > 0) startCooldownTick(); });
 
 async function onGetCaptcha() {
@@ -73,6 +73,7 @@ onBeforeUnmount(() => { if (cooldownTimer) clearInterval(cooldownTimer); });
       </label>
       <label class="field">
         <span>验证码</span>
+        <img v-if="auth.captchaImage" class="captcha-img" :src="auth.captchaImage" alt="验证码" />
         <div class="captcha-row">
           <input v-model="captcha" type="text" placeholder="验证码" :disabled="!auth.isConnected" />
           <button class="captcha-btn" :disabled="!auth.isConnected || auth.captchaCooldown > 0" @click="onGetCaptcha">
@@ -107,6 +108,7 @@ onBeforeUnmount(() => { if (cooldownTimer) clearInterval(cooldownTimer); });
 .field > span { display: block; font-size: 13px; color: #374151; margin-bottom: 6px; }
 .field input { width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
 .field input:disabled { background: #f3f4f6; color: #9ca3af; }
+.captcha-img { display: block; height: 44px; margin: 0 0 8px; border-radius: 6px; border: 1px solid #e5e7eb; background: #fff; }
 .captcha-row { display: flex; gap: 8px; }
 .captcha-row input { flex: 1; }
 .captcha-btn { white-space: nowrap; padding: 0 12px; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 8px; font-size: 13px; cursor: pointer; }
