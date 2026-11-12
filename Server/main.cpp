@@ -37,12 +37,8 @@ int main(int argc, char *argv[])
         qCCritical(lcApp) << "Online-state reconciliation failed (see lcDb critical log). Exiting.";
         return 1;
     }
-    // REQ-EXT-FILE-001 F-3/D5 修复：存量"绝对机器路径"键一次性确定性转换为逻辑键
-    //（幂等可重放；必须先于迁移，否则他树旧行与新键并存产生重复/错误命中）。
-    OperateDB::instance().normalizeLogicKeys();
-    // REQ-EXT-FILE-001 T6：存量迁移在版本检查通过后、事件循环启动前自动执行一次。
-    // 此时尚未处理任何业务请求（a.exec 未开始），且幂等：重跑仅跳过已映射文件。
-    OperateDB::instance().migrateLegacyFiles();
+    // REQ-MIG-001：存量键归一化与存量文件迁移均已完成一次性收敛，启动不再跑迁移管线。
+    // 文件域只认逻辑条目 + objects/ 对象存储，不做旧物理路径兼容。
     // REQ-EXT-RECLAIM-001：周期清理调度器（延迟删除的收割者）。
     // 放在这里而不是更早：它要用 filesPath（initialize 载入）、DB 连接池（connect）
     // 与迁移后的 schema（checkSchemaVersion 已 fail-fast）。

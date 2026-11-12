@@ -130,13 +130,6 @@ public:
     };
     // P0-P7 判定点在同一事务/同一入口内按序执行；失败码段 -2xxx 与群消息同源。
     GroupFileResult handleGroupFileOperation(GroupFileRequest &request, const QString &actor);
-    //REQ-EXT-FILE-001 T6：存量文件启动自动迁移（幂等：file_migration_map 已有记录即跳过；
-    //失败记 failed 继续其余，绝不删除旧文件——验收5）。main 在版本检查通过后调用一次。
-    void migrateLegacyFiles();
-    //REQ-EXT-FILE-001 F-3/D5 修复：存量"绝对机器路径"键 → owner 相对逻辑键的一次性确定性转换
-    //（幂等可重放；uk_loc 冲突按 file_id 最早保留，后到 active 行软删+减引用）。
-    //main 在 checkSchemaVersion 后、migrateLegacyFiles 前调用。
-    void normalizeLogicKeys();
     //执行注册用户操作函数
     // 注册新用户：用户名已存在直接失败；成功时生成随机盐并以 md5(客户端哈希+盐) 落库
     bool handleRegit(char* strname,char*strpwd);
