@@ -609,7 +609,7 @@ PDU *MsgHandler::deldir(const QString& loginName)
     }
     else {
         // REQ-EXT-FILE-001 D5：先按逻辑条目解引用（验收3：减引用，归零→待回收，不物理删对象）；
-        // 无条目则回退物理删除（未迁移存量文件）。
+        // 无条目只可能是目录物理残留（条目软删不落盘），按目录回收。
         const QFileInfo delInfo(delFilePath);
         const QString delParent = FileObjectStore::normalizeParent(loginName, delInfo.absolutePath());
         const QString delName = delInfo.fileName();
@@ -709,7 +709,7 @@ PDU *MsgHandler::flushfile()
         respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
         return respdu;
     }
-    // REQ-EXT-FILE-001 D5：逻辑条目为权威；未迁移物理文件按名并入（不与 active 条目重名）。
+    // REQ-EXT-FILE-001 D5：逻辑条目为权威；目录物理实体按名并入（残留目录可见性兜底），文件只来自条目。
     struct Row { QString name; bool isDir; };
     QVector<Row> rows;
     QSet<QString> seen;
@@ -779,7 +779,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
     }
     else {
         // REQ-EXT-FILE-001 D5：条目优先。有条目→只动逻辑键（目录条目级联子树，同事务），
-        // 物理实体若存在（已迁移旧文件）尽力同步改名防回退视图幽灵；无条目→回退纯物理改名（未迁移）。
+        // 目录物理实体若存在则同步改名防幽灵；无条目目录走物理改名+条目级联，无条目文件一律拒绝。
         const QString renParent = FileObjectStore::normalizeParent(loginName, dirPath);
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, renParent, oldName);
@@ -826,7 +826,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
             ret=0;
             qCWarning(lcFs)<<"[renamefile] 拒绝：重命名源不存在 conn="<<m_connId<<":"<<oldFilePath;
         }
-        else if(serverIsDir){//目录（未迁移：物理改名 + 子树条目前缀级联，防幽灵键）
+        else if(serverIsDir){//目录物理残留：物理改名 + 子树条目前缀级联，防幽灵键
             QDir dir;
             ret=dir.rename(oldFilePath,newFilePath);
             if(ret){
@@ -1935,7 +1935,7 @@ PDU *MsgHandler::downloadfile()
     // REQ-EXT-SEC-001: 下载范围收敛为 actor 本人用户根，他人文件不可下载
     // REQ-EXT-FILE-001 D5：对象文件不物理落用户路径，改为校验所在目录在 actor 根内
     if(parentDirInActorRoot(filePath) && !fileName.isEmpty()){
-        // REQ-EXT-FILE-001 D5：优先解析逻辑条目→对象绝对路径；对象缺失回退物理文件（未迁移）。
+        // REQ-EXT-FILE-001 D5：只解析逻辑条目→对象绝对路径，对象缺失即拒绝。
         const QString dlParent = FileObjectStore::normalizeParent(m_actorName, fileInfo.absolutePath());
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(m_actorName, dlParent, fileName);

@@ -109,7 +109,8 @@ def normalize_parent(owner, dir_path, fs_root):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--fsroot", default=r"E:/qt/xiangmu/Server/filesys")
+    ap.add_argument("--fsroot", default=r"E:/qt/xiangmu/dist/filesys",
+                    help="服务端运行树（E2E 以 dist 为 cwd）；Server/filesys 为历史残留树")
     args = ap.parse_args()
     fs_root = os.path.abspath(args.fsroot).replace("\\", "/").rstrip("/")
     fs_base = os.path.basename(fs_root)
@@ -168,8 +169,9 @@ def main():
     for k in unmigrated[:50]:
         emit(f"    {k}")
 
-    # 对象覆盖：active 条目缺 object_id（回退条目）+ file_object 指向的物理对象是否在盘
-    no_obj = rows("SELECT COUNT(*) FROM user_file WHERE status='active' AND object_id IS NULL")[0][0]
+    # 对象覆盖：active 文件条目缺 object_id（回退条目）+ file_object 指向的物理对象是否在盘。
+    # is_dir=1 的目录条目本就没有对象，不计入。
+    no_obj = rows("SELECT COUNT(*) FROM user_file WHERE status='active' AND is_dir=0 AND object_id IS NULL")[0][0]
     emit(f"[5] user_file active 且无对象（回退条目）: {no_obj} 行")
     miss = 0
     for r in rows("SELECT object_id,storage_path FROM file_object"):
