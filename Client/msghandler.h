@@ -39,6 +39,15 @@ public:
     void getcharmsg();
     // REQ-CLI-MSGSTORE-001：服务端 16 私聊入库应答（只决定自发消息是否落本地库，不改界面语义）
     void handleChatAck();
+    // ===== REQ-CHAT-ACK-001：桌面端私聊接收确认 =====
+    // 109 实时投递：caData[0,32)=发送人、[32,40)=消息 ID、caMsg=Msg 记录
+    void chatDeliver();
+    // 112 待送达批量响应：每条 qint64 id + qint32 正文长 + qint32 时间长 + 正文 + 时间
+    void getPendingChat();
+    // 114 待处理好友申请：caMsg 为 32 字节定长请求方账号数组，逐条弹窗询问
+    void handlePendingFriendList();
+    // 把已处理的消息 ID 批量回 110（服务端据此置已送达）
+    void sendChatDeliveredAck(const QList<qint64> &ids);
     // 处理建目录响应，成功则刷新文件列表。
     void mkdir();
     // 处理删除响应：成功则重新请求当前目录列表（异常时名称为“文件夹”）。

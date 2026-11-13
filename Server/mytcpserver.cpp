@@ -195,6 +195,34 @@ bool MyTcpServer::reseed(char *tarname, PDU *pdu){
     return false;
 }
 
+// REQ-CHAT-ACK-001：在线私聊投递按目标连接能力分流。
+// 声明过 116 的桌面连接收 109（携带消息 ID），送达由 110 确认；
+// 未声明的网页/旧连接收 15，维持「写出成功即已送达」的旧语义。
+int MyTcpServer::deliverChat(char *tarname, PDU *ackPdu, PDU *legacyPdu)
+{
+    if(tarname==nullptr){
+        return 0;
+    }
+    QMutexLocker locker(&m_tcpsocketlistMutex);
+    for(int i=0;i<tcpsocketlist.size();i++){
+        MyTcpSocket* sock=tcpsocketlist[i];
+        if(sock==nullptr){
+            continue;
+        }
+        if(strcmp(sock->m_strLoginName.toStdString().c_str(),tarname)!=0){
+            continue;
+        }
+        if(sock->m_supportsChatAck && ackPdu!=nullptr){
+            return sock->write((char*)ackPdu,ackPdu->uiTotalLen)>=0 ? 1 : 0;
+        }
+        if(legacyPdu!=nullptr){
+            return sock->write((char*)legacyPdu,legacyPdu->uiTotalLen)>=0 ? 2 : 0;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 void MyTcpServer::sendGroupEvent(const QStringList& users, PDU *pdu)
 {
     if (pdu == nullptr || users.isEmpty()) {

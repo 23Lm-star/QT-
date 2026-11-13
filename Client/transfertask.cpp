@@ -512,9 +512,10 @@ void TransferManager::onFastcheckRespond(PDU* pdu)
         pumpFastcheck();
         return;
     }
-    bool ret = false, hit = false;
+    int code = 0;
+    bool hit = false;
     uint version = 0;
-    memcpy(&ret, pdu->caData + FASTCHECK_RESP_RET_OFFSET, sizeof(ret));
+    memcpy(&code, pdu->caData + FASTCHECK_RESP_RET_OFFSET, PROTOCOL_CODE_SIZE);
     memcpy(&hit, pdu->caData + FASTCHECK_RESP_HIT_OFFSET, sizeof(hit));
     memcpy(&version, pdu->caData + FASTCHECK_RESP_VERSION_OFFSET, sizeof(version));
     if (version != FASTCHECK_VERSION) {
@@ -522,8 +523,8 @@ void TransferManager::onFastcheckRespond(PDU* pdu)
         pumpFastcheck();
         return;
     }
-    if (!ret) {
-        finishTask(*t, Failed, QStringLiteral("上传失败：服务端拒绝秒传预检查"));
+    if (code != ENUM_PROTOCOL_CODE_OK) {
+        finishTask(*t, Failed, QStringLiteral("上传失败：%1").arg(protocolCodeText(code)));
         pumpFastcheck();
         return;
     }
@@ -735,15 +736,15 @@ void TransferManager::onUploadInitRespond(PDU* pdu)
     const quint64 id = transferIdOf(pdu);
     Task* t = taskByTransferId(id);
     if (t == nullptr) return;
-    bool ret = false;
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
     qint64 resumeOffset = 0;
     uint magic = 0;
-    memcpy(&ret, pdu->caData, sizeof(ret));
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
     memcpy(&magic, pdu->caData + UPLOAD_RESUME_MAGIC_OFFSET, sizeof(magic));
     if (magic == UPLOAD_RESUME_MAGIC) {
         memcpy(&resumeOffset, pdu->caData + UPLOAD_RESUME_OFFSET, sizeof(resumeOffset));
     }
-    if (!ret) {
+    if (code != ENUM_PROTOCOL_CODE_OK) {
         // AUD-2 修复（design §3.3 / 验收 5）：INIT 被拒 = 合法的"继续排队"信号，不是失败。
         if (t->state != Running) return;   // 迟到响应（任务已被暂停/取消）：忽略，名额此前已归还
         if (m_activeUploads > 0) --m_activeUploads;   // 归还本任务在 startTask 计入的名额
@@ -791,17 +792,18 @@ void TransferManager::onUploadDataRespond(PDU* pdu)
     const quint64 id = transferIdOf(pdu);
     Task* t = taskByTransferId(id);
     if (t == nullptr || t->uploader == nullptr) return;
-    bool ret = true, complete = false;
+    int code = ENUM_PROTOCOL_CODE_OK;
+    bool complete = false;
     qint64 nextOffset = 0;
     uint magic = 0;
     memcpy(&magic, pdu->caData + UPLOAD_RESUME_MAGIC_OFFSET, sizeof(magic));
     if (magic == UPLOAD_RESUME_MAGIC) {
-        memcpy(&ret, pdu->caData, sizeof(ret));
+        memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
         memcpy(&nextOffset, pdu->caData + UPLOAD_ACK_NEXT_OFFSET, sizeof(nextOffset));
         memcpy(&complete, pdu->caData + UPLOAD_ACK_COMPLETE_OFFSET, sizeof(complete));
     }
     t->doneBytes = nextOffset;
-    t->uploader->acknowledge(ret, nextOffset, complete);
+    t->uploader->acknowledge(code == ENUM_PROTOCOL_CODE_OK, nextOffset, complete);
     emit tasksChanged();
 }
 
@@ -870,18 +872,16 @@ void TransferManager::onDownloadRespond(PDU* pdu)
     const quint64 id = transferIdOf(pdu);
     Task* t = taskByTransferId(id);
     if (t == nullptr) return;
-    bool ret = false;
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
     qint64 fileSize = 0, accepted = 0;
-    memcpy(&ret, pdu->caData, sizeof(ret));
-    memcpy(&fileSize, pdu->caData + sizeof(bool), sizeof(fileSize));
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
+    memcpy(&fileSize, pdu->caData + DOWNLOAD_RESP_SIZE_OFFSET, sizeof(fileSize));
     memcpy(&accepted, pdu->caData + DOWNLOAD_ACCEPTED_OFFSET, sizeof(accepted));
     QString fileName = QString::fromUtf8(pdu->caData + 32);
     if (fileName.isEmpty()) fileName = QStringLiteral("download.bin");
     const qint64 requested = t->doneBytes;   // 本次 40 声明的起点（0 = 新任务/从头）
-    if (!ret) {
-        finishTask(*t, Failed, requested > 0
-                ? QStringLiteral("服务端未接受续传起点")
-                : QStringLiteral("服务端拒绝下载请求"));
+    if (code != ENUM_PROTOCOL_CODE_OK) {
+        finishTask(*t, Failed, protocolCodeText(code));
         return;
     }
     const int resumeProblem = checkResumeRespond(requested, accepted, fileSize, t->totalBytes);
@@ -1006,11 +1006,12 @@ void TransferManager::onDownloadFinish(PDU* pdu)
     // REQ-EXT-TRANSFER-002（FINDING-AUDIT-1 双保险）：43 仅对 Running 任务有意义；
     // 护栏/IO 失败后映射虽已摘除，仍拒绝在途 43 改写非 Running 的终态。
     if (t->state != Running) return;
-    bool success = false;
-    memcpy(&success, pdu->caData, sizeof(success));
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
     // REQ-EXT-TRANSFER-002 C6（D7）：失败**不再删除**分片——保留是续传前提，
     // 清理仅由「取消」承担；失败任务留同名分片直到取消或重试成功（如实记录，无后台清理）。
-    finishTask(*t, success ? Done : Failed, success ? QString() : QStringLiteral("下载失败"));
+    finishTask(*t, code == ENUM_PROTOCOL_CODE_OK ? Done : Failed,
+               code == ENUM_PROTOCOL_CODE_OK ? QString() : protocolCodeText(code));
 }
 
 // 发送 107（UPLOADFILE_ABORT）——暂停与取消共用，服务端只负责释放槽位
@@ -1034,12 +1035,12 @@ void TransferManager::sendAbortIfActive(Task& t)
 void TransferManager::onAbortRespond(PDU* pdu)
 {
     const quint64 id = transferIdOf(pdu);
-    bool ret = false;
-    memcpy(&ret, pdu->caData, sizeof(ret));
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
     Task* t = taskByTransferId(id);
     if (t == nullptr) return;
     // 暂停/取消已在本地落定，108 仅确认服务端已释放槽位（幂等，无需二次动作）
-    qCDebug(lcCli) << "[transfer] 108 释放确认 id=" << id << " ret=" << ret;
+    qCDebug(lcCli) << "[transfer] 108 释放确认 id=" << id << " code=" << code;
 }
 
 void TransferManager::pause(quint64 key)

@@ -188,11 +188,11 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(d.getUint32(24, true), 11);          // './filesys/u'
   assert.strictEqual(d.getUint32(28, true), 32);          // reqId
   assert.ok(Buffer.from(f.msg).equals(Buffer.concat([Buffer.from(sha), Buffer.from('f.bin'), Buffer.from('./filesys/u'), Buffer.from(reqId)])));
-  // 构造 98 响应并解析
+  // 构造 98 响应并解析：标准码@0、hit@4、version@8、fileId@16、sessionId@24、next@32、nameLen@40。
   const cd = new Uint8Array(64); const dv2 = new DataView(cd.buffer);
-  cd[0] = 1; cd[1] = 1; dv2.setUint32(2, 1, true);
-  dv2.setBigInt64(8, 77n, true); dv2.setBigInt64(16, 99n, true); dv2.setBigInt64(24, 0n, true);
-  dv2.setUint32(32, 6, true);
+  dv2.setInt32(0, 0, true); cd[4] = 1; dv2.setUint32(8, 1, true);
+  dv2.setBigInt64(16, 77n, true); dv2.setBigInt64(24, 99n, true); dv2.setBigInt64(32, 0n, true);
+  dv2.setUint32(40, 6, true);
   const msg = fields.concatBytes('f2.bin', reqId);
   const r98 = drive.parseFastcheckResponse({ caData: cd, caMsg: msg, uiMsgLen: msg.length });
   assert.strictEqual(r98.ret, true); assert.strictEqual(r98.hit, true);
@@ -202,7 +202,7 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   ok('97 帧布局与 98 解析（含 reqId 回带归属）');
 }
 
-// 14) 29 帧布局 + 30 解析（RSUM 魔数、size@32、tid@48；caMsg=目录+NUL）。
+// 14) 29 帧布局 + 30 解析（标准码@0、RSUM 魔数、size@32、tid@48；caMsg=目录+NUL）。
 {
   const f = drive.buildUploadInitFrame({ name: 'f.bin', fileSize: 1234n, tid: 5n, dirAbsPath: './filesys/u' });
   const d = new DataView(f.caData.buffer);
@@ -212,7 +212,7 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(d.getBigUint64(48, true), 5n);
   assert.ok(Buffer.from(f.msg).equals(Buffer.from('./filesys/u\0')));
   const cd = new Uint8Array(64); const dv2 = new DataView(cd.buffer);
-  cd[0] = 1; dv2.setBigInt64(32, 64n, true); dv2.setUint32(40, 0x5253554d, true); dv2.setBigUint64(48, 5n, true);
+  dv2.setInt32(0, 0, true); dv2.setBigInt64(32, 64n, true); dv2.setUint32(40, 0x5253554d, true); dv2.setBigUint64(48, 5n, true);
   const r = drive.parseUploadInitResponse({ caData: cd });
   assert.strictEqual(r.ret, true); assert.strictEqual(r.resumeOffset, 64n); assert.strictEqual(r.tid, 5n);
   ok('29 帧布局与 30 解析（RSUM/续传偏移/tid）');
@@ -228,14 +228,14 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(d.getBigUint64(48, true), 5n);
   assert.ok(Buffer.from(f.msg).equals(Buffer.from(chunk)));
   const cd = new Uint8Array(64); const dv2 = new DataView(cd.buffer);
-  cd[0] = 1; dv2.setBigInt64(8, 65539n, true); cd[16] = 1; dv2.setUint32(40, 0x5253554d, true); dv2.setBigUint64(48, 5n, true);
+  dv2.setInt32(0, 0, true); dv2.setBigInt64(8, 65539n, true); cd[16] = 1; dv2.setUint32(40, 0x5253554d, true); dv2.setBigUint64(48, 5n, true);
   const a = drive.parseUploadAck({ caData: cd });
   assert.strictEqual(a.ret, true); assert.strictEqual(a.nextOffset, 65539n);
   assert.strictEqual(a.complete, true); assert.strictEqual(a.tid, 5n);
   ok('31 帧布局与 32 解析（停等确认字段）');
 }
 
-// 16) 40 帧布局 + 41 解析（fileSize 在非对齐偏移 1！tid@16、accepted@24、名@32）。
+// 16) 40 帧布局 + 41 解析（标准码@0、fileSize@4、tid@16、accepted@24、名@32）。
 {
   const f = drive.buildDownloadFrame({ name: 'f.bin', resumeOffset: 100n, tid: 6n, serverAbsPath: './filesys/u/f.bin' });
   const d = new DataView(f.caData.buffer);
@@ -244,15 +244,15 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(d.getBigUint64(48, true), 6n);
   assert.ok(Buffer.from(f.msg).equals(Buffer.from('./filesys/u/f.bin\0')));
   const cd = new Uint8Array(64); const dv2 = new DataView(cd.buffer);
-  cd[0] = 1;
-  dv2.setBigInt64(1, 1234n, true);            // 非对齐 i64@1
+  dv2.setInt32(0, 0, true);
+  dv2.setBigInt64(4, 1234n, true);            // 标准码@0 后的非对齐 i64@4
   dv2.setBigUint64(16, 6n, true);
   dv2.setBigInt64(24, 100n, true);
   fields.writeFixedStringNul(cd, 32, 32, 'f.bin');
   const r = drive.parseDownloadResponse({ caData: cd });
   assert.strictEqual(r.ret, true); assert.strictEqual(r.fileSize, 1234n);
   assert.strictEqual(r.tid, 6n); assert.strictEqual(r.accepted, 100n); assert.strictEqual(r.fileName, 'f.bin');
-  ok('40 帧布局与 41 解析（非对齐 fileSize@1、tid@16）');
+  ok('40 帧布局与 41 解析（标准码@0、fileSize@4、tid@16）');
 }
 
 // 17) FileInfo 数组解析（36B 步长；0=目录 1=文件；名止于 NUL）。
@@ -274,7 +274,7 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   const f = drive.buildAbortFrame(7n);
   assert.strictEqual(new DataView(f.caData.buffer).getBigUint64(48, true), 7n);
   assert.strictEqual(f.msg, null);
-  const cd = new Uint8Array(64); cd[0] = 1; new DataView(cd.buffer).setBigUint64(48, 7n, true);
+  const cd = new Uint8Array(64); new DataView(cd.buffer).setInt32(0, 0, true); new DataView(cd.buffer).setBigUint64(48, 7n, true);
   const r = drive.parseAbortResponse({ caData: cd });
   assert.strictEqual(r.ret, true); assert.strictEqual(r.tid, 7n);
   ok('107/108 任务释放帧布局');
@@ -495,7 +495,7 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   ok('35 分享邀请 push 解析（分享人 + 源路径 + 文件名）');
 }
 
-// 31) 36 接受请求：caData[0..31]=接收人、caMsg=源路径+NUL；37 回执 bool@0。
+// 31) 36 接受请求：caData[0..31]=接收人、caMsg=源路径+NUL；37 回执标准码@0。
 {
   const src = './filesys/bob/x.txt';
   const f = share.buildShareAcceptFrame({ receiverName: 'bob', sourceAbsPath: src });
@@ -503,9 +503,9 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(fields.readFixedString(f.caData, 0, 32), 'bob');
   assert.strictEqual(fields.readFixedString(f.msg, 0, f.msg.length), src);
   assert.strictEqual(f.msg[f.msg.length - 1], 0);
-  const ca = new Uint8Array(64); ca[0] = 1;
+  const ca = new Uint8Array(64); new DataView(ca.buffer).setInt32(0, 0, true);
   assert.strictEqual(share.parseShareFinish({ caData: ca, caMsg: new Uint8Array(0), uiMsgLen: 0 }).ok, true);
-  ca[0] = 0;
+  new DataView(ca.buffer).setInt32(0, -4006, true);
   assert.strictEqual(share.parseShareFinish({ caData: ca, caMsg: new Uint8Array(0), uiMsgLen: 0 }).ok, false);
   ok('36/37 接受分享请求与回执（接收人 + 源路径 / bool）');
 }
@@ -530,22 +530,21 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   ok('52 创建外链请求布局：路径+NUL+[action+NUL+[seconds]]');
 }
 
-// 33) 53 创建外链响应：ok@0、state@8、caMsg=cloud-disk://share/<token>。
+// 33) 53 创建外链响应：标准码@0、caMsg=cloud-disk://share/<token>。
 {
   const caData = new Uint8Array(64);
-  caData[0] = 1;
-  new DataView(caData.buffer).setUint32(share.PUBLINK_STATE_OFFSET, share.PUBLINK_STATE_EXPIRED, true);
+  new DataView(caData.buffer).setInt32(0, share.PUBLINK_STATE_EXPIRED, true);
   const link = 'cloud-disk://share/AbC-_1234567890abcd';
   const msg = fields.concatBytes(link, new Uint8Array(1));
   const r = share.parseCreatePublishLinkResponse({ caData, caMsg: msg, uiMsgLen: msg.length });
-  assert.deepStrictEqual(r, { ok: true, state: share.PUBLINK_STATE_EXPIRED, link });
-  caData[0] = 0;
-  const r0 = share.parseCreatePublishLinkResponse({ caData, caMsg: new Uint8Array(0), uiMsgLen: 0 });
-  assert.deepStrictEqual([r0.ok, r0.state, r0.link], [false, share.PUBLINK_STATE_EXPIRED, '']);
-  ok('53 创建外链响应：ok@0、state@8、链接文本');
+  assert.deepStrictEqual(r, { ok: false, state: share.PUBLINK_STATE_EXPIRED, link });
+  new DataView(caData.buffer).setInt32(0, 0, true);
+  const success = share.parseCreatePublishLinkResponse({ caData, caMsg: msg, uiMsgLen: msg.length });
+  assert.deepStrictEqual(success, { ok: true, state: share.PUBLINK_STATE_VALID, link });
+  ok('53 创建外链响应：标准码@0、链接文本');
 }
 
-// 34) 56/57 查询外链：owner 32B + 相对路径+NUL；响应 exists@0、state@8。
+// 34) 56/57 查询外链：owner 32B + 相对路径+NUL；响应标准码@0。
 {
   const f = share.buildQueryPublishLinkFrame({ owner: 'alice', relativePath: 'dir/f.txt' });
   assert.strictEqual(f.type, T.QUERY_FILE_PUBLINK_REQUEST);
@@ -553,15 +552,15 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
   assert.strictEqual(fields.readFixedString(f.msg, 0, f.msg.length), 'dir/f.txt');
 
   const caData = new Uint8Array(64);
-  new DataView(caData.buffer).setUint32(share.PUBLINK_STATE_OFFSET, share.PUBLINK_STATE_REVOKED, true);
+  new DataView(caData.buffer).setInt32(0, share.PUBLINK_STATE_REVOKED, true);
   const none = share.parseQueryPublishLinkResponse({ caData, caMsg: new Uint8Array(0), uiMsgLen: 0 });
-  assert.deepStrictEqual(none, { exists: false, state: share.PUBLINK_STATE_REVOKED, link: '' });
+  assert.deepStrictEqual(none, { exists: true, state: share.PUBLINK_STATE_REVOKED, link: '' });
 
-  caData[0] = 1;
+  new DataView(caData.buffer).setInt32(0, 0, true);
   const link = 'cloud-disk://share/' + 'f'.repeat(64);
   const msg = fields.concatBytes(link, new Uint8Array(1));
   const hit = share.parseQueryPublishLinkResponse({ caData, caMsg: msg, uiMsgLen: msg.length });
-  assert.deepStrictEqual(hit, { exists: true, state: share.PUBLINK_STATE_REVOKED, link });
+  assert.deepStrictEqual(hit, { exists: true, state: share.PUBLINK_STATE_VALID, link });
   ok('56/57 查询外链请求与响应（exists/state/链接文本）');
 }
 
@@ -577,7 +576,7 @@ ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量�
 
   const mkPdu = (ok, text) => {
     const caData = new Uint8Array(64);
-    caData[0] = ok ? 1 : 0;
+    new DataView(caData.buffer).setInt32(0, ok ? 0 : share.PUBLINK_STATE_INVALID, true);
     const msg = fields.concatBytes(text, new Uint8Array(1));
     return { caData, caMsg: msg, uiMsgLen: msg.length };
   };

@@ -110,12 +110,12 @@ export const useAuthStore = defineStore('auth', {
     async login(username, password, captcha) {
       try {
         const r = await account.login(net, { username, password, captcha, clientId: this.clientId });
-        if (r.ret === 1) {
+        if (r.ret === 0) {
           this.loggedIn = true;
           this.loginName = r.loginName || username;
           this._setMsg(`登录成功：${this.loginName}`, 'success');
         } else {
-          if (r.ret === -4) this.captchaCooldown = r.remaining || 600;
+          if (r.ret === -3014) this.captchaCooldown = r.remaining || 600;
           this._setMsg(account.describeAuthRet(r.ret), 'error');
         }
         return r;
@@ -130,7 +130,7 @@ export const useAuthStore = defineStore('auth', {
         const r = await account.register(net, { username, password, captcha });
         if (r.success) this._setMsg(`注册成功：${r.name || username}，请登录`, 'success');
         else {
-          if (r.ret === -4) this.captchaCooldown = r.remaining || 600;
+          if (r.ret === -3014) this.captchaCooldown = r.remaining || 600;
           this._setMsg(account.describeAuthRet(r.ret), 'error');
         }
         return r;

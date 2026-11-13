@@ -13,7 +13,7 @@
 // 信封，响应信封回带同一 request_id；bindGroup 一次性给所有响应类型挂 onPush，按
 // `respType:requestId` 投递等待者。102/106 例外：其 request_id 即 transfer_id，由
 // stores/transfer.js 按 tid 路由，本模块不参与其关联（只导出帧构造/解析供其复用）。
-import { T } from '../msgtypes.js';
+import { T, protocolCodeText } from '../msgtypes.js';
 import { getNet } from '../net.js';
 import { concatBytes, textEncoder, textDecoder, utf8Length } from '../fields.js';
 
@@ -562,7 +562,7 @@ export function describeGroupCode(code) {
     case -2106: return '上传并发已满或任务标识冲突';
     case -2107: return '下载并发已满';
     case -2108: return '续传起点非法';
-    default: return `群操作失败（code=${code}）`;
+    default: return protocolCodeText(code);
   }
 }
 

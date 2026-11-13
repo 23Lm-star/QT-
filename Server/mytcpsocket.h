@@ -40,6 +40,8 @@ public:
     quint64 m_connectionId;
     // REQ-EXT-SEC-001：连接认证状态（仅服务端登录成功/注销/断线时写入，客户端不可覆盖）
     bool m_actorAuthenticated = false;
+    // REQ-CHAT-ACK-001：客户端是否声明支持 109/110 私聊接收确认（登录后发 116）
+    bool m_supportsChatAck = false;
     // 本连接认证代次：登录/注销/断线时自增，供日志区分同一连接的不同身份阶段。
     quint64 m_actorSessionVersion = 0;
     // REQ-EXT-SESSION-001：登录时服务端事务分配的用户域版本（0=未认证），每请求处理前比对登记表

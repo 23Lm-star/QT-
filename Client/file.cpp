@@ -662,7 +662,7 @@ QString File::selectedFileRelativePath(QListWidgetItem *item)
 // REQ-EXT-SHARE-001：外链已失效时不再只丢一句"链接无效"——让主人当场在
 // 「重新生成链接」（作废旧链接、换一条新的）与「续期」（延长当前链接有效期）之间选。
 // 已撤销的链接不给续期入口：续期只改 expire_time，不会让作废的链接复活。
-void File::promptShareLinkRecovery(quint32 state, const QString &note)
+void File::promptShareLinkRecovery(int code, const QString &note)
 {
     if(m_strShareFileName.isEmpty()){
         QMessageBox::information(this, "提示", "请先在文件列表里选中一个文件");
@@ -674,12 +674,12 @@ void File::promptShareLinkRecovery(quint32 state, const QString &note)
     box.setText(QString("文件「%1」的分享链接%2。%3\n\n可以重新生成一条新链接（旧链接随即失效），"
                         "或给当前链接续期。")
                 .arg(m_strShareFileName)
-                .arg(state == PUBLINK_STATE_REVOKED ? "已被撤销" : "已过期")
+                .arg(code == ENUM_PROTOCOL_CODE_LINK_REVOKED ? "已被撤销" : "已过期")
                 .arg(note));
     QPushButton* regenBtn = box.addButton("重新生成链接", QMessageBox::AcceptRole);
     QPushButton* renewBtn = box.addButton("续期", QMessageBox::ActionRole);
     box.addButton("取消", QMessageBox::RejectRole);
-    if(state == PUBLINK_STATE_REVOKED){
+    if(code == ENUM_PROTOCOL_CODE_LINK_REVOKED){
         renewBtn->setEnabled(false);
     }
     box.exec();

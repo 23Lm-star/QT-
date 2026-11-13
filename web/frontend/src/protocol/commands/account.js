@@ -2,7 +2,7 @@
 // 逐字节复刻 Client/client.cpp 的 on_login_PB_clicked / on_register_PB_clicked 与
 // msghandler.cpp 的 handllogin / handlrigist / handleCaptcha。
 import md5 from 'js-md5';
-import { T, LoginRet, CaptchaStatus } from '../msgtypes.js';
+import { T, LoginRet, CaptchaStatus, protocolCodeText } from '../msgtypes.js';
 import { CA_DATA_SIZE } from '../pdu.js';
 import {
   writeFixedStringNul, writeExactBytes, writeBytes, concatBytes,
@@ -101,7 +101,8 @@ export function describeAuthRet(ret) {
     case LoginRet.CAPTCHA_WRONG: return '验证码错误，请重新输入';
     case LoginRet.CAPTCHA_EXPIRED: return '验证码已过期，请重新获取';
     case LoginRet.LOCKED: return '验证码错误次数过多，账号已锁定';
-    case 0: return '操作失败';
-    default: return `未知返回码 ${ret}`;
+    case LoginRet.ACCOUNT_EXISTS: return '账号已存在';
+    case LoginRet.DB_UNAVAILABLE: return '数据库不可用，请联系服务端';
+    default: return protocolCodeText(ret);
   }
 }

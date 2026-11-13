@@ -7,6 +7,7 @@
 // 多字节整数按主机字节序直接 memcpy（局域网内同架构），群协议部分则显式小端。
 
 #include <QByteArray>
+#include <QString>
 #include <QtGlobal>
 
 typedef unsigned int uint;
@@ -153,6 +154,17 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST = 107,   // 上传任务释放请求（暂停/取消共用）
     ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND = 108,   // 上传任务释放响应
 
+    // ===== REQ-CHAT-ACK-001：私聊接收确认（仅追加，旧编号 1-108 不变） =====
+    ENUM_MSG_TYPE_CHAT_DELIVER_EVENT = 109,          // 实时投递事件，caData[32,40)=qint64 消息 ID
+    ENUM_MSG_TYPE_CHAT_DELIVER_ACK = 110,            // 接收确认，caMsg=N×qint64 消息 ID
+    ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST = 111,   // 拉取待送达私聊（同 17 布局，响应带 ID）
+    ENUM_MSG_TYPE_CHAT_PULL_PENDING_RESPOND = 112,   // 每条：qint64 id + qint32 正文长 + qint32 时间长 + 正文 + 时间
+    ENUM_MSG_TYPE_LIST_PENDING_FRIEND_REQUEST = 113, // 待处理好友申请列表请求
+    ENUM_MSG_TYPE_LIST_PENDING_FRIEND_RESPOND = 114, // 响应：caMsg 为 32 字节定长请求方账号数组
+    ENUM_MSG_TYPE_REJECT_FRIEND_REQUEST = 115,       // 拒绝好友申请，caData[0,32)=请求方账号
+    // 客户端能力声明：桌面端登录后发送，声明支持 109/110 接收确认
+    ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY = 116,
+
     // 哨兵上限，无实际消息含义
     ENUM_MSG_TYPE_MAX = 99999,
 };
@@ -173,14 +185,14 @@ static const int FASTCHECK_REQID_LEN_OFFSET  = 28;  // u32
 static const int FASTCHECK_SHA_HEX_LEN       = 64;
 static const int FASTCHECK_REQID_HEX_LEN     = 32;
 
-// 响应 caData：ret/hit 后接定长字段；最终展示名进 caMsg（hit 时非空）
-static const int FASTCHECK_RESP_RET_OFFSET        = 0;   // bool
-static const int FASTCHECK_RESP_HIT_OFFSET        = 1;   // bool
-static const int FASTCHECK_RESP_VERSION_OFFSET    = 2;   // u32
-static const int FASTCHECK_RESP_FILE_ID_OFFSET    = 8;   // qint64
-static const int FASTCHECK_RESP_SESSION_ID_OFFSET = 16;  // qint64
-static const int FASTCHECK_RESP_NEXT_OFFSET       = 24;  // qint64，miss 时续传起点
-static const int FASTCHECK_RESP_NAME_LEN_OFFSET   = 32;  // u32
+// 响应 caData：标准码(4B) 之后接 hit 与定长字段；最终展示名进 caMsg（hit 时非空）
+static const int FASTCHECK_RESP_RET_OFFSET        = 0;   // int32 标准码
+static const int FASTCHECK_RESP_HIT_OFFSET        = 4;   // u8 bool
+static const int FASTCHECK_RESP_VERSION_OFFSET    = 8;   // u32
+static const int FASTCHECK_RESP_FILE_ID_OFFSET    = 16;  // qint64
+static const int FASTCHECK_RESP_SESSION_ID_OFFSET = 24;  // qint64
+static const int FASTCHECK_RESP_NEXT_OFFSET       = 32;  // qint64，miss 时续传起点
+static const int FASTCHECK_RESP_NAME_LEN_OFFSET   = 40;  // u32
 
 // ===== REQ-EXT-GROUP-003：群文件 PDU 布局常量（两端逐字节一致，只追加） =====
 // 全部载荷以 GROUP-001/002 的 20B 群信封开头（version|envelope_length|request_id|group_id），
@@ -312,17 +324,124 @@ static const quint32 MAX_PARALLEL_DOWNLOADS = 3;          // 单连接并发下�
 // ===== REQ-EXT-TRANSFER-002：下载续传起点（两端逐字节一致，仅追加；0 = 从头） =====
 static const int DOWNLOAD_RESUME_OFFSET = 32;             // u64；40/105 请求：客户端声明的续传起点
 static const int DOWNLOAD_ACCEPTED_OFFSET = 24;           // u64；41/106 响应：服务端实际采纳的起点
+static const int DOWNLOAD_RESP_SIZE_OFFSET = 4;           // u64；41 响应：文件大小（标准码占 [0,4) 后顺延）
 
 // ===== REQ-EXT-SHARE-001：外链分享生命周期（两端逐字节一致，仅追加） =====
-// 53/57 响应 caData[PUBLINK_STATE_OFFSET]：u32 状态字。旧服务端不写此区间、
-// mkPDU 全零初始化 → 旧客户端读到 0 = 有效，语义与旧版一致。
-static const int PUBLINK_STATE_OFFSET = 8;
-static const quint32 PUBLINK_STATE_VALID = 0;
-static const quint32 PUBLINK_STATE_EXPIRED = 1;
-static const quint32 PUBLINK_STATE_REVOKED = 2;
+// REQ-PROTO-CODE-001：53/55/57 的结果并入标准码（caData[0,4)），不再单设状态字：
+// 0=链接可用，-2017=已过期，-2018=已吊销，-2019=不存在或无效 token。
 // 52 请求 caMsg 的附加动作区：<relativePath>\0[<action>\0[<seconds>]]。action 缺省 = 旧语义
 // （有记录则复用、无则新建）。旧服务端用 fixedString 读到首个 NUL 即止 → 附加区被忽略，向后兼容。
 static const char PUBLINK_ACTION_NEW[] = "new";       // 作废旧行并重新生成
 static const char PUBLINK_ACTION_RENEW[] = "renew";   // 续期：延长既有行有效期
 static const int PUBLINK_RENEW_DEFAULT_SECONDS = 30 * 24 * 3600;   // 续期缺省 30 天
+
+// ===== REQ-PROTO-CODE-001：服务端处理结果标准码（两端逐字节一致，只追加） =====
+// 所有响应 PDU 在 caData[0,4) 写 int32 标准码，取代原先的 bool/0-1-2 数值判断：
+//   0 = 成功完成；1 = 已受理、等待对方确认（好友申请）；负数 = 失败原因。
+// 分段：-1xxx 认证/会话（与群协议共用 -1001/-1002）、-2xxx 业务/权限、
+//       -3xxx 参数/协议、-4xxx 存储/文件、-5xxx 并发/传输、-9xxx 内部错误。
+// 群协议（60-108）继续使用其 20B 信封内的 code 字段，值域并入本枚举且码值不变；
+// 其 -1003..-1049 细分码按原样沿用，只表示群操作的更细失败原因。
+static const int PROTOCOL_CODE_OFFSET = 0;      // int32，所有响应的标准码位置
+static const int PROTOCOL_CODE_SIZE = 4;
+
+enum ENUM_PROTOCOL_CODE {
+    ENUM_PROTOCOL_CODE_OK = 0,                       // 成功完成
+    ENUM_PROTOCOL_CODE_ACCEPTED = 1,                 // 已受理，等待对方确认
+
+    // ===== 认证 / 会话 =====
+    ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED = -1001,    // 未认证：无登录上下文或会话已失效
+    ENUM_PROTOCOL_CODE_DB_UNAVAILABLE = -1002,       // 数据库不可用
+
+    // ===== 业务 / 权限 =====
+    ENUM_PROTOCOL_CODE_BAD_CREDENTIALS = -2011,      // 账号或密码错误
+    ENUM_PROTOCOL_CODE_ACCOUNT_EXISTS = -2012,       // 账号已存在
+    ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND = -2013,     // 目标用户/文件不存在
+    ENUM_PROTOCOL_CODE_TARGET_UNAVAILABLE = -2014,   // 目标不可用或不在线
+    ENUM_PROTOCOL_CODE_NOT_FRIEND = -2015,           // 双方不是好友
+    ENUM_PROTOCOL_CODE_NO_PENDING_REQUEST = -2016,   // 没有待处理的好友申请
+    ENUM_PROTOCOL_CODE_LINK_EXPIRED = -2017,         // 外链已过期
+    ENUM_PROTOCOL_CODE_LINK_REVOKED = -2018,         // 外链已吊销
+    ENUM_PROTOCOL_CODE_LINK_INVALID = -2019,         // 外链不存在或 token 无效
+    ENUM_PROTOCOL_CODE_NOT_ALLOWED = -2020,          // 当前身份或状态不允许该操作
+    ENUM_PROTOCOL_CODE_GROUP_NOT_MEMBER = -2101,     // 非群成员（群协议原值）
+    ENUM_PROTOCOL_CODE_GROUP_NOT_FOUND = -2102,      // 群不存在或已解散（群协议原值）
+    ENUM_PROTOCOL_CODE_GROUP_CONTENT_INVALID = -2103,// 群内容/幂等键非法（群协议原值）
+    ENUM_PROTOCOL_CODE_GROUP_IDEMPOTENT_CONFLICT = -2104, // 群幂等冲突异常（原值）
+    ENUM_PROTOCOL_CODE_GROUP_SEQ_FAILED = -2105,     // 群序号分配或入库失败（原值）
+    ENUM_PROTOCOL_CODE_CONCURRENCY_LIMIT = -2107,    // 并发传输已达上限（群协议原值）
+
+    // ===== 参数 / 协议 =====
+    ENUM_PROTOCOL_CODE_BAD_PARAM = -3001,            // 参数缺失或非法
+    ENUM_PROTOCOL_CODE_VERSION_MISMATCH = -3002,     // 版本或魔数不匹配
+    ENUM_PROTOCOL_CODE_BAD_FORMAT = -3003,           // 报文格式或长度非法
+    ENUM_PROTOCOL_CODE_UNKNOWN_TYPE = -3004,         // 未知消息类型
+    ENUM_PROTOCOL_CODE_CAPTCHA_WRONG = -3011,        // 验证码错误
+    ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED = -3012,      // 验证码已过期
+    ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN = -3013,     // 获取过于频繁，仍在冷却
+    ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED = -3014,       // 验证码错误次数过多，账号锁定
+
+    // ===== 存储 / 文件 =====
+    ENUM_PROTOCOL_CODE_FILE_NOT_FOUND = -4001,       // 文件不存在
+    ENUM_PROTOCOL_CODE_DIR_NOT_FOUND = -4002,        // 目录不存在
+    ENUM_PROTOCOL_CODE_CREATE_FAILED = -4003,        // 创建文件/目录失败
+    ENUM_PROTOCOL_CODE_DELETE_FAILED = -4004,        // 删除失败
+    ENUM_PROTOCOL_CODE_RENAME_FAILED = -4005,        // 重命名或移动失败
+    ENUM_PROTOCOL_CODE_WRITE_FAILED = -4006,         // 写入或持久化失败
+    ENUM_PROTOCOL_CODE_ALREADY_EXISTS = -4007,       // 同名项已存在
+    ENUM_PROTOCOL_CODE_IO_FAILED = -4008,            // 通用读写或事务失败
+
+    // ===== 并发 / 传输 =====
+    ENUM_PROTOCOL_CODE_TRANSFER_NOT_FOUND = -5002,   // 传输任务或上传会话不存在
+
+    // ===== 内部 =====
+    ENUM_PROTOCOL_CODE_INTERNAL = -9001              // 服务端内部错误
+};
+
+// 标准码 → 用户可见文案（两端共用，服务端日志同样使用）。未知码回退为带编号的通用文案。
+inline QString protocolCodeText(int code)
+{
+    switch (code) {
+    case ENUM_PROTOCOL_CODE_OK: return QStringLiteral("操作成功");
+    case ENUM_PROTOCOL_CODE_ACCEPTED: return QStringLiteral("已受理，等待对方确认");
+    case ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED: return QStringLiteral("未登录或会话已失效");
+    case ENUM_PROTOCOL_CODE_DB_UNAVAILABLE: return QStringLiteral("数据库不可用");
+    case ENUM_PROTOCOL_CODE_BAD_CREDENTIALS: return QStringLiteral("账号或密码错误");
+    case ENUM_PROTOCOL_CODE_ACCOUNT_EXISTS: return QStringLiteral("账号已存在");
+    case ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND: return QStringLiteral("目标不存在");
+    case ENUM_PROTOCOL_CODE_TARGET_UNAVAILABLE: return QStringLiteral("目标不可用或不在线");
+    case ENUM_PROTOCOL_CODE_NOT_FRIEND: return QStringLiteral("对方不是你的好友");
+    case ENUM_PROTOCOL_CODE_NO_PENDING_REQUEST: return QStringLiteral("没有待处理的好友申请");
+    case ENUM_PROTOCOL_CODE_LINK_EXPIRED: return QStringLiteral("分享链接已过期");
+    case ENUM_PROTOCOL_CODE_LINK_REVOKED: return QStringLiteral("分享链接已吊销");
+    case ENUM_PROTOCOL_CODE_LINK_INVALID: return QStringLiteral("分享链接不存在或无效");
+    case ENUM_PROTOCOL_CODE_NOT_ALLOWED: return QStringLiteral("当前身份或状态不允许该操作");
+    case ENUM_PROTOCOL_CODE_GROUP_NOT_MEMBER: return QStringLiteral("你不是该群成员");
+    case ENUM_PROTOCOL_CODE_GROUP_NOT_FOUND: return QStringLiteral("群不存在或已解散");
+    case ENUM_PROTOCOL_CODE_GROUP_CONTENT_INVALID: return QStringLiteral("群内容或幂等键非法");
+    case ENUM_PROTOCOL_CODE_GROUP_IDEMPOTENT_CONFLICT: return QStringLiteral("群操作幂等冲突");
+    case ENUM_PROTOCOL_CODE_GROUP_SEQ_FAILED: return QStringLiteral("群序号分配或入库失败");
+    case ENUM_PROTOCOL_CODE_CONCURRENCY_LIMIT: return QStringLiteral("并发传输已达上限");
+    case ENUM_PROTOCOL_CODE_BAD_PARAM: return QStringLiteral("请求参数非法");
+    case ENUM_PROTOCOL_CODE_VERSION_MISMATCH: return QStringLiteral("协议版本不匹配");
+    case ENUM_PROTOCOL_CODE_BAD_FORMAT: return QStringLiteral("报文格式或长度非法");
+    case ENUM_PROTOCOL_CODE_UNKNOWN_TYPE: return QStringLiteral("未知消息类型");
+    case ENUM_PROTOCOL_CODE_CAPTCHA_WRONG: return QStringLiteral("验证码错误，请重新输入");
+    case ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED: return QStringLiteral("验证码已过期，请重新获取");
+    case ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN: return QStringLiteral("获取验证码过于频繁，请稍后再试");
+    case ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED: return QStringLiteral("验证码错误次数过多，账号已锁定");
+    case ENUM_PROTOCOL_CODE_FILE_NOT_FOUND: return QStringLiteral("文件不存在");
+    case ENUM_PROTOCOL_CODE_DIR_NOT_FOUND: return QStringLiteral("目录不存在");
+    case ENUM_PROTOCOL_CODE_CREATE_FAILED: return QStringLiteral("创建失败");
+    case ENUM_PROTOCOL_CODE_DELETE_FAILED: return QStringLiteral("删除失败");
+    case ENUM_PROTOCOL_CODE_RENAME_FAILED: return QStringLiteral("重命名或移动失败");
+    case ENUM_PROTOCOL_CODE_WRITE_FAILED: return QStringLiteral("写入失败");
+    case ENUM_PROTOCOL_CODE_ALREADY_EXISTS: return QStringLiteral("同名项已存在");
+    case ENUM_PROTOCOL_CODE_IO_FAILED: return QStringLiteral("存储读写失败");
+    case ENUM_PROTOCOL_CODE_TRANSFER_NOT_FOUND: return QStringLiteral("传输任务不存在");
+    case ENUM_PROTOCOL_CODE_INTERNAL: return QStringLiteral("服务端内部错误");
+    default: return QStringLiteral("未知错误(%1)").arg(code);
+    }
+}
+
 #endif // PROTOCOL_H

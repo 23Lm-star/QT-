@@ -54,10 +54,10 @@ export function sendAddFriendAgree(myName, requester, net = getNet()) {
 }
 
 // 删除好友（13→14）：caData[0..31]=被删好友、[32..64)=自己。
-// 响应 caData[0] 仅 1 字节 bool；成功后服务端会联动清除双方私聊记录。
+// 响应 caData[0..3]=标准码；成功后服务端会联动清除双方私聊记录。
 export async function deleteFriend(target, myName, net = getNet()) {
   const resp = await net.request(T.DELETEFRIEND_REQUEST, T.DELETEFRIEND_RESPOND, twoNameCaData(target, myName));
-  return resp.caData[0] !== 0;
+  return readI32(resp.caData, 0) === 0;
 }
 
 // 查找用户（5→6）：caData[0..31]=待查用户名；响应 caData[0..3]=ret。
@@ -69,7 +69,7 @@ export async function findUser(name, net = getNet()) {
 }
 
 // 获取用户信息（46→47）：caData[0..31]=用户名。
-// 响应 caData[0..3]=resultCode(0 找到/-1 未找到)、[4..7]=在线态、[32..63]=用户名。
+// 响应 caData[0..3]=标准码（0 找到/-2013 未找到）、[4..7]=在线态、[32..63]=用户名。
 export async function getUserInfo(name, net = getNet()) {
   const caData = new Uint8Array(64);
   writeFixedStringNul(caData, 0, 32, name);
@@ -86,15 +86,15 @@ export function parseIncomingFriendRequest(pdu) {
   return { requester: readFixedString(pdu.caData, 0, 32) };
 }
 
-// push 解析：收到 10 = 加好友结果（caData[0..3]=ret）。1 成功；-2 对方不在线；其余失败。
+// push 解析：收到 10 = 加好友结果（caData[0..3]=标准码）。0 关系已建立；1 申请已登记待确认。
 export function parseFriendResult(pdu) {
   return { ret: readI32(pdu.caData, 0) };
 }
 
 export function describeFriendRet(ret) {
-  if (ret === 1) return '好友添加成功';
-  if (ret === -2) return '该用户不在线';
-  return '添加失败：对方不在线或已是好友';
+  if (ret === 0) return '好友添加成功';
+  if (ret === 1) return '好友申请已发送，等待对方确认';
+  return protocolCodeText(ret);
 }
 
 // readU32 再导出，便于测试断言布局。

@@ -7,7 +7,7 @@
 import { T } from '../msgtypes.js';
 import { getNet } from '../net.js';
 import {
-  writeFixedStringNul, readFixedString, u32ToBytes, u64ToBytes, concatBytes, textEncoder,
+  writeFixedStringNul, readFixedString, readI32, u32ToBytes, u64ToBytes, concatBytes, textEncoder,
 } from '../fields.js';
 
 // ===== 常量（对齐 Server/protocol.h 与 Client/uploader.h）=====
@@ -36,6 +36,7 @@ export const TRANSFER_ID_OFFSET = 48;
 export const DOWNLOAD_RESP_TRANSFER_ID_OFFSET = 16; // 仅 41
 export const DOWNLOAD_RESUME_OFFSET = 32;  // 40 请求声明起点
 export const DOWNLOAD_ACCEPTED_OFFSET = 24; // 41 响应采纳起点
+export const DOWNLOAD_RESP_SIZE_OFFSET = 4;  // 41 响应文件大小（标准码占 [0,4)）
 
 export const FASTCHECK_VERSION_OFFSET = 0;
 export const FASTCHECK_MAGIC_OFFSET = 4;
@@ -47,12 +48,12 @@ export const FASTCHECK_REQID_LEN_OFFSET = 28;
 export const FASTCHECK_SHA_HEX_LEN = 64;
 
 export const FASTCHECK_RESP_RET_OFFSET = 0;
-export const FASTCHECK_RESP_HIT_OFFSET = 1;
-export const FASTCHECK_RESP_VERSION_OFFSET = 2;
-export const FASTCHECK_RESP_FILE_ID_OFFSET = 8;
-export const FASTCHECK_RESP_SESSION_ID_OFFSET = 16;
-export const FASTCHECK_RESP_NEXT_OFFSET = 24;
-export const FASTCHECK_RESP_NAME_LEN_OFFSET = 32;
+export const FASTCHECK_RESP_HIT_OFFSET = 4;
+export const FASTCHECK_RESP_VERSION_OFFSET = 8;
+export const FASTCHECK_RESP_FILE_ID_OFFSET = 16;
+export const FASTCHECK_RESP_SESSION_ID_OFFSET = 24;
+export const FASTCHECK_RESP_NEXT_OFFSET = 32;
+export const FASTCHECK_RESP_NAME_LEN_OFFSET = 40;
 
 export const MAX_PARALLEL_UPLOADS = 3;
 export const MAX_PARALLEL_DOWNLOADS = 3;
@@ -116,13 +117,13 @@ export async function makeDirectory(parentAbsPath, dirName, net = getNet()) {
   const caData = new Uint8Array(64);
   writeFixedStringNul(caData, 0, 32, dirName);
   const resp = await net.request(T.MKDIR_REQUEST, T.MKDIR_RESPOND, caData, pathMsg(parentAbsPath), DRIVE_REQ_TIMEOUT_MS);
-  return resp.caData[0] !== 0;
+  return readI32(resp.caData, 0) === 0;
 }
 
 // 21→22 跳转目录：返回 {exists, path}（传文件路径时服务端回其父目录）。
 export async function changeDirectory(targetAbsPath, net = getNet()) {
   const resp = await net.request(T.CHANGEDIR_REQUEST, T.CHANGEDIR_RESPOND, null, pathMsg(targetAbsPath), DRIVE_REQ_TIMEOUT_MS);
-  const exists = resp.caData[0] !== 0;
+  const exists = readI32(resp.caData, 0) === 0;
   const path = exists ? readFixedString(resp.caMsg, 0, resp.uiMsgLen) : '';
   return { exists, path };
 }
@@ -130,7 +131,7 @@ export async function changeDirectory(targetAbsPath, net = getNet()) {
 // 25→26 删除文件/目录（uiType: 0=目录 1=文件）。
 export async function deleteEntry(absPath, uiType, net = getNet()) {
   const resp = await net.request(T.DELFILE_REQUEST, T.DELFILE_RESPOND, u32ToBytes(uiType), pathMsg(absPath), DRIVE_REQ_TIMEOUT_MS);
-  return resp.caData[0] !== 0;
+  return readI32(resp.caData, 0) === 0;
 }
 
 // 27→28 重命名：caMsg = uiType u32 + 目录绝对路径 + NUL。
@@ -140,7 +141,7 @@ export async function renameEntry(dirAbsPath, oldName, newName, uiType, net = ge
   writeFixedStringNul(caData, 32, 32, newName);
   const msg = concatBytes(u32ToBytes(uiType), textEncoder.encode(dirAbsPath), new Uint8Array(1));
   const resp = await net.request(T.RENAMEFILE_REQUEST, T.RENAMEFILE_RESPOND, caData, msg, DRIVE_REQ_TIMEOUT_MS);
-  return resp.caData[0] !== 0;
+  return readI32(resp.caData, 0) === 0;
 }
 
 // 38→39 移动（相对用户根路径）：caMsg = srcRel\0dstRel\0。返回 {ok, finalName}。
@@ -149,7 +150,7 @@ export async function moveEntry(srcRel, dstRel, srcName, net = getNet()) {
   writeFixedStringNul(caData, 0, 32, srcName);
   const msg = concatBytes(textEncoder.encode(srcRel), new Uint8Array(1), textEncoder.encode(dstRel), new Uint8Array(1));
   const resp = await net.request(T.MOVEFILE_REQUEST, T.MOVEFILE_RESPOND, caData, msg, DRIVE_REQ_TIMEOUT_MS);
-  return { ok: resp.caData[0] !== 0, finalName: readFixedString(resp.caData, 32, 32) };
+  return { ok: readI32(resp.caData, 0) === 0, finalName: readFixedString(resp.caData, 32, 32) };
 }
 
 // 58→59 列子目录（移动目标选择用；relPath 空 = 用户根）。
@@ -200,7 +201,7 @@ export function parseFastcheckResponse(pdu) {
     ? new TextDecoder('utf-8').decode(msg.subarray(nameLen, msg.length))
     : '';
   return {
-    ret: pdu.caData[FASTCHECK_RESP_RET_OFFSET] !== 0,
+    ret: readI32(pdu.caData, FASTCHECK_RESP_RET_OFFSET) === 0,
     hit: pdu.caData[FASTCHECK_RESP_HIT_OFFSET] !== 0,
     version: d.getUint32(FASTCHECK_RESP_VERSION_OFFSET, true),
     fileId: readI64(pdu.caData, FASTCHECK_RESP_FILE_ID_OFFSET),
@@ -226,7 +227,7 @@ export function parseUploadInitResponse(pdu) {
   const d = dv(pdu.caData);
   const hasMagic = d.getUint32(UPLOAD_RESUME_MAGIC_OFFSET, true) === RSUM_MAGIC;
   return {
-    ret: pdu.caData[0] !== 0,
+    ret: readI32(pdu.caData, 0) === 0,
     resumeOffset: hasMagic ? readI64(pdu.caData, UPLOAD_RESUME_OFFSET) : 0n,
     tid: d.getBigUint64(TRANSFER_ID_OFFSET, true),
   };
@@ -246,7 +247,7 @@ export function parseUploadAck(pdu) {
   const d = dv(pdu.caData);
   const hasMagic = d.getUint32(UPLOAD_RESUME_MAGIC_OFFSET, true) === RSUM_MAGIC;
   return {
-    ret: pdu.caData[0] !== 0,
+    ret: readI32(pdu.caData, 0) === 0,
     nextOffset: hasMagic ? readI64(pdu.caData, UPLOAD_ACK_NEXT_OFFSET) : 0n,
     complete: hasMagic ? pdu.caData[UPLOAD_ACK_COMPLETE_OFFSET] !== 0 : false,
     tid: d.getBigUint64(TRANSFER_ID_OFFSET, true),
@@ -260,7 +261,7 @@ export function buildAbortFrame(tid) {
   return { type: T.UPLOADFILE_ABORT_REQUEST, caData, msg: null };
 }
 export function parseAbortResponse(pdu) {
-  return { ret: pdu.caData[0] !== 0, tid: dv(pdu.caData).getBigUint64(TRANSFER_ID_OFFSET, true) };
+  return { ret: readI32(pdu.caData, 0) === 0, tid: dv(pdu.caData).getBigUint64(TRANSFER_ID_OFFSET, true) };
 }
 
 // ===== 下载链 =====
@@ -274,12 +275,12 @@ export function buildDownloadFrame({ name, resumeOffset, tid, serverAbsPath }) {
   return { type: T.DOWNLOADFILE_REQUEST, caData, msg: pathMsg(serverAbsPath) };
 }
 
-// 41 响应解析：ret bool@0、fileSize i64@1（非对齐）、tid@16、accepted@24、文件名@32..62。
+// 41 响应解析：标准码@0、fileSize i64@4、tid@16、accepted@24、文件名@32..62。
 export function parseDownloadResponse(pdu) {
   const d = dv(pdu.caData);
   return {
-    ret: pdu.caData[0] !== 0,
-    fileSize: readI64(pdu.caData, 1),
+    ret: readI32(pdu.caData, 0) === 0,
+    fileSize: readI64(pdu.caData, DOWNLOAD_RESP_SIZE_OFFSET),
     tid: d.getBigUint64(DOWNLOAD_RESP_TRANSFER_ID_OFFSET, true),
     accepted: readI64(pdu.caData, DOWNLOAD_ACCEPTED_OFFSET),
     fileName: readFixedString(pdu.caData, 32, 32),
@@ -291,9 +292,9 @@ export function parseDownloadData(pdu) {
   return { tid: dv(pdu.caData).getBigUint64(TRANSFER_ID_OFFSET, true), chunk: pdu.caMsg };
 }
 
-// 43 完成：success bool@0 + tid@48。
+// 43 完成：标准码@0 + tid@48。
 export function parseDownloadFinish(pdu) {
-  return { success: pdu.caData[0] !== 0, tid: dv(pdu.caData).getBigUint64(TRANSFER_ID_OFFSET, true) };
+  return { success: readI32(pdu.caData, 0) === 0, tid: dv(pdu.caData).getBigUint64(TRANSFER_ID_OFFSET, true) };
 }
 
 // 生成 32 位 hex 请求标识（等价桌面端 QUuid rfc4122 hex 的长度与字符集）。

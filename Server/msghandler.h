@@ -130,6 +130,17 @@ public:
     // 写出失败/断线则不调用，消息保持待送达等下次重投。
     QVector<qlonglong> m_pendingDeliveredIds;
     void confirmChatDelivered();
+    // ===== REQ-CHAT-ACK-001：桌面端私聊接收确认 =====
+    // 111：拉取本人待送达私聊（来自 caData[0,32) 指定的对方），响应 112 每条带消息 ID，
+    //      只读不标记——只有客户端 110 确认后才置已送达。
+    PDU* chatPending();
+    // 110：客户端确认已处理的消息 ID 列表（caMsg 为 N×qint64），按「ID+收件人」标记，
+    //      无响应；返回 nullptr。
+    void chatDeliveredAck();
+    // 113/114：本人仍待处理的好友申请（离线期间登记的也在内）
+    PDU* listPendingFriendRequests();
+    // 115：拒绝好友申请（只清本人收到的 pending 行，无响应）
+    void rejectFriendRequest();
     // 取验证码：成功则生成新码并从 caMsg 返回，锁定/冷却中只回状态码与剩余秒数。
     PDU* captcha();//验证码生成
     // 从固定字符表随机生成 length 位验证码（依赖 MsgHandler 构造时的 qrand 播种）。

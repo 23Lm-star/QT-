@@ -43,6 +43,10 @@ public:
     // 与 seedAddFriend 相同但用于聊天消息；同样不接管所有权。
     // REQ-AUDIT-001 R1：返回"找到目标连接且 write() 未报错"，调用方据此决定是否标记已送达。
     bool reseed(char*tarname,PDU*pdu);
+    // REQ-CHAT-ACK-001：按目标连接能力投递私聊。
+    // 目标声明过 116（桌面端）→ 只发 109 并等客户端 110；否则发 15 并按旧语义处理。
+    // 返回：0=目标不在线；1=已按 ACK 模式投递（调用方不得标记）；2=已按旧模式投递（可标记）
+    int deliverChat(char* tarname, PDU* ackPdu, PDU* legacyPdu);
     // REQ-EXT-GROUP-001：向当前在线群成员广播已提交的成员/邀请事件。
     // 事件 PDU 为一次性所有权：内部广播后 memfree，调用方不得再访问。
     void sendGroupEvent(const QStringList& users, PDU* pdu);

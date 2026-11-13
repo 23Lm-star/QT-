@@ -28,6 +28,8 @@ public:
     Chat* m_chat;
     //刷新好友接口函数->引导刷新好友
     void flushfriend();
+    // REQ-CHAT-ACK-001 R10：拉取待处理好友申请（登录与刷新好友时调用）
+    void requestPendingFriendRequests();
     // 返回好友列表控件（供外部/测试直接访问，正常刷新走 rebuildFriendList）
     QListWidget* getfile_LW();
     //刷新好友操作函数——仅接管数据，不直接写 QListWidget
