@@ -30,8 +30,8 @@ export const useFriendsStore = defineStore('friends', {
       });
       net.onPush(T.ADDFRIEND_RESPOND, (pdu) => {
         const { ret } = friendCmd.parseFriendResult(pdu);
-        this.setHint(friendCmd.describeFriendRet(ret), ret === 1 ? 'success' : 'error');
-        if (ret === 1) this.loadFriends();
+        this.setHint(friendCmd.describeFriendRet(ret), ret >= 0 ? 'success' : 'error');
+        if (ret === 0) this.loadFriends();
       });
     },
     setHint(text, type = 'info') { this.hint = text; this.hintType = type; },

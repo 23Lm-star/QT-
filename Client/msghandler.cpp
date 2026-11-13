@@ -20,21 +20,17 @@ MsgHandler::MsgHandler()
 
 // 注册响应：caData[0..3]=ret，[32..63]=登录名。
 void MsgHandler::handlrigist(){
-    int ret;
-    memcpy(&ret,this->pdu->caData,sizeof(ret));
-    qCDebug(lcCli)<<"rigist ret"<<ret<<endl;
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,this->pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"rigist code"<<code<<endl;
     char rigistName[32]={'\0'};
     memcpy(rigistName,this->pdu->caData+32,32);
     qCDebug(lcCli)<<QString(rigistName)<<endl;
-    if(ret==-2){
-        QMessageBox::information(&Client::getinstance(),"提示","验证码错误，请重新输入");
+    if(code==ENUM_PROTOCOL_CODE_CAPTCHA_WRONG || code==ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED){
+        QMessageBox::information(&Client::getinstance(),"提示",protocolCodeText(code));
         return;
     }
-    if(ret==-3){
-        QMessageBox::information(&Client::getinstance(),"提示","验证码已过期，请重新获取");
-        return;
-    }
-    if(ret==-4){
+    if(code==ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED){
         int rem=0;
         memcpy(&rem,this->pdu->caData+4,sizeof(rem));
         // 触发客户端 10 分钟锁定：获取验证码按钮进入倒计时，注册/登录被客户端拦截
@@ -43,8 +39,8 @@ void MsgHandler::handlrigist(){
             QString("验证码错误次数过多，账号已锁定，请 %1 分钟后再试").arg(qMax(1,rem/60)));
         return;
     }
-    if(ret){
-        // 非零即成功：延迟 1.5s 让动画走完，再提示并本地创建用户目录。
+    if(code==ENUM_PROTOCOL_CODE_OK){
+        // 成功：延迟 1.5s 让动画走完，再提示并本地创建用户目录。
         Client::getinstance().showLoadingAnimation(true);
         QString name=QString(rigistName);
         QTimer::singleShot(1500,[name](){
@@ -58,6 +54,7 @@ void MsgHandler::handlrigist(){
     }
     else {
         Client::getinstance().showLoadingAnimation(false);
+        QMessageBox::information(&Client::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
@@ -65,17 +62,13 @@ void MsgHandler::handlrigist(){
 // 验证码错误/过期/锁定的处理与注册响应一致。成功时立即返回名字。
 QString MsgHandler::handllogin()
 {
-    int ret;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    if(ret==-2){
-        QMessageBox::information(&Client::getinstance(),"提示","验证码错误，请重新输入");
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    if(code==ENUM_PROTOCOL_CODE_CAPTCHA_WRONG || code==ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED){
+        QMessageBox::information(&Client::getinstance(),"提示",protocolCodeText(code));
         return QString();
     }
-    if(ret==-3){
-        QMessageBox::information(&Client::getinstance(),"提示","验证码已过期，请重新获取");
-        return QString();
-    }
-    if(ret==-4){
+    if(code==ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED){
         int rem=0;
         memcpy(&rem,pdu->caData+4,sizeof(rem));
         // 触发客户端 10 分钟锁定：获取验证码按钮进入倒计时，注册/登录被客户端拦截
@@ -84,7 +77,7 @@ QString MsgHandler::handllogin()
             QString("验证码错误次数过多，账号已锁定，请 %1 分钟后再试").arg(qMax(1,rem/60)));
         return QString();
     }
-    if(ret==1){
+    if(code==ENUM_PROTOCOL_CODE_OK){
         // 成功：先同步取名字返回，UI 切换延后 1.5s。
         Client::getinstance().showLoadingAnimation(true);
         char lName[32]={'\0'};
@@ -113,16 +106,11 @@ QString MsgHandler::handllogin()
         });
         return loginName;
     }
-    else if(ret==-1){
-        Client::getinstance().showLoadingAnimation(false);
-        QTimer::singleShot(1500,[](){
-            QMessageBox::information(&Client::getinstance(),"提示","用户或密码其中一个错误");
-        });
-    }
     else{
         Client::getinstance().showLoadingAnimation(false);
-        QTimer::singleShot(1500,[](){
-            QMessageBox::information(&Client::getinstance(),"提示","状态异常");
+        const QString text=protocolCodeText(code);
+        QTimer::singleShot(1500,[text](){
+            QMessageBox::information(&Client::getinstance(),"提示",text);
         });
     }
     return QString();
@@ -146,24 +134,26 @@ void MsgHandler::handlonlineuser(){
 
 void MsgHandler::handlAddFriend()
 {
-    int ret=0;
-    memcpy(&ret,pdu->caData,sizeof (ret));
-    qCDebug(lcCli)<<"AddFriend ans ret"<<ret<<endl;
+    int code=0;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"AddFriend ans code"<<code<<endl;
     // REQ-UX-001 A1：任何结果都必须有可见反馈并更新在线用户窗口提示条
     OnlineUser *ou=Index::getinstance().getFriend()->m_onlineUser;
-    if(ret==1){
+    if(code==ENUM_PROTOCOL_CODE_OK){
         // ret=1 来自对方的"同意"回执：双向好友关系已建立
         Index::getinstance().getFriend()->flushfriend();
         if(ou){ ou->setHint(QStringLiteral("好友添加成功")); }
         QMessageBox::information(ou,"提示","好友添加成功");
     }
-    else if(ret==-2){
-        if(ou){ ou->setHint(QStringLiteral("该用户不在线")); }
-        QMessageBox::information(ou,"提示","该用户不在线");
+    else if(code==ENUM_PROTOCOL_CODE_ACCEPTED){
+        // REQ-CHAT-ACK-001 R10：申请已登记（离线也可登记），等待对方下次上线/刷新处理
+        if(ou){ ou->setHint(QStringLiteral("好友申请已发送，等待对方确认")); }
+        QMessageBox::information(ou,"提示","好友申请已发送，等待对方确认");
     }
     else {
-        if(ou){ ou->setHint(QStringLiteral("添加失败：对方不在线或已是好友")); }
-        QMessageBox::information(ou,"提示","添加失败：对方不在线或已是好友");
+        const QString text=protocolCodeText(code);
+        if(ou){ ou->setHint(text); }
+        QMessageBox::information(ou,"提示",text);
     }
 }
 //同意添加好友
@@ -203,13 +193,13 @@ void MsgHandler::handlFlushFriend()
 //删除好友
 void MsgHandler::handlDeleteFriend()
 {
-    bool ret=0;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    if(ret){
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    if(code==ENUM_PROTOCOL_CODE_OK){
         Index::getinstance().getFriend()->flushfriend();
     }
     else {
-        QMessageBox::information(Index::getinstance().getFriend(),"提示","删除好友失败");
+        QMessageBox::information(Index::getinstance().getFriend(),"提示",protocolCodeText(code));
     }
 }
 
@@ -255,28 +245,120 @@ void MsgHandler::getcharmsg()
         for (int i = 0; i + 1 < Msglist.size(); i += 2)
             chat->receivePeerMessage(peer, Msglist.at(i), Msglist.at(i + 1));
 }
+
+// REQ-CHAT-ACK-001：109 实时投递（caData[0,32)=发送人、[32,40)=消息 ID）。
+// 渲染与落库后立刻回 110；落库失败只降级为内存展示，仍确认避免无限重投。
+void MsgHandler::chatDeliver()
+{
+    char seedName[32]={'\0'};
+    memcpy(seedName,pdu->caData,32);
+    qint64 msgId=0;
+    memcpy(&msgId,pdu->caData+32,sizeof(msgId));
+    QByteArray body;
+    QString currtime;
+    if (!readChatMsg(pdu->caMsg, pdu->uiMsgLen, &body, &currtime)) return;
+    Chat* chat = Index::getinstance().getFriend()->m_chat;
+    chat->m_strChatName = seedName;
+    chat->receivePeerMessage(QString(seedName), QString::fromUtf8(body), currtime);
+    if (msgId > 0) {
+        QList<qint64> ids;
+        ids.append(msgId);
+        sendChatDeliveredAck(ids);
+    }
+}
+
+// REQ-CHAT-ACK-001：112 批量待送达记录。逐条严格边界校验，畸形即止；
+// 全部渲染落库后一次性回 110（服务端按 ID+收件人置已送达）。
+void MsgHandler::getPendingChat()
+{
+    Chat* chat = Index::getinstance().getFriend()->m_chat;
+    const QString peer = chat->historyPeer().isEmpty() ? chat->m_strChatName : chat->historyPeer();
+    QList<qint64> ids;
+    uint dis = 0;
+    while (dis + uint(sizeof(qint64) + sizeof(qint32) * 2) <= pdu->uiMsgLen) {
+        qint64 id = 0;
+        qint32 contentLen = 0;
+        qint32 timeLen = 0;
+        memcpy(&id, pdu->caMsg + dis, sizeof(id)); dis += sizeof(id);
+        memcpy(&contentLen, pdu->caMsg + dis, sizeof(contentLen)); dis += sizeof(contentLen);
+        memcpy(&timeLen, pdu->caMsg + dis, sizeof(timeLen)); dis += sizeof(timeLen);
+        if (contentLen < 0 || timeLen < 0) break;
+        if (dis + uint(contentLen) + uint(timeLen) > pdu->uiMsgLen) break;
+        const QByteArray body(pdu->caMsg + dis, int(contentLen)); dis += uint(contentLen);
+        const QByteArray timeBytes(pdu->caMsg + dis, int(timeLen)); dis += uint(timeLen);
+        chat->receivePeerMessage(peer, QString::fromUtf8(body), QString::fromUtf8(timeBytes));
+        if (id > 0) ids.append(id);
+    }
+    sendChatDeliveredAck(ids);
+}
+
+void MsgHandler::sendChatDeliveredAck(const QList<qint64> &ids)
+{
+    if (ids.isEmpty()) return;
+    PDU* ack = mkPDU(uint(ids.size() * int(sizeof(qint64))));
+    ack->uiType = ENUM_MSG_TYPE_CHAT_DELIVER_ACK;
+    for (int i = 0; i < ids.size(); ++i) {
+        memcpy(ack->caMsg + i * int(sizeof(qint64)), &ids.at(i), sizeof(qint64));
+    }
+    Client::getinstance().seedMsg(ack);
+}
+
+// REQ-CHAT-ACK-001 R10：114 待处理好友申请。逐条询问；同意走原 10（服务端按 pending 校验），
+// 拒绝回 115 把该行置 rejected，避免每次刷新重复弹出。
+void MsgHandler::handlePendingFriendList()
+{
+    const int count = int(pdu->uiMsgLen / 32);
+    Friend* fr = Index::getinstance().getFriend();
+    const QByteArray self = Client::getinstance().m_LoginName.toUtf8();
+    for (int i = 0; i < count; ++i) {
+        char name[32] = {'\0'};
+        memcpy(name, pdu->caMsg + i * 32, 32);
+        const QString requester = QString::fromUtf8(name);
+        if (requester.isEmpty()) continue;
+        const QMessageBox::StandardButton answer = QMessageBox::question(
+            fr, QStringLiteral("提示"),
+            QStringLiteral("你同意%1的好友申请吗?").arg(requester),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        PDU* req = mkPDU();
+        if (answer == QMessageBox::Yes) {
+            req->uiType = ENUM_MSG_TYPE_ADDFRIEND_RESPOND;
+            memcpy(req->caData, self.constData(), size_t(qMin(self.size(), 31)));
+            memcpy(req->caData + 32, name, 32);
+        } else {
+            req->uiType = ENUM_MSG_TYPE_REJECT_FRIEND_REQUEST;
+            memcpy(req->caData, name, 32);
+        }
+        // TLS 握手完成前不发 PDU，保持与其它尽力发送一致
+        if (Client::getinstance().tlsPending()) {
+            free(req);
+            continue;
+        }
+        Client::getinstance().sorket.write((char*)req, req->uiTotalLen);
+        free(req);
+    }
+}
 //创建目录
 void MsgHandler::mkdir()
 {
-    bool ret=1;
-    memcpy(&ret,pdu->caData,sizeof (ret));
-    qCDebug(lcCli)<<"mkdir ret"<<ret<<endl;
-    if(ret){
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"mkdir code"<<code<<endl;
+    if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","创建文件夹成功");
         Index::getinstance().getFile()->flushfile();
     }
     else {
-        QMessageBox::information(&Index::getinstance(),"提示","创建文件夹失败");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
 // 删除响应：成功不本地改列表，而是重新请求 FLUSHFILE（以服务端为准）。
 void MsgHandler::deldir()
 {
-    bool ret=0;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    qCDebug(lcCli)<<"删除文件结果"<<ret<<endl;
-    if(ret){
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"删除文件结果"<<code<<endl;
+    if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","删除文件夹成功");
         // 注意：局部 pdu 覆盖成员指针，避免误用刚处理完的响应。
         PDU* pdu=mkPDU(Index::getinstance().getFile()->m_strCurPath.size()+1);
@@ -285,31 +367,31 @@ void MsgHandler::deldir()
         Client::getinstance().seedMsg(pdu);
     }
     else {
-        QMessageBox::information(&Index::getinstance(),"提示","删除文件夹失败");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
 // 切换目录响应：成功时 caMsg 为服务端确认后的相对路径。
 void MsgHandler::changedir()
 {
-    bool ret=0;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    if(ret){//如果路径存在
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    if(code==ENUM_PROTOCOL_CODE_OK){//如果路径存在
         Index::getinstance().getFile()->m_strCurPath=pdu->caMsg;
         Index::getinstance().getFile()->flushfile();
     }
     else {//如果路径不存在
-        QMessageBox::information(&Index::getinstance(),"提示","路径不存在");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
         Index::getinstance().getFile()->flushCurrLE();
     }
 }
 //重命名文件
 void MsgHandler::renamedir()
 {
-    bool ret=0;
-    memcpy(&ret,pdu->caData,sizeof (ret));
-    qCDebug(lcCli)<<"rename ret"<<ret<<endl;
-    if(ret){
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"rename code"<<code<<endl;
+    if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","文件重命名成功");
         PDU* pdu=mkPDU(Index::getinstance().getFile()->m_strCurPath.toUtf8().toStdString().size()+1);
         pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
@@ -317,7 +399,7 @@ void MsgHandler::renamedir()
         Client::getinstance().seedMsg(pdu);
     }
     else {
-        QMessageBox::information(&Index::getinstance(),"提示","文件重命名失败");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
@@ -343,15 +425,15 @@ void MsgHandler::sharefileagree()
 
 void MsgHandler::sharefilefinsh()
 {
-    bool ret=0;
-    memcpy(&ret,pdu->caData,sizeof (ret));
-    qCDebug(lcCli)<<"sharefilefinsh ret"<<ret<<endl;
-    if(ret){
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"sharefilefinsh code"<<code<<endl;
+    if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","接收分享文件成功");
         Index::getinstance().getFile()->flushfile();//刷新一下文件
     }
     else {
-        QMessageBox::information(&Index::getinstance(),"提示","接收分享文件失败");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
@@ -373,11 +455,11 @@ void MsgHandler::flushfile()
 // 解析分享链接响应：服务端已把文件复制到其【用户目录/分享链接/】，这里提示并刷新列表
 void MsgHandler::handleResolvePublishLink(PDU* pdu)
 {
-    bool ok = false;
-    memcpy(&ok, pdu->caData, sizeof(ok));
-    qCDebug(lcCli) << "[handleResolvePublishLink] 服务端返回 ok=" << ok;
-    if(!ok){
-        QMessageBox::information(&Index::getinstance(), "提示", "分享链接无效或已失效（链接不存在/已撤销/已过期）");
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli) << "[handleResolvePublishLink] 服务端返回 code=" << code;
+    if(code != ENUM_PROTOCOL_CODE_OK){
+        QMessageBox::information(&Index::getinstance(), "提示", protocolCodeText(code));
         return;
     }
     // 服务端已把文件复制到其【用户目录/分享链接/】下，这里解析返回的相对路径并提示
@@ -404,39 +486,41 @@ void MsgHandler::handleResolvePublishLink(PDU* pdu)
 }
 
 void MsgHandler::handlfinduser(){
-    int ret;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    qCDebug(lcCli)<<"client finduser ret"<<ret<<endl;
-    if(ret==2){
-        QMessageBox::information(&Client::getinstance(),"提示","该用户不存在");
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    int online=0;
+    memcpy(&online,pdu->caData+PROTOCOL_CODE_SIZE,sizeof(online));
+    qCDebug(lcCli)<<"client finduser code"<<code<<" online"<<online;
+    if(code!=ENUM_PROTOCOL_CODE_OK){
+        QMessageBox::information(&Client::getinstance(),"提示",protocolCodeText(code));
     }
-    else if(ret==1){
+    else if(online){
         QMessageBox::information(&Client::getinstance(),"提示","该用户在线");
     }
-    else if(ret==0){
+    else{
        QMessageBox::information(&Client::getinstance(),"提示","该用户不在线");
     }
 }
 
 // 验证码响应：caData[0..3]=status，[4..7]=服务端剩余秒数；成功时 caMsg=验证码文本。
 void MsgHandler::handleCaptcha(){
-    int status;
-    memcpy(&status, pdu->caData, sizeof(status));
+    int code;
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
     int remaining;
     memcpy(&remaining, pdu->caData + 4, sizeof(remaining));
 
-    if (status == 0) {
+    if (code == ENUM_PROTOCOL_CODE_OK) {
         // 成功：REQ-AUDIT-001 R8——载荷是 PNG 图片，文本答案只在服务端
         const QByteArray png(pdu->caMsg, pdu->uiMsgLen);
         qCDebug(lcCli) << "收到服务端验证码图片，字节数:" << png.size();
         Client::getinstance().updateCaptchaImage(png);
         Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
-    } else if (status == -5) {
+    } else if (code == ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN) {
         // 冷却中：禁止获取，按服务端剩余秒数倒计时
         Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
         QMessageBox::information(&Client::getinstance(), "提示",
             QString("获取验证码过于频繁，请 %1 秒后再试").arg(remaining));
-    } else if (status == -6) {
+    } else if (code == ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED) {
         // 锁定中：获取验证码按钮进入 10 分钟倒计时，并禁用注册/登录（客户端拦截）
         Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 600, true);
         QMessageBox::information(&Client::getinstance(), "提示",
@@ -447,26 +531,26 @@ void MsgHandler::handleCaptcha(){
 // 移动文件响应：caData[0]=结果，[32..63]=被移动文件名（用于提示）。
 void MsgHandler::handlMoveFile()
 {
-    bool ret=false;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    char fileName[32]={'\0'};
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    char fileName[32]={' '};
     memcpy(fileName,pdu->caData+32,32);
-    qCDebug(lcCli)<<"movefile ret:"<<ret<<" fileName:"<<QString::fromUtf8(fileName);
-    if(ret){
+    qCDebug(lcCli)<<"movefile code:"<<code<<" fileName:"<<QString::fromUtf8(fileName);
+    if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示",QString("文件%1移动成功").arg(QString::fromUtf8(fileName)));
         Index::getinstance().getFile()->flushfile();
     }
     else {
-        QMessageBox::information(&Index::getinstance(),"提示","文件移动失败");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
 void MsgHandler::handlLogoff()
 {
-    bool ret=false;
-    memcpy(&ret,pdu->caData,sizeof(ret));
-    qCDebug(lcCli)<<"handlLogoff result:"<<ret;
-    if(ret){
+    int code=ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
+    qCDebug(lcCli)<<"handlLogoff code:"<<code;
+    if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","账户已成功注销，即将返回登录界面。");
         // REQ-CLI-MSGSTORE-001：账号注销后本地消息（含水位）一并清除，同名重注册不复用
         Client::getinstance().msgStore().removeUser();
@@ -478,7 +562,7 @@ void MsgHandler::handlLogoff()
         Client::getinstance().sorket.disconnectFromHost();
     }
     else {
-        QMessageBox::information(&Index::getinstance(),"提示","注销失败：密码错误或用户不存在。");
+        QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
     }
 }
 
@@ -491,8 +575,8 @@ void MsgHandler::handleChatAck()
     if (pdu->uiMsgLen < sizeof(Msg)) return;
     char peerName[33] = {'\0'};
     memcpy(peerName, pdu->caData, 32);
-    bool stored = false;
-    memcpy(&stored, pdu->caData + 32, sizeof(stored));
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData + 32, PROTOCOL_CODE_SIZE);
 
     // REQ-CLI-MSGBND-001：正文与时间统一走 readChatMsg：按报文实际携带的字节取，
     // 声明越界时钳制并裁到完整码点。旧写法钳到 109 字节是迁就定长缓冲的历史惯怛。
@@ -500,23 +584,21 @@ void MsgHandler::handleChatAck()
     QString currtime;
     if (!readChatMsg(pdu->caMsg, pdu->uiMsgLen, &body, &currtime)) return;
     Index::getinstance().getFriend()->m_chat->handleSendAck(
-        QString::fromUtf8(peerName), QString::fromUtf8(body), currtime, stored);
+        QString::fromUtf8(peerName), QString::fromUtf8(body), currtime, code == ENUM_PROTOCOL_CODE_OK);
 }
 
 void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
-    bool exists = false;
-    memcpy(&exists, pdu->caData, sizeof(exists));
-    quint32 state = PUBLINK_STATE_VALID;
-    memcpy(&state, pdu->caData + PUBLINK_STATE_OFFSET, sizeof(state));
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
 
-    if (!exists) {
+    if (code == ENUM_PROTOCOL_CODE_LINK_INVALID) {
         QMessageBox::information(&Index::getinstance(), "提示", "暂无分享链接");
         return;
     }
     // REQ-EXT-SHARE-001：链接已过期/已撤销时给出「重新生成 / 续期」的选择，
     // 不再把一条已知失效的链接当有效链接展示给主人
-    if (state != PUBLINK_STATE_VALID) {
-        Index::getinstance().getFile()->promptShareLinkRecovery(state);
+    if (code != ENUM_PROTOCOL_CODE_OK) {
+        Index::getinstance().getFile()->promptShareLinkRecovery(code);
         return;
     }
 
@@ -532,20 +614,17 @@ void MsgHandler::handleQueryFilePublishLink(PDU* pdu) {
 }
 
 void MsgHandler::handleCreatePublishLink(PDU* pdu) {
-    bool ok = false;
-    memcpy(&ok, pdu->caData, sizeof(ok));
-    quint32 state = PUBLINK_STATE_VALID;
-    memcpy(&state, pdu->caData + PUBLINK_STATE_OFFSET, sizeof(state));
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData, PROTOCOL_CODE_SIZE);
     QString link = QString::fromUtf8(pdu->caMsg);
-    if (ok && state == PUBLINK_STATE_VALID) {
+    if (code == ENUM_PROTOCOL_CODE_OK) {
         QMessageBox::information(&Index::getinstance(), "提示",
             QString("生成成功！\n分享链接：%1").arg(link));
-    } else if (state != PUBLINK_STATE_VALID) {
-        // 旧语义复用了一条已失效的链接，或续期被拒（例如链接已被撤销）→ 回到选择框，
-        // 已撤销时「续期」按钮不可用，只能改走「重新生成链接」
+    } else if (code == ENUM_PROTOCOL_CODE_LINK_EXPIRED || code == ENUM_PROTOCOL_CODE_LINK_REVOKED) {
+        // 复用了一条已失效的链接，或续期被拒（例如链接已被撤销）→ 回到选择框
         Index::getinstance().getFile()->promptShareLinkRecovery(
-            state, QStringLiteral("（本次操作没有拿到可用链接）"));
+            code, QStringLiteral("（本次操作没有拿到可用链接）"));
     } else {
-        QMessageBox::information(&Index::getinstance(), "提示", "生成分享链接失败");
+        QMessageBox::information(&Index::getinstance(), "提示", protocolCodeText(code));
     }
 }

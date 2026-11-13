@@ -180,6 +180,13 @@ public:
     QStringList getchatMsg(char*seedName,char *revName,QVector<qlonglong>* idOut=nullptr);
     // REQ-AUDIT-001 R1/R2：把指定消息标记为已送达（幂等，只更新仍为未送达的行）
     bool markChatDelivered(const QVector<qlonglong> &ids);
+    // REQ-CHAT-ACK-001：客户端确认收货时按「消息 ID + 收件人」双条件标记，
+    // 防止伪造 ID 把别人的消息标成已送达。rev=当前认证账号。
+    bool markChatDeliveredFor(const QString &rev, const QVector<qlonglong> &ids);
+    // REQ-CHAT-ACK-001 R10：本人待处理的好友申请（status='pending'），按时间倒序
+    QStringList listPendingFriendRequests(const QString &target);
+    // 拒绝好友申请：只把本人收到的 pending 行置为 rejected，不建立关系
+    bool rejectFriendRequest(const QString &requester, const QString &target);
     //获取用户信息
     // 按名查询，命中时回填规范用户名与 online 标志
     bool handleGetUserInfo(const char* userName, QString& outName, int& outOnline);

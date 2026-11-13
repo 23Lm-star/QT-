@@ -31,7 +31,7 @@ async function onLogin() {
   busy.value = true;
   try {
     const r = await auth.login(username.value.trim(), password.value, captcha.value.trim());
-    if (r && r.ret === 1) router.push({ name: 'main' });
+    if (r && r.ret === 0) router.push({ name: 'main' });
   } finally { busy.value = false; }
 }
 async function onRegister() {

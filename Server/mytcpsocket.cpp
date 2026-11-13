@@ -237,6 +237,33 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->chatmsg();
         break;
     }
+    // ===== REQ-CHAT-ACK-001：桌面端私聊接收确认 =====
+    case ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST:{
+        respdu=m_MsgHandler->chatPending();
+        break;
+    }
+    case ENUM_MSG_TYPE_CHAT_DELIVER_ACK:{
+        m_MsgHandler->chatDeliveredAck();
+        break;
+    }
+    case ENUM_MSG_TYPE_LIST_PENDING_FRIEND_REQUEST:{
+        respdu=m_MsgHandler->listPendingFriendRequests();
+        break;
+    }
+    case ENUM_MSG_TYPE_REJECT_FRIEND_REQUEST:{
+        m_MsgHandler->rejectFriendRequest();
+        break;
+    }
+    // REQ-CHAT-ACK-001：桌面端登录后声明支持 109/110；未声明的连接走旧的 15 语义
+    case ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY:{
+        m_supportsChatAck=true;
+        break;
+    }
+    // 事件只能由服务端生成，客户端发入的 109 一律丢弃
+    case ENUM_MSG_TYPE_CHAT_DELIVER_EVENT:{
+        qCWarning(lcNet) << "[chat] 拒绝客户端伪造投递事件 conn=" << m_connectionId;
+        break;
+    }
     case ENUM_MSG_TYPE_MKDIR_REQUEST:{
         respdu=m_MsgHandler->MKDIR();
         break;
@@ -295,11 +322,11 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         m_MsgHandler->m_downloadResumeOffset=resumeOffset;
         respdu=m_MsgHandler->downloadfile();
         if(respdu){
-            bool valid=false;
-            memcpy(&valid,respdu->caData,sizeof(valid));
+            int dlCode=ENUM_PROTOCOL_CODE_INTERNAL;
+            memcpy(&dlCode,respdu->caData,PROTOCOL_CODE_SIZE);
             sendAndRelease(respdu);
             respdu=nullptr;
-            if(valid && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
+            if(dlCode==ENUM_PROTOCOL_CODE_OK && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
                 startDownloadStream(m_MsgHandler->m_downloadCanonicalPath,transferId,resumeOffset);
             }
         }
@@ -552,7 +579,8 @@ PDU* MyTcpSocket::handleTransferAbort(PDU* pdu)
     }
     PDU* resp=mkPDU();
     resp->uiType=ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND;
-    memcpy(resp->caData,&ret,sizeof(ret));
+    const int abortCode = ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_TRANSFER_NOT_FOUND;
+    memcpy(resp->caData,&abortCode,sizeof(abortCode));
     memcpy(resp->caData+TRANSFER_ID_OFFSET,&transferId,sizeof(transferId));
     return resp;
 }
@@ -560,11 +588,12 @@ PDU* MyTcpSocket::handleTransferAbort(PDU* pdu)
 void MyTcpSocket::sendUploadAck(quint64 transferId, bool success, qint64 nextOffset, bool complete)
 {
     PDU* response=mkPDU();
-    // caData 布局：0=success(bool)，8=nextOffset(qint64)，16=complete(bool)，
+    // caData 布局：0=标准码(int32)，8=nextOffset(qint64)，16=complete(bool)，
     // 40=resumeMagic(u32)，48=transfer_id(qint64)；偏移与 Client 端逐字节一致。
     const uint resumeMagic=UPLOAD_RESUME_MAGIC;
+    const int ackCode = success ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED;
     response->uiType=ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND;
-    memcpy(response->caData,&success,sizeof(success));
+    memcpy(response->caData,&ackCode,sizeof(ackCode));
     memcpy(response->caData+UPLOAD_ACK_NEXT_OFFSET,&nextOffset,sizeof(nextOffset));
     memcpy(response->caData+UPLOAD_ACK_COMPLETE_OFFSET,&complete,sizeof(complete));
     memcpy(response->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
@@ -577,7 +606,8 @@ void MyTcpSocket::seedDownloadFinish(quint64 transferId, bool success)
 {
     PDU* finishPdu=mkPDU();
     finishPdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_FINISH;
-    memcpy(finishPdu->caData,&success,sizeof(success));
+    const int finishCode = success ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED;
+    memcpy(finishPdu->caData,&finishCode,sizeof(finishCode));
     memcpy(finishPdu->caData+TRANSFER_ID_OFFSET,&transferId,sizeof(transferId));
     seedMsg(finishPdu);
 }
@@ -924,16 +954,18 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         PDU* r=mkPDU();
         r->uiType=respType;
         memset(r->caData,0,sizeof(r->caData));
+        const int unauth=ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED;
+        memcpy(r->caData,&unauth,sizeof(unauth));
         return r;
     };
     switch(uiType){
     case ENUM_MSG_TYPE_findUser_REQUEST:{
-        PDU* r=reject(ENUM_MSG_TYPE_findUser_RESPOND); int ret=-1; memcpy(r->caData,&ret,sizeof(ret)); return r;
+        return reject(ENUM_MSG_TYPE_findUser_RESPOND);
     }
     case ENUM_MSG_TYPE_ONLINEUSER_REQUEST:
         return reject(ENUM_MSG_TYPE_ONLINEUSER_RESPOND);
     case ENUM_MSG_TYPE_ADDFRIEND_REQUEST:{
-        PDU* r=reject(ENUM_MSG_TYPE_ADDFRIEND_RESPOND); int ret=-1; memcpy(r->caData,&ret,sizeof(ret)); return r;
+        return reject(ENUM_MSG_TYPE_ADDFRIEND_RESPOND);
     }
     case ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST:
         return reject(ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND);
@@ -976,7 +1008,7 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
     case ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST:
         return reject(ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND);
     case ENUM_MSG_TYPE_GETUSERINFORMATION_REQUEST:{
-        PDU* r=reject(ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND); int ret=-1; memcpy(r->caData,&ret,sizeof(ret)); return r;
+        return reject(ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND);
     }
     case ENUM_MSG_TYPE_LOGOFF_REQUEST:
         return reject(ENUM_MSG_TYPE_LOGOFF_RESPOND);

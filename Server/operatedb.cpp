@@ -851,10 +851,11 @@ int OperateDB::handleAddFriend(char *usrname, char *tarname)
     QSqlDatabase db = connection.database();
     QSqlQuery q(db);
 
-    q.prepare("select * from user_info where name = ? and online = 1");
+    // REQ-CHAT-ACK-001 R10：不再要求目标在线——离线申请同样登记到 friend_request，
+    // 由对方下次登录/刷新好友时经 113/114 拉取处理。这里只校验目标账号存在。
+    q.prepare("select 1 from user_info where name = ?");
     q.addBindValue(target);
-    q.exec();
-    if(!q.next()){
+    if(!q.exec() || !q.next()){
         return 0;
     }
     // 幂等：同一对请求方/目标只保留一条 pending；重复请求不重复登记，也不刷新时间。
@@ -1096,6 +1097,83 @@ bool OperateDB::markChatDelivered(const QVector<qlonglong> &ids)
     }
     if(!q.exec()){
         qCWarning(lcDb)<<"markChatDelivered failed:"<<q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+// REQ-CHAT-ACK-001：客户端 110 确认收货后按「ID + 收件人」双条件标记，
+// 伪造的他人消息 ID 不会命中本账号的行（rev_name = ?）。幂等：只更新 issuccess=0。
+bool OperateDB::markChatDeliveredFor(const QString &rev, const QVector<qlonglong> &ids)
+{
+    if(rev.isEmpty() || ids.isEmpty()){
+        return true;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return false;
+    }
+    QStringList placeholders;
+    for(int i=0;i<ids.size();++i){
+        placeholders.append(QStringLiteral("?"));
+    }
+    QSqlQuery q(connection.database());
+    q.prepare(QStringLiteral("update message_info set issuccess = 1 "
+                             "where rev_name = ? and issuccess = 0 and id in (%1)")
+              .arg(placeholders.join(QLatin1Char(','))));
+    q.addBindValue(rev);
+    for(int i=0;i<ids.size();++i){
+        q.addBindValue(ids.at(i));
+    }
+    if(!q.exec()){
+        qCWarning(lcDb)<<"markChatDeliveredFor failed:"<<q.lastError().text();
+        return false;
+    }
+    return true;
+}
+
+// REQ-CHAT-ACK-001 R10：本人仍待处理的好友申请，按登记时间倒序（早的先处理）
+QStringList OperateDB::listPendingFriendRequests(const QString &target)
+{
+    QStringList ret;
+    if(target.isEmpty()){
+        return ret;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return ret;
+    }
+    QSqlQuery q(connection.database());
+    q.prepare("select requester_name from friend_request "
+              "where target_name = ? and status = 'pending' order by created_at asc, id asc");
+    q.addBindValue(target);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"listPendingFriendRequests failed:"<<q.lastError().text();
+        return ret;
+    }
+    while(q.next()){
+        ret.append(q.value(0).toString());
+    }
+    return ret;
+}
+
+// 拒绝好友申请：只清理本人收到的 pending 行，不建立关系、不删对方账号
+bool OperateDB::rejectFriendRequest(const QString &requester, const QString &target)
+{
+    if(requester.isEmpty() || target.isEmpty()){
+        return false;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return false;
+    }
+    QSqlQuery q(connection.database());
+    q.prepare("update friend_request set status = 'rejected', handled_at = NOW() "
+              "where requester_name = ? and target_name = ? and status = 'pending'");
+    q.addBindValue(requester);
+    q.addBindValue(target);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"rejectFriendRequest failed:"<<q.lastError().text();
         return false;
     }
     return true;

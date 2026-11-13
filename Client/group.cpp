@@ -371,7 +371,7 @@ QString Group::groupErrorText(quint32 code) const
     case -1046: return QStringLiteral("只有群主能解散群");
     case -1047: return QStringLiteral("解散失败（服务端错误）");
     case -2001: case -2002: return QStringLiteral("请求格式被服务端拒绝");
-    default: return QStringLiteral("错误码 %1").arg(qint32(code));
+    default: return protocolCodeText(qint32(code));
     }
 }
 

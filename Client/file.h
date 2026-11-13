@@ -39,7 +39,7 @@ public:
     void onGetShareLink();
     void handleListDirRespond(PDU *pdu);//LISTDIR_RESPOND 转发给目录选择弹窗
     // REQ-EXT-SHARE-001：外链已过期/已撤销时的处置选择（重新生成 / 续期）
-    void promptShareLinkRecovery(quint32 state, const QString &note = QString());
+    void promptShareLinkRecovery(int code, const QString &note = QString());
     // REQ-EXT-SHARE-001：发 CREATE_PUBLINK；action 非空则在路径 NUL 之后附动作区
     void sendCreatePublishLink(const QString &relativePath, const QString &action, int seconds);
     explicit File(QWidget *parent = nullptr);

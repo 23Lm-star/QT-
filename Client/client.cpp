@@ -239,6 +239,15 @@ void Client::handlMsg(PDU *&pdu)
         // REQ-EXT-TRANSFER-003 G7/C7：重连登录后恢复调度（不依赖 setCurrentUser 的提前返回——同用户重连会提前返回）
         TransferManager::instance().onConnectionRestored();
         m_loggedIn = true;   // 登录过才监控断开，避免登录界面误报
+        // REQ-CHAT-ACK-001：声明本端支持 109/110 私聊接收确认（服务端据此决定投递方式）
+        {
+            PDU* cap = mkPDU();
+            cap->uiType = ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY;
+            seedMsg(cap);
+        }
+        // REQ-CHAT-ACK-001 R10：登录后拉取离线期间登记的好友申请
+        if (Index::getinstance().getFriend())
+            Index::getinstance().getFriend()->requestPendingFriendRequests();
         break;
     }
     case ENUM_MSG_TYPE_findUser_RESPOND:{
@@ -276,6 +285,19 @@ void Client::handlMsg(PDU *&pdu)
     // REQ-CLI-MSGSTORE-001：16 私聊入库应答，仅决定自发消息是否写进本地存储
     case ENUM_MSG_TYPE_CHAT_RESPOND:{
         m_mhptr->handleChatAck();
+        break;
+    }
+    // ===== REQ-CHAT-ACK-001：桌面端私聊接收确认 =====
+    case ENUM_MSG_TYPE_CHAT_DELIVER_EVENT:{
+        m_mhptr->chatDeliver();
+        break;
+    }
+    case ENUM_MSG_TYPE_CHAT_PULL_PENDING_RESPOND:{
+        m_mhptr->getPendingChat();
+        break;
+    }
+    case ENUM_MSG_TYPE_LIST_PENDING_FRIEND_RESPOND:{
+        m_mhptr->handlePendingFriendList();
         break;
     }
     case ENUM_MSG_TYPE_MKDIR_RESPOND:{

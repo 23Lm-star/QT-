@@ -7,13 +7,14 @@
 import { T } from '../msgtypes.js';
 import { getNet } from '../net.js';
 import {
-  writeFixedStringNul, readFixedString, readU32, concatBytes, textEncoder,
+  writeFixedStringNul, readFixedString, readI32, readU32, concatBytes, textEncoder,
 } from '../fields.js';
 
+// REQ-PROTO-CODE-001：外链状态并入标准码（caData[0,4)），不再单设状态字。
 export const PUBLINK_STATE_VALID = 0;
-export const PUBLINK_STATE_EXPIRED = 1;
-export const PUBLINK_STATE_REVOKED = 2;
-export const PUBLINK_STATE_OFFSET = 8;       // 53/57 caData 状态字
+export const PUBLINK_STATE_EXPIRED = -2017;
+export const PUBLINK_STATE_REVOKED = -2018;
+export const PUBLINK_STATE_INVALID = -2019;
 export const PUBLINK_ACTION_NEW = 'new';     // 作废旧行并重新生成
 export const PUBLINK_ACTION_RENEW = 'renew'; // 续期
 export const PUBLINK_PREFIX = 'cloud-disk://share/';
@@ -72,9 +73,9 @@ export function buildShareAcceptFrame({ receiverName, sourceAbsPath }) {
   return { type: T.SHAREFILE_AGREE_RESPOND, caData, msg: pathMsg(sourceAbsPath) };
 }
 
-// 36→37：37 只有 caData[0]=bool，无关联字段 → 调用方须串行接受邀请。
+// 36→37：37 只有 caData[0..3]=标准码，无关联字段 → 调用方须串行接受邀请。
 export function parseShareFinish(pdu) {
-  return { ok: pdu.caData[0] !== 0 };
+  return { ok: readI32(pdu.caData, 0) === 0 };
 }
 
 export async function acceptShare({ receiverName, sourceAbsPath }, net = getNet()) {
@@ -99,11 +100,12 @@ export function buildCreatePublishLinkFrame({ relativePath, action = '', seconds
   return { type: T.CREATE_PUBLINK_REQUEST, caData: null, msg: concatBytes(...parts) };
 }
 
-// 53 响应：caData[0]=ok、caData[8..11]=state、caMsg=cloud-disk://share/<token>。
+// 53 响应：caData[0..3]=标准码（0/-2017/-2018）、caMsg=cloud-disk://share/<token>。
 export function parseCreatePublishLinkResponse(pdu) {
+  const code = readI32(pdu.caData, 0);
   return {
-    ok: pdu.caData[0] !== 0,
-    state: readU32(pdu.caData, PUBLINK_STATE_OFFSET),
+    ok: code === 0,
+    state: code,
     link: readFixedString(pdu.caMsg, 0, pdu.uiMsgLen),
   };
 }
@@ -121,11 +123,12 @@ export function buildQueryPublishLinkFrame({ owner, relativePath }) {
   return { type: T.QUERY_FILE_PUBLINK_REQUEST, caData, msg: pathMsg(relativePath) };
 }
 
-// 57 响应：caData[0]=exists、caData[8..11]=state、caMsg=链接文本（无链接时为空）。
+// 57 响应：caData[0..3]=标准码（0/-2017/-2018/-2019）、caMsg=链接文本（无链接时为空）。
 export function parseQueryPublishLinkResponse(pdu) {
+  const code = readI32(pdu.caData, 0);
   return {
-    exists: pdu.caData[0] !== 0,
-    state: readU32(pdu.caData, PUBLINK_STATE_OFFSET),
+    exists: code !== PUBLINK_STATE_INVALID,
+    state: code,
     link: readFixedString(pdu.caMsg, 0, pdu.uiMsgLen),
   };
 }
@@ -143,9 +146,9 @@ export function buildResolvePublishLinkFrame(input) {
   return { type: T.RESOLVE_PUBLINK_REQUEST, caData: null, msg: pathMsg(token) };
 }
 
-// 55 响应：caData[0]=ok、caMsg={"saved_path":"分享链接/<名>"}；失败无原因码。
+// 55 响应：caData[0..3]=标准码（0/-2017/-2018/-2019）、caMsg={"saved_path":"分享链接/<名>"}。
 export function parseResolvePublishLinkResponse(pdu) {
-  const ok = pdu.caData[0] !== 0;
+  const ok = readI32(pdu.caData, 0) === 0;
   let savedPath = '';
   if (ok) {
     try {

@@ -19,6 +19,13 @@
 #include <QVector>
 #include <QSet>
 #include <cerrno>
+
+// REQ-PROTO-CODE-001：统一把标准码写入响应 caData[0,4)
+inline void setProtocolCode(PDU *pdu, int code)
+{
+    memcpy(pdu->caData, &code, PROTOCOL_CODE_SIZE);
+}
+
 #include <cstring>
 
 // msghandler.cpp — 服务端 MsgHandler 的实现：把一条客户端 PDU 翻译成数据库操作、
@@ -83,12 +90,12 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
     if (m_captchaLockUntil.isValid() && now < m_captchaLockUntil) {
         remainingSec = now.secsTo(m_captchaLockUntil);
         qCDebug(lcAuth) << "验证码校验失败: 账号已锁定，剩余" << remainingSec << "秒";
-        return -4;
+        return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
     }
 
     if (uiMsgLen < 4) {
         m_captchaFailCount++;
-        return -2;
+        return ENUM_PROTOCOL_CODE_CAPTCHA_WRONG;
     }
     QString userInput = QString::fromUtf8(caMsg).trimmed();
 
@@ -96,7 +103,7 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
     if (m_captchaCode.isEmpty() || now > m_captchaExpiry) {
         m_captchaCode.clear();
         qCDebug(lcAuth) << "验证码校验失败: 无有效码或已过期";
-        return -3;
+        return ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED;
     }
 
     if (userInput != m_captchaCode) {
@@ -108,10 +115,10 @@ int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remaining
             m_captchaCode.clear();
             remainingSec = CAPTCHA_LOCKOUT_SEC;
             qCWarning(lcAuth) << "验证码连续错误" << m_captchaFailCount << "次，账号锁定" << CAPTCHA_LOCKOUT_SEC << "秒";
-            return -4;
+            return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
         }
         qCDebug(lcAuth) << "验证码校验失败: 输入不符";
-        return -2;
+        return ENUM_PROTOCOL_CODE_CAPTCHA_WRONG;
     }
 
     // 校验成功：一次性使用，作废当前码并重置错误计数
@@ -132,8 +139,7 @@ PDU *MsgHandler::logoff(bool &revoked)
         qCWarning(lcAuth)<<"[logoff] 拒绝：连接无认证上下文 conn="<<m_connId;
         PDU* respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_LOGOFF_RESPOND;
-        bool ret=false;
-        memcpy(respdu->caData,&ret,sizeof(ret));
+        setProtocolCode(respdu, ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED);
         return respdu;
     }
 
@@ -172,7 +178,7 @@ PDU *MsgHandler::logoff(bool &revoked)
 
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LOGOFF_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_BAD_CREDENTIALS);
     return respdu;
 }
 
@@ -280,7 +286,11 @@ PDU *MsgHandler::captcha()
         respdu = mkPDU();
     }
     respdu->uiType = ENUM_MSG_TYPE_CAPTCHA_RESPOND;
-    memcpy(respdu->caData, &status, sizeof(status));
+    const int captchaCode = (status == 0) ? ENUM_PROTOCOL_CODE_OK
+            : (status == -5 ? ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN
+                            : (status == -6 ? ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED
+                                            : ENUM_PROTOCOL_CODE_INTERNAL));
+    setProtocolCode(respdu, captchaCode);
     memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
     return respdu;
 }
@@ -294,8 +304,8 @@ PDU *MsgHandler::rigist()
     if (captchaRet != 0) {
         PDU* respdu = mkPDU();
         respdu->uiType = ENUM_MSG_TYPE_REGIST_RESPOND;
-        memcpy(respdu->caData, &captchaRet, sizeof(captchaRet));
-        if (captchaRet == -4) {
+        setProtocolCode(respdu, captchaRet);
+        if (captchaRet == ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED) {
             memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
         }
         return respdu;
@@ -315,7 +325,7 @@ PDU *MsgHandler::rigist()
     }
     //将注册结果打包进响应报文返回
     PDU* respdu=mkPDU();
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_ACCOUNT_EXISTS);
     QByteArray strnameBytes=strname.toUtf8();
     memcpy(respdu->caData+32,strnameBytes.constData(),qMin(strnameBytes.size(),31));
     respdu->uiType=ENUM_MSG_TYPE_REGIST_RESPOND;
@@ -335,8 +345,8 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
     if (captchaRet != 0) {
         PDU* respdu = mkPDU();
         respdu->uiType = ENUM_MSG_TYPE_LOGIN_RESPOND;
-        memcpy(respdu->caData, &captchaRet, sizeof(captchaRet));
-        if (captchaRet == -4) {
+        setProtocolCode(respdu, captchaRet);
+        if (captchaRet == ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED) {
             memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
         }
         return respdu;
@@ -384,7 +394,9 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
     //将登录结果打包进响应报文并返回
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LOGIN_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    const int loginCode = (ret == 1) ? ENUM_PROTOCOL_CODE_OK
+            : (ret < 0 ? ENUM_PROTOCOL_CODE_DB_UNAVAILABLE : ENUM_PROTOCOL_CODE_BAD_CREDENTIALS);
+    setProtocolCode(respdu, loginCode);
     QByteArray usernameBytes=username.toUtf8();
     memcpy(respdu->caData+32,usernameBytes.constData(),qMin(usernameBytes.size(),31));
     return respdu;
@@ -400,7 +412,11 @@ PDU *MsgHandler::finduser(){
     //将查找用户的状态打包进响应报文中并返回
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_findUser_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    const int findCode = (ret == 2) ? ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND
+            : (ret < 0 ? ENUM_PROTOCOL_CODE_DB_UNAVAILABLE : ENUM_PROTOCOL_CODE_OK);
+    setProtocolCode(respdu, findCode);
+    const int online = (ret == 1) ? 1 : 0;
+    memcpy(respdu->caData + PROTOCOL_CODE_SIZE, &online, sizeof(online));
     return respdu;
 }
 //查找所有用户
@@ -440,19 +456,24 @@ PDU *MsgHandler::addfriend()
     int ret=OperateDB::instance().handleAddFriend(userName,seedName);
     qCDebug(lcNet)<<"addfriend ret"<<ret<<endl;
     PDU* respdu=nullptr;
-    //将若是添加的好友不在线打包进响应报文并返回
-    // 注意：ret==1 时本请求不产生直接响应，而是把好友请求转发给在线目标（返回 nullptr）。
+    // REQ-CHAT-ACK-001 R10：ret==1 表示已登记为待处理好友申请（离线也登记），
+    // 目标在线时顺带实时推送；请求方统一收到 ret=2「已发送，等待对方处理」。
     if(ret!=1){
         respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_RESPOND;
-        memcpy(respdu->caData,&ret,sizeof(ret));
+        setProtocolCode(respdu, ret < 0 ? ENUM_PROTOCOL_CODE_DB_UNAVAILABLE
+                                        : ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND);
     }
-    else {//在线给目标添加的好友发送请求
+    else {
         PDU*pdu=mkPDU();
         pdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_REQUEST;
         memcpy(pdu->caData,userName,32);
         memcpy(pdu->caData+32,seedName,32);
         MyTcpServer::getinstance().sendAddFriendAndRelease(seedName,pdu);
+        const int pending=ENUM_PROTOCOL_CODE_ACCEPTED;
+        respdu=mkPDU();
+        respdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_RESPOND;
+        setProtocolCode(respdu, pending);
     }
     return respdu;
 }
@@ -475,7 +496,9 @@ PDU *MsgHandler::addfriendFin()
     // 同一结果 PDU 推送给同意方与请求方，发送后立即释放；本请求无直回响应。
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_ADDFRIEND_RESPOND;
-    memcpy(pdu->caData,&ret,sizeof(ret));
+    const int finCode = (ret == 1) ? ENUM_PROTOCOL_CODE_OK
+            : (ret < 0 ? ENUM_PROTOCOL_CODE_BAD_PARAM : ENUM_PROTOCOL_CODE_NO_PENDING_REQUEST);
+    setProtocolCode(pdu, finCode);
     MyTcpServer::getinstance().seedAddFriend(seedName,pdu);
     MyTcpServer::getinstance().seedAddFriend(agreeName,pdu);
     memfree(pdu);
@@ -520,7 +543,7 @@ PDU *MsgHandler::deletefriend()
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_DELETEFRIEND_RESPOND;
-    memcpy(pdu->caData,&ret,sizeof(ret));
+    setProtocolCode(pdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_NOT_FRIEND);
     return pdu;
 }
 
@@ -557,10 +580,21 @@ PDU *MsgHandler::chat()
         qCWarning(lcNet)<<"[chat] 私聊正文拒绝 conn="<<m_connId<<" uiMsgLen="<<pdu->uiMsgLen
                         <<" 原因="<<why;
     }
-    // REQ-AUDIT-001 R1：只有真正写出成功才标记已送达；找不到连接或写失败则保持待送达，
-    // 由接收方下次 17 拉取重投（宁可重复，不能丢）。
+    // REQ-CHAT-ACK-001：按目标连接能力分流投递。
+    // 桌面端（声明过 116）只收 109，送达以客户端 110 为准；
+    // 网页/旧客户端仍收 15，并维持「写出成功即已送达」的旧语义。
     if(ret && msgId>=0 && stored){
-        if(MyTcpServer::getinstance().reseed(tarName,pdu)){
+        PDU* deliver=mkPDU(pdu->uiMsgLen);
+        deliver->uiType=ENUM_MSG_TYPE_CHAT_DELIVER_EVENT;
+        memcpy(deliver->caData,pdu->caData,32);          // 发送人（已按认证主体改写）
+        memset(deliver->caData+32,0,32);
+        memcpy(deliver->caData+32,&msgId,sizeof(msgId)); // 消息 ID
+        if(pdu->uiMsgLen>0){
+            memcpy(deliver->caMsg,pdu->caMsg,size_t(pdu->uiMsgLen));
+        }
+        const int mode=MyTcpServer::getinstance().deliverChat(tarName,deliver,pdu);
+        memfree(deliver);
+        if(mode==2){
             QVector<qlonglong> delivered;
             delivered.append(msgId);
             OperateDB::instance().markChatDelivered(delivered);
@@ -574,7 +608,8 @@ PDU *MsgHandler::chat()
     PDU* ack = mkPDU(pdu->uiMsgLen);
     ack->uiType = ENUM_MSG_TYPE_CHAT_RESPOND;
     memcpy(ack->caData, tarName, 32);
-    memcpy(ack->caData + 32, &stored, sizeof(stored));
+    const int chatCode = stored ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED;
+    memcpy(ack->caData + 32, &chatCode, sizeof(chatCode));
     if (pdu->uiMsgLen > 0) {
         memcpy(ack->caMsg, pdu->caMsg, size_t(pdu->uiMsgLen));
     }
@@ -633,7 +668,7 @@ PDU *MsgHandler::MKDIR(){
     // 仅以最终子目录的创建结果（ret2）作为整体成败。
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_MKDIR_RESPOND;
-    memcpy(respdu->caData,&ret2,sizeof(ret2));
+    setProtocolCode(respdu, ret2 ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_CREATE_FAILED);
     return respdu;
 }
 //删除目录
@@ -691,7 +726,7 @@ PDU *MsgHandler::deldir(const QString& loginName)
     //返回报文
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_DELFILE_RESPOND;
-    memcpy(respdu->caData,&ans,sizeof(ans));
+    setProtocolCode(respdu, ans ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_DELETE_FAILED);
     return respdu;
 }
 //切换目录
@@ -735,7 +770,7 @@ PDU *MsgHandler::changedir(){
         respdu=mkPDU();
     }
     respdu->uiType=ENUM_MSG_TYPE_CHANGEDIR_RESPOND;
-    memcpy(respdu->caData,&isExist,sizeof (isExist));
+    setProtocolCode(respdu, isExist ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_DIR_NOT_FOUND);
     return respdu;
 }
 //刷新目录
@@ -748,6 +783,7 @@ PDU *MsgHandler::flushfile()
         qCWarning(lcFs)<<"[flushfile] 拒绝越权列目录 conn="<<m_connId<<":"<<path;
         PDU* respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
+        setProtocolCode(respdu, ENUM_PROTOCOL_CODE_NOT_ALLOWED);
         return respdu;
     }
     // REQ-EXT-FILE-001 D5：逻辑条目为权威；目录物理实体按名并入（残留目录可见性兜底），文件只来自条目。
@@ -905,7 +941,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
 
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_RENAMEFILE_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_RENAME_FAILED);
     return respdu;
 }
 //分享文件（询问）
@@ -978,8 +1014,7 @@ PDU *MsgHandler::sharefilemove()
     if(recvName.isEmpty()){
         qCWarning(lcFs)<<"[sharefilemove] 拒绝：连接无认证上下文 conn="<<m_connId;
         PDU* respdu=mkPDU();
-        bool fail=false;
-        memcpy(respdu->caData,&fail,sizeof(fail));
+        setProtocolCode(respdu, ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED);
         respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND;
         return respdu;
     }
@@ -1040,7 +1075,7 @@ PDU *MsgHandler::sharefilemove()
         }
     }
     PDU* respdu=mkPDU();
-    memcpy(respdu->caData,&ret,sizeof (ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED);
     respdu->uiType=ENUM_MSG_TYPE_SHAREFILE_FINISH_RESPOND;
     return respdu;
 
@@ -1157,7 +1192,7 @@ PDU *MsgHandler::movefile(const QString& loginName)
 
     // 响应：caData[0]=ret；caData+32 回显服务端最终文件名（重名时可能带 (n) 后缀）。
     PDU* respdu=mkPDU();
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_RENAME_FAILED);
     QByteArray fileNameBytes=echoName.toUtf8();
     memcpy(respdu->caData+32,fileNameBytes.constData(),qMin(fileNameBytes.size(),31));
     respdu->uiType=ENUM_MSG_TYPE_MOVEFILE_RESPOND;
@@ -1300,7 +1335,7 @@ PDU *MsgHandler::uploadfileinit()
     // [48..55]=transfer_id；客户端据此决定从哪个偏移继续分块。
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof (ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED);
     memcpy(respdu->caData+UPLOAD_RESUME_OFFSET,&resumeOffset,sizeof(resumeOffset));
     if(resumeEnabled){
         memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
@@ -1463,7 +1498,7 @@ PDU *MsgHandler::uploadfilefastcheck()
         PDU* r = mkPDU(uint(echo.size()));
         const uint respVersion = FASTCHECK_VERSION;
         r->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
-        memcpy(r->caData + FASTCHECK_RESP_RET_OFFSET, &ret, sizeof(ret));
+        setProtocolCode(r, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_BAD_PARAM);
         memcpy(r->caData + FASTCHECK_RESP_VERSION_OFFSET, &respVersion, sizeof(respVersion));
         if (!echo.isEmpty()) {
             memcpy(r->caMsg, echo.constData(), size_t(echo.size()));   // nameLen=0，客户端从 caMsg[0..] 读标识
@@ -1711,7 +1746,7 @@ PDU *MsgHandler::uploadfiledata()
             bool ret=false;
             PDU* respdu=mkPDU();
             respdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND;
-            memcpy(respdu->caData,&ret,sizeof(ret));
+            setProtocolCode(respdu, ENUM_PROTOCOL_CODE_BAD_PARAM);
             memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
             return respdu;
         }
@@ -1727,7 +1762,7 @@ PDU *MsgHandler::uploadfiledata()
     }
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof(ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED);
     resumeMagic=UPLOAD_RESUME_MAGIC;
     memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
     return respdu;
@@ -1901,7 +1936,7 @@ PDU* MsgHandler::buildFastcheck98(bool ret, bool hit, qint64 fileId, qint64 sess
     respdu->uiType = ENUM_MSG_TYPE_UPLOADFILE_FASTCHECK_RESPOND;
     const uint respVersion = FASTCHECK_VERSION;
     const uint nameLenOut = uint(finalName.size());
-    memcpy(respdu->caData + FASTCHECK_RESP_RET_OFFSET, &ret, sizeof(ret));
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED);
     memcpy(respdu->caData + FASTCHECK_RESP_HIT_OFFSET, &hit, sizeof(hit));
     memcpy(respdu->caData + FASTCHECK_RESP_VERSION_OFFSET, &respVersion, sizeof(respVersion));
     memcpy(respdu->caData + FASTCHECK_RESP_FILE_ID_OFFSET, &fileId, sizeof(fileId));
@@ -1956,8 +1991,8 @@ PDU *MsgHandler::downloadfile()
                         << " id=" << m_currentTransferId;
         PDU* respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND;
-        memcpy(respdu->caData,&ret,sizeof(ret));
-        memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
+        setProtocolCode(respdu, ENUM_PROTOCOL_CODE_CONCURRENCY_LIMIT);
+        memcpy(respdu->caData+DOWNLOAD_RESP_SIZE_OFFSET,&fileSize,sizeof(fileSize));
         memcpy(respdu->caData+DOWNLOAD_RESP_TRANSFER_ID_OFFSET,&m_currentTransferId,sizeof(m_currentTransferId));
         return respdu;
     }
@@ -1993,8 +2028,12 @@ PDU *MsgHandler::downloadfile()
     //仅返回元数据 PDU（不含文件内容），实际数据由 MyTcpSocket 流式发送
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND;
-    memcpy(respdu->caData,&ret,sizeof(ret));
-    memcpy(respdu->caData+sizeof(bool),&fileSize,sizeof(fileSize));
+    // 失败原因区分：越权/不存在 → 文件不存在；续传起点越界 → 参数非法
+    const int dlCode = ret ? ENUM_PROTOCOL_CODE_OK
+            : (m_downloadResumeOffset > fileSize ? ENUM_PROTOCOL_CODE_BAD_PARAM
+                                                 : ENUM_PROTOCOL_CODE_FILE_NOT_FOUND);
+    setProtocolCode(respdu, dlCode);
+    memcpy(respdu->caData+DOWNLOAD_RESP_SIZE_OFFSET,&fileSize,sizeof(fileSize));
     // 41 的 [32..62] 被文件名字段占用 → id 落在独立的 [16..23]（D2）
     memcpy(respdu->caData+DOWNLOAD_RESP_TRANSFER_ID_OFFSET,&m_currentTransferId,sizeof(m_currentTransferId));
     // REQ-EXT-TRANSFER-002 S4/D6：受理并建流时回带采纳起点（R4：拒绝/无流时该区间保持 0）
@@ -2059,6 +2098,87 @@ void MsgHandler::confirmChatDelivered()
     m_pendingDeliveredIds.clear();
 }
 
+// REQ-CHAT-ACK-001：111 拉取本人待送达私聊（对方账号在 caData[0,32)）。
+// 响应 112 每条：qint64 消息 ID + qint32 正文长 + qint32 时间长 + 正文 + 时间。
+// 只读不标记——客户端 110 确认后才置已送达；重投的重复内容由客户端按 ID 去重。
+PDU *MsgHandler::chatPending()
+{
+    char peerName[32]={'\0'};
+    memcpy(peerName,pdu->caData,32);
+    QByteArray actorBytes=m_actorName.toUtf8();
+    QVector<qlonglong> ids;
+    const QStringList list=OperateDB::instance().getchatMsg(peerName,actorBytes.data(),&ids);
+
+    uint total=0;
+    for(int i=0;i<list.size();i+=2){
+        total+=uint(sizeof(qint64)+sizeof(qint32)*2)
+               +uint(list.at(i).toUtf8().size())
+               +uint(list.at(i+1).toUtf8().size());
+    }
+    PDU* respdu=mkPDU(total);
+    respdu->uiType=ENUM_MSG_TYPE_CHAT_PULL_PENDING_RESPOND;
+    uint dis=0;
+    for(int i=0;i<list.size();i+=2){
+        const qint64 id=ids.at(i/2);
+        const QByteArray content=list.at(i).toUtf8();
+        const QByteArray timeBytes=list.at(i+1).toUtf8();
+        const qint32 contentLen=content.size();
+        const qint32 timeLen=timeBytes.size();
+        memcpy(respdu->caMsg+dis,&id,sizeof(id)); dis+=sizeof(id);
+        memcpy(respdu->caMsg+dis,&contentLen,sizeof(contentLen)); dis+=sizeof(contentLen);
+        memcpy(respdu->caMsg+dis,&timeLen,sizeof(timeLen)); dis+=sizeof(timeLen);
+        if(contentLen>0){ memcpy(respdu->caMsg+dis,content.constData(),size_t(contentLen)); dis+=uint(contentLen); }
+        if(timeLen>0){ memcpy(respdu->caMsg+dis,timeBytes.constData(),size_t(timeLen)); dis+=uint(timeLen); }
+    }
+    return respdu;
+}
+
+// 110：客户端确认已处理的消息 ID（caMsg=N×qint64）。按「ID + 收件人」双条件标记，
+// 伪造他人 ID 不会命中，重复确认幂等。无响应。
+void MsgHandler::chatDeliveredAck()
+{
+    if(pdu==nullptr || pdu->uiMsgLen<sizeof(qint64)){
+        return;
+    }
+    const int count=int(pdu->uiMsgLen/sizeof(qint64));
+    QVector<qlonglong> ids;
+    ids.reserve(count);
+    for(int i=0;i<count;i++){
+        qint64 id=0;
+        memcpy(&id,pdu->caMsg+i*sizeof(qint64),sizeof(qint64));
+        if(id>0) ids.append(id);
+    }
+    if(ids.isEmpty()){
+        return;
+    }
+    OperateDB::instance().markChatDeliveredFor(m_actorName,ids);
+}
+
+// 113/114：本人仍待处理的好友申请（离线期间登记的也在内），caMsg=32 字节定长账号数组
+PDU *MsgHandler::listPendingFriendRequests()
+{
+    const QStringList names=OperateDB::instance().listPendingFriendRequests(m_actorName);
+    PDU* respdu=mkPDU(uint(names.size())*32);
+    respdu->uiType=ENUM_MSG_TYPE_LIST_PENDING_FRIEND_RESPOND;
+    for(int i=0;i<names.size();i++){
+        const QByteArray nameBytes=names.at(i).toUtf8();
+        memcpy(respdu->caMsg+i*32,nameBytes.constData(),size_t(qMin(nameBytes.size(),31)));
+    }
+    return respdu;
+}
+
+// 115：拒绝好友申请，只把本人收到的 pending 行置为 rejected。无响应。
+void MsgHandler::rejectFriendRequest()
+{
+    char requester[32]={'\0'};
+    memcpy(requester,pdu->caData,32);
+    const QString requesterName=QString::fromUtf8(requester);
+    if(requesterName.isEmpty()){
+        return;
+    }
+    OperateDB::instance().rejectFriendRequest(requesterName,m_actorName);
+}
+
 //获取用户信息
 PDU *MsgHandler::getuserinformation()
 {
@@ -2069,7 +2189,7 @@ PDU *MsgHandler::getuserinformation()
     int outOnline=0;
     bool found=OperateDB::instance().handleGetUserInfo(userName,outName,outOnline);
 
-    int resultCode=found ? 0 : -1;
+    int resultCode=found ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND;
     // 响应：caData[0..3]=resultCode、[4..7]=在线状态、[32..63]=用户名。
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_GETUSERINFORMATION_RESPOND;
@@ -2142,21 +2262,18 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
                             << " owner=" << ownerName;
             PDU* respdu = mkPDU(128);
             respdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND;
-            bool ok = false;
-            const quint32 state = PUBLINK_STATE_VALID;
-            memcpy(respdu->caData, &ok, sizeof(ok));
-            memcpy(respdu->caData + PUBLINK_STATE_OFFSET, &state, sizeof(state));
+            setProtocolCode(respdu, ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND);
             return respdu;
         }
     }
 
     OperateDB::ShareLinkInfo existing;
     const bool hasExisting = OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, existing);
-    quint32 state = PUBLINK_STATE_VALID;
+    int stateCode = ENUM_PROTOCOL_CODE_OK;
     if(hasExisting){
         const bool expired = QDateTime::currentDateTime() >= existing.expireTime;
-        state = existing.revoked ? PUBLINK_STATE_REVOKED
-                                 : (expired ? PUBLINK_STATE_EXPIRED : PUBLINK_STATE_VALID);
+        stateCode = existing.revoked ? ENUM_PROTOCOL_CODE_LINK_REVOKED
+                  : (expired ? ENUM_PROTOCOL_CODE_LINK_EXPIRED : ENUM_PROTOCOL_CODE_OK);
     }
 
     QString linkValue;
@@ -2169,7 +2286,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
                                                     relativePath, ShareLinkService::defaultExpireTime());
         if(ok){
             linkValue = token;
-            state = PUBLINK_STATE_VALID;
+            stateCode = ENUM_PROTOCOL_CODE_OK;
         } else {
             qCWarning(lcFs) << "[createPublishLink] 重新生成失败（旧链接保留）owner=" << ownerName;
         }
@@ -2182,16 +2299,17 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
                                                        QDateTime::currentDateTime().addSecs(renewSeconds));
             if(ok){
                 linkValue = token;
-                state = PUBLINK_STATE_VALID;
+                stateCode = ENUM_PROTOCOL_CODE_OK;
             }
         } else if(existing.revoked){
+            stateCode = ENUM_PROTOCOL_CODE_LINK_REVOKED;
             qCWarning(lcFs) << "[createPublishLink] 拒绝续期：链接已撤销 owner=" << ownerName;
         } else {
             ok = OperateDB::instance().renewShareLink(ownerName, relativePath,
                                                       QDateTime::currentDateTime().addSecs(renewSeconds));
             if(ok){
                 linkValue = existing.tokenHash;   // 续期不改 token，链接文本不变、只是重新可用
-                state = PUBLINK_STATE_VALID;
+                stateCode = ENUM_PROTOCOL_CODE_OK;
             }
         }
     } else if(hasExisting){
@@ -2212,14 +2330,12 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
         }
     }
 
-    qCDebug(lcFs) << "[createPublishLink] action=" << action << " ok=" << ok << " state=" << state;
-    // 响应：caData[0]=ok、PUBLINK_STATE_OFFSET 处为状态字；成功时 caMsg 为 cloud-disk:// 外链文本。
+    qCDebug(lcFs) << "[createPublishLink] action=" << action << " ok=" << ok << " state=" << stateCode;
+    // 响应：caData[0,4)=标准码；成功时 caMsg 为 cloud-disk:// 外链文本。
     PDU* respdu = mkPDU(128);
     respdu->uiType = ENUM_MSG_TYPE_CREATE_PUBLINK_RESPOND;
-    memcpy(respdu->caData, &ok, sizeof(ok));
-    // 状态字回真实状态而不是"ok 就当有效"：旧语义复用的可能正是一条过期链接，
-    // 客户端要靠这一格才知道拿到的是死链、该给重新生成/续期的选择
-    memcpy(respdu->caData + PUBLINK_STATE_OFFSET, &state, sizeof(state));
+    // 复用已有链接时拿到的可能正是过期/吊销链接：状态码如实回带，客户端据此选择重新生成或续期
+    setProtocolCode(respdu, ok ? stateCode : ENUM_PROTOCOL_CODE_WRITE_FAILED);
     if(ok) {
         QString link = QString("cloud-disk://share/%1").arg(linkValue);
         QByteArray linkBytes = link.toUtf8();
@@ -2256,7 +2372,7 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
     PDU* respdu = mkPDU(1024); // 预留 JSON 空间
     respdu->uiType = ENUM_MSG_TYPE_RESOLVE_PUBLINK_RESPOND;
 
-    bool ok = false;
+    int resultCode = ENUM_PROTOCOL_CODE_LINK_INVALID;
     QString savedRelPath; // 形如 "分享链接/2.pdf"，返回给客户端展示
     if (OperateDB::instance().getShareLinkByHash(hash, info)) {
         qCDebug(lcFs) << "[resolvePublishLink] 命中记录: owner=" << info.ownerName
@@ -2264,8 +2380,10 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                  << " revoked=" << info.revoked
                  << " expireTime=" << info.expireTime.toString("yyyy-MM-dd HH:mm:ss");
         if (info.revoked) {
+            resultCode = ENUM_PROTOCOL_CODE_LINK_REVOKED;
             qCWarning(lcFs) << "[resolvePublishLink] 链接已撤销，拒绝";
         } else if (QDateTime::currentDateTime() >= info.expireTime) {
+            resultCode = ENUM_PROTOCOL_CODE_LINK_EXPIRED;
             qCWarning(lcFs) << "[resolvePublishLink] 链接已过期，拒绝";
         } else {
             QString ownerRoot = QDir(Server::getinstance().filesPath).filePath(info.ownerName);
@@ -2294,13 +2412,14 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                     FileObjectStore::instance().attachExistingObject(
                         loginName, shareDir, QFileInfo(cleanSrcPath).fileName(), srcEntry.objectId, -1);
                 if (attached.ok) {
-                    ok = true;
+                    resultCode = ENUM_PROTOCOL_CODE_OK;
                     savedRelPath = QString("分享链接/%1").arg(attached.displayName);
                     qCDebug(lcFs) << "[resolvePublishLink] 条目引用完成 fileId=" << attached.fileId
                              << " objId=" << srcEntry.objectId
                              << " name=" << attached.displayName
                              << " idempotent=" << attached.idempotent;
                 } else {
+                    resultCode = ENUM_PROTOCOL_CODE_WRITE_FAILED;
                     qCWarning(lcFs) << "[resolvePublishLink] 条目安置失败:" << attached.error
                              << " src=" << srcPath;
                 }
@@ -2314,9 +2433,9 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                  << hash.left(16) << "...)";
     }
 
-    // 响应：caData[0]=ok；成功时 caMsg 为 {"saved_path":"分享链接/..."} JSON 文本。
-    memcpy(respdu->caData, &ok, sizeof(ok));
-    if (ok) {
+    // 响应：caData[0,4)=标准码；成功时 caMsg 为 {"saved_path":"分享链接/..."} JSON 文本。
+    setProtocolCode(respdu, resultCode);
+    if (resultCode == ENUM_PROTOCOL_CODE_OK) {
         QString json = QString("{\"saved_path\":\"%1\"}").arg(savedRelPath);
         QByteArray jsonBytes = json.toUtf8();
         memcpy(respdu->caMsg, jsonBytes.constData(), jsonBytes.size());
@@ -2334,23 +2453,22 @@ PDU* MsgHandler::queryFilePublishLink() {
     
     QString token = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
 
-    // 响应：caData[0]=exists、PUBLINK_STATE_OFFSET 处为真实状态字；存在时 caMsg 为外链文本。
+    // 响应：caData[0,4)=标准码（0 有效 / -2017 过期 / -2018 吊销 / -2019 无链接）；有效时 caMsg 为外链文本。
     PDU* respdu = mkPDU(128);
     respdu->uiType = ENUM_MSG_TYPE_QUERY_FILE_PUBLINK_RESPOND;
-    bool exists = !token.isEmpty();
-    memcpy(respdu->caData, &exists, sizeof(exists));
-    // REQ-EXT-SHARE-001：回带状态字——只有 exists 时旧版客户端看不出链接是否已过期/撤销，
-    // 只能等解析失败才知道；这一格让"获取分享链接"当场给出重新生成/续期的选择
-    quint32 state = PUBLINK_STATE_VALID;
+    const bool exists = !token.isEmpty();
+    int resultCode = exists ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_LINK_INVALID;
     if(exists){
         OperateDB::ShareLinkInfo info;
         if(OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, info)){
             const bool expired = QDateTime::currentDateTime() >= info.expireTime;
-            state = info.revoked ? PUBLINK_STATE_REVOKED
-                                 : (expired ? PUBLINK_STATE_EXPIRED : PUBLINK_STATE_VALID);
+            resultCode = info.revoked ? ENUM_PROTOCOL_CODE_LINK_REVOKED
+                       : (expired ? ENUM_PROTOCOL_CODE_LINK_EXPIRED : ENUM_PROTOCOL_CODE_OK);
+        } else {
+            resultCode = ENUM_PROTOCOL_CODE_LINK_INVALID;
         }
     }
-    memcpy(respdu->caData + PUBLINK_STATE_OFFSET, &state, sizeof(state));
+    setProtocolCode(respdu, resultCode);
     if (exists) {
         QString link = QString("cloud-disk://share/%1").arg(token);
         QByteArray linkBytes = link.toUtf8();

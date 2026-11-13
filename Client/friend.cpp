@@ -33,6 +33,16 @@ void Friend::flushfriend()
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST;
     Client::getinstance().seedMsg(pdu);
+    // REQ-CHAT-ACK-001 R10：顺带拉取仍待处理的好友申请（含离线期间登记的）
+    requestPendingFriendRequests();
+}
+
+// REQ-CHAT-ACK-001 R10：拉取本人待处理的好友申请，响应 114 由 MsgHandler 逐条询问
+void Friend::requestPendingFriendRequests()
+{
+    PDU* pdu=mkPDU();
+    pdu->uiType=ENUM_MSG_TYPE_LIST_PENDING_FRIEND_REQUEST;
+    Client::getinstance().seedMsg(pdu);
 }
 
 QListWidget *Friend::getfile_LW()
@@ -172,9 +182,10 @@ void Friend::on_chat_PB_clicked()
         // REQ-CLI-MSGSTORE-001：先把本机存过的历史灌进窗口，再发 17 取离线补发；
         // 两条路径都按「时间+正文」去重，同一条消息不会显示两遍
         m_chat->loadLocalHistory(pName);
-        m_chat->beginHistoryRequest(m_chat->m_strChatName);   // 18 的归属按发请求时的会话定
+        m_chat->beginHistoryRequest(m_chat->m_strChatName);   // 112 的归属按发请求时的会话定
         PDU* pdu= mkPDU();
-        pdu->uiType=ENUM_MSG_TYPE_GETCHATMSG_REQUEST;
+        // REQ-CHAT-ACK-001：桌面端改走 111，响应 112 每条带消息 ID，落库后回 110 才置已送达
+        pdu->uiType=ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST;
         // caData[0,32)=当前用户；[32,64)=聊天对象，服务端据此取双方历史记录
         memcpy(pdu->caData,Client::getinstance().m_LoginName.toStdString().c_str(),32);
         memcpy(pdu->caData+32,m_chat->m_strChatName.toStdString().c_str(),32);
