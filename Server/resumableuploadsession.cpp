@@ -72,11 +72,26 @@ ResumableUploadSession::BeginResult ResumableUploadSession::begin(const QString 
     return result;
 }
 
+// REQ-RESUME-AUDIT-001 M1：确定性暂存路径单独暴露——调用方需在建会话前先查
+// upload_session 行（confirmed_offset 封顶 + 摘要回填），路径计算必须先于 beginStaged。
+QString ResumableUploadSession::stagedPathFor(const QString &owner, const QString &parentPath,
+                                              const QString &displayName, qint64 totalSize)
+{
+    // 确定性 token：同一 (owner, parent, name, size) 重连必然落到同一 .part。
+    // SHA-1 仅用于生成短文件名，不承担内容完整性职责（完整性由 commitUpload 的 SHA-256 复算保证）。
+    const QByteArray key = (owner + "|" + parentPath + "|" + displayName + "|" + QString::number(totalSize))
+                               .toUtf8();
+    const QString token = QString::fromLatin1(
+        QCryptographicHash::hash(key, QCryptographicHash::Sha1).toHex());
+    return QDir(Server::getinstance().filesPath).absoluteFilePath(
+        QStringLiteral(".staging/") + token + QStringLiteral(".part"));
+}
+
 // REQ-EXT-FILE-001 T4：暂存路径 = filesys/.staging/<sha1(owner|parent|display|size)>.part
 // 同参数重连命中同一 staging（断点续传）；完成前不进最终目录（§4）。
 ResumableUploadSession::BeginResult ResumableUploadSession::beginStaged(
         const QString &owner, const QString &parentPath, const QString &displayName,
-        qint64 totalSize, bool resumeEnabled)
+        qint64 totalSize, bool resumeEnabled, qint64 confirmedCap)
 {
     reset();
 
@@ -87,18 +102,11 @@ ResumableUploadSession::BeginResult ResumableUploadSession::beginStaged(
         return result;
     }
 
-    // 确定性 token：同一 (owner, parent, name, size) 重连必然落到同一 .part。
-    // SHA-1 仅用于生成短文件名，不承担内容完整性职责（完整性由 commitUpload 的 SHA-256 复算保证）。
-    const QByteArray key = (owner + "|" + parentPath + "|" + displayName + "|" + QString::number(totalSize))
-                               .toUtf8();
-    const QString token = QString::fromLatin1(
-        QCryptographicHash::hash(key, QCryptographicHash::Sha1).toHex());
-
     QDir stageRoot(QDir(Server::getinstance().filesPath).absoluteFilePath(".staging"));
     if (!stageRoot.exists() && !stageRoot.mkpath(".")) {
         return result;
     }
-    m_filePath = stageRoot.filePath(token + ".part");
+    m_filePath = stagedPathFor(owner, parentPath, displayName, totalSize);
     m_owner = owner;
     m_parent = parentPath;
     m_display = displayName;
@@ -107,16 +115,25 @@ ResumableUploadSession::BeginResult ResumableUploadSession::beginStaged(
     // 写任务只 seek+write+flush（S3）；无需 Append——每块显式 seek 到 chunkOffset。
 
     // 已有 .part 小于总长 → 从其大小处续传；等于总长 → 直接视为完成（后续走校验/转正）。
+    // REQ-RESUME-AUDIT-001 M1：起点以会话行 confirmed_offset 封顶——物理可能超前（崩溃半块/
+    // 尾部垃圾）也可能落后（TTL 已删 .part 而行仍在），两个方向都不能当已确认数据续。
+    // 物理超出总长视为不可信残留，整文件重传（与既有 existingSize>totalSize 收敛一致）。
     QFileInfo fileInfo(m_filePath);
     qint64 offset = 0;
     if (resumeEnabled && fileInfo.exists() && fileInfo.isFile()) {
         const qint64 existingSize = fileInfo.size();
-        if (existingSize > 0 && existingSize < totalSize) {
+        if (existingSize > totalSize) {
+            offset = 0;
+        } else if (confirmedCap >= 0 && existingSize > confirmedCap) {
+            // 截到已确认偏移续传；[offset, existingSize) 的残留字节会被后续分块按绝对偏移覆写
+            offset = confirmedCap;
+        } else {
             offset = existingSize;
-        } else if (existingSize == totalSize) {
-            m_receivedSize = existingSize;
+        }
+        if (offset == totalSize) {
+            m_receivedSize = offset;
             m_totalSize = totalSize;
-            return {true, existingSize, true};
+            return {true, offset, true};
         }
     }
 

@@ -409,7 +409,7 @@ void TransferManager::sendGroupUploadInit(Task& t)
     emit tasksChanged();
 }
 
-// 单飞：同一时刻只允许一个 97 在途（服务端预检查落在旧单流槽）
+// 单飞：同一时刻只允许一个 97 在途（服务端使用临时预检查槽）
 void TransferManager::pumpFastcheck()
 {
     if (m_fastcheckInFlight != 0) return;

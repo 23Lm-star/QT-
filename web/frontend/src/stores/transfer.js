@@ -23,7 +23,7 @@ import * as gcmd from '../protocol/commands/group.js';
 import Sha256Worker from '../workers/sha256.worker.js?worker';
 
 // ===== 模块级引擎状态 =====
-let idCounter = 0n;             // 会话级 transfer_id，从 1 单调递增（0 为服务端旧单流保留值）
+let idCounter = 0n;             // 会话级 transfer_id，从 1 单调递增（0 为无效编号）
 let keySeq = 0;                 // 任务行键
 const tidToKey = new Map();     // tid 字符串 -> 任务 key（30/32/41/42/43 路由）
 const waiters = new Map();      // 等待键 -> {resolve, timer|null, beat|null}

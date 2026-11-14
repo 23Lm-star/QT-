@@ -34,11 +34,17 @@ public:
 
     // REQ-EXT-FILE-001 T4：内容寻址上传暂存。staging 按 (owner|parent|display|size)
     // 派生确定性路径，重连/续传命中同一 staging；完成前绝不落最终目录（§4）。
+    // REQ-RESUME-AUDIT-001 M1：confirmedCap>=0 时续传起点按会话行 confirmed_offset 封顶
+    // （min(物理大小, cap)）——防崩溃半块与 TTL 删 .part 两个方向的错位续传；<0 = 不封顶。
     BeginResult beginStaged(const QString &owner,
                             const QString &parentPath,
                             const QString &displayName,
                             qint64 totalSize,
-                            bool resumeEnabled);
+                            bool resumeEnabled,
+                            qint64 confirmedCap = -1);
+    // 同一确定性暂存路径（纯计算，不建目录不落盘）：供调用方在建会话前先查会话行。
+    static QString stagedPathFor(const QString &owner, const QString &parentPath,
+                                 const QString &displayName, qint64 totalSize);
     // 仅在 offset == 已确认字节数且不越过总大小时推进进度（连续性检查）。
     bool acceptWrittenChunk(qint64 offset, qint64 len);
     // receivedSize >= totalSize。

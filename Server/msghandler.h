@@ -28,9 +28,9 @@ public:
     // 历史用户名槽位（当前源码未使用；授权一律以 m_actorName 为准）
     QString ClientName;
 
-    // ===== REQ-EXT-TRANSFER-001：每连接 per-transfer 上传上下文（D8：id=0 旧单流路径落入同一容器） =====
+    // ===== REQ-EXT-TRANSFER-001：每连接 per-transfer 上传上下文 =====
     struct UploadCtx {
-        quint64  id = 0;                 // 0 = 旧单流槽
+        quint64  id = 0;                 // 0 = 无效编号
         ResumableUploadSession session;  // 既有类型，原样复用
         qint64   sessionId = -1;         // upload_session.session_id
         QString  expectedSha;            // 既有 m_uploadExpectedSha
@@ -38,7 +38,7 @@ public:
         QString  groupDisplayName;       // 既有 m_groupUploadDisplayName
         bool     writeInFlight = false;  // 既有 m_uploadWriteInFlight（逐 transfer 化）
         qint64   lastProgressMs = 0;     // 空闲回收用
-        // AUD-1：97 秒传预检查借 id=0 槽做暂存登记，这不是一次上传，**不占用上传并发名额**。
+        // AUD-1：97 秒传预检查借临时槽做暂存登记，这不是一次上传，**不占用上传并发名额**。
         // 首次收到该槽的 31 正文（或该槽被随后的 29 采纳）时本标记失效。
         bool     fastcheckPlaceholder = false;
         // AUD-4：107 在写盘在途时到达 → 延迟释放。立即 abort 会让在途写落在 ctx 消失之后，
@@ -53,7 +53,7 @@ public:
         bool     hashInFlight = false;
         // 复算落定后要迟到补发的应答类型（DeferredRespond）。
         quint8   deferredRespond = 0;
-        // 32：末块落定时的 success/下一偏移（复算结果不改变这两个字段，与改前一致）。
+        // 32：末块写落定时的 success/下一偏移（M3 后 32 成败以提交结果为准，本字段仅留档）。
         bool     deferredAckSuccess = false;
         qint64   deferredAckOffset = 0;
         // 98：回带的 97 请求标识 + 命中时的续传起点（=文件总大小）。
@@ -63,8 +63,11 @@ public:
         // 102：群信封 request_id 与展示名（应答体重建用）。
         quint64  deferredRequestId = 0;
         QString  deferredName;
+        // REQ-RESUME-AUDIT-001 M3：30 迟到补发参数（29 的暂存已在尾部时，complete 依赖条目落定）。
+        qint64   deferredResumeOffset = 0;      // 成功时回带的续传起点（封顶后）
+        bool     deferredResumeMagicOn = false; // 29 请求是否启用续传魔数
     };
-    QHash<quint64, UploadCtx> m_uploads;   // key 0 = 旧单流路径
+    QHash<quint64, UploadCtx> m_uploads;   // key 为有效传输编号
     // handlMsg 按 PDU 落位写入的当前传输 id（29/31/40/101/105/107）；非传输族 = 0
     quint64 m_currentTransferId = 0;
     // 97 未命中建立的会话暂存：随后的 29 INIT（同 parent/display/size）直接采纳，
@@ -76,6 +79,9 @@ public:
         QString parent;
         QString display;
         qint64  size = 0;
+        // REQ-RESUME-AUDIT-001（审计修复）：97 登记时的已确认偏移——29 采纳（adopt）路径
+        // 以此为续传起点封顶，使 adopt 与复用/新建路径同受 min(物理, 已确认) 约束。
+        qint64  offset = 0;
     };
     PendingFastcheck m_pendingFastcheck;
     // 按传输 id 查找上下文；不存在返回 nullptr。返回指针指向哈希表内部节点，
@@ -86,11 +92,11 @@ public:
     // 否则 Windows 下会被占用句柄拒绝（实测：97 别名句柄让 commitUpload 的 rename 失败 → 会话判 failed）。
     void releaseOtherStagingHandles(quint64 keepId, const QString &stagingPath);
     UploadCtx& currentUpload();            // 不存在则新建（调用方须先过 acquireUploadSlot）
-    // 上限（D7）与重复 id（T-17）判定；true = 可占用该槽（id=0 每次重置旧槽）
+    // 上限（D7）与重复编号（T-17）判定
     bool acquireUploadSlot(quint64 id);
     void abortUpload(quint64 id);          // 释放槽位：upload_session 置 expired，staging 保留
     void reapIdleUploads(qint64 nowMs, int idleSec);   // 空闲回收（返回被回收条目数）
-    // AUD-1：上传并发名额计数**排除** 97 预检查占位（id=0 纯暂存槽），其余条目照旧计入
+    // AUD-1：上传并发名额计数**排除** 97 预检查占位，其余条目照旧计入
     int  activeUploadCount() const {
         int n = 0;
         for (QHash<quint64, UploadCtx>::const_iterator it = m_uploads.constBegin();
@@ -216,19 +222,24 @@ public:
         DeferredNone = 0,
         DeferredDataAck32 = 1,
         DeferredFastcheck98 = 2,
-        DeferredGroupInit102 = 3
+        DeferredGroupInit102 = 3,
+        DeferredInit30 = 4    // REQ-RESUME-AUDIT-001 M3：29 的暂存已在尾部 → 30 按提交结果迟到补发
     };
     struct HashFinishAction {
-        PDU* respondPdu = nullptr;   // 迟到补发的 98/102（已构造，发送并 memfree 由连接层负责）
+        PDU* respondPdu = nullptr;   // 迟到补发的 98/102/30（已构造，发送并 memfree 由连接层负责）
         bool needDataAck = false;    // 迟到补发的 32
         bool ackSuccess = false;
         qint64 ackOffset = 0;
+        bool ackComplete = true;     // REQ-RESUME-AUDIT-001 M3：32 的 complete 随提交结果
     };
     HashFinishAction onStagingHashFinished(quint64 transferId, bool hashOk,
                                            const QString& shaHex, qint64 sizeBytes);
     // 98 应答体构造（同步尾部与迟到路径共用，字段布局逐字节一致）。
     PDU* buildFastcheck98(bool ret, bool hit, qint64 fileId, qint64 sessionId, qint64 nextOffset,
                           const QByteArray& finalName, const QByteArray& reqIdBytes);
+    // REQ-RESUME-AUDIT-001 M3：30 迟到补发构造（29 的暂存已在尾部路径），
+    // 布局与 uploadfileinit 同步路径逐字节一致（code/[32..39]=offset/[40..43]=magic/[48..55]=tid）。
+    PDU* buildUploadInit30(quint64 tid, bool ok, qint64 resumeOffset, bool resumeMagicOn);
     // 102 应答体构造（信封 + caData 回带 transfer_id，同 groupFileRequest 内 response()）。
     PDU* buildGroupInit102(quint64 requestId, quint64 groupId, int code,
                            const QByteArray& body, quint64 transferId);

@@ -66,7 +66,7 @@ public:
     static const int DOWNLOAD_CHUNK_SIZE = 65536; // 64KB
     // 单条下载流的状态。file 由本连接独占并负责 close/delete（断线、完成、abort 三条路径）。
     struct DownloadStream {
-        // 传输 id（0=旧单流路径）
+        // 传输编号（从 1 开始）
         quint64 id = 0;
         // 已按续传起点 seek 的只读句柄
         QFile*  file = nullptr;
@@ -76,7 +76,7 @@ public:
         qint64  sentSize = 0;
         qint64  remaining() const { return totalSize - sentSize; }
     };
-    QHash<quint64, DownloadStream> m_downloads;   // key 0 = 旧单流路径
+    QHash<quint64, DownloadStream> m_downloads;   // key 为有效传输编号
     QList<quint64> m_downloadRing;                // round-robin 环（活跃顺序）
     // 下一块轮到的环下标
     int m_rrCursor = 0;

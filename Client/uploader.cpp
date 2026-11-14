@@ -58,7 +58,9 @@ void Uploader::acknowledge(bool success, qint64 nextOffset, bool complete)
     }
 
     m_waitingAck = false;
-    if (!success || nextOffset < m_nextOffset) {
+    // REQ-RESUME-AUDIT-001 M4：偏移必须严格连续（= 本块起点 + 本块长度），
+    // 跳跃/回退一律失败收口，防止错位数据继续发送。
+    if (!success || nextOffset != m_nextOffset + m_sentLen) {
         emit errnoMsg("Upload chunk rejected");
         finish(false);
         return;
@@ -80,7 +82,14 @@ void Uploader::sendNextChunk()
         return;
     }
 
+    // REQ-RESUME-AUDIT-001 M4：显式定位读取，不依赖顺序读的隐式游标。
+    if (!m_file.seek(m_nextOffset)) {
+        emit errnoMsg("Upload file seek failed");
+        finish(false);
+        return;
+    }
     const QByteArray chunk = m_file.read(m_chunkSize);
+    m_sentLen = chunk.size();
     // 未收到 complete 就 EOF，说明服务端确认落后于本地读取
     if (chunk.isEmpty()) {
         emit errnoMsg("Upload file ended before server confirmation");
