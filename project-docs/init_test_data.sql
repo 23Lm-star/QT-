@@ -32,7 +32,9 @@ CREATE TABLE friend (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 插入测试用户（注意：pwd 字段存储的是服务端加盐后的 32 字符 hex 串，不是明文！）
--- REQ-MIG-001 起无空盐分支：pwd = md5(客户端MD5 + salt)；缺 salt 的账号无法登录
+-- 存储值 = md5(md5(明文) + salt)（服务端内存摘要后加盐）；缺 salt 的账号无法登录。
+-- 2026-11-14 客户端明文化前后等价：旧客户端发 md5(明文)、新客户端发明文，
+-- 服务端对收到值做一次 md5 再加盐——两条链存储值相同，存量账号天然兼容。
 -- 123456 的 MD5 = e10adc3949ba59abbe56e057f20f883e；种子盐固定 0123456789abcdef0123456789abcdef
 -- 加盐后 pwd = 8cd647f4cec7bdfe190aee5399a6a638
 INSERT INTO user_info (name, pwd, salt, online) VALUES

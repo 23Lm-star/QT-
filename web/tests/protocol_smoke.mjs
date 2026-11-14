@@ -1,4 +1,4 @@
-// 前端协议层冒烟测试（无需浏览器）：用 node:crypto 交叉验证 MD5 哈希链、
+// 前端协议层冒烟测试（无需浏览器）：验证明文密码 caData 布局、
 // PDU 编解码往返、分帧器重组、登录/注册 caMsg 字节布局。
 // 运行：node web/tests/protocol_smoke.mjs
 import assert from 'node:assert';
@@ -19,16 +19,21 @@ const { T } = await import(`${SRC}/msgtypes.js`);
 let pass = 0;
 function ok(name) { pass++; console.log(`  ok  ${name}`); }
 
-// 1) MD5 哈希链：js-md5(utf8 bytes) 必须等于 node crypto 对相同 UTF-8 字节的 MD5 hex。
-for (const pwd of ['123456', 'password', '中文密码测试', 'p@ss w0rd!']) {
-  const expected = crypto.createHash('md5').update(Buffer.from(pwd, 'utf8')).digest('hex');
-  const got = account.passwordHashForProtocol(pwd);
-  assert.strictEqual(got, expected, `MD5 不符: ${pwd}`);
-  assert.strictEqual(got.length, 32);
+// 1) 密码明文 caData 布局：[0,32)=用户名 NUL 补零、[32,64)=UTF-8 明文 NUL 补零
+//    （对齐 client.cpp 与 account.js buildAuthCaData；服务端内存摘要+加盐，客户端不做哈希）。
+{
+  const caData = new Uint8Array(64);
+  fields.writeFixedStringNul(caData, 0, 32, 'alice');
+  fields.writeFixedStringNul(caData, 32, 32, 'p@ss w0rd!');
+  assert.strictEqual(fields.readFixedString(caData, 0, 32), 'alice');
+  assert.strictEqual(fields.readFixedString(caData, 32, 32), 'p@ss w0rd!');
+  for (const pwd of ['123456', '中文密码测试', 'p@ss w0rd!']) {
+    const one = new Uint8Array(64);
+    fields.writeFixedStringNul(one, 32, 32, pwd);
+    assert.strictEqual(fields.readFixedString(one, 32, 32), pwd, `明文往返不符: ${pwd}`);
+  }
+  ok('密码明文 caData 布局与 UTF-8 往返一致（含中文/符号）');
 }
-// 已知向量兜底
-assert.strictEqual(account.passwordHashForProtocol('123456'), 'e10adc3949ba59abbe56e057f20f883e');
-ok('密码 MD5 哈希链与 node:crypto 一致（含中文/符号/已知向量）');
 
 // 2) PDU 编解码往返。
 {

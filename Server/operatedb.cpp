@@ -34,11 +34,13 @@ QString generatePasswordSalt()
                                  QCryptographicHash::Sha256).toHex().left(32));
 }
 
-// 统一加盐摘要：md5(客户端哈希+盐)；REQ-MIG-001 起不再存在空盐老数据分支
-QString applyPasswordSalt(const QString &clientHash, const QString &salt)
+// 统一加盐摘要：md5(存储摘要+盐)；REQ-MIG-001 起不再存在空盐老数据分支。
+// REQ-PWD-PLAIN-001（密码明文化）：客户端经 TLS 传明文，hashPasswordForStorage 已在
+// 内存完成第一层摘要——此处收到的即存储摘要，不再区分"客户端哈希/服务端哈希"。
+QString applyPasswordSalt(const QString &passwordHash, const QString &salt)
 {
     return QString::fromLatin1(
-        QCryptographicHash::hash((clientHash + salt).toUtf8(), QCryptographicHash::Md5).toHex());
+        QCryptographicHash::hash((passwordHash + salt).toUtf8(), QCryptographicHash::Md5).toHex());
 }
 
 // 客户端传明文密码，服务端只在内存中计算摘要后再加盐。
@@ -697,7 +699,7 @@ int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId,
     QSqlQuery q(db);
 
     QString nameParam = QString::fromUtf8(strname);
-    const QString clientHash = hashPasswordForStorage(QString::fromUtf8(strpwd));
+    const QString passwordHash = hashPasswordForStorage(QString::fromUtf8(strpwd));
 
     // 按用户名取存储哈希与盐
     q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
@@ -713,7 +715,7 @@ int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId,
     }
     const QString storedPwd = q.value(0).toString();
     const QString salt = q.value(1).toString();
-    const QString effectiveHash = applyPasswordSalt(clientHash, salt);
+    const QString effectiveHash = applyPasswordSalt(passwordHash, salt);
     if(effectiveHash != storedPwd){
         qCWarning(lcDb)<<"user name or password not found";
         return -1;

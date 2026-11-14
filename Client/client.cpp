@@ -20,7 +20,6 @@
 #include <QDebug>
 #include <QMessageBox>
 #include <QHostAddress>
-#include <QCryptographicHash>
 #include <QGraphicsOpacityEffect>
 #include <QTimer>
 #include <QCoreApplication>
@@ -33,24 +32,11 @@
 #include <string>
 
 namespace {
-// 口令在协议中只传 MD5 的 32 字节十六进制文本（不传明文）。
-QByteArray passwordHashForProtocol(const QString &password)
-{
-    return QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Md5).toHex();
-}
-
 // 复制到定长字段并保证以 NUL 结尾：最多拷贝 dstSize-1 字节。
 void copyFixedField(char *dst, int dstSize, const QByteArray &src)
 {
     memset(dst, 0, dstSize);
     memcpy(dst, src.constData(), qMin(src.size(), dstSize - 1));
-}
-
-// 复制到定长字段但不保留结尾 NUL（用于 32 字节 MD5 十六进制串等恰好占满的字段）。
-void copyExactField(char *dst, int dstSize, const QByteArray &src)
-{
-    memset(dst, 0, dstSize);
-    memcpy(dst, src.constData(), qMin(src.size(), dstSize));
 }
 
 // 把剩余秒数格式化成 MM:SS，用于获取验证码按钮的倒计时显示
@@ -332,7 +318,7 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->sharefilefinsh();
         break;
     }
-    // REQ-EXT-TRANSFER-001：32 确认按 transfer_id 路由到该上传任务（id=0 时无任务，忽略）
+    // REQ-EXT-TRANSFER-001：32 确认按 transfer_id 路由到该上传任务
     case ENUM_MSG_TYPE_UPLOADFILE_DATA_RESPOND:{
         TransferManager::instance().onUploadDataRespond(pdu);
         break;
@@ -540,12 +526,11 @@ void Client::on_register_PB_clicked(){
         return ;
     }
     QByteArray captchaBytes=ui->randcode_LE->text().toUtf8();
-    // caData: [0..31]=用户名，[32..63]=MD5；caMsg: 验证码（含结尾 NUL）。
+    // caData: [0..31]=用户名，[32..63]=UTF-8 明文密码；caMsg: 验证码（含结尾 NUL）。
     PDU* pdu=mkPDU(captchaBytes.size()+1);
     pdu->uiType=ENUM_MSG_TYPE_REGIST_REQUEST;
-    QByteArray passwordHash=passwordHashForProtocol(strpwd);
     copyFixedField(pdu->caData,32,strname.toUtf8());
-    copyExactField(pdu->caData+32,32,passwordHash);
+    copyFixedField(pdu->caData+32,32,strpwd.toUtf8());
     memcpy(pdu->caMsg,captchaBytes.constData(),captchaBytes.size()+1);
     seedMsg(pdu);
 }
@@ -567,14 +552,13 @@ void Client::on_login_PB_clicked(){
         return;
     }
     QByteArray captchaBytes=captchaInput.toUtf8();
-    // caData: [0..31]=用户名，[32..63]=MD5。
+    // caData: [0..31]=用户名，[32..63]=UTF-8 明文密码。
     // REQ-EXT-SESSION-001 D1：验证码 NUL 之后追加 32 字节客户端 ID（零协议改动，老服务端按 uiMsgLen 忽略）
     QByteArray clientIdBytes=m_clientId.toUtf8();
     PDU* pdu=mkPDU(captchaBytes.size()+1+clientIdBytes.size());
     pdu->uiType=ENUM_MSG_TYPE_LOGIN_REQUEST;
-    QByteArray passwordHash=passwordHashForProtocol(strpwd);
     copyFixedField(pdu->caData,32,strname.toUtf8());
-    copyExactField(pdu->caData+32,32,passwordHash);
+    copyFixedField(pdu->caData+32,32,strpwd.toUtf8());
     memcpy(pdu->caMsg,captchaBytes.constData(),captchaBytes.size()+1);
     memcpy(pdu->caMsg+captchaBytes.size()+1,clientIdBytes.constData(),clientIdBytes.size());
     seedMsg(pdu);
@@ -681,12 +665,11 @@ void Client::sendLogoffRequest()
         return;
     }
 
-    QByteArray passwordHash=passwordHashForProtocol(pwdInput);
-    // caData: [0..31]=当前登录名，[32..63]=MD5；服务端会再次校验密码。
+    // caData: [0..31]=当前登录名，[32..63]=UTF-8 明文密码；服务端会再次校验密码。
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_LOGOFF_REQUEST;
     copyFixedField(pdu->caData,32,m_LoginName.toUtf8());
-    copyExactField(pdu->caData+32,32,passwordHash);
+    copyFixedField(pdu->caData+32,32,pwdInput.toUtf8());
     seedMsg(pdu);
 }
 

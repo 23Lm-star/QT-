@@ -13,7 +13,7 @@
 
 | 原需求/能力 | 必须保持的业务规则 | 现状及依据 |
 |---|---|---|
-| REQ-AUTH-001 / REQ-AUTH-002 / REQ-LOG-007：账号与凭据 | 注册、登录、验证码、注销；服务端加盐保存（REQ-MIG-001 起无空盐兼容分支，salt 为必填）；日志不泄露密码及凭据 | 有实现与历史集成记录，当前未重新验收；[数据库实现](Server/operatedb.cpp)、[认证历史](docs/archive/legacy-development-os-2026-10-24/project-docs/requirements/REQ-AUTH-002-password-salt.md)。现有加盐 MD5 不等同于现代强密码派生 |
+| REQ-AUTH-001 / REQ-AUTH-002 / REQ-LOG-007：账号与凭据 | 注册、登录、验证码、注销；服务端加盐保存（REQ-MIG-001 起无空盐兼容分支，salt 为必填）；日志不泄露密码及凭据。2026-11-14 起客户端经 TLS 传**明文密码**、服务端内存 MD5 摘要后加盐存储，客户端不再做哈希（存储值与旧"客户端 MD5"链数学等价，存量账号免迁移；部署要求服务端与两端客户端/网页同步切换） | 有实现与历史集成记录，当前未重新验收；[数据库实现](Server/operatedb.cpp)、[认证历史](docs/archive/legacy-development-os-2026-10-24/project-docs/requirements/REQ-AUTH-002-password-salt.md)。现有加盐 MD5 不等同于现代强密码派生 |
 | REQ-FS-003 / REQ-EXT-SEC-001 / REQ-EXT-SEC-002：授权 | 请求身份由服务端会话决定；路径、文件及分享操作不得越过该身份的授权边界 | 有实现；[请求处理](Server/msghandler.cpp)、[授权套件](project-docs/evidence/REQ-EXT-SEC-001/verify.py)、[逻辑路径套件](project-docs/evidence/REQ-EXT-SEC-002/verify.py)；当前未重新验收 |
 | REQ-EXT-SESSION-001 / REQ-EXT-SESSION-002：会话 | 新登录使旧会话失效；注销后允许同名重注册；单实例启动时清理上次异常退出遗留在线状态，对账失败不得继续正常服务 | 有实现与最新历史合并记录；[会话代码](Server/mytcpsocket.cpp)、[数据库实现](Server/operatedb.cpp)、[最新交接](docs/archive/legacy-development-os-2026-10-24/project-docs/handoffs/startup-online-reconcile-merged-2026-10-13.txt)；当前未重新验收 |
 | 好友、私聊及基础心跳 | 好友管理、在线状态、私聊历史与离线补发；连接断开不应伪装发送成功；心跳与手动重连不能被文件传输长期阻塞 | 已有基础实现，完整自动恢复不在当前承诺内；[客户端连接](Client/client.cpp)、[服务端请求处理](Server/msghandler.cpp)。旧“尚无心跳”表述已过期；专门组件化与故障恢复见 TODO |
