@@ -1,5 +1,6 @@
 #include "uploadwritetask.h"
 
+#include "logging.h"
 #include "mytcpserver.h"
 
 #include <QFile>
@@ -25,10 +26,18 @@ void UploadWriteTask::run()
 {
     // REQ-EXT-TRANSFER-003 S3：句柄由会话共享持有（已打开），此处只定位写入；
     // 不 open/不 close——关句柄的代价（Windows CreateFileW ≈ 13 ms）不在本路径上。
-    bool success = !m_file.isNull() && m_file->isOpen()
-            && m_file->seek(m_offset)
-            && m_file->write(m_data) == m_data.size()
-            && m_file->flush();
+    // REQ-RESUME-AUDIT-001：写盘失败此前完全静默（客户端只见 -4006 无归因），补一条告警。
+    const bool okOpen = !m_file.isNull() && m_file->isOpen();
+    const bool okSeek = okOpen && m_file->seek(m_offset);
+    const qint64 written = okSeek ? m_file->write(m_data) : qint64(-1);
+    const bool okFlush = (written == m_data.size()) && m_file->flush();
+    const bool success = okOpen && okSeek && (written == m_data.size()) && okFlush;
+    if (!success) {
+        qCWarning(lcFs) << "[transfer] 暂存写入失败 tid=" << m_transferId << "off=" << m_offset
+                        << "open=" << okOpen << "seek=" << okSeek << "written=" << written
+                        << "expect=" << m_data.size()
+                        << "err=" << (okOpen ? m_file->errorString() : QStringLiteral("句柄已空"));
+    }
 
     // 队列连接跨线程投递：连接/会话状态只在主线程修改。
     QMetaObject::invokeMethod(&MyTcpServer::getinstance(), "handleUploadWriteFinished",

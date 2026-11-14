@@ -40,6 +40,13 @@ QString applyPasswordSalt(const QString &clientHash, const QString &salt)
     return QString::fromLatin1(
         QCryptographicHash::hash((clientHash + salt).toUtf8(), QCryptographicHash::Md5).toHex());
 }
+
+// 客户端传明文密码，服务端只在内存中计算摘要后再加盐。
+QString hashPasswordForStorage(const QString &password)
+{
+    return QString::fromLatin1(
+        QCryptographicHash::hash(password.toUtf8(), QCryptographicHash::Md5).toHex());
+}
 }
 
 // 单例由静态局部对象持有，连接池随进程退出统一关闭
@@ -231,9 +238,15 @@ bool OperateDB::restartUploadSession(qint64 sessionId, const QString &parentPath
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if (!connection.isValid()) return false;
     QSqlQuery q(connection.database());
-    QString sql = "UPDATE upload_session SET parent_path=?,display_name=?,expected_size=?,"
-                  "client_sha256=?,staging_path=?,confirmed_offset=?,status='uploading',"
-                  "expires_at=?,file_id=NULL";
+    // REQ-RESUME-AUDIT-001 M2：摘要为空时跳过 client_sha256 列——29/101 复用路径不带摘要，
+    // 不能把首次 97 登记的值抹成 NULL（否则续传转正退化为不校验）。
+    const bool hasSha = !clientSha256.isEmpty();
+    QString sql = "UPDATE upload_session SET parent_path=?,display_name=?,expected_size=?,";
+    if (hasSha) {
+        sql += "client_sha256=?,";
+    }
+    sql += "staging_path=?,confirmed_offset=?,status='uploading',"
+           "expires_at=?,file_id=NULL";
     if (!clientRequestId.isEmpty()) {
         sql += ",client_request_id=?";   // S14：按暂存键复用时把请求键改写到本行（任何 reqId 重放都收敛于此）
     }
@@ -242,7 +255,9 @@ bool OperateDB::restartUploadSession(qint64 sessionId, const QString &parentPath
     q.addBindValue(parentPath);
     q.addBindValue(displayName);
     q.addBindValue(expectedSize);
-    q.addBindValue(clientSha256.isEmpty() ? QVariant() : QVariant(clientSha256));
+    if (hasSha) {
+        q.addBindValue(clientSha256);
+    }
     q.addBindValue(stagingPath);
     q.addBindValue(confirmedOffset);
     q.addBindValue(QDateTime::currentDateTime().addSecs(ttlSec > 0 ? ttlSec : 3600)
@@ -261,19 +276,27 @@ bool OperateDB::restartUploadSession(qint64 sessionId, const QString &parentPath
 // REQ-EXT-TRANSFER-003 S12/D7：按 (owner, staging_path) 找可复用的未完成会话行。
 // 暂存路径 = sha1(owner|parent|display|size) 的确定性产物 = "同一逻辑上传"的唯一身份；
 // 状态白名单排除 done（已完成由请求级幂等短路处理），取 session_id 最大者。
-qint64 OperateDB::findReusableUploadSession(const QString &owner, const QString &stagingPath)
+// REQ-RESUME-AUDIT-001 M1/M2：返回结构体——confirmed_offset 供续传起点封顶，
+// client_sha256 供 29/101 复用路径回填内存摘要（转正比对读内存副本，不读该列）。
+OperateDB::ReusableUploadSession OperateDB::findReusableUploadSession(const QString &owner,
+                                                                      const QString &stagingPath)
 {
-    if (owner.isEmpty() || stagingPath.isEmpty()) return -1;
+    ReusableUploadSession out;
+    if (owner.isEmpty() || stagingPath.isEmpty()) return out;
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
-    if (!connection.isValid()) return -1;
+    if (!connection.isValid()) return out;
     QSqlQuery q(connection.database());
-    q.prepare("SELECT session_id FROM upload_session WHERE owner_name=? AND staging_path=? "
+    q.prepare("SELECT session_id,confirmed_offset,client_sha256 FROM upload_session "
+              "WHERE owner_name=? AND staging_path=? "
               "AND status IN ('uploading','expired','failed','verifying') "
               "ORDER BY session_id DESC LIMIT 1");
     q.addBindValue(owner);
     q.addBindValue(stagingPath);
-    if (!q.exec() || !q.next()) return -1;
-    return q.value(0).toLongLong();
+    if (!q.exec() || !q.next()) return out;
+    out.sessionId = q.value(0).toLongLong();
+    out.confirmedOffset = q.value(1).toLongLong();
+    out.clientSha256 = q.value(2).toString();
+    return out;
 }
 
 // REQ-EXT-FILE-002 §2 步骤4：秒传命中即登记完成态会话（零正文传输）。
@@ -353,7 +376,7 @@ bool OperateDB::finishUploadSession(qint64 sessionId, const QString &status, qin
 }
 
 // 注册：先查重再插入，两步非事务（并发同名可能由唯一键兜底失败）。
-// 客户端传的是密码哈希，服务端再加随机盐做一次 MD5；明文密码不落库。
+// 客户端传明文密码，服务端只保存加盐摘要，明文密码不落库。
 // 返回 true 仅表示 INSERT 成功。
 bool OperateDB::handleRegit(char *strname, char *strpwd)
 {
@@ -382,7 +405,7 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
     const QString salt = generatePasswordSalt();
     q.prepare("insert into user_info(name,pwd,salt) values(?,?,?)");
     q.addBindValue(QString::fromUtf8(strname));
-    q.addBindValue(applyPasswordSalt(QString::fromUtf8(strpwd), salt));
+    q.addBindValue(applyPasswordSalt(hashPasswordForStorage(QString::fromUtf8(strpwd)), salt));
     q.addBindValue(salt);
     qCDebug(lcDb)<<"insert new user:"<<QString::fromUtf8(strname);
     return q.exec();
@@ -674,7 +697,7 @@ int OperateDB::handleLogin(char *strname, char *strpwd, const QString& clientId,
     QSqlQuery q(db);
 
     QString nameParam = QString::fromUtf8(strname);
-    const QString clientHash = QString::fromUtf8(strpwd);
+    const QString clientHash = hashPasswordForStorage(QString::fromUtf8(strpwd));
 
     // 按用户名取存储哈希与盐
     q.prepare("SELECT pwd, salt FROM user_info WHERE name = ?");
@@ -1229,7 +1252,8 @@ bool OperateDB::handleLogoff(const char* name, const char* pwd)
         db.rollback();
         return false;
     }
-    const QString effectiveHash = applyPasswordSalt(QString::fromUtf8(pwd), q.value(1).toString());
+    const QString effectiveHash = applyPasswordSalt(
+        hashPasswordForStorage(QString::fromUtf8(pwd)), q.value(1).toString());
     if(effectiveHash != q.value(0).toString()){
         qCWarning(lcDb)<<"logoff: user/pwd mismatch or user not found:"<<QString::fromUtf8(name);
         db.rollback();

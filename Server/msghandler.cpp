@@ -1246,6 +1246,7 @@ PDU *MsgHandler::uploadfileinit()
     bool complete = false;
     qint64 resumeOffset = 0;
     bool adoptedFastcheck = false;   // AUD-1：本次 29 消费了前序 97 的暂存 → 随后释放 id=0 占位
+    bool deferred30 = false;         // REQ-RESUME-AUDIT-001 M3：暂存已在尾部 → 30 迟到补发
 
     // D7 硬上限 / T-17 重复 id：未通过则不建任何状态（P7：不回退到 id=0）
     if (acquireUploadSlot(tid)) {
@@ -1262,29 +1263,51 @@ PDU *MsgHandler::uploadfileinit()
         // REQ-FS-003①/SEC-001：所在目录须在 actor 本人用户根内；父路径规范化后作逻辑条目键。
         const QString parentPath = FileObjectStore::normalizeParent(m_actorName, dirPath);
         // 采纳前序 97 预检查建立的会话（同 parent/display/size）：不重复建会话，保留摘要对照
-        const bool adopt = (tid != TRANSFER_ID_LEGACY) && m_pendingFastcheck.active
+        const bool adopt = (tid != TRANSFER_ID_INVALID) && m_pendingFastcheck.active
                 && !m_actorName.isEmpty()
                 && m_pendingFastcheck.parent == parentPath
                 && m_pendingFastcheck.display == fileName
                 && m_pendingFastcheck.size == fileSize;
         if (pathInActorRoot(dirPath) && !m_actorName.isEmpty()) {
+            // REQ-RESUME-AUDIT-001 M1/M2：非采纳路径先查会话行——confirmed_offset 封顶续传起点
+            // （min(物理大小, 已确认偏移)，防崩溃半块与 TTL 删 .part 两向错位），并把行内
+            // client_sha256 回填内存摘要：29 不携带摘要，复用不得清空首次 97 的登记值。
+            OperateDB::ReusableUploadSession reuse;
+            // REQ-RESUME-AUDIT-001（审计修复）：cap 缺省 0——无可信确认偏移即 Truncate 重建，
+            // 不按物理大小续传；adopt 用 97 登记时的已确认偏移，非 adopt 用复用行。
+            qint64 confirmedCap = 0;
+            if (adopt) {
+                confirmedCap = m_pendingFastcheck.offset;
+            } else {
+                reuse = OperateDB::instance().findReusableUploadSession(
+                            m_actorName, ResumableUploadSession::stagedPathFor(
+                                             m_actorName, parentPath, fileName, fileSize));
+                if (reuse.sessionId >= 0 && reuse.confirmedOffset >= 0) {
+                    confirmedCap = reuse.confirmedOffset;
+                }
+            }
             const ResumableUploadSession::BeginResult result =
-                    ctx.session.beginStaged(m_actorName, parentPath, fileName, fileSize, resumeEnabled);
+                    ctx.session.beginStaged(m_actorName, parentPath, fileName, fileSize,
+                                            resumeEnabled, confirmedCap);
             if (result.ok) {
                 if (adopt) {
                     ctx.sessionId = m_pendingFastcheck.sessionId;
                     ctx.expectedSha = m_pendingFastcheck.shaHex;
                     adoptedFastcheck = true;
                 } else {
-                    // REQ-EXT-TRANSFER-003 S13/D7：先按暂存键找未完成行复用（同一 .part 只有一行）；
+                    // REQ-EXT-TRANSFER-003 S13/D7：按暂存键复用未完成行（同一 .part 只有一行）；
                     // 29 不携带请求键 → 不改写 client_request_id。未命中才新登记。
-                    const qint64 reuseId = OperateDB::instance().findReusableUploadSession(
-                                m_actorName, ctx.session.stagingFilePath());
-                    if (reuseId >= 0) {
-                        OperateDB::instance().restartUploadSession(
-                                    reuseId, parentPath, fileName, fileSize, QString(),
-                                    ctx.session.stagingFilePath(), result.offset, 3600);
-                        ctx.sessionId = reuseId;
+                    if (reuse.sessionId >= 0) {
+                        if (!OperateDB::instance().restartUploadSession(
+                                    reuse.sessionId, parentPath, fileName, fileSize, QString(),
+                                    ctx.session.stagingFilePath(), result.offset, 3600)) {
+                            // REQ-RESUME-AUDIT-001（审计建议）：重置失败时行停留旧状态，
+                            // 节流落库（仅 uploading 生效）会静默失效，至少留告警。
+                            qCWarning(lcFs) << "uploadfileinit 会话重置失败 conn=" << m_connId
+                                            << " session=" << reuse.sessionId;
+                        }
+                        ctx.sessionId = reuse.sessionId;
+                        ctx.expectedSha = reuse.clientSha256;   // M2：行内摘要回填（空=行未登记）
                     } else {
                         // 仅预检元数据（客户端不提交摘要，服务端复算为准）；登记会话行
                         ctx.sessionId = OperateDB::instance().createUploadSession(
@@ -1302,10 +1325,16 @@ PDU *MsgHandler::uploadfileinit()
                 ctx.lastPersistOffset = result.offset;
                 ctx.lastPersistMs = QDateTime::currentMSecsSinceEpoch();
                 if (result.complete) {
-                    // 0 字节或断点已到尾部：立即落定（仍走服务端复算，验收4）。
-                    // REQ-EXT-PERF-002：复算改线程池——30 的 ret/resumeOffset/complete 不依赖
-                    // 提交结果（改前此分支也从不查看转正返回值），照常即时回，无迟到应答。
-                    finalizeUploadOnComplete();
+                    // REQ-RESUME-AUDIT-001 M3：0 字节或断点已到尾部——条目是否建成由复算决定，
+                    // 30 不再即时回 complete：复算走线程池，落定后由 onStagingHashFinished 按
+                    // 提交结果补发（DeferredInit30，与 97/101 迟到补发同模式）。
+                    ctx.deferredRespond = DeferredInit30;
+                    ctx.deferredResumeOffset = result.offset;
+                    ctx.deferredResumeMagicOn = resumeEnabled;
+                    const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
+                    if (cr.deferred) {
+                        deferred30 = true;
+                    }
                 }
             }
         } else {
@@ -1318,7 +1347,11 @@ PDU *MsgHandler::uploadfileinit()
             // AUD-1：97 的暂存已被本次 29 采纳（会话/摘要已转入本槽），id=0 占位不再需要——
             // 释放以免残留条目长期滞留、并与真实槽重复引用同一 upload_session 行。
             // 注：此处 ctx 引用不再使用，remove 可能引起 QHash 重排，故放在最后。
-            m_uploads.remove(TRANSFER_ID_LEGACY);
+            m_uploads.remove(TRANSFER_ID_INVALID);
+        }
+        if (deferred30) {
+            // M3：槽位/占位清理已完成，30 由复算落定路径补发（连接层容忍空返回，97 路径同）。
+            return nullptr;
         }
     } else {
         qCWarning(lcFs) << "uploadfileinit 拒绝：并发上限或 id 冲突 conn=" << m_connId
@@ -1353,7 +1386,7 @@ MsgHandler::UploadCtx* MsgHandler::findUpload(quint64 id)
 }
 
 // REQ-EXT-TRANSFER-003 S5 补充：释放除 keepId 外所有指向同一暂存路径的句柄。
-// 同一逻辑上传可能同时挂在两个上下文上（97 预检查的 id=0 槽 + 真实传输槽；幂等重放的旧槽），
+// 同一逻辑上传可能同时挂在两个上下文上（97 预检查的无效编号槽 + 真实传输槽；幂等重放的旧槽），
 // 它们指向同一个 .part——留着的第二个写句柄会让 rename/delete/truncate 在 Windows 上失败。
 void MsgHandler::releaseOtherStagingHandles(quint64 keepId, const QString &stagingPath)
 {
@@ -1379,14 +1412,10 @@ MsgHandler::UploadCtx& MsgHandler::currentUpload()
     return ctx;
 }
 
-// id=0 为旧单流槽，每次 INIT 重置；非 0 遵循 D7 上限与 T-17 重复 id 拒绝。
-// 判定顺序：id=0 走旧单流槽（每次重置）→ 重复 id 拒绝 → 全局并发名额检查。
+// 无效编号直接拒绝；有效编号遵循 D7 上限与 T-17 重复编号拒绝。
 bool MsgHandler::acquireUploadSlot(quint64 id)
 {
-    if (id == TRANSFER_ID_LEGACY) {
-        m_uploads.remove(TRANSFER_ID_LEGACY);
-        return true;
-    }
+    if (id == TRANSFER_ID_INVALID) return false;
     if (m_uploads.contains(id)) {
         return false;
     }
@@ -1461,8 +1490,8 @@ void MsgHandler::reapIdleUploads(qint64 nowMs, int idleSec)
 // 不读客户端物理路径、不复制物理文件；拒绝路径只记长度与类型，不落内容/路径明文（lcFs）。
 PDU *MsgHandler::uploadfilefastcheck()
 {
-    // 97 无 transfer_id（P2：客户端预检查保持单飞）→ 始终落在旧单流槽（id=0）
-    m_uploads.remove(TRANSFER_ID_LEGACY);
+    // 97 不携带 transfer_id（传输编号），仅使用无效编号槽保存预检查暂存状态。
+    m_uploads.remove(TRANSFER_ID_INVALID);
     UploadCtx& ctx = currentUpload();
     // N-1：97 纯占位此前从不置 lastProgressMs，永不满足 D5 的空闲回收条件（要求 lastProgressMs > 0），
     // 残留的 id=0 暂存槽与 upload_session 行只能等 3600s TTL 或下一次 97 覆盖。建槽即起空闲计时，
@@ -1471,9 +1500,7 @@ PDU *MsgHandler::uploadfilefastcheck()
     // AUD-1 修复：97 是**预检查/暂存登记**，不是一次上传，其 id=0 槽不得占用上传并发名额
     // （activeUploadCount() 按此标记排除）。否则并行客户端"每文件先 97 再 29"会为每个文件留下
     // 一个被计入的占位，使同一连接第 3 路新个人上传的 INIT 被上限误拒（违背 D6 上传=3 / 验收 5）。
-    // 注意：不得在此清掉该槽——旧客户端（REQ-EXT-FILE-002 形态）未命中后直接发 31 分块（无 29），
-    // 正是靠这个 id=0 上下文接收正文；该槽在 31 推进时转为普通活跃上下文（见 handleUploadWriteFinished），
-    // 或在被随后的 29 采纳后由 uploadfileinit 释放。
+    // 该槽只用于新客户端随后 29 初始化时采纳，不能直接承载 31 正文。
     ctx.fastcheckPlaceholder = true;
     bool ret = false;
     bool hit = false;
@@ -1569,20 +1596,32 @@ PDU *MsgHandler::uploadfilefastcheck()
     // retrySessionId >= 0 = 复用既有会话行（uk_req 下不可再插一行，只能原地重置）。
     // REQ-EXT-TRANSFER-003 S14/D7：入参来源扩展——请求键未命中时再按暂存键找同一 .part 的
     // 未完成行；按暂存键命中即把请求键改写为本次 reqId（任何 reqId 重放都收敛到同一行）。
-    auto beginStagedSession = [&](qint64 retrySessionId) {
+    auto beginStagedSession = [&](qint64 retrySessionId, qint64 priorConfirmedOffset) {
+        // REQ-RESUME-AUDIT-001 M1：先取可复用行的 confirmed_offset 封顶续传起点再建会话
+        // （行已知用行值，未知按暂存键查）；97 恒带摘要，摘要回填只在 29/101 路径需要。
+        OperateDB::ReusableUploadSession reuse;
+        if (retrySessionId >= 0) {
+            reuse.sessionId = retrySessionId;
+            reuse.confirmedOffset = priorConfirmedOffset;
+        } else {
+            reuse = OperateDB::instance().findReusableUploadSession(
+                        m_actorName, ResumableUploadSession::stagedPathFor(
+                                         m_actorName, parent, displayName, fileSize));
+        }
+        // REQ-RESUME-AUDIT-001（审计修复）：查不到可复用行时 cap=0（Truncate 重建），
+        // 不按物理大小续传——与 29/101 路径同一口径。
+        const qint64 confirmedCap = (reuse.sessionId >= 0 && reuse.confirmedOffset >= 0)
+                                        ? reuse.confirmedOffset : qint64(0);
         const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
-                    m_actorName, parent, displayName, fileSize, true);
+                    m_actorName, parent, displayName, fileSize, true, confirmedCap);
         if (!br.ok) {
             qCWarning(lcFs) << "[fastcheck] 暂存会话建立失败 conn=" << m_connId;
             return;
         }
         QString rewriteReqId;
-        if (retrySessionId < 0) {
-            retrySessionId = OperateDB::instance().findReusableUploadSession(
-                        m_actorName, ctx.session.stagingFilePath());
-            if (retrySessionId >= 0) {
-                rewriteReqId = reqId;
-            }
+        if (retrySessionId < 0 && reuse.sessionId >= 0) {
+            retrySessionId = reuse.sessionId;
+            rewriteReqId = reqId;
         }
         if (retrySessionId >= 0) {
             if (!OperateDB::instance().restartUploadSession(
@@ -1640,9 +1679,11 @@ PDU *MsgHandler::uploadfilefastcheck()
         finalName = prior.displayName.toUtf8();
         handled = true;
     } else if (prior.found && prior.status == "uploading") {
-        // 断点续传：用会话行（而非本次请求）的 parent/display/size 复原同一 staging 令牌
+        // 断点续传：用会话行（而非本次请求）的 parent/display/size 复原同一 staging 令牌。
+        // REQ-RESUME-AUDIT-001 M1：起点以行内 confirmed_offset 封顶（min(物理, 已确认)）。
         const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
-                    m_actorName, prior.parentPath, prior.displayName, prior.expectedSize, true);
+                    m_actorName, prior.parentPath, prior.displayName, prior.expectedSize, true,
+                    prior.confirmedOffset >= 0 ? prior.confirmedOffset : qint64(-1));
         if (br.ok) {
             ctx.sessionId = prior.sessionId;
             ctx.expectedSha = prior.clientSha256;
@@ -1666,7 +1707,7 @@ PDU *MsgHandler::uploadfilefastcheck()
                                || prior.status == "verifying")) {
         // 同请求键重试：原地重置会话行后重新走暂存登记（uk_req 下不可再插一行）。
         // 注：status='done' 但 file_id 为空的历史行不在此列——落到步骤 4 由内容预检查收敛。
-        beginStagedSession(prior.sessionId);
+        beginStagedSession(prior.sessionId, prior.confirmedOffset);
         handled = true;
     }
 
@@ -1701,7 +1742,7 @@ PDU *MsgHandler::uploadfilefastcheck()
             // 未命中：不建对象、不建条目，只登记暂存会话（后续走既有分块 PDU，零改动）
             ctx.sessionId = -1;
             ctx.expectedSha.clear();
-            beginStagedSession(-1);
+            beginStagedSession(-1, -1);
         }
     }
 
@@ -1717,6 +1758,7 @@ PDU *MsgHandler::uploadfilefastcheck()
         m_pendingFastcheck.parent = pc.session.parentPath();
         m_pendingFastcheck.display = pc.session.displayName();
         m_pendingFastcheck.size = pc.session.totalSize();
+        m_pendingFastcheck.offset = pc.session.receivedSize();   // 审计修复：adopt 封顶用
     }
 
     qCDebug(lcFs) << "[fastcheck] conn=" << m_connId << " ret=" << ret << " hit=" << hit
@@ -1843,7 +1885,9 @@ MsgHandler::HashFinishAction MsgHandler::onStagingHashFinished(quint64 transferI
     const qint64 deferredFileSize = cp->deferredFileSize;
     const quint64 groupRequestId = cp->deferredRequestId;
     const QString deferredName = cp->deferredName;
-    const bool ackSuccess = cp->deferredAckSuccess;
+    // REQ-RESUME-AUDIT-001 M3：30 迟到补发参数（m_uploads.remove 前必须先拷出）。
+    const qint64 deferredResumeOffset = cp->deferredResumeOffset;
+    const bool deferredResumeMagicOn = cp->deferredResumeMagicOn;
     const qint64 ackOffset = cp->deferredAckOffset;
 
     FileObjectStore::CommitResult r;
@@ -1890,10 +1934,12 @@ MsgHandler::HashFinishAction MsgHandler::onStagingHashFinished(quint64 transferI
 
     switch (respondKind) {
     case DeferredDataAck32:
-        // 32 的 success/偏移沿用末块写落定时的记录，不受转正结果影响（改前同一口径）。
+        // REQ-RESUME-AUDIT-001 M3：最终 32 反映"条目是否建成"（成功判据=逻辑条目落定，
+        // 含去重复用既有对象）；条目未建成不得报完成。中间块 32 维持即时应答不变。
         act.needDataAck = true;
-        act.ackSuccess = ackSuccess;
-        act.ackOffset = ackOffset;
+        act.ackSuccess = r.ok;
+        act.ackOffset = r.ok ? ackOffset : 0;
+        act.ackComplete = r.ok;
         break;
     case DeferredFastcheck98:
         // 98 迟到重建：命中取提交结果；失败与改前同步路径等价
@@ -1921,8 +1967,15 @@ MsgHandler::HashFinishAction MsgHandler::onStagingHashFinished(quint64 transferI
         act.respondPdu = buildGroupInit102(groupRequestId, groupId, code, body, transferId);
         break;
     }
+    case DeferredInit30:
+        // REQ-RESUME-AUDIT-001 M3：29 的暂存已在尾部（0 字节/断点到尾）——30 按提交结果补发。
+        // 成功 ret=OK（resumeOffset=封顶后起点，客户端按 resumeOffset>=total 判完成）；
+        // 失败 ret=WRITE_FAILED，客户端走既有"初始化被拒→重试"语义。
+        act.respondPdu = buildUploadInit30(transferId, r.ok,
+                                           deferredResumeOffset, deferredResumeMagicOn);
+        break;
     default:
-        break;   // DeferredNone：29 INIT 的 30 与提交结果无关，已在发起复算前即时回执
+        break;   // DeferredNone：即时应答已发（29 非完成态的 30 与提交结果无关）
     }
     return act;
 }
@@ -1949,6 +2002,23 @@ PDU* MsgHandler::buildFastcheck98(bool ret, bool hit, qint64 fileId, qint64 sess
     if (!reqIdBytes.isEmpty()) {
         memcpy(respdu->caMsg + finalName.size(), reqIdBytes.constData(), size_t(reqIdBytes.size()));
     }
+    return respdu;
+}
+
+// REQ-RESUME-AUDIT-001 M3：30 迟到补发构造——29 的暂存已在尾部时，complete 依赖条目落定。
+// 字段布局与 uploadfileinit 同步路径逐字节一致：code/[32..39]=resumeOffset/[40..43]=magic/[48..55]=tid。
+PDU* MsgHandler::buildUploadInit30(quint64 tid, bool ok, qint64 resumeOffset, bool resumeMagicOn)
+{
+    PDU* respdu = mkPDU();
+    respdu->uiType = ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND;
+    setProtocolCode(respdu, ok ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED);
+    const qint64 off = ok ? resumeOffset : 0;
+    memcpy(respdu->caData + UPLOAD_RESUME_OFFSET, &off, sizeof(off));
+    if (resumeMagicOn) {
+        const uint magic = UPLOAD_RESUME_MAGIC;
+        memcpy(respdu->caData + UPLOAD_RESUME_MAGIC_OFFSET, &magic, sizeof(magic));
+    }
+    memcpy(respdu->caData + TRANSFER_ID_OFFSET, &tid, sizeof(tid));
     return respdu;
 }
 
@@ -2852,22 +2922,32 @@ PDU* MsgHandler::groupFileRequest(uint requestType)
             ctx.lastProgressMs = QDateTime::currentMSecsSinceEpoch();
 
             const QString parent = QStringLiteral("/");
+            // REQ-RESUME-AUDIT-001 M1：先按暂存键查可复用行，confirmed_offset 封顶续传起点
+            // （min(物理大小, 已确认偏移)；101 恒带摘要，无需回填）。
+            const OperateDB::ReusableUploadSession reuse = OperateDB::instance().findReusableUploadSession(
+                        m_actorName, ResumableUploadSession::stagedPathFor(
+                                         m_actorName, parent, request.displayName, request.fileSize));
+            // REQ-RESUME-AUDIT-001（审计修复）：查不到可复用行时 cap=0（Truncate 重建）。
+            const qint64 confirmedCap = (reuse.sessionId >= 0 && reuse.confirmedOffset >= 0)
+                                            ? reuse.confirmedOffset : qint64(0);
             const ResumableUploadSession::BeginResult br = ctx.session.beginStaged(
-                        m_actorName, parent, request.displayName, request.fileSize, true);
+                        m_actorName, parent, request.displayName, request.fileSize, true, confirmedCap);
             if (!br.ok) {
                 code = -2105;
                 m_uploads.remove(tid);
                 qCWarning(lcFs) << "[GROUPFILE] 暂存会话建立失败 conn=" << m_connId
                                 << " group=" << request.groupId;
             } else {
-                // REQ-EXT-TRANSFER-003 S15/D7：同个人路径，先按暂存键复用未完成行（101 不携带请求键）
-                const qint64 reuseId = OperateDB::instance().findReusableUploadSession(
-                            m_actorName, ctx.session.stagingFilePath());
-                if (reuseId >= 0) {
-                    OperateDB::instance().restartUploadSession(
-                                reuseId, parent, request.displayName, request.fileSize,
-                                request.shaHex, ctx.session.stagingFilePath(), br.offset, 3600);
-                    sessionId = reuseId;
+                // REQ-EXT-TRANSFER-003 S15/D7：同个人路径，按暂存键复用未完成行（101 不携带请求键）
+                if (reuse.sessionId >= 0) {
+                    if (!OperateDB::instance().restartUploadSession(
+                                reuse.sessionId, parent, request.displayName, request.fileSize,
+                                request.shaHex, ctx.session.stagingFilePath(), br.offset, 3600)) {
+                        // REQ-RESUME-AUDIT-001（审计建议）：重置失败留告警，理由同 29 路径。
+                        qCWarning(lcFs) << "[GROUPFILE] 会话重置失败 conn=" << m_connId
+                                        << " session=" << reuse.sessionId;
+                    }
+                    sessionId = reuse.sessionId;
                 } else {
                     sessionId = OperateDB::instance().createUploadSession(
                                 m_actorName, parent, request.displayName, request.fileSize,

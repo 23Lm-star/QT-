@@ -288,8 +288,15 @@ public:
 
     // REQ-EXT-TRANSFER-003 S12/D7：按 (owner, staging_path) 找可复用的未完成会话行——
     // 暂存路径是"同一逻辑上传"的确定性身份（sha1(owner|parent|display|size) 产物），
-    // 状态白名单排除 done/cancelled（done 由请求级幂等短路处理）。命中返回 session_id，否则 -1。
-    qint64 findReusableUploadSession(const QString &owner, const QString &stagingPath);
+    // 状态白名单排除 done/cancelled（done 由请求级幂等短路处理），取 session_id 最大者。
+    // REQ-RESUME-AUDIT-001 M1/M2：同时带回 confirmed_offset（续传起点封顶）与 client_sha256
+    // （29/101 复用路径回填内存摘要——转正比对读内存副本，不读该列）。
+    struct ReusableUploadSession {
+        qint64 sessionId = -1;        // <0 = 无可复用行
+        qint64 confirmedOffset = -1;  // 行内已确认偏移（<0 视为不可用）
+        QString clientSha256;         // 行内登记摘要（可能为空）
+    };
+    ReusableUploadSession findReusableUploadSession(const QString &owner, const QString &stagingPath);
 
     // 秒传命中：登记 status='done' 的会话行（零正文传输的完成态），返回 session_id（<0 失败）。
     qint64 insertCompletedUploadSession(const QString &owner, const QString &parentPath,

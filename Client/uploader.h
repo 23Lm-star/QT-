@@ -53,6 +53,8 @@ private:
     qint64 m_chunkSize = UPLOAD_CHUNK_MAX;   // C1：start() 按文件大小算定
     // 下一块起始偏移（服务端确认后推进）
     qint64 m_nextOffset;
+    // REQ-RESUME-AUDIT-001 M4：在途块长度——校验 32 回带偏移的严格连续性
+    qint64 m_sentLen = 0;
     // 是否有块在途（停等控制）
     bool m_waitingAck;
     // start 后、finish 前为 true

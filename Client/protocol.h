@@ -314,10 +314,10 @@ inline bool groupReadString(const QByteArray &in, int &offset, QByteArray &value
     return true;
 }
 
-// ===== REQ-EXT-TRANSFER-001：transfer_id 落位（两端逐字节一致，仅追加；0 = 旧单流路径） =====
+// ===== REQ-EXT-TRANSFER-001：transfer_id 落位（两端逐字节一致；0 = 无效编号） =====
 static const int TRANSFER_ID_OFFSET = 48;                 // u64；29/30/31/32/40/42/43/101/102/105/106/107/108
 static const int DOWNLOAD_RESP_TRANSFER_ID_OFFSET = 16;   // u64；仅 41（其 [32..62] 已被文件名字段占用）
-static const quint64 TRANSFER_ID_LEGACY = 0;              // 保留值：旧协议单流路径
+static const quint64 TRANSFER_ID_INVALID = 0;             // 无效编号：传输任务从 1 开始
 static const quint32 MAX_PARALLEL_UPLOADS = 3;            // 单连接并发上传上限（个人+群共享；客户端排队 + 服务端硬兜底）
 static const quint32 MAX_PARALLEL_DOWNLOADS = 3;          // 单连接并发下载上限（个人+群共享；客户端排队 + 服务端硬兜底）
 

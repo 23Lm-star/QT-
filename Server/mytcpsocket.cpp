@@ -134,7 +134,7 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     m_MsgHandler->pdu=pdu;
 
     // ===== REQ-EXT-TRANSFER-001：按 PDU 落位读 transfer_id（请求侧传输族；D2 统一 [48..55]） =====
-    quint64 transferId=TRANSFER_ID_LEGACY;
+    quint64 transferId=TRANSFER_ID_INVALID;
     switch(pdu->uiType){
     case ENUM_MSG_TYPE_UPLOADFILE_INIT_REQUEST:
     case ENUM_MSG_TYPE_UPLOADFILE_DATA_REQUEST:
@@ -315,8 +315,9 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     case ENUM_MSG_TYPE_DOWNLOADFILE_REQUEST:{
         // D7：超下载上限时 41 回 ret=false（同 id 重发视为替换，不占额外名额）
         m_MsgHandler->m_downloadSlotAvailable =
-                (m_downloads.contains(transferId) || m_downloads.size() < int(MAX_PARALLEL_DOWNLOADS));
-        // REQ-EXT-TRANSFER-002 S2：读出 40 声明的续传起点（TRANSFER_ID_OFFSET 的同一读法；旧客户端为 0）
+                transferId != TRANSFER_ID_INVALID
+                && (m_downloads.contains(transferId) || m_downloads.size() < int(MAX_PARALLEL_DOWNLOADS));
+        // REQ-EXT-TRANSFER-002 S2：读出 40 声明的续传起点
         qint64 resumeOffset=0;
         memcpy(&resumeOffset,pdu->caData+DOWNLOAD_RESUME_OFFSET,sizeof(resumeOffset));
         m_MsgHandler->m_downloadResumeOffset=resumeOffset;
@@ -326,7 +327,8 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
             memcpy(&dlCode,respdu->caData,PROTOCOL_CODE_SIZE);
             sendAndRelease(respdu);
             respdu=nullptr;
-            if(dlCode==ENUM_PROTOCOL_CODE_OK && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
+            if(dlCode==ENUM_PROTOCOL_CODE_OK && transferId != TRANSFER_ID_INVALID
+                    && !m_MsgHandler->m_downloadCanonicalPath.isEmpty()){
                 startDownloadStream(m_MsgHandler->m_downloadCanonicalPath,transferId,resumeOffset);
             }
         }
@@ -449,8 +451,12 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
 // 上传数据：按 transfer_id 取上下文（未知 id 拒绝且不回退，P7）
 void MyTcpSocket::handleUploadData(PDU* pdu)
 {
-    quint64 transferId=TRANSFER_ID_LEGACY;
+    quint64 transferId=TRANSFER_ID_INVALID;
     memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
+    if (transferId == TRANSFER_ID_INVALID) {
+        sendUploadAck(transferId,false,0,false);
+        return;
+    }
     MsgHandler::UploadCtx* cp=m_MsgHandler->findUpload(transferId);
     if(cp==nullptr){
         qCWarning(lcNet)<<"[transfer] 未知上传 id 拒绝 conn="<<m_connectionId<<" id="<<transferId;
@@ -476,6 +482,15 @@ void MyTcpSocket::handleUploadData(PDU* pdu)
             || chunkOffset != expectedOffset || pdu->uiMsgLen == 0
             || pdu->uiMsgLen > cp->session.totalSize()-expectedOffset
             || cp->session.stagingFilePath().isEmpty()){
+        // REQ-RESUME-AUDIT-001：守卫拒绝此前完全静默，客户端只见 -4006 无归因；
+        // 降为 debug 级（生产默认关），保留字段级归因供联调。
+        qCDebug(lcNet) << "[transfer] 分块守卫拒绝 tid=" << transferId
+                       << "magic_ok=" << (resumeMagic == UPLOAD_RESUME_MAGIC)
+                       << "wif=" << cp->writeInFlight
+                       << "co=" << chunkOffset << "exp=" << expectedOffset
+                       << "mlen=" << pdu->uiMsgLen
+                       << "tot=" << cp->session.totalSize()
+                       << "path=" << cp->session.stagingFilePath();
         sendUploadAck(transferId,false,expectedOffset,cp->session.isComplete());
         return;
     }
@@ -517,8 +532,12 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
         if (r.deferred) {
             return;
         }
+        // REQ-RESUME-AUDIT-001（审计修复）：仅 finalize 的"上下文缺失"早退会走到这里
+        // （deferred=false、r.ok=false、槽已被移除）——不得沿用写盘成功值假成功，按失败收口。
+        sendUploadAck(transferId, false, 0, false);
+        return;
     }else if(success){
-        // AUD-1：该槽已开始承载正文（旧客户端 97→31 直传路径），不再是 97 纯暂存占位 → 重新计入名额
+        // 该槽已开始承载正文，不再是 97 纯暂存占位 → 重新计入名额
         cp->fastcheckPlaceholder=false;
         cp->lastProgressMs=QDateTime::currentMSecsSinceEpoch();   // 推进空闲回收计时
         // REQ-EXT-TRANSFER-003 S9/D6：进度落库节流——≥1 MiB 或 ≥2 s 才写一次
@@ -547,19 +566,20 @@ void MyTcpSocket::handleStagingHashFinished(quint64 transferId, bool ok,
         seedMsg(act.respondPdu);
     }
     if (act.needDataAck) {
-        sendUploadAck(transferId, act.ackSuccess, act.ackOffset, true);
+        // REQ-RESUME-AUDIT-001 M3：complete 随提交结果——条目未建成不得报完成。
+        sendUploadAck(transferId, act.ackSuccess, act.ackOffset, act.ackComplete);
     }
 }
 
 // 107：释放传输槽位。上传（暂停/取消同处置：会话 expired，staging 保留）；
 // REQ-EXT-TRANSFER-002 S1：未命中上传槽时再查下载流 → 摘环停发、名额回落。
-// 未知 id → ret=false；id=0 一律不受理（维持既有断言 T-12a，旧单流路径不受 107 影响）。
+// 未知编号或无效编号 → ret=false。
 PDU* MyTcpSocket::handleTransferAbort(PDU* pdu)
 {
-    quint64 transferId=TRANSFER_ID_LEGACY;
+    quint64 transferId=TRANSFER_ID_INVALID;
     memcpy(&transferId,pdu->caData+TRANSFER_ID_OFFSET,sizeof(transferId));
     bool ret=false;
-    if(transferId!=TRANSFER_ID_LEGACY){
+    if(transferId!=TRANSFER_ID_INVALID){
         MsgHandler::UploadCtx* cp=m_MsgHandler->findUpload(transferId);
         if(cp!=nullptr){
             // AUD-4：写盘在途时不得立即释放——否则在途写会落在 ctx 消失之后（回调落空），暂存物理大小
@@ -612,7 +632,7 @@ void MyTcpSocket::seedDownloadFinish(quint64 transferId, bool success)
     seedMsg(finishPdu);
 }
 
-// 新流加入环尾（id=0 = 旧单流路径）。
+// 新流加入环尾。
 // REQ-EXT-TRANSFER-002 S3：startOffset = 采纳的续传起点，seek 后只发后缀；起点==大小即 0 字节正文 + 43 success（D5）。
 // 起点>大小在调用方已按 §2.3 拒绝，此处仅断言式防护：不建流并明确失败，绝不静默拼坏文件。
 void MyTcpSocket::startDownloadStream(const QString& filePath, quint64 transferId, qint64 startOffset)
@@ -877,7 +897,7 @@ void MyTcpSocket::recvmsg(){
 //客户端下线->更改客户端的登录状态，并且移除sorket对应的
 void MyTcpSocket::clientOffLine(){
     // REQ-EXT-TRANSFER-001 §3.5：断线清理全部下载流与上传上下文；不写 DB
-    //（staging 与 upload_session 行留给既有 3600s TTL 收敛，与今日单流语义一致）
+    //（staging 与 upload_session 行留给既有 3600s TTL 收敛）
     for(QHash<quint64,DownloadStream>::iterator it=m_downloads.begin();it!=m_downloads.end();++it){
         if(it->file){
             it->file->close();
@@ -988,7 +1008,7 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
     // REQ-EXT-TRANSFER-001：未认证 107 → 108{ret=false}（回带 id）
     case ENUM_MSG_TYPE_UPLOADFILE_ABORT_REQUEST:{
         PDU* r=reject(ENUM_MSG_TYPE_UPLOADFILE_ABORT_RESPOND);
-        quint64 tid=TRANSFER_ID_LEGACY;
+        quint64 tid=TRANSFER_ID_INVALID;
         if(m_MsgHandler!=nullptr && m_MsgHandler->pdu!=nullptr){
             memcpy(&tid,m_MsgHandler->pdu->caData+TRANSFER_ID_OFFSET,sizeof(tid));
         }
