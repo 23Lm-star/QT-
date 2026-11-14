@@ -1,26 +1,18 @@
 // 账号域命令（1-4, 44-45）：构造 caData/caMsg 并解析响应。
 // 逐字节复刻 Client/client.cpp 的 on_login_PB_clicked / on_register_PB_clicked 与
 // msghandler.cpp 的 handllogin / handlrigist / handleCaptcha。
-import md5 from 'js-md5';
 import { T, LoginRet, CaptchaStatus, protocolCodeText } from '../msgtypes.js';
 import { CA_DATA_SIZE } from '../pdu.js';
 import {
-  writeFixedStringNul, writeExactBytes, writeBytes, concatBytes,
+  writeFixedStringNul, writeBytes, concatBytes,
   readFixedString, readI32, textEncoder, utf8Length,
 } from '../fields.js';
 
-// 密码协议哈希：MD5(password 的 UTF-8 字节) 的小写 hex（32 字符）。
-// 对齐 passwordHashForProtocol：QCryptographicHash::hash(pwd.toUtf8(), Md5).toHex()。
-// 传字节而非字符串给 md5，确保与 Qt 的 UTF-8 编码逐字节一致。
-export function passwordHashForProtocol(password) {
-  return md5(textEncoder.encode(password)); // js-md5 接受 Uint8Array，返回小写 hex
-}
-
-// 组装 caData[64]：[0..31]=用户名(NUL 补零)，[32..63]=MD5 hex(恰好 32 字节)。
-function buildAuthCaData(username, passwordHashHex) {
+// 组装 caData[64]：[0..31]=用户名(NUL 补零)，[32..63]=UTF-8 明文密码。
+function buildAuthCaData(username, password) {
   const caData = new Uint8Array(CA_DATA_SIZE);
   writeFixedStringNul(caData, 0, 32, username);
-  writeExactBytes(caData, 32, 32, textEncoder.encode(passwordHashHex));
+  writeFixedStringNul(caData, 32, 32, password);
   return caData;
 }
 
@@ -59,7 +51,7 @@ export async function login(net, { username, password, captcha, clientId }) {
   const err = validateCredentials(username, password);
   if (err) throw new Error(err);
   if (!captcha) throw new Error('请输入验证码');
-  const caData = buildAuthCaData(username, passwordHashForProtocol(password));
+  const caData = buildAuthCaData(username, password);
   const captchaBytes = textEncoder.encode(captcha);
   const clientIdBytes = textEncoder.encode(clientId || '');
   const msg = concatBytes(captchaBytes, new Uint8Array(1), clientIdBytes); // +NUL+clientId
@@ -76,7 +68,7 @@ export async function register(net, { username, password, captcha }) {
   const err = validateCredentials(username, password);
   if (err) throw new Error(err);
   if (!captcha) throw new Error('请输入验证码');
-  const caData = buildAuthCaData(username, passwordHashForProtocol(password));
+  const caData = buildAuthCaData(username, password);
   const captchaBytes = textEncoder.encode(captcha);
   const msg = concatBytes(captchaBytes, new Uint8Array(1)); // +NUL
   const resp = await net.request(T.REGIST_REQUEST, T.REGIST_RESPOND, caData, msg);
