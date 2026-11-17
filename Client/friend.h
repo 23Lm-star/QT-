@@ -33,7 +33,9 @@ public:
     // 返回好友列表控件（供外部/测试直接访问，正常刷新走 rebuildFriendList）
     QListWidget* getfile_LW();
     //刷新好友操作函数——仅接管数据，不直接写 QListWidget
-    void flushFriend_LW(const QStringList& q);
+    // REQ-PAGE-FETCH-002：q 为本页纯用户名（「序号.用户名」编号跨页连续由本函数追加）；
+    // total/hasMore/capped 为分页与总量封顶元数据
+    void flushFriend_LW(const QStringList& q, uint total, bool hasMore, bool capped);
     explicit Friend(QWidget *parent = nullptr);
     ~Friend();
 
@@ -52,11 +54,19 @@ private slots:
     void on_del_PB_clicked();
     //聊天槽函数
     void on_chat_PB_clicked();
+    // REQ-PAGE-FETCH-002：加载更多好友（按已加载条数请求下一页）
+    void on_loadMore_PB_clicked();
 
 private:
     Ui::Friend *ui;
-    // 缓存的好友列表数据
+    // REQ-PAGE-FETCH-002：按 limit=50 请求指定偏移页
+    void requestFriendPage(uint offset);
+    // 缓存的好友列表数据（「序号.用户名」，编号跨页连续）
     QStringList m_friendList;
+    // REQ-PAGE-FETCH-002 分页状态（已加载条数=m_friendList.size()）
+    uint m_friendTotal=0;       // 好友总数（封顶后）
+    bool m_friendHasMore=false; // 还有下一页
+    bool m_friendCapped=false;  // 好友总数超 LIST_TOTAL_CAP
     // 存在待处理的 UI 刷新数据
     bool m_pendingUiRefresh = false;
     // 已有一个 UI 刷新排队中

@@ -4,6 +4,7 @@
 #include "ui_friend.h"
 #include "client.h"
 #include <QInputDialog>
+#include <QMessageBox>
 #include <qdebug.h>
 
 // 好友页实现：所有操作都走“构造 PDU → Client::seedMsg”的异步模型，
@@ -29,12 +30,31 @@ Friend::~Friend()
 
 void Friend::flushfriend()
 {
-    // 请求服务端回发完整好友列表；真正的 UI 更新在响应回调里完成
-    PDU* pdu=mkPDU();
-    pdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST;
-    Client::getinstance().seedMsg(pdu);
+    // REQ-PAGE-FETCH-002：从第 0 页重置重拉（刷新/删除好友/加好友成功同此入口，避免 offset 漂移）
+    m_friendList.clear();
+    m_friendTotal=0; m_friendHasMore=false; m_friendCapped=false;
+    rebuildFriendList();
+    ui->loadMore_PB->setHidden(true);
+    requestFriendPage(0);
     // REQ-CHAT-ACK-001 R10：顺带拉取仍待处理的好友申请（含离线期间登记的）
     requestPendingFriendRequests();
+}
+
+// REQ-PAGE-FETCH-002：好友分页请求（limit=50，offset=已加载条数）
+void Friend::requestFriendPage(uint offset)
+{
+    PDU* pdu=mkPDU();
+    pdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST;
+    const uint limit=50;
+    memcpy(pdu->caData+FRIEND_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
+    memcpy(pdu->caData+FRIEND_REQ_OFFSET_OFFSET,&offset,sizeof(offset));
+    Client::getinstance().seedMsg(pdu);
+}
+
+void Friend::on_loadMore_PB_clicked()
+{
+    if(!m_friendHasMore) return;
+    requestFriendPage(uint(m_friendList.size()));
 }
 
 // REQ-CHAT-ACK-001 R10：拉取本人待处理的好友申请，响应 114 由 MsgHandler 逐条询问
@@ -52,12 +72,24 @@ QListWidget *Friend::getfile_LW()
 }
 
 // flushFriend_LW：仅接管好友列表数据，不直接写 QListWidget
-void Friend::flushFriend_LW(const QStringList& q)
+// REQ-PAGE-FETCH-002：追加本页纯用户名并跨页连续编号；封顶提示只在首页弹一次
+void Friend::flushFriend_LW(const QStringList& q, uint total, bool hasMore, bool capped)
 {
-    qCDebug(lcCli) << "[Friend] flushFriend_LW: 缓存" << q.size() << "个好友条目";
-    m_friendList = q;
+    qCDebug(lcCli) << "[Friend] flushFriend_LW: 追加" << q.size() << "个好友条目，total" << total << "hasMore" << hasMore;
+    const bool firstPage = m_friendList.isEmpty();
+    for(const QString& name : q){
+        m_friendList.append(QString("%1.%2").arg(m_friendList.size()+1).arg(name));
+    }
+    m_friendTotal=total;
+    m_friendHasMore=hasMore;
+    m_friendCapped=capped;
+    ui->loadMore_PB->setHidden(!hasMore);
     m_pendingUiRefresh = true;
     scheduleUiRefresh();
+    if(capped && firstPage){
+        QMessageBox::information(this, QStringLiteral("提示"),
+            QStringLiteral("好友总数超过 %1 条，仅显示前 %1 条").arg(LIST_TOTAL_CAP));
+    }
 }
 
 // scheduleUiRefresh：合并排队——最多排入一个 UI 刷新回调
