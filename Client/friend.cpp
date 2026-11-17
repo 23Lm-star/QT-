@@ -115,20 +115,19 @@ void Friend::on_findUser_PB_clicked()
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_findUser_REQUEST;
-    // caData 前 32 字节：待查找的用户名
-    memcpy(pdu->caData,strname.toStdString().c_str(),32);
+    // caData 前 32 字节：待查找的用户名（REQ-AUDIT-FULL-001：按实际长度拷贝，防短源越界读）
+    const QByteArray findBytes=strname.toUtf8();
+    memcpy(pdu->caData,findBytes.constData(),size_t(qMin(findBytes.size(),31)));
     Client::getinstance().seedMsg(pdu);
 }
 
 void Friend::on_onlineUser_PB_clicked()
 {
-    // 先展示窗口再异步拉取列表，回包后由 updateOnlineUser 填充
+    // 先展示窗口再异步拉取列表（REQ-PAGE-FETCH-001：从第 0 页开始分页）
     if(m_onlineUser->isHidden()){
         m_onlineUser->show();
     }
-    PDU* pdu=mkPDU();
-    pdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_REQUEST;
-    Client::getinstance().seedMsg(pdu);
+    m_onlineUser->resetAndRequest();
 }
 
 void Friend::on_flush_PB_clicked()
@@ -152,9 +151,11 @@ void Friend::on_del_PB_clicked()
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_DELETEFRIEND_REQUEST;
-    // caData[0,32)=被删好友；[32,64)=发起删除的当前用户
-    memcpy(pdu->caData,tarname.toStdString().c_str()+cnt+1,32);
-    memcpy(pdu->caData+32,Client::getinstance().m_LoginName.toStdString().c_str(),32);
+    // caData[0,32)=被删好友；[32,64)=发起删除的当前用户（REQ-AUDIT-FULL-001：按实际长度拷贝）
+    const QByteArray tarBytes=tarname.mid(cnt+1).toUtf8();
+    memcpy(pdu->caData,tarBytes.constData(),size_t(qMin(tarBytes.size(),31)));
+    const QByteArray selfBytes=Client::getinstance().m_LoginName.toUtf8();
+    memcpy(pdu->caData+32,selfBytes.constData(),size_t(qMin(selfBytes.size(),31)));
     Client::getinstance().seedMsg(pdu);
 }
 
@@ -173,7 +174,9 @@ void Friend::on_chat_PB_clicked()
             break;
         }
     }
-    memcpy(pName,pitem->text().toStdString().c_str()+cnt+1,32);
+    // REQ-AUDIT-FULL-001：聊天对象按实际长度拷入（pName 已零初始化，≤31 保留 NUL）
+    const QByteArray chatBytes=pitem->text().mid(cnt+1).toUtf8();
+    memcpy(pName,chatBytes.constData(),size_t(qMin(chatBytes.size(),31)));
     m_chat->m_strChatName=pName;//记录聊天对象
     // 仅首次打开时拉取历史消息；窗口已显示则视为切换会话外的重复点击，直接忽略
     if(m_chat->isHidden()){
@@ -183,12 +186,14 @@ void Friend::on_chat_PB_clicked()
         // 两条路径都按「时间+正文」去重，同一条消息不会显示两遍
         m_chat->loadLocalHistory(pName);
         m_chat->beginHistoryRequest(m_chat->m_strChatName);   // 112 的归属按发请求时的会话定
+        m_chat->requestServerHistory(0);                      // REQ-PAGE-FETCH-001：同时取服务端最新一页历史
         PDU* pdu= mkPDU();
         // REQ-CHAT-ACK-001：桌面端改走 111，响应 112 每条带消息 ID，落库后回 110 才置已送达
         pdu->uiType=ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST;
-        // caData[0,32)=当前用户；[32,64)=聊天对象，服务端据此取双方历史记录
-        memcpy(pdu->caData,Client::getinstance().m_LoginName.toStdString().c_str(),32);
-        memcpy(pdu->caData+32,m_chat->m_strChatName.toStdString().c_str(),32);
+        // caData[0,32)=对方账号：服务端 111 以连接身份作收件人，仅从首段取对方（与 17 不同，探针/112 处理器同此口径）
+        // 此前误按 17 布局把本人放首段，服务端变成「自己查自己」，112 恒空，离线补收失效（2026-11-14 GUI 实测）
+        const QByteArray peerBytes=m_chat->m_strChatName.toUtf8();
+        memcpy(pdu->caData,peerBytes.constData(),size_t(qMin(peerBytes.size(),31)));
         Client::getinstance().seedMsg(pdu);
     }
 }

@@ -46,6 +46,8 @@ public:
     void getPendingChat();
     // 114 待处理好友申请：caMsg 为 32 字节定长请求方账号数组，逐条弹窗询问
     void handlePendingFriendList();
+    // REQ-PAGE-FETCH-001：118 聊天历史分页响应，解析后交给 Chat 窗口渲染与落库
+    void chatHistoryResp();
     // 把已处理的消息 ID 批量回 110（服务端据此置已送达）
     void sendChatDeliveredAck(const QList<qint64> &ids);
     // 处理建目录响应，成功则刷新文件列表。

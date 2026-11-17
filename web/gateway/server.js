@@ -68,7 +68,8 @@ function serveStatic(req, res) {
   // 规范化并阻断 ../ 目录穿越；最终必须仍位于 staticDir 内。
   const rel = path.normalize(urlPath).replace(/^([/\\])+/, '');
   const filePath = path.join(config.staticDir, rel);
-  if (!filePath.startsWith(config.staticDir)) {
+  // REQ-AUDIT-FULL-001：改用 relative 判定，避免同前缀兄弟目录（如 dist-private）误放行
+  if (path.relative(config.staticDir, filePath).startsWith('..')) {
     res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('forbidden');
     return;

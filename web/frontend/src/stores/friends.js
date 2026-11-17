@@ -10,7 +10,8 @@ import { useChatStore } from './chat.js';
 export const useFriendsStore = defineStore('friends', {
   state: () => ({
     friends: [],
-    onlineUsers: [],
+    onlineUsers: [],        // REQ-PAGE-FETCH-001：{name, online} 条目数组
+    onlineNames: [],        // 名字数组（ShareView 等旧消费点）
     incomingRequest: null, // { requester } 待处理的好友申请（push 9）
     hint: '',
     hintType: 'info',
@@ -64,8 +65,12 @@ export const useFriendsStore = defineStore('friends', {
     },
     async loadOnlineUsers() {
       const auth = useAuthStore();
-      try { this.onlineUsers = await friendCmd.fetchOnlineUsers(auth.loginName); }
-      catch (e) { this.setHint(e.message || '获取在线用户失败', 'error'); }
+      try {
+        // REQ-PAGE-FETCH-001：条目含在线状态；onlineNames 供旧消费点按名匹配
+        const entries = await friendCmd.fetchOnlineUsers(auth.loginName);
+        this.onlineUsers = entries;
+        this.onlineNames = entries.map((e) => e.name);
+      } catch (e) { this.setHint(e.message || '获取在线用户失败', 'error'); }
     },
     // 发送好友申请（9）：发送即忘，结果经 push 10 异步到达。
     addFriend(target) {
@@ -107,6 +112,7 @@ export const useFriendsStore = defineStore('friends', {
       this.stopSync();
       this.friends = [];
       this.onlineUsers = [];
+      this.onlineNames = [];
       this.incomingRequest = null;
       this.hint = '';
       this.hintType = 'info';

@@ -90,7 +90,8 @@ span* CentralCache::GetOneSpan(SpanList& list, size_t size)
 	Span->_FreeList = start;//现将这块内存的开始地址存入空闲链表
 	void* tail = start;//用于记录上一个小内存块的开始位置
 	start += size;
-	while (start < end)
+	// 必须保证剩余空间够一整块才切：start<end 会把不足 size 的尾部当整块借出，写满即越界。
+	while (start + size <= end)
 	{
 		Next(tail) = start;
 		tail = start;

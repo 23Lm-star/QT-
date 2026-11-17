@@ -37,10 +37,20 @@ public:
     void beginHistoryRequest(const QString &peer);
     QString historyPeer() const { return m_historyPeer; }
 
+    // ===== REQ-PAGE-FETCH-001：服务端历史分页（117/118；17/18 网页端语义不变） =====
+    struct ServerHistRow { qint64 id; bool fromSelf; QString content; QString timeText; };
+    // 发 117 取服务端历史：cursorId=0 取最新一页并重置状态，>0 从该 ID 更早处向前翻页
+    void requestServerHistory(qint64 cursorId);
+    // 收 118：去重后渲染/落库本页，并维护「加载更早消息」按钮状态
+    void applyServerHistory(const QString &peer, qint64 oldestId, bool hasMore, uint total,
+                            const QVector<ServerHistRow> &rows);
+
 private slots:
     void on_output_PB_clicked();//点击聊天消息发送按钮->发送消息
     // REQ-CLI-MSGSTORE-001：清空当前会话在本机的存储
     void on_clear_PB_clicked();
+    // REQ-PAGE-FETCH-001：加载更早消息（按本页最旧 ID 向前翻页）
+    void on_loadEarlier_PB_clicked();
 
 private:
     // 自发消息登记：等待服务端 16 回带入库结果
@@ -58,6 +68,12 @@ private:
     QList<PendingSelf> m_pendingSelf;
     // 最近一次 17 请求归属的会话（响应按它落库）
     QString m_historyPeer;
+    // REQ-PAGE-FETCH-001 服务端分页状态
+    qint64 m_serverOldestId=0;      // 本页最旧消息 ID（下一页游标）
+    bool m_serverHasMore=false;     // 更早还有消息
+    qint64 m_lastHistoryCursor=0;   // 本次请求的游标（0=最新一页，追加；>0=更早页，插顶）
+    // 把整块更早历史插到显示区顶部（保持时间正序）
+    void prependHistoryBlock(const QString &block);
 };
 
 #endif // CHAT_H

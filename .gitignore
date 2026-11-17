@@ -168,3 +168,7 @@ web/**/*.local
 # REQ-EXT-TLS-001: relay 取证的临时证书与链路 dump 不入库
 project-docs/evidence/REQ-EXT-TLS-001/relay_certs/
 project-docs/evidence/REQ-EXT-TLS-001/relay_dumps/
+
+# 2026-11-14 dir cleanup append
+.qoder/
+docs/_q*.txt

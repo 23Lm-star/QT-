@@ -22,13 +22,10 @@ private:
 };
 
 // 返回线程本地指针的引用；首次使用前为 nullptr，由 ConCurrentAlloc 惰性创建。
-// Windows 使用 __declspec(thread)，其他平台使用 thread_local，各线程互不影响。
+// 统一用 C++11 thread_local：MinGW 会忽略函数内 static 上的 __declspec(thread)
+// （编译警告 attribute ignored），导致所有线程共享同一个缓存指针，并发分配互相踩踏。
 inline ThreadCache*& GetTLSThreadCache()
 {
-#ifdef _WIN32
-	__declspec(thread) static ThreadCache* pTLSThreadCache = nullptr;
-#else
-	thread_local static ThreadCache* pTLSThreadCache = nullptr;
-#endif
+	static thread_local ThreadCache* pTLSThreadCache = nullptr;
 	return pTLSThreadCache;
 }

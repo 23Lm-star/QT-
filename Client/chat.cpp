@@ -6,6 +6,7 @@
 #include "ui_chat.h"
 
 #include <QMessageBox>
+#include <QTextCursor>
 
 // 单聊发送端：收集输入框文本 + 当前时间，封成 Msg 柔性数组后交 Client 发送。
 // 协议布局：PDU.caData[0,32) 发送人、[32,64) 接收人；caMsg 起为 Msg 头 + 变长正文。
@@ -54,8 +55,11 @@ void Chat::on_output_PB_clicked(){
     pdu->uiType=ENUM_MSG_TYPE_CHAT_REQUEST;
     //现将发送人和接收人的用户名记录下来
     // 两个 32 字节定长槽位，未用满部分由 mkPDU 的零初始化保证
-    memcpy(pdu->caData,Client::getinstance().m_LoginName.toStdString().c_str(),32);
-    memcpy(pdu->caData+32,m_strChatName.toStdString().c_str(),32);
+    // （REQ-AUDIT-FULL-001：按实际长度拷贝，防对短源串越界读）
+    const QByteArray selfBytes=Client::getinstance().m_LoginName.toUtf8();
+    memcpy(pdu->caData,selfBytes.constData(),size_t(qMin(selfBytes.size(),31)));
+    const QByteArray peerBytes=m_strChatName.toUtf8();
+    memcpy(pdu->caData+32,peerBytes.constData(),size_t(qMin(peerBytes.size(),31)));
     //构造一条消息（消息本体+发送时间）
     Msg* pdu_msg=(Msg*)pdu->caMsg;
     pdu_msg->totalLen=Msglen;//消息总长度（+消息本体长度+1）
@@ -137,6 +141,87 @@ void Chat::loadLocalHistory(const QString &peer)
 void Chat::beginHistoryRequest(const QString &peer)
 {
     m_historyPeer = peer;
+}
+
+// ===== REQ-PAGE-FETCH-001：服务端历史分页 =====
+// 发 117：caData[0,32)=自己、[32,64)=对方；caMsg 头部=游标(qint64)+limit(u32)
+void Chat::requestServerHistory(qint64 cursorId)
+{
+    const QString peer = m_historyPeer.isEmpty() ? m_strChatName : m_historyPeer;
+    if (peer.isEmpty()) return;
+    if (cursorId == 0) {                       // 最新一页：重置分页状态
+        m_serverOldestId = 0;
+        m_serverHasMore = false;
+        ui->loadEarlier_PB->setHidden(true);
+    }
+    m_lastHistoryCursor = cursorId;
+    PDU* pdu = mkPDU(uint(CHAT_HIST_REQ_LEN));
+    pdu->uiType = ENUM_MSG_TYPE_CHAT_HISTORY_REQUEST;
+    const QByteArray self = Client::getinstance().m_LoginName.toUtf8();
+    const QByteArray peerB = peer.toUtf8();
+    memcpy(pdu->caData, self.constData(), size_t(qMin(self.size(), 31)));
+    memcpy(pdu->caData + 32, peerB.constData(), size_t(qMin(peerB.size(), 31)));
+    memcpy(pdu->caMsg + CHAT_HIST_REQ_CURSOR_OFFSET, &cursorId, sizeof(cursorId));
+    const uint limit = 50;
+    memcpy(pdu->caMsg + CHAT_HIST_REQ_LIMIT_OFFSET, &limit, sizeof(limit));
+    Client::getinstance().seedMsg(pdu);
+}
+
+// 收 118：本页去重后渲染/落库；最新页追加显示，更早页整块插顶
+void Chat::applyServerHistory(const QString &peer, qint64 oldestId, bool hasMore, uint total,
+                              const QVector<ServerHistRow> &rows)
+{
+    if (peer.isEmpty()) return;
+    // 118 不回显双方名，归属全靠本地 bookkeeping：请求发出后用户已切到别的会话时，
+    // 迟到的旧页直接丢弃，防止渲染进当前会话窗口（串会话）
+    if (peer != m_strChatName) return;
+    // rows 为 id 降序（新→旧）；组装成时间正序的可见行
+    QStringList lines;
+    const bool latestPage = (m_lastHistoryCursor == 0);
+    if (latestPage) {
+        // 最新页整页替换：以服务端页为准重置显示去重缓存；沿用旧键会把本地库已知的行
+        // 从替换后的视图里剔除，权威页显示不全（wcy 清屏/lilei 只剩 1 条，2026-11-14 实测）。
+        m_shownKeys.clear();
+    }
+    for (int i = rows.size() - 1; i >= 0; --i) {
+        const ServerHistRow &r = rows.at(i);
+        const quint8 dir = r.fromSelf ? 1 : 0;
+        const QString key = dedupKey(r.timeText, r.content, dir);
+        if (!latestPage && m_shownKeys.contains(key)) continue;   // 更早页插顶仍按旧键去重防重复行
+        m_shownKeys.insert(key);
+        const QString who = r.fromSelf ? QStringLiteral("我") : peer;
+        lines.append(QStringLiteral("%1:%2  发送时间:%3").arg(who, r.content, r.timeText));
+        persist(peer, r.content, r.timeText, dir);
+    }
+    if (latestPage) {
+        // 最新页以服务端为准确整页替换：先渲染本地库再收 118 时，旧键会把服务端整页
+        // 全部去重吞掉，窗口只剩本地库内容（wcy 空白/lilei 乱序，2026-11-14 GUI 实测）。
+        // 服务端是权威数据源，最新页必然覆盖本地缓存显示（含空页清屏）。
+        ui->show_TE->setPlainText(lines.join(QLatin1Char('\n')));
+    } else if (!lines.isEmpty()) {
+        prependHistoryBlock(lines.join(QLatin1Char('\n')));
+    }
+    m_serverOldestId = oldestId;
+    m_serverHasMore = hasMore;
+    ui->loadEarlier_PB->setHidden(!hasMore);
+    if (!hasMore && m_lastHistoryCursor != 0) {
+        ui->loadEarlier_PB->setToolTip(QStringLiteral("已到最早（共 %1 条）").arg(total));
+    }
+}
+
+// 更早历史整块插到显示区顶部
+void Chat::prependHistoryBlock(const QString &block)
+{
+    QTextCursor cur = ui->show_TE->textCursor();
+    cur.movePosition(QTextCursor::Start);
+    cur.insertText(block + QStringLiteral("\n"));
+}
+
+// 加载更早消息：按本页最旧 ID 继续向前翻页
+void Chat::on_loadEarlier_PB_clicked()
+{
+    if (!m_serverHasMore || m_serverOldestId <= 0) return;
+    requestServerHistory(m_serverOldestId);
 }
 
 void Chat::handleSendAck(const QString &peer, const QString &content, const QString &timeText,

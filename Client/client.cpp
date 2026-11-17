@@ -282,6 +282,11 @@ void Client::handlMsg(PDU *&pdu)
         m_mhptr->getPendingChat();
         break;
     }
+    // REQ-PAGE-FETCH-001：118 聊天历史分页响应（桌面端）
+    case ENUM_MSG_TYPE_CHAT_HISTORY_RESPOND:{
+        m_mhptr->chatHistoryResp();
+        break;
+    }
     case ENUM_MSG_TYPE_LIST_PENDING_FRIEND_RESPOND:{
         m_mhptr->handlePendingFriendList();
         break;
@@ -426,6 +431,7 @@ void Client::seedMsg(PDU *pdu){
         return;
     }
     // QTcpSocket::write 会立即拷贝数据到内部写缓冲，因此可以马上 free。
+    logPduFrame("C->S", pdu);      // REQ-AUDIT-FULL-001：发包日志
     sorket.write((char*)pdu,pdu->uiTotalLen);
     free(pdu);
     // 仅清空局部副本，调用方的指针不受影响
@@ -500,18 +506,35 @@ void Client::recvmsg(){
     if (tls::pduWriteBlocked(m_tlsMode, sorket.isEncrypted())) return;   // REQ-EXT-TLS-001 业务规则 5
     // 追加本次读到的字节；循环尝试切出完整 PDU。
     m_pdulist.append(sorket.readAll());
+    // 重入闸：handlMsg 里的模态弹窗会开嵌套事件循环，期间新包触发 readyRead 会重入本函数。
+    // 重入只追加字节立即返回，剩余字节由外层循环继续；否则嵌套 remove 会让外层指向
+    // m_pdulist 的裸指针失效——0xC0000374 堆损坏（2026-11-14 GUI 三次崩溃，事件日志实锤）
+    if (m_dispatchingPdu) {
+        return;
+    }
+    m_dispatchingPdu = true;
     // 条件保证头部 76 字节齐全后才读取 uiTotalLen（避免半包越界）。
     while (m_pdulist.size()>=(int)sizeof(PDU)) {
-        // 注意：pdu 直接指向 QByteArray 内部，不能在 handlMsg 前 remove/追加。
         PDU*pdu=(PDU*)m_pdulist.data();
         uint pdutotallen=pdu->uiTotalLen;
+        if(pdutotallen<(uint)sizeof(PDU)){
+            // 畸形帧（totalLen<76）无法恢复帧边界，清空重同步，防 remove(0,0) 死循环
+            qCWarning(lcCli)<<"[recvmsg] 畸形帧 uiTotalLen="<<pdutotallen<<"，清空缓冲重同步";
+            m_pdulist.clear();
+            break;
+        }
         if((uint)m_pdulist.size()>=pdutotallen){
-            handlMsg(pdu);
-            // 处理完再移走整包；剩余的下一包字节留在缓冲中继续循环。
-            m_pdulist.remove(0,pdu->uiTotalLen);
+            // 先取整帧稳定副本并出队，再分发：处理期间的嵌套事件循环可能追加字节导致
+            // 缓冲区重分配，任何指向 m_pdulist 内部的指针都不能跨 handlMsg 存活
+            const QByteArray frame = m_pdulist.left(int(pdutotallen));
+            m_pdulist.remove(0, int(pdutotallen));
+            logPduFrame("C<-S", (const PDU*)frame.constData());  // REQ-AUDIT-FULL-001：收包日志
+            PDU* framePdu = (PDU*)frame.constData();
+            handlMsg(framePdu);
         }
         else break;
     }
+    m_dispatchingPdu = false;
 }
 
 void Client::on_register_PB_clicked(){
@@ -640,9 +663,22 @@ void Client::onCaptchaCooldownTick(){
             ui->register_PB->setEnabled(true);
             ui->login_PB->setEnabled(true);
         }
+        if (m_captchaAutoRefresh && !m_captchaLocked) {
+            // 登录验证码失败后的自动补拉：冷却归零立即取新码，用户免手点
+            m_captchaAutoRefresh = false;
+            on_pushButton_clicked();
+        }
         return;
     }
     ui->pushButton->setText(formatCooldown(m_captchaCooldownSec));
+}
+
+// 登录失败（验证码错/过期）后自动换新码：验证码一次性，失败后复用旧图必再失败
+//（-3012，2026-11-14 GUI 实测）。立即请求一次；若服务端冷却中，-5 响应接管倒计时，
+// 归零时 onCaptchaCooldownTick 依据 m_captchaAutoRefresh 自动补拉。
+void Client::requestCaptchaAutoRefresh(){
+    m_captchaAutoRefresh = true;
+    on_pushButton_clicked();
 }
 
 //发送注销账户请求

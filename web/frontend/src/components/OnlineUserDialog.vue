@@ -1,5 +1,6 @@
 <script setup>
-// 在线用户对话框：列出在线用户（服务端已排除自己），可发送好友申请。
+// 所有用户对话框（REQ-PAGE-FETCH-001，原"在线用户"）：列出全部可添加的陌生用户
+// （含离线；服务端已排除自己与好友），点标在线状态，可发送好友申请。
 import { useFriendsStore } from '../stores/friends.js';
 
 const emit = defineEmits(['close']);
@@ -13,23 +14,23 @@ function onAdd(name) { friends.addFriend(name); }
   <div class="mask" @click.self="emit('close')">
     <div class="dialog">
       <header>
-        <span>在线用户</span>
+        <span>所有用户</span>
         <div class="head-btns">
           <button @click="friends.loadOnlineUsers()">刷新</button>
           <button class="close" @click="emit('close')">✕</button>
         </div>
       </header>
       <ul>
-        <li v-if="friends.onlineUsers.length === 0" class="empty">当前没有其他在线用户</li>
-        <li v-for="name in friends.onlineUsers" :key="name">
-          <span class="dot" />
-          <span class="name">{{ name }}</span>
-          <button :disabled="isFriend(name)" @click="onAdd(name)">
-            {{ isFriend(name) ? '已是好友' : '加好友' }}
+        <li v-if="friends.onlineUsers.length === 0" class="empty">当前没有可添加的用户</li>
+        <li v-for="entry in friends.onlineUsers" :key="entry.name">
+          <span class="dot" :class="{ offline: !entry.online }" />
+          <span class="name">{{ entry.name }}（{{ entry.online ? '在线' : '离线' }}）</span>
+          <button :disabled="isFriend(entry.name)" @click="onAdd(entry.name)">
+            {{ isFriend(entry.name) ? '已是好友' : '加好友' }}
           </button>
         </li>
       </ul>
-      <p class="note">发送后需等待对方同意；对方不在线时会提示失败。</p>
+      <p class="note">列表含离线用户；发送后需等待对方同意，对方不在线时申请会登记待处理。</p>
     </div>
   </div>
 </template>
@@ -46,6 +47,7 @@ ul .empty { padding: 20px; text-align: center; color: #9ca3af; font-size: 13px; 
 li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; }
 li:hover { background: #f9fafb; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; flex: none; }
+.dot.offline { background: #d1d5db; }
 .name { flex: 1; font-size: 14px; color: #111827; }
 li button { border: 1px solid #bfdbfe; background: #eff6ff; color: #1d4ed8; border-radius: 6px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
 li button:disabled { border-color: #e5e7eb; background: #f3f4f6; color: #9ca3af; cursor: default; }

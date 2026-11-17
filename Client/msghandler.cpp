@@ -66,6 +66,8 @@ QString MsgHandler::handllogin()
     memcpy(&code,pdu->caData,PROTOCOL_CODE_SIZE);
     if(code==ENUM_PROTOCOL_CODE_CAPTCHA_WRONG || code==ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED){
         QMessageBox::information(&Client::getinstance(),"提示",protocolCodeText(code));
+        // 验证码一次性：失败后自动换新码，复用旧图必再失败（-3012，2026-11-14 GUI 实测）
+        Client::getinstance().requestCaptchaAutoRefresh();
         return QString();
     }
     if(code==ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED){
@@ -117,19 +119,23 @@ QString MsgHandler::handllogin()
 }
 
 void MsgHandler::handlonlineuser(){
-      //取出所有在线用户的用户名
-      int leng=pdu->uiMsgLen/32;//柔性数组长度
-      QStringList userNamelist;
-      for(int i=0;i<leng;i++){
-          char userName[33]={'\0'};
-          memcpy(userName,pdu->caMsg+i*32,32);//取出每一个用户的用户名
-          if(strcmp(userName,Client::getinstance().m_LoginName.toStdString().c_str())==0){
-              continue;
-          }
-          // REQ-UX-001：列表项直接展示用户名（旧实现加 "<序号>." 前缀，消费端按首个 '.' 解析，用户名含 '.' 会解析错）
-          userNamelist.append(QString::fromUtf8(userName));
+      // REQ-PAGE-FETCH-001：所有用户分页响应（caData 码/total/has_more/count，载荷每条 33B）
+      uint total=0; quint8 hasMore=0; quint32 count=0;
+      memcpy(&total,pdu->caData+ALLUSER_RESP_TOTAL_OFFSET,sizeof(total));
+      memcpy(&hasMore,pdu->caData+ALLUSER_RESP_HASMORE_OFFSET,sizeof(hasMore));
+      memcpy(&count,pdu->caData+ALLUSER_RESP_COUNT_OFFSET,sizeof(count));
+      const uint cap=uint(pdu->uiMsgLen/ALLUSER_ENTRY_BYTES);
+      if(count>cap) count=cap;
+      QVector<QPair<QString,bool>> entries;
+      entries.reserve(int(count));
+      for(uint i=0;i<count;i++){
+          const uint base=i*ALLUSER_ENTRY_BYTES;
+          char userName[ALLUSER_ENTRY_NAME_BYTES]={'\0'};
+          memcpy(userName,pdu->caMsg+base,ALLUSER_ENTRY_NAME_BYTES);
+          const bool online=pdu->caMsg[base+ALLUSER_ENTRY_NAME_BYTES]==1;
+          entries.append(qMakePair(QString::fromUtf8(userName),online));
       }
-      Index::getinstance().getFriend()->m_onlineUser->updateOnlineUser(userNamelist);
+      Index::getinstance().getFriend()->m_onlineUser->updateOnlineUser(entries,total,hasMore==1,true);
 }
 
 void MsgHandler::handlAddFriend()
@@ -181,14 +187,24 @@ void MsgHandler::handlAddFriendAgree(const QString &myName)
 // 好友列表：caMsg 是 32 字节定长用户名数组，数量 = uiMsgLen/32。
 void MsgHandler::handlFlushFriend()
 {
-    int leng=pdu->uiMsgLen/32;//柔性数组长度
+    // REQ-PAGE-FETCH-001：好友列表服务端数量截断（至多 PAGE_MAX_LIMIT 条），超限提示
+    quint8 truncated=0; quint32 count=0;
+    memcpy(&truncated,pdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,sizeof(truncated));
+    memcpy(&count,pdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,sizeof(count));
+    const uint cap=uint(pdu->uiMsgLen/32);
+    if(count==0) count=cap;                        // 兼容空 caData（旧响应/测试桩）
+    if(count>cap) count=cap;
     QStringList userNamelist;
-    for(int i=0;i<leng;i++){
+    for(uint i=0;i<count;i++){
         char userName[32]={'\0'};
         memcpy(userName,pdu->caMsg+i*32,32);//取出每一个用户的用户名
         userNamelist.append(QString("%1.%2").arg(i+1).arg(userName));//将编号还有用户名都统一加进去
     }
     Index::getinstance().getFriend()->flushFriend_LW(userNamelist);
+    if(truncated){
+        QMessageBox::information(Index::getinstance().getFriend(),QStringLiteral("提示"),
+            QStringLiteral("好友数量较多，已截断显示最近 %1 条").arg(uint(count)));
+    }
 }
 //删除好友
 void MsgHandler::handlDeleteFriend()
@@ -290,6 +306,18 @@ void MsgHandler::getPendingChat()
         if (id > 0) ids.append(id);
     }
     sendChatDeliveredAck(ids);
+    // REQ-PAGE-FETCH-001：本批已达上限仍有未送达 → 确认（110）后同会话再拉下一批
+    quint8 truncated = 0;
+    memcpy(&truncated, pdu->caData + CHAT_PULL_RESP_TRUNCATED_OFFSET, sizeof(truncated));
+    if (truncated == 1 && !ids.isEmpty() && !peer.isEmpty()) {
+        PDU* again = mkPDU();
+        again->uiType = ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST;
+        const QByteArray self = Client::getinstance().m_LoginName.toUtf8();
+        const QByteArray peerB = peer.toUtf8();
+        memcpy(again->caData, self.constData(), size_t(qMin(self.size(), 31)));
+        memcpy(again->caData + 32, peerB.constData(), size_t(qMin(peerB.size(), 31)));
+        Client::getinstance().seedMsg(again);
+    }
 }
 
 void MsgHandler::sendChatDeliveredAck(const QList<qint64> &ids)
@@ -303,12 +331,58 @@ void MsgHandler::sendChatDeliveredAck(const QList<qint64> &ids)
     Client::getinstance().seedMsg(ack);
 }
 
+// ===== REQ-PAGE-FETCH-001：118 历史分页响应（归属按发请求时记录的会话） =====
+void MsgHandler::chatHistoryResp()
+{
+    int code = ENUM_PROTOCOL_CODE_INTERNAL;
+    memcpy(&code, pdu->caData + CHAT_HIST_RESP_RET_OFFSET, PROTOCOL_CODE_SIZE);
+    if (code != ENUM_PROTOCOL_CODE_OK) {
+        QMessageBox::information(&Index::getinstance(), QStringLiteral("提示"), protocolCodeText(code));
+        return;
+    }
+    uint total = 0; quint8 hasMore = 0; qint64 oldestId = 0; quint32 count = 0;
+    memcpy(&total, pdu->caData + CHAT_HIST_RESP_TOTAL_OFFSET, sizeof(total));
+    memcpy(&hasMore, pdu->caData + CHAT_HIST_RESP_HASMORE_OFFSET, sizeof(hasMore));
+    memcpy(&oldestId, pdu->caMsg + CHAT_HIST_RESP_OLDEST_OFFSET, sizeof(oldestId));
+    memcpy(&count, pdu->caMsg + CHAT_HIST_RESP_COUNT_OFFSET, sizeof(count));
+    // 记录区严格边界校验（与 112 同口径，畸形即止）
+    QVector<Chat::ServerHistRow> rows;
+    uint dis = CHAT_HIST_RESP_RECORDS_OFFSET;
+    for (uint i = 0; i < count; ++i) {
+        if (dis + uint(CHAT_HIST_REC_BODY_OFFSET) > pdu->uiMsgLen) break;
+        qint64 id = 0; quint8 dir = 0; qint32 contentLen = 0, timeLen = 0;
+        memcpy(&id, pdu->caMsg + dis + CHAT_HIST_REC_ID_OFFSET, sizeof(id));
+        dir = quint8(pdu->caMsg[dis + CHAT_HIST_REC_DIR_OFFSET]);
+        memcpy(&contentLen, pdu->caMsg + dis + CHAT_HIST_REC_CONTENTLEN_OFFSET, sizeof(contentLen));
+        memcpy(&timeLen, pdu->caMsg + dis + CHAT_HIST_REC_TIMELEN_OFFSET, sizeof(timeLen));
+        if (contentLen < 0 || timeLen < 0) break;
+        if (dis + uint(CHAT_HIST_REC_BODY_OFFSET) + uint(contentLen) + uint(timeLen) > pdu->uiMsgLen) break;
+        Chat::ServerHistRow row;
+        row.id = id;
+        row.fromSelf = (dir == 0);           // 0=查询者发送，1=对方发送
+        row.content = QString::fromUtf8(pdu->caMsg + dis + CHAT_HIST_REC_BODY_OFFSET, int(contentLen));
+        row.timeText = QString::fromUtf8(pdu->caMsg + dis + CHAT_HIST_REC_BODY_OFFSET + uint(contentLen), int(timeLen));
+        dis += uint(CHAT_HIST_REC_BODY_OFFSET) + uint(contentLen) + uint(timeLen);
+        rows.append(row);
+    }
+    Chat* chat = Index::getinstance().getFriend()->m_chat;
+    const QString peer = chat->historyPeer().isEmpty() ? chat->m_strChatName : chat->historyPeer();
+    chat->applyServerHistory(peer, oldestId, hasMore == 1, total, rows);
+}
+
 // REQ-CHAT-ACK-001 R10：114 待处理好友申请。逐条询问；同意走原 10（服务端按 pending 校验），
 // 拒绝回 115 把该行置 rejected，避免每次刷新重复弹出。
 void MsgHandler::handlePendingFriendList()
 {
+    // REQ-PAGE-FETCH-001：服务端只回最近 N 天、至多 200 条，超限先提示再逐条询问
+    quint8 reqTruncated = 0;
+    memcpy(&reqTruncated, pdu->caData + LIST_TRUNC_RESP_TRUNCATED_OFFSET, sizeof(reqTruncated));
     const int count = int(pdu->uiMsgLen / 32);
     Friend* fr = Index::getinstance().getFriend();
+    if (reqTruncated == 1) {
+        QMessageBox::information(fr, QStringLiteral("提示"),
+                                 QStringLiteral("好友申请较多，仅显示最近 %1 条").arg(count));
+    }
     const QByteArray self = Client::getinstance().m_LoginName.toUtf8();
     for (int i = 0; i < count; ++i) {
         char name[32] = {'\0'};
@@ -393,10 +467,7 @@ void MsgHandler::renamedir()
     qCDebug(lcCli)<<"rename code"<<code<<endl;
     if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","文件重命名成功");
-        PDU* pdu=mkPDU(Index::getinstance().getFile()->m_strCurPath.toUtf8().toStdString().size()+1);
-        pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
-        memcpy(pdu->caMsg,Index::getinstance().getFile()->m_strCurPath.toStdString().c_str(),Index::getinstance().getFile()->m_strCurPath.toUtf8().toStdString().size());
-        Client::getinstance().seedMsg(pdu);
+        // 统一走 File::flushfile()：重置分页状态；手工拼请求不重置 m_loadedCount，响应被按「加载更多」追加，表现为改名后旧名+新名并存（2026-11-14 GUI 实测）
     }
     else {
         QMessageBox::information(&Index::getinstance(),"提示",protocolCodeText(code));
@@ -441,15 +512,39 @@ void MsgHandler::sharefilefinsh()
 // 这里为每条记录 new 一个副本，所有权随列表交给文件页刷新函数。
 void MsgHandler::flushfile()
 {
+    // REQ-AUDIT-LOG-001：先看结果码——目录不存在/无权访问不再静默清空列表
+    int listCode = ENUM_PROTOCOL_CODE_OK;
+    memcpy(&listCode, pdu->caData + FLUSHFILE_RESP_RET_OFFSET, PROTOCOL_CODE_SIZE);
+    // REQ-PAGE-FETCH-001：目录分页响应（caData 码/total/has_more/count，载荷 FileInfo 数组）
+    uint total=0; quint8 hasMore=0; quint32 count=0;
+    memcpy(&total,pdu->caData+FLUSHFILE_RESP_TOTAL_OFFSET,sizeof(total));
+    memcpy(&hasMore,pdu->caData+FLUSHFILE_RESP_HASMORE_OFFSET,sizeof(hasMore));
+    memcpy(&count,pdu->caData+FLUSHFILE_RESP_COUNT_OFFSET,sizeof(count));
+    const uint cap=uint(pdu->uiMsgLen/sizeof(FileInfo));
+    if(count==0) count=cap;                        // 兼容空 caData（旧响应/测试桩）
+    if(count>cap) count=cap;
     QList<FileInfo*>qFileinfolist;
-    int len=pdu->uiMsgLen/sizeof(FileInfo);
-    for(int i=0;i<len;i++){
+    for(uint i=0;i<count;i++){
         FileInfo* newFileInfo=new FileInfo;
         memcpy(newFileInfo,pdu->caMsg+i*sizeof (FileInfo),sizeof(FileInfo));
         qFileinfolist.append(newFileInfo);
-        qCDebug(lcCli)<<"newFileInfo->caName"<<newFileInfo->caName<<" newFileInfo->uiType"<<newFileInfo->uiType<<" ";
     }
-    Index::getinstance().getFile()->updateCurrfile(qFileinfolist);
+    if (listCode != ENUM_PROTOCOL_CODE_OK) {
+        // 拒绝（如 -2020 无权访问/-4004 目录不存在）：提示且不清空现有列表，避免用户误以为目录为空
+        for (FileInfo *p : qFileinfolist) delete p;
+        QMessageBox::warning(Index::getinstance().getFile(), QStringLiteral("提示"),
+                             protocolCodeText(listCode));
+        return;
+    }
+    if (listCode != ENUM_PROTOCOL_CODE_OK) {
+        // 拒绝（如 -2020 无权访问/-4004 目录不存在）：提示且不清空现有列表，避免用户误以为目录为空
+        for (FileInfo *p : qFileinfolist) delete p;
+        QMessageBox::warning(Index::getinstance().getFile(), QStringLiteral("提示"),
+                             protocolCodeText(listCode));
+        return;
+    }
+    // append=true：加载更多在已有列表后追加；第 0 页由 File 在请求时清空状态
+    Index::getinstance().getFile()->updateCurrfilePage(qFileinfolist,total,hasMore==1);
 }
 
 // 解析分享链接响应：服务端已把文件复制到其【用户目录/分享链接/】，这里提示并刷新列表
@@ -514,6 +609,7 @@ void MsgHandler::handleCaptcha(){
         const QByteArray png(pdu->caMsg, pdu->uiMsgLen);
         qCDebug(lcCli) << "收到服务端验证码图片，字节数:" << png.size();
         Client::getinstance().updateCaptchaImage(png);
+        Client::getinstance().m_captchaAutoRefresh = false;   // 新码已到，自动补拉完成
         Client::getinstance().startCaptchaCooldown(remaining > 0 ? remaining : 60);
     } else if (code == ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN) {
         // 冷却中：禁止获取，按服务端剩余秒数倒计时

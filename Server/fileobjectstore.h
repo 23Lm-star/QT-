@@ -5,6 +5,7 @@
 #include <QString>
 #include <QStringList>
 #include <QList>
+#include <QSet>
 
 // 文件对象存储（单例）对外接口。
 // 磁盘布局：filesys/objects/<sha 前2位>/<object_id> 为最终对象，filesys/.staging/*.part 为上传暂存。
@@ -130,6 +131,10 @@ public:
 
     // 列出 parent 下 active 条目（flushfile/listdir 渲染）；无记录返回空表。
     QList<EntryInfo> listEntries(const QString& owner, const QString& parentPath) const;
+
+    // parent 下已软删条目名集合（status='deleted'）：目录软删不落盘（D5），物理目录
+    // 在回收调度前仍存在，列目录时按此过滤，避免"删除成功后列表仍显示"（REQ-PAGE-FETCH-001 GUI 实测）。
+    QSet<QString> deletedDisplayNames(const QString& owner, const QString& rawParentPath) const;
 
     // 查询单条目（含目录）；不存在返回 invalid。
     EntryInfo entryByPath(const QString& owner, const QString& parentPath,

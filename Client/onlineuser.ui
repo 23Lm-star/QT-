@@ -11,7 +11,7 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>在线用户</string>
+   <string>所有用户</string>
   </property>
   <property name="windowIcon">
    <iconset resource="config.qrc">
@@ -30,6 +30,13 @@
    </item>
    <item>
     <widget class="QListWidget" name="listWidget"/>
+   </item>
+   <item>
+    <widget class="QPushButton" name="loadMore_PB">
+     <property name="text">
+      <string>加载更多</string>
+     </property>
+    </widget>
    </item>
   </layout>
  </widget>

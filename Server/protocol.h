@@ -162,7 +162,7 @@ enum ENUM_MSG_TYPE {
     // 15/17/18 保持原语义供网页端使用；桌面端改走 109-112，送达以客户端 110 确认为准。
     ENUM_MSG_TYPE_CHAT_DELIVER_EVENT = 109,          // 实时投递事件，caData[32,40)=qint64 消息 ID
     ENUM_MSG_TYPE_CHAT_DELIVER_ACK = 110,            // 接收确认，caMsg=N×qint64 消息 ID
-    ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST = 111,   // 拉取待送达私聊（同 17 布局，响应带 ID）
+    ENUM_MSG_TYPE_CHAT_PULL_PENDING_REQUEST = 111,   // 拉取待送达私聊（caData[0,32)=对方；收件人取连接身份，响应带 ID）
     ENUM_MSG_TYPE_CHAT_PULL_PENDING_RESPOND = 112,   // 每条：qint64 id + qint32 正文长 + qint32 时间长 + 正文 + 时间
     ENUM_MSG_TYPE_LIST_PENDING_FRIEND_REQUEST = 113, // 待处理好友申请列表请求
     ENUM_MSG_TYPE_LIST_PENDING_FRIEND_RESPOND = 114, // 响应：caMsg 为 32 字节定长请求方账号数组
@@ -170,6 +170,11 @@ enum ENUM_MSG_TYPE {
     // 客户端能力声明：桌面端登录后发送，声明支持 109/110 接收确认。
     // 未声明的连接（网页端/旧客户端）继续按旧的「15 写出成功即已送达」处理。
     ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY = 116,
+
+    // ===== REQ-PAGE-FETCH-001：聊天历史分页（仅追加） =====
+    // 17/18 布局被网页端（消费式离线补发）依赖保持不变；桌面端历史分页走新编号。
+    ENUM_MSG_TYPE_CHAT_HISTORY_REQUEST = 117,        // 历史分页请求（caData=双方名，caMsg 头部分页块）
+    ENUM_MSG_TYPE_CHAT_HISTORY_RESPOND = 118,        // 历史分页响应（caData=码/total/has_more，caMsg=页信息+记录）
 
     ENUM_MSG_TYPE_MAX = 99999,
 };
@@ -198,6 +203,62 @@ static const int FASTCHECK_RESP_FILE_ID_OFFSET    = 16;  // qint64
 static const int FASTCHECK_RESP_SESSION_ID_OFFSET = 24;  // qint64
 static const int FASTCHECK_RESP_NEXT_OFFSET       = 32;  // qint64，miss 时续传起点
 static const int FASTCHECK_RESP_NAME_LEN_OFFSET   = 40;  // u32
+
+// ===== REQ-PAGE-FETCH-001：全量拉取分页布局常量（两端逐字节一致，只追加） =====
+// 分页请求在 caData 固定偏移放 limit/offset；响应在 caData 固定偏移放标准码/total/has_more
+// （/truncated）。聊天历史因 caData 64B 被双方账号占满，分页块放 caMsg 头部。
+static const uint PAGE_MAX_LIMIT = 200;      // 单页条数上限（分页与低量列表截断共用，可调）
+static const uint PAGE_TRUNCATE_DAYS = 30;   // 低量列表截断时间窗口（天，可调）
+
+// ---- 7/8 所有用户 ----
+static const int ALLUSER_REQ_LIMIT_OFFSET  = 0;    // u32 每页条数（1-200）
+static const int ALLUSER_REQ_OFFSET_OFFSET = 4;    // u32 分页起点（0 起）
+static const int ALLUSER_RESP_RET_OFFSET     = 0;  // int32 标准码
+static const int ALLUSER_RESP_TOTAL_OFFSET   = 4;  // u32 符合条件总数
+static const int ALLUSER_RESP_HASMORE_OFFSET = 8;  // u8 1=还有下一页
+static const int ALLUSER_RESP_COUNT_OFFSET   = 12; // u32 本页条数
+// 载荷每条 33 字节：名字[32] + u8 online（1=在线 0=离线）
+static const int ALLUSER_ENTRY_NAME_BYTES = 32;
+static const int ALLUSER_ENTRY_BYTES      = 33;
+
+// ---- 23/24 刷新目录（请求 caMsg 仍为路径） ----
+static const int FLUSHFILE_REQ_LIMIT_OFFSET  = 0;  // u32 每页条数（1-200）
+static const int FLUSHFILE_REQ_OFFSET_OFFSET = 4;  // u32 分页起点（0 起）
+static const int FLUSHFILE_RESP_RET_OFFSET     = 0;  // int32 标准码
+static const int FLUSHFILE_RESP_TOTAL_OFFSET   = 4;  // u32 条目总数
+static const int FLUSHFILE_RESP_HASMORE_OFFSET = 8;  // u8 1=还有下一页
+static const int FLUSHFILE_RESP_COUNT_OFFSET   = 12; // u32 本页条数
+
+// ---- 17/18 聊天历史分页 ----
+// 请求 caData[0,32)=查询者、[32,64)=对方（沿用）；caMsg 头部为分页块：
+static const int CHAT_HIST_REQ_CURSOR_OFFSET = 0;  // qint64 游标消息 ID；0=从最新一页开始
+static const int CHAT_HIST_REQ_LIMIT_OFFSET  = 8;  // u32 每页条数（1-200）
+static const int CHAT_HIST_REQ_LEN           = 12;
+// 响应 caData：
+static const int CHAT_HIST_RESP_RET_OFFSET     = 0;  // int32 标准码
+static const int CHAT_HIST_RESP_TOTAL_OFFSET   = 4;  // u32 双方历史总条数
+static const int CHAT_HIST_RESP_HASMORE_OFFSET = 8;  // u8 1=更早还有
+// 响应 caMsg 头部页信息块，其后为连续记录：
+static const int CHAT_HIST_RESP_OLDEST_OFFSET  = 0;  // qint64 本页最旧消息 ID（下一页游标）
+static const int CHAT_HIST_RESP_COUNT_OFFSET   = 8;  // u32 本页条数
+static const int CHAT_HIST_RESP_RECORDS_OFFSET = 12; // 记录区起始
+// 每条记录：qint64 id + u8 direction(0=查询者发,1=对方发) + qint32 正文长 + qint32 时间长 + 正文 + 时间
+static const int CHAT_HIST_REC_ID_OFFSET         = 0;
+static const int CHAT_HIST_REC_DIR_OFFSET        = 8;
+static const int CHAT_HIST_REC_CONTENTLEN_OFFSET = 9;
+static const int CHAT_HIST_REC_TIMELEN_OFFSET    = 13;
+static const int CHAT_HIST_REC_BODY_OFFSET       = 17;
+
+// ---- 112 离线补发截断标志（响应 caData 原为空） ----
+static const int CHAT_PULL_RESP_RET_OFFSET       = 0;  // int32 标准码
+static const int CHAT_PULL_RESP_TRUNCATED_OFFSET = 4;  // u8 1=本批已达上限，仍有未送达
+static const int CHAT_PULL_RESP_COUNT_OFFSET     = 8;  // u32 本批条数
+
+// ---- 低量列表截断（11/12、58/59、113/114 响应 caData 原为空） ----
+static const int LIST_TRUNC_RESP_RET_OFFSET       = 0; // int32 标准码
+static const int LIST_TRUNC_RESP_TRUNCATED_OFFSET = 4; // u8 1=超上限截断
+static const int LIST_TRUNC_RESP_COUNT_OFFSET     = 8; // u32 返回条数
+// 78/79、80/81、82/83 群信封响应：body 末尾追加 u8 truncated（旧端多出 1 字节不读，兼容）
 
 // ===== REQ-EXT-GROUP-003：群文件 PDU 布局常量（两端逐字节一致，只追加） =====
 // 全部载荷以 GROUP-001/002 的 20B 群信封开头（version|envelope_length|request_id|group_id），
@@ -263,6 +324,8 @@ struct Msg{
 //构建pdu协议对象的函数
 //返回pdu对象的地址
 PDU* mkPDU(uint uiMsgLen=0);
+// REQ-AUDIT-FULL-001：PDU 报文日志（终端+文件双落盘，供纠错排查）
+void logPduFrame(const char *dir, const PDU *pdu);
 
 // 群协议公共信封长度：版本(2)+长度(2)+request_id(8)+group_id(8)，不直接传输 C++ 结构体。
 static const quint16 GROUP_PROTOCOL_VERSION = 1;

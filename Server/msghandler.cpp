@@ -11,6 +11,7 @@
 #include "memalloc.h"
 #include "chatbounds.h"
 #include <QByteArray>
+#include <algorithm>
 
 #include <QFile>
 #include <QFileInfo>
@@ -229,6 +230,15 @@ namespace {
 bool captchaTextEchoForTests()
 {
     static const bool enabled = qEnvironmentVariableIsSet("CLOUDDISK_CAPTCHA_TEXT_FOR_TESTS");
+    if (enabled) {
+        // REQ-AUDIT-FULL-001：旁路启用即审计留痕——生产环境误设该变量时日志可见
+        static const bool warned = [](){
+            qCWarning(lcAuth) << "[审计] 验证码文本旁路已启用（CLOUDDISK_CAPTCHA_TEXT_FOR_TESTS），"
+                                 "仅限测试部署；生产/公网环境必须移除该变量";
+            return true;
+        }();
+        Q_UNUSED(warned);
+    }
     return enabled;
 }
 }
@@ -422,19 +432,31 @@ PDU *MsgHandler::finduser(){
 //查找所有用户
 PDU *MsgHandler::onlineuser(const QString &myname)
 {
-    //在数据库中查找所有在线用户
-    QStringList userNames=OperateDB::instance().handleOnlineUsers(myname);
-    //打印查找信息
-    qCDebug(lcNet)<<"所有在线用户个数"<<userNames.size()<<" ";
-    for(int i=0;i<userNames.size();i++){
-        qCDebug(lcNet)<<userNames[i]<<" ";
-    } qCDebug(lcNet)<<endl;
-    //将查找的在线用户的信息打包进响应报文中并返回
-    // 载荷为 N*32 字节的定长用户名数组，每项不足 32 字节以 '\0' 补齐。
-    PDU* respdu=mkPDU(userNames.size()*32);
+    // REQ-PAGE-FETCH-001：所有用户分页（含离线、排除自己与双向好友）。
+    // 请求 caData：limit(u32)、offset(u32)；limit=0 视为默认页大小（兼容空请求）。
+    uint limit=0, offset=0;
+    memcpy(&limit,pdu->caData+ALLUSER_REQ_LIMIT_OFFSET,sizeof(limit));
+    memcpy(&offset,pdu->caData+ALLUSER_REQ_OFFSET_OFFSET,sizeof(offset));
+    if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;   // limit==0 保留旧全量语义（网页端/旧脚本）
+    uint total=0; bool hasMore=false;
+    const QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,limit,offset,&total,&hasMore);
+    qCDebug(lcNet)<<"所有用户个数"<<total<<"本页"<<users.size()<<"offset"<<offset;
+    // 响应 caData：标准码、total、has_more、count；载荷每条 33B=名字[32]+online(u8)
+    PDU* respdu=mkPDU(uint(users.size())*ALLUSER_ENTRY_BYTES);
     respdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_RESPOND;
-    for(int i=0;i<userNames.size();i++){
-        memcpy(respdu->caMsg+i*32,userNames[i].toStdString().c_str(),32);
+    const int ok=ENUM_PROTOCOL_CODE_OK;
+    memcpy(respdu->caData+ALLUSER_RESP_RET_OFFSET,&ok,sizeof(ok));
+    memcpy(respdu->caData+ALLUSER_RESP_TOTAL_OFFSET,&total,sizeof(total));
+    const quint8 more=hasMore?1:0;
+    memcpy(respdu->caData+ALLUSER_RESP_HASMORE_OFFSET,&more,sizeof(more));
+    const quint32 count=quint32(users.size());
+    memcpy(respdu->caData+ALLUSER_RESP_COUNT_OFFSET,&count,sizeof(count));
+    for(int i=0;i<users.size();i++){
+        char* entry=respdu->caMsg+i*ALLUSER_ENTRY_BYTES;
+        const QByteArray nameBytes=users[i].first.toUtf8();
+        memset(entry,0,ALLUSER_ENTRY_BYTES);
+        memcpy(entry,nameBytes.constData(),size_t(qMin(nameBytes.size(),ALLUSER_ENTRY_NAME_BYTES-1)));
+        entry[ALLUSER_ENTRY_NAME_BYTES]=users[i].second?1:0;
     }
     return respdu;
 }
@@ -507,16 +529,26 @@ PDU *MsgHandler::addfriendFin()
 
 PDU *MsgHandler::flushfriend(const QString &username)
 {
-    QStringList ret=OperateDB::instance().handleFlushFriend(username);
+    // REQ-PAGE-FETCH-001：服务端数量截断（无时间列只限条数），超限置 truncated 标志
+    bool truncated=false;
+    QStringList ret=OperateDB::instance().handleFlushFriend(username,&truncated);
     qCDebug(lcNet)<<"ret.size()="<<ret.size();
     for(int i=0;i<ret.size();i++){
         qCDebug(lcNet)<<ret[i]<<" ";
     }qCDebug(lcNet)<<endl;
     // 载荷同样为 N*32 字节的定长好友名数组。
-    PDU* respdu=mkPDU(ret.size()*32);
+    PDU* respdu=mkPDU(uint(ret.size())*32);
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND;
+    const int ok=ENUM_PROTOCOL_CODE_OK;
+    memcpy(respdu->caData+LIST_TRUNC_RESP_RET_OFFSET,&ok,sizeof(ok));
+    const quint8 tr=truncated?1:0;
+    memcpy(respdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,&tr,sizeof(tr));
+    const quint32 count=quint32(ret.size());
+    memcpy(respdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,&count,sizeof(count));
     for(int i=0;i<ret.size();i++){
-        memcpy(respdu->caMsg+i*32,ret[i].toStdString().c_str(),32);
+        // REQ-AUDIT-FULL-001：定长槽按实际长度拷贝（≤31 保留 NUL），避免对短源串越界读
+        const QByteArray nameBytes=ret[i].toUtf8();
+        memcpy(respdu->caMsg+i*32,nameBytes.constData(),size_t(qMin(nameBytes.size(),31)));
     }
     return respdu;
 }
@@ -533,13 +565,12 @@ PDU *MsgHandler::deletefriend()
     char tarName[32]={'\0'};
     memcpy(strName,pdu->caData,32);
     memcpy(tarName,pdu->caData+32,32);
-    bool ret=OperateDB::instance().handleDeleteFriend(strName,tarName);
+    // REQ-AUDIT-FULL-001：删好友与清双方私聊记录合并为同一事务（改前消息清理失败留"非好友但历史仍在"窗口）
+    bool ret=OperateDB::instance().deleteFriendCascade(QString::fromUtf8(strName), QString::fromUtf8(tarName));
     qCDebug(lcNet)<<"deletefriend ret"<<ret<<endl;
 
-    // 跨功能联动：好友删除成功后，清理两人互发的私聊记录
     if(ret){
-        OperateDB::instance().deleteFriendMessages(QString::fromUtf8(strName), QString::fromUtf8(tarName));
-        qCDebug(lcNet) << "[deletefriend] 已联动清理双方私聊记录: " << strName << " - " << tarName;
+        qCDebug(lcNet) << "[deletefriend] 好友关系与双方私聊记录已同事务清理: " << strName << " - " << tarName;
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_DELETEFRIEND_RESPOND;
@@ -566,14 +597,12 @@ PDU *MsgHandler::chat()
     QByteArray body;
     QString currTime;
     QString why;
-    bool ret=false;
     bool stored=false;
     qint64 msgId=-1;
     if(checkChatMsgStrict(pdu->caMsg, pdu->uiMsgLen, CHAT_MAX_BODY_BYTES, &body, &currTime, &why)){
         const QString msg=QString::fromUtf8(body);
         qCDebug(lcNet)<<"接收到的msg"<<msg<<" 时间为"<<currTime<<endl;
-        ret= OperateDB::instance().seedchatMsg(seedName,tarName,msg,currTime,&stored,&msgId);
-        qCDebug(lcNet)<<"char ret"<<ret<<endl;
+        OperateDB::instance().seedchatMsg(seedName,tarName,msg,currTime,&stored,&msgId);
     }
     else{
         // 只记长度与原因，不落正文明文
@@ -583,7 +612,10 @@ PDU *MsgHandler::chat()
     // REQ-CHAT-ACK-001：按目标连接能力分流投递。
     // 桌面端（声明过 116）只收 109，送达以客户端 110 为准；
     // 网页/旧客户端仍收 15，并维持「写出成功即已送达」的旧语义。
-    if(ret && msgId>=0 && stored){
+    // 在线判定以连接列表为准：库内 online 是连接生命的滞后副本，用它当门槛会让
+    // 在线用户漏收 109 实时投递（2026-11-14 GUI 实测 lilei 在线未收到）；deliverChat
+    // 找不到目标自然落空返回 0，消息仍留 issuccess=0 等下次补发，无重复投递风险。
+    if(msgId>=0 && stored){
         PDU* deliver=mkPDU(pdu->uiMsgLen);
         deliver->uiType=ENUM_MSG_TYPE_CHAT_DELIVER_EVENT;
         memcpy(deliver->caData,pdu->caData,32);          // 发送人（已按认证主体改写）
@@ -780,6 +812,16 @@ PDU *MsgHandler::flushfile()
     // REQ-FS-003⑤: 沙箱外目录一律不回显条目
     // REQ-EXT-SEC-001: 列目录范围收敛为 actor 本人用户根
     if(!pathInActorRoot(path)){
+        // 沙箱判否含两种情形：目录在盘上但不在本人根内=真越权(-2020)；
+        // 路径不存在(canonical 为空被判否)=目录不存在(-4004)，与 changedir 的
+        // 「沙箱外按不存在处理」同口径，不再把输错路径误报成身份问题（2026-11-14 GUI 实测）
+        if(!QDir(path).exists()){
+            qCWarning(lcFs)<<"[flushfile] 目录不存在 conn="<<m_connId<<":"<<path;
+            PDU* respdu=mkPDU();
+            respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
+            setProtocolCode(respdu, ENUM_PROTOCOL_CODE_DIR_NOT_FOUND);
+            return respdu;
+        }
         qCWarning(lcFs)<<"[flushfile] 拒绝越权列目录 conn="<<m_connId<<":"<<path;
         PDU* respdu=mkPDU();
         respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
@@ -799,23 +841,50 @@ PDU *MsgHandler::flushfile()
     QDir dir(path);
     if(dir.exists()){
         const QFileInfoList phys = dir.entryInfoList();
+        // 目录软删不落盘（D5）：物理残留目录在回收调度前仍在，按软删条目名过滤，
+        // 避免"删除成功后列表仍显示、再对其操作报源无逻辑条目"（2026-11-14 GUI 实测）
+        const QSet<QString> tombstones =
+                FileObjectStore::instance().deletedDisplayNames(m_actorName, path);
         for(int i=0;i<phys.size();++i){
             const QString nm = phys[i].fileName();
             if(nm=="."||nm==".."||nm==".staging"||nm=="objects") continue;
             if(seen.contains(nm)) continue;
+            if(tombstones.contains(nm)) continue;
             // REQ-MIG-001：文件只来自逻辑条目（对象存储）；此处仅保留目录残留的可见性兜底
             if(!phys[i].isDir()) continue;
             Row r; r.name=nm; r.isDir=phys[i].isDir(); rows.append(r);
         }
     }
+    // REQ-PAGE-FETCH-001：合并后统一排序（目录在前、名字字典序）保证分页切片稳定；
+    // 请求 caData：limit(u32)、offset(u32)；limit=0 视为默认页大小（兼容空请求）。
+    std::sort(rows.begin(),rows.end(),[](const Row&a,const Row&b){
+        if(a.isDir!=b.isDir) return a.isDir;            // 目录优先
+        return a.name.compare(b.name,Qt::CaseSensitive)<0;
+    });
+    uint limit=0, offset=0;
+    memcpy(&limit,pdu->caData+FLUSHFILE_REQ_LIMIT_OFFSET,sizeof(limit));
+    memcpy(&offset,pdu->caData+FLUSHFILE_REQ_OFFSET_OFFSET,sizeof(offset));
+    if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;   // limit==0 保留旧全量语义（网页端/旧脚本）
+    const uint total=uint(rows.size());
+    uint count = (limit==0)? total : qMin(limit,total-offset);
+    if(limit!=0 && offset>total) offset=total;
+    const bool hasMore=(limit!=0) && ((offset+count)<total);
     // 载荷为 FileInfo 数组：caName 定长 32B，uiType 0=目录、1=文件。
     // 条目与物理文件按名去重，内部目录（.staging/objects）不外显。
-    PDU* respdu=mkPDU(sizeof(FileInfo)*rows.size());
+    PDU* respdu=mkPDU(sizeof(FileInfo)*count);
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_RESPOND;
-    for(int i=0;i<rows.size();++i){
+    const int ok=ENUM_PROTOCOL_CODE_OK;
+    memcpy(respdu->caData+FLUSHFILE_RESP_RET_OFFSET,&ok,sizeof(ok));
+    memcpy(respdu->caData+FLUSHFILE_RESP_TOTAL_OFFSET,&total,sizeof(total));
+    const quint8 more=hasMore?1:0;
+    memcpy(respdu->caData+FLUSHFILE_RESP_HASMORE_OFFSET,&more,sizeof(more));
+    memcpy(respdu->caData+FLUSHFILE_RESP_COUNT_OFFSET,&count,sizeof(count));
+    for(uint i=0;i<count;++i){
+        const Row& r=rows[int(offset+i)];
         FileInfo* pFileInfo=(FileInfo*)respdu->caMsg+i;
-        memcpy(pFileInfo->caName,rows[i].name.toUtf8().constData(),32);
-        pFileInfo->uiType=rows[i].isDir?0:1;
+        const QByteArray entryBytes=r.name.toUtf8();   // REQ-AUDIT-FULL-001：按实际长度拷贝
+        memcpy(pFileInfo->caName,entryBytes.constData(),size_t(qMin(entryBytes.size(),31)));
+        pFileInfo->uiType=r.isDir?0:1;
     }
     return respdu;
 }
@@ -1210,18 +1279,37 @@ PDU *MsgHandler::listdir(const QString& loginName)
     QFileInfo dirInfo(absDir);
 
     // 只列子目录（不含文件、"." 与 ".."）；响应载荷为 FileInfo 数组，uiType 恒为 0。
+    // REQ-PAGE-FETCH-001：数量截断，超限置 truncated 标志。
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
     if(isPathInSandbox(absDir, userRoot) && dirInfo.isDir()){
         QFileInfoList list=QDir(absDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
-        respdu=mkPDU(sizeof(FileInfo)*list.size());
+        // 目录软删不落盘（D5）：物理残留目录在回收调度前不外显，与 flushfile 同口径
+        const QSet<QString> tombstones =
+                FileObjectStore::instance().deletedDisplayNames(loginName, absDir);
+        QFileInfoList visible;
+        visible.reserve(list.size());
+        for(int i=0;i<list.size();++i){
+            if(!tombstones.contains(list[i].fileName())) visible.append(list[i]);
+        }
+        list=visible;
+        bool truncated=list.size()>int(PAGE_MAX_LIMIT);
+        if(truncated) list=list.mid(0,int(PAGE_MAX_LIMIT));
+        respdu=mkPDU(sizeof(FileInfo)*uint(list.size()));
         respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
+        const int ok=ENUM_PROTOCOL_CODE_OK;
+        memcpy(respdu->caData+LIST_TRUNC_RESP_RET_OFFSET,&ok,sizeof(ok));
+        const quint8 tr=truncated?1:0;
+        memcpy(respdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,&tr,sizeof(tr));
+        const quint32 count=quint32(list.size());
+        memcpy(respdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,&count,sizeof(count));
         for(int i=0;i<list.size();i++){
             FileInfo* p=(FileInfo*)respdu->caMsg+i;
-            memcpy(p->caName,list[i].fileName().toStdString().c_str(),32);
+            const QByteArray dirBytes=list[i].fileName().toUtf8();   // REQ-AUDIT-FULL-001：按实际长度拷贝
+            memcpy(p->caName,dirBytes.constData(),size_t(qMin(dirBytes.size(),31)));
             p->uiType=0;
         }
-        qCDebug(lcFs)<<"listdir rel="<<relPath<<" 子目录数="<<list.size();
+        qCDebug(lcFs)<<"listdir rel="<<relPath<<" 子目录数="<<list.size()<<"truncated="<<truncated;
     } else {
         qCWarning(lcFs)<<"listdir 越权或目录不存在: rel="<<relPath;
     }
@@ -1243,6 +1331,8 @@ PDU *MsgHandler::uploadfileinit()
     const QString fileName = fixedString(strname, 32);
     const quint64 tid = m_currentTransferId;
     bool ret = false;
+    bool slotRejected = false;    // REQ-AUDIT-LOG-001：并发槽位拒绝
+    bool dirRejected = false;     // REQ-AUDIT-LOG-001：目录越权拒绝
     bool complete = false;
     qint64 resumeOffset = 0;
     bool adoptedFastcheck = false;   // AUD-1：本次 29 消费了前序 97 的暂存 → 随后释放 id=0 占位
@@ -1338,6 +1428,7 @@ PDU *MsgHandler::uploadfileinit()
                 }
             }
         } else {
+            dirRejected = true;   // REQ-AUDIT-LOG-001：越权目录回 -2020
             qCWarning(lcFs) << "uploadfileinit 拒绝越权目录 conn=" << m_connId << ":" << dirPath;
         }
         m_pendingFastcheck.active = false;   // 一次 29 之后失效（无论是否采纳）
@@ -1354,6 +1445,7 @@ PDU *MsgHandler::uploadfileinit()
             return nullptr;
         }
     } else {
+        slotRejected = true;   // REQ-AUDIT-LOG-001：并发上限/ID 冲突回 -2107，不再误报写入失败
         qCWarning(lcFs) << "uploadfileinit 拒绝：并发上限或 id 冲突 conn=" << m_connId
                         << " id=" << tid << " active=" << activeUploadCount();
     }
@@ -1368,7 +1460,11 @@ PDU *MsgHandler::uploadfileinit()
     // [48..55]=transfer_id；客户端据此决定从哪个偏移继续分块。
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_UPLOADFILE_INIT_RESPOND;
-    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_WRITE_FAILED);
+    // REQ-AUDIT-LOG-001：拒绝原因细分——并发上限(-2107)/越权目录(-2020)/其余写入失败(-4006)
+    setProtocolCode(respdu, ret ? ENUM_PROTOCOL_CODE_OK
+                    : (slotRejected ? ENUM_PROTOCOL_CODE_CONCURRENCY_LIMIT
+                       : (dirRejected ? ENUM_PROTOCOL_CODE_NOT_ALLOWED
+                                      : ENUM_PROTOCOL_CODE_WRITE_FAILED)));
     memcpy(respdu->caData+UPLOAD_RESUME_OFFSET,&resumeOffset,sizeof(resumeOffset));
     if(resumeEnabled){
         memcpy(respdu->caData+UPLOAD_RESUME_MAGIC_OFFSET,&resumeMagic,sizeof(resumeMagic));
@@ -2177,7 +2273,10 @@ PDU *MsgHandler::chatPending()
     memcpy(peerName,pdu->caData,32);
     QByteArray actorBytes=m_actorName.toUtf8();
     QVector<qlonglong> ids;
-    const QStringList list=OperateDB::instance().getchatMsg(peerName,actorBytes.data(),&ids);
+    // REQ-PAGE-FETCH-001：单批最多 PAGE_MAX_LIMIT 条，仍有未送达时置 truncated，
+    // 客户端确认（110）后可再次拉取直至取尽
+    bool truncated=false;
+    const QStringList list=OperateDB::instance().getchatMsg(peerName,actorBytes.data(),&ids,&truncated);
 
     uint total=0;
     for(int i=0;i<list.size();i+=2){
@@ -2187,6 +2286,12 @@ PDU *MsgHandler::chatPending()
     }
     PDU* respdu=mkPDU(total);
     respdu->uiType=ENUM_MSG_TYPE_CHAT_PULL_PENDING_RESPOND;
+    const int ok=ENUM_PROTOCOL_CODE_OK;
+    memcpy(respdu->caData+CHAT_PULL_RESP_RET_OFFSET,&ok,sizeof(ok));
+    const quint8 tr=truncated?1:0;
+    memcpy(respdu->caData+CHAT_PULL_RESP_TRUNCATED_OFFSET,&tr,sizeof(tr));
+    const quint32 batchCount=quint32(ids.size());
+    memcpy(respdu->caData+CHAT_PULL_RESP_COUNT_OFFSET,&batchCount,sizeof(batchCount));
     uint dis=0;
     for(int i=0;i<list.size();i+=2){
         const qint64 id=ids.at(i/2);
@@ -2224,15 +2329,83 @@ void MsgHandler::chatDeliveredAck()
     OperateDB::instance().markChatDeliveredFor(m_actorName,ids);
 }
 
-// 113/114：本人仍待处理的好友申请（离线期间登记的也在内），caMsg=32 字节定长账号数组
+// 113/114：本人仍待处理的好友申请（离线期间登记的也在内），caMsg=32 字节定长账号数组。
+// REQ-PAGE-FETCH-001：仅最近 PAGE_TRUNCATE_DAYS 天、至多 PAGE_MAX_LIMIT 条；超限置 truncated。
 PDU *MsgHandler::listPendingFriendRequests()
 {
-    const QStringList names=OperateDB::instance().listPendingFriendRequests(m_actorName);
+    bool truncated=false;
+    const QStringList names=OperateDB::instance().listPendingFriendRequests(m_actorName,&truncated);
     PDU* respdu=mkPDU(uint(names.size())*32);
     respdu->uiType=ENUM_MSG_TYPE_LIST_PENDING_FRIEND_RESPOND;
+    const int ok=ENUM_PROTOCOL_CODE_OK;
+    memcpy(respdu->caData+LIST_TRUNC_RESP_RET_OFFSET,&ok,sizeof(ok));
+    const quint8 tr=truncated?1:0;
+    memcpy(respdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,&tr,sizeof(tr));
+    const quint32 count=quint32(names.size());
+    memcpy(respdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,&count,sizeof(count));
     for(int i=0;i<names.size();i++){
         const QByteArray nameBytes=names.at(i).toUtf8();
         memcpy(respdu->caMsg+i*32,nameBytes.constData(),size_t(qMin(nameBytes.size(),31)));
+    }
+    return respdu;
+}
+
+// ===== REQ-PAGE-FETCH-001：117/118 聊天历史分页（桌面端专用；17/18 网页端语义不变） =====
+// 请求 caData[0,32)=查询者(actor 覆盖)、[32,64)=对方；caMsg 头部：cursorId(qint64)、limit(u32)。
+// 响应 caData：标准码、total、has_more；caMsg 头部：oldestId(qint64)、count(u32)，
+// 其后每条记录：id(qint64)+direction(u8)+正文长(qint32)+时间长(qint32)+正文+时间。
+PDU *MsgHandler::chatHistory()
+{
+    const QString claimedSelf = fixedString(pdu->caData, 32);
+    if(claimedSelf != m_actorName){
+        qCWarning(lcNet)<<"[chatHistory] 查询者字段与连接身份不符，按连接身份改写 conn="<<m_connId;
+    }
+    copySelfField(pdu->caData, m_actorName);
+    const QString self=m_actorName;
+    const QString peer=fixedString(pdu->caData+32, 32);
+    qint64 cursorId=0; uint limit=0;
+    if(pdu->uiMsgLen>=CHAT_HIST_REQ_LEN){
+        memcpy(&cursorId,pdu->caMsg+CHAT_HIST_REQ_CURSOR_OFFSET,sizeof(cursorId));
+        memcpy(&limit,pdu->caMsg+CHAT_HIST_REQ_LIMIT_OFFSET,sizeof(limit));
+    }
+    if(limit==0 || limit>PAGE_MAX_LIMIT) limit=50;
+    if(cursorId<0) cursorId=0;
+
+    uint total=0; bool hasMore=false; qint64 oldestId=0;
+    const QVector<OperateDB::ChatHistoryRow> rows=
+            OperateDB::instance().getChatHistoryPage(self,peer,cursorId,limit,&total,&hasMore,&oldestId);
+
+    uint bodyLen=CHAT_HIST_RESP_RECORDS_OFFSET;
+    for(int i=0;i<rows.size();++i){
+        bodyLen+=uint(CHAT_HIST_REC_BODY_OFFSET)
+                +uint(rows[i].msg.toUtf8().size())
+                +uint(rows[i].time.toUtf8().size());
+    }
+    PDU* respdu=mkPDU(bodyLen);
+    respdu->uiType=ENUM_MSG_TYPE_CHAT_HISTORY_RESPOND;
+    const int ok=ENUM_PROTOCOL_CODE_OK;
+    memcpy(respdu->caData+CHAT_HIST_RESP_RET_OFFSET,&ok,sizeof(ok));
+    memcpy(respdu->caData+CHAT_HIST_RESP_TOTAL_OFFSET,&total,sizeof(total));
+    const quint8 more=hasMore?1:0;
+    memcpy(respdu->caData+CHAT_HIST_RESP_HASMORE_OFFSET,&more,sizeof(more));
+    memcpy(respdu->caMsg+CHAT_HIST_RESP_OLDEST_OFFSET,&oldestId,sizeof(oldestId));
+    const quint32 count=quint32(rows.size());
+    memcpy(respdu->caMsg+CHAT_HIST_RESP_COUNT_OFFSET,&count,sizeof(count));
+    uint dis=CHAT_HIST_RESP_RECORDS_OFFSET;
+    for(int i=0;i<rows.size();++i){
+        const QByteArray content=rows[i].msg.toUtf8();
+        const QByteArray timeBytes=rows[i].time.toUtf8();
+        const qint64 id=rows[i].id;
+        const quint8 dir=rows[i].fromSelf?0:1;
+        const qint32 contentLen=content.size();
+        const qint32 timeLen=timeBytes.size();
+        memcpy(respdu->caMsg+dis+CHAT_HIST_REC_ID_OFFSET,&id,sizeof(id));
+        respdu->caMsg[dis+CHAT_HIST_REC_DIR_OFFSET]=char(dir);
+        memcpy(respdu->caMsg+dis+CHAT_HIST_REC_CONTENTLEN_OFFSET,&contentLen,sizeof(contentLen));
+        memcpy(respdu->caMsg+dis+CHAT_HIST_REC_TIMELEN_OFFSET,&timeLen,sizeof(timeLen));
+        if(contentLen>0){ memcpy(respdu->caMsg+dis+CHAT_HIST_REC_BODY_OFFSET,content.constData(),size_t(contentLen)); }
+        if(timeLen>0){ memcpy(respdu->caMsg+dis+CHAT_HIST_REC_BODY_OFFSET+uint(contentLen),timeBytes.constData(),size_t(timeLen)); }
+        dis+=uint(CHAT_HIST_REC_BODY_OFFSET)+uint(contentLen)+uint(timeLen);
     }
     return respdu;
 }

@@ -242,6 +242,11 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         respdu=m_MsgHandler->chatPending();
         break;
     }
+    // ===== REQ-PAGE-FETCH-001：117 桌面端聊天历史分页 =====
+    case ENUM_MSG_TYPE_CHAT_HISTORY_REQUEST:{
+        respdu=m_MsgHandler->chatHistory();
+        break;
+    }
     case ENUM_MSG_TYPE_CHAT_DELIVER_ACK:{
         m_MsgHandler->chatDeliveredAck();
         break;
@@ -883,6 +888,7 @@ void MyTcpSocket::recvmsg(){
                         <<"pdu->caData"<<pdu->caData<<" "
                         <<"pdu->caData+32"<<pdu->caData+32<<" "
                         <<"pdu->caMsg"<<pdu->caMsg<<endl;
+                logPduFrame("S<-C", pdu);   // REQ-AUDIT-FULL-001：收包日志
                 PDU* respdu=handlMsg(pdu);
                 // REQ-AUDIT-001 R2：18 只在写出成功后确认已送达；失败则保持待送达重投。
                 const bool sent=seedMsg(respdu);
@@ -991,8 +997,10 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return reject(ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND);
     case ENUM_MSG_TYPE_DELETEFRIEND_REQUEST:
         return reject(ENUM_MSG_TYPE_DELETEFRIEND_RESPOND);
-    case ENUM_MSG_TYPE_GETCHATMSG_REQUEST:
+    case ENUM_MSG_TYPE_GETCHATMSG_REQUEST:
         return reject(ENUM_MSG_TYPE_GETCHATMSG_RESPOND);
+    case ENUM_MSG_TYPE_CHAT_HISTORY_REQUEST:
+        return reject(ENUM_MSG_TYPE_CHAT_HISTORY_RESPOND);
     case ENUM_MSG_TYPE_MKDIR_REQUEST:
         return reject(ENUM_MSG_TYPE_MKDIR_RESPOND);
     case ENUM_MSG_TYPE_CHANGEDIR_REQUEST:
@@ -1105,16 +1113,8 @@ bool MyTcpSocket::seedMsg(PDU *respdu){
     if(respdu==nullptr){
         return false;
     }
+    logPduFrame("S->C", respdu);   // REQ-AUDIT-FULL-001：发包日志（替代旧散点调试输出）
     const bool written = this->write((char*)respdu,respdu->uiTotalLen) >= 0;
-    qCDebug(lcNet)<<"响应信息 已发送:"<<" "
-            <<"respdu->uiTotalLen"<<respdu->uiTotalLen<<" "
-            <<"respdu->uiMsgLen"<<respdu->uiMsgLen<<" "
-            <<"respdu->uiType"<<respdu->uiType<<" "
-              <<"respdu->caData"<<respdu->caData<<" "
-            <<"respdu->caData+32"<<respdu->caData+32<<" "
-            <<(respdu->uiType==ENUM_MSG_TYPE_DOWNLOADFILE_DATA ? QByteArray::number(respdu->uiMsgLen).constData() :
-               respdu->uiType==ENUM_MSG_TYPE_DOWNLOADFILE_RESPOND ? "metadata" : "respdu->caMsg")
-            <<endl;
     memfree(respdu);
     respdu=nullptr;
     return written;

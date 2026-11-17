@@ -90,13 +90,15 @@ void MyTcpServer::incomingConnection(qintptr handle)
     // REQ-EXT-TLS-001：TLS 监听实例接受的连接先登记 TLS 模式再进入连接表，
     // 保证握手完成前该连接不会被当作 PDU 流解析（见 MyTcpSocket::recvmsg 守卫）。
     if (m_isTlsListener) m_tcpSocket->setTlsMode(true);
+    // TLS 监听是独立 MyTcpServer 实例：连接表必须统一登记到主单例，否则
+    // deliverChat（109 私聊推送）、sendGroupEvent（90 群消息推送）、上传写盘
+    // 回调路由、踢旧连接与僵尸清扫等按主单例连接表工作的路径全部找不到
+    // TLS 连接（2026-11-14 GUI 实测：私聊/群聊不实时、上传 0% 卡死的根因）。
+    MyTcpServer &registry = MyTcpServer::getinstance();
     {
-        QMutexLocker locker(&m_tcpsocketlistMutex);
-        m_tcpSocket->m_connectionId=++m_nextConnectionId;
-        tcpsocketlist.append(m_tcpSocket);
-        for(int i=0;i<tcpsocketlist.size();i++){
-            qCDebug(lcNet)<<tcpsocketlist[i]<<endl;
-        }
+        QMutexLocker locker(&registry.m_tcpsocketlistMutex);
+        m_tcpSocket->m_connectionId=++registry.m_nextConnectionId;
+        registry.tcpsocketlist.append(m_tcpSocket);
     }
     qCDebug(lcNet)<<"新客户端连接完成"<<endl;
 }
@@ -213,13 +215,16 @@ int MyTcpServer::deliverChat(char *tarname, PDU *ackPdu, PDU *legacyPdu)
             continue;
         }
         if(sock->m_supportsChatAck && ackPdu!=nullptr){
+            logPduFrame("S->C(私聊推送)", ackPdu);   // 推送走裸 write 绕过 seedMsg 日志，此处补齐（2026-11-14 排查盲区）
             return sock->write((char*)ackPdu,ackPdu->uiTotalLen)>=0 ? 1 : 0;
         }
         if(legacyPdu!=nullptr){
+            logPduFrame("S->C(私聊推送)", legacyPdu);
             return sock->write((char*)legacyPdu,legacyPdu->uiTotalLen)>=0 ? 2 : 0;
         }
         return 0;
     }
+    qCWarning(lcNet)<<"[deliverChat] 目标无在线连接，留待补发 tar="<<tarname;
     return 0;
 }
 

@@ -426,7 +426,10 @@ void Group::handleResponse(PDU *pdu)
             item->setData(Qt::UserRole + 2, item->text());              // 基础文案（徽标在其上追加）
             refreshUnreadBadge(id, m_unreadByGroup.value(id, 0));
         }
-        m_statusLabel->setText(QStringLiteral("我的群聊：%1 个").arg(count));
+        // REQ-PAGE-FETCH-001：服务端数量截断时 body 末尾带 u8 truncated
+        bool listTruncated = (offset < payload.size() && quint8(payload.at(offset)) == 1);
+        m_statusLabel->setText(QStringLiteral("我的群聊：%1 个%2").arg(count)
+                               .arg(listTruncated ? QStringLiteral("，已截断") : QString()));
     } else if (pdu->uiType == ENUM_MSG_TYPE_QUERY_GROUP_INVITATIONS_RESPOND) {
         // 邀请响应：count × {invitation_id, group_id, group_name, inviter, status, expires_at}
         quint32 count = 0;
@@ -445,7 +448,9 @@ void Group::handleResponse(PDU *pdu)
                                              .arg(QString::fromUtf8(status)), m_invitationList);
             item->setData(Qt::UserRole, QVariant::fromValue<qulonglong>(invitationId));
         }
-        m_statusLabel->setText(QStringLiteral("待处理邀请：%1 个").arg(count));
+        bool invTruncated = (offset < payload.size() && quint8(payload.at(offset)) == 1);
+        m_statusLabel->setText(QStringLiteral("待处理邀请：%1 个%2").arg(count)
+                               .arg(invTruncated ? QStringLiteral("，已截断") : QString()));
     } else if (pdu->uiType == ENUM_MSG_TYPE_LIST_GROUP_MEMBERS_RESPOND) {
         // 成员响应：count × {username, role, status}，本页直接用弹窗展示
         quint32 count = 0;
@@ -457,6 +462,10 @@ void Group::handleResponse(PDU *pdu)
                     || !groupReadString(payload, offset, status)) return;
             members << QStringLiteral("%1 [%2] %3").arg(QString::fromUtf8(user))
                        .arg(QString::fromUtf8(role)).arg(QString::fromUtf8(status));
+        }
+        // REQ-PAGE-FETCH-001：服务端数量截断时 body 末尾带 u8 truncated
+        if (offset < payload.size() && quint8(payload.at(offset)) == 1) {
+            members << QStringLiteral("……（成员较多，已截断）");
         }
         QMessageBox::information(this, QStringLiteral("群成员"), members.join(QStringLiteral("\n")));
     } else if (pdu->uiType == ENUM_MSG_TYPE_CREATE_GROUP_RESPOND) {
