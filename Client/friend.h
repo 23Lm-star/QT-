@@ -67,6 +67,7 @@ private:
     uint m_friendTotal=0;       // 好友总数（封顶后）
     bool m_friendHasMore=false; // 还有下一页
     bool m_friendCapped=false;  // 好友总数超 LIST_TOTAL_CAP
+    bool m_friendInFlight=false; // 有请求在途：加载更多拦截防双击重复页（刷新入口强制重置可恢复）
     // 存在待处理的 UI 刷新数据
     bool m_pendingUiRefresh = false;
     // 已有一个 UI 刷新排队中

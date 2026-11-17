@@ -59,7 +59,7 @@ class Session {
     const cap = await account.requestCaptcha(this.net);
     assert.strictEqual(cap.status, 0, `验证码获取失败 status=${cap.status}`);
     const r = await account.login(this.net, { username: this.name, password: PASSWORD, captcha: cap.code, clientId: CID });
-    assert.strictEqual(r.ret, 1, `登录失败 ret=${r.ret}`);
+    assert.strictEqual(r.ret, 0, `登录失败 ret=${r.ret}`);   // 标准码 0=成功（PROTO-CODE-001）
   }
   close() { if (this.net) { this.net.close(); this.net = null; } }
 }
@@ -69,18 +69,20 @@ async function main() {
   const A = new Session(UA);
   const B = new Session(UB);
 
-  await A.register();
-  await B.register();
-  check('注册', '双用户经网关注册成功', true, `${UA} / ${UB}`);
-  await A.login();
-  await B.login();
-  check('登录', '双用户登录成功并保持长连接', true, '');
-
+  // try/finally 覆盖注册/登录：异常路径也关闭会话（清心跳定时器），进程自然退出，编排不再无限等待
   try {
+    await A.register();
+    await B.register();
+    check('注册', '双用户经网关注册成功', true, `${UA} / ${UB}`);
+    await A.login();
+    await B.login();
+    check('登录', '双用户登录成功并保持长连接', true, '');
     // 1) 在线列表：A 应看到 B，且不含自己（服务端已排除请求者）。
     const onlineA = await friendCmd.fetchOnlineUsers(A.name, A.net);
+    // 001 起返回 {name, online} 条目数组（旧字符串 includes 断言过期）
     check('在线列表', 'A 的在线列表包含 B 且不含自己',
-      onlineA.includes(UB) && !onlineA.includes(UA), `online=${JSON.stringify(onlineA)}`);
+      onlineA.some((e) => e.name === UB) && !onlineA.some((e) => e.name === UA),
+      `online=${JSON.stringify(onlineA)}`);
 
     // 2) A 发好友申请（9，发送即忘）→ B 收到 push 9。
     const reqOnB = waitForPush(B.net, T.ADDFRIEND_REQUEST,
@@ -91,12 +93,12 @@ async function main() {
 
     // 3) B 同意（10）→ 双方都收到 push 10 ret=1。
     const resOnA = waitForPush(A.net, T.ADDFRIEND_RESPOND,
-      (pdu) => friendCmd.parseFriendResult(pdu).ret === 1, 8000, '(A 收结果)');
+      (pdu) => friendCmd.parseFriendResult(pdu).ret === 0, 8000, '(A 收结果)');
     const resOnB = waitForPush(B.net, T.ADDFRIEND_RESPOND,
-      (pdu) => friendCmd.parseFriendResult(pdu).ret === 1, 8000, '(B 收结果)');
+      (pdu) => friendCmd.parseFriendResult(pdu).ret === 0, 8000, '(B 收结果)');
     friendCmd.sendAddFriendAgree(B.name, A.name, B.net);
     await Promise.all([resOnA, resOnB]);
-    check('同意结果', '同意后双方均收到 push 10 ret=1', true, '');
+    check('同意结果', '同意后双方均收到 push 10 ret=0（标准码成功）', true, '');
 
     // 4) 好友列表互含。
     const [fa, fb] = await Promise.all([friendCmd.fetchFriends(A.net), friendCmd.fetchFriends(B.net)]);
@@ -157,4 +159,5 @@ async function main() {
   process.exitCode = nfail === 0 ? 0 : 1;
 }
 
+// 不用 process.exit 强制退出：Node 26 下 WS 关闭 handle 未落定时强退会触发 libuv 断言崩溃
 main().catch((e) => { console.error('[chat_e2e] 异常:', e); process.exitCode = 2; });

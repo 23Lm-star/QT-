@@ -52,6 +52,7 @@ void OnlineUser::updateOnlineUser(const QVector<QPair<QString,bool>>& entries, u
     m_total=total;
     m_hasMore=hasMore;
     m_capped=capped;
+    m_inFlight=false;
     ui->loadMore_PB->setHidden(!hasMore);
     if(m_offset==0){
         ui->hintLabel->setText(m_keyword.isEmpty()?QStringLiteral("当前没有可添加的用户")
@@ -74,6 +75,7 @@ void OnlineUser::requestPage(uint offset)
     memcpy(pdu->caData+ALLUSER_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
     memcpy(pdu->caData+ALLUSER_REQ_OFFSET_OFFSET,&offset,sizeof(offset));
     copyFixedField(pdu->caData+ALLUSER_REQ_KEYWORD_OFFSET,ALLUSER_REQ_KEYWORD_BYTES,m_keyword.toUtf8());
+    m_inFlight=true;
     Client::getinstance().seedMsg(pdu);
 }
 
@@ -90,13 +92,14 @@ void OnlineUser::resetAndRequest()
 // 加载更多：按已加载条数请求下一页（携带当前搜索词）
 void OnlineUser::on_loadMore_PB_clicked()
 {
-    if(!m_hasMore) return;
+    if(!m_hasMore || m_inFlight) return;
     requestPage(m_offset);
 }
 
 // REQ-PAGE-FETCH-002：搜索/清空关键词均从第 0 页重拉；超限关键词客户端拦截不发送
 void OnlineUser::on_search_PB_clicked()
 {
+    if(m_inFlight) return;   // 在途拦截：防连续搜索响应交错混页（重开窗口走 resetAndRequest 强制恢复）
     const QString kw=ui->search_LE->text().trimmed();
     if(kw.toUtf8().size()>ALLUSER_REQ_KEYWORD_BYTES-1){
         ui->hintLabel->setText(QStringLiteral("关键词过长（UTF-8 须 ≤31 字节），请缩短后重试"));

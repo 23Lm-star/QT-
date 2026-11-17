@@ -68,7 +68,7 @@ class Session {
     const cap = await account.requestCaptcha(this.net);
     assert.strictEqual(cap.status, 0, `验证码失败 status=${cap.status}`);
     const r = await account.login(this.net, { username: this.name, password: PASSWORD, captcha: cap.code, clientId: CID });
-    assert.strictEqual(r.ret, 1, `登录失败 ret=${r.ret}`);
+    assert.strictEqual(r.ret, 0, `登录失败 ret=${r.ret}`);   // 标准码 0=成功（PROTO-CODE-001）
   }
   close() { if (this.net) { this.net.close(); this.net = null; } }
 }
@@ -87,8 +87,8 @@ async function makeFriends(a, b) {
     (p) => friend.parseIncomingFriendRequest(p).requester === a.name, 15000, '(push 9)');
   a.net.sendFrame(T.ADDFRIEND_REQUEST, twoName(a.name, b.name));
   await w9;
-  const wA = waitForPush(a.net, T.ADDFRIEND_RESPOND, (p) => friend.parseFriendResult(p).ret === 1, 15000, '(push 10 A)');
-  const wB = waitForPush(b.net, T.ADDFRIEND_RESPOND, (p) => friend.parseFriendResult(p).ret === 1, 15000, '(push 10 B)');
+  const wA = waitForPush(a.net, T.ADDFRIEND_RESPOND, (p) => friend.parseFriendResult(p).ret === 0, 15000, '(push 10 A)');
+  const wB = waitForPush(b.net, T.ADDFRIEND_RESPOND, (p) => friend.parseFriendResult(p).ret === 0, 15000, '(push 10 B)');
   b.net.sendFrame(T.ADDFRIEND_RESPOND, twoName(b.name, a.name));
   await Promise.all([wA, wB]);
 }
@@ -156,10 +156,11 @@ async function main() {
   const A = new Session(USER_A);
   const B = new Session(USER_B);
   const C = new Session(USER_C);
-  for (const s of [A, B, C]) await s.register();
-  await A.login();
-  await B.login();
+  // try/finally 覆盖注册/登录：异常路径也关闭会话（清心跳定时器），进程自然退出，编排不再无限等待
   try {
+    for (const s of [A, B, C]) await s.register();
+    await A.login();
+    await B.login();
     // ===== 好友关系（网页 UI 只允许分享给好友；服务端本身不校验） =====
     await makeFriends(A, B);
     const aFriends = await friend.fetchFriends(A.net);
@@ -289,8 +290,9 @@ async function main() {
       `state=${qExpired.state}`);
 
     const cReuseDead = await share.createPublishLink({ relativePath: rel }, A.net);
-    check('L12', '52 缺省复用如实回带过期状态（ok=true/state=1）',
-      cReuseDead.ok && cReuseDead.state === share.PUBLINK_STATE_EXPIRED,
+    // PROTO-CODE-001 R4：独立状态字取消，过期由标准码表达（ok=false/state=-2017）；旧 ok=true/state=1 前提过期
+    check('L12', '52 缺省复用按标准码如实回过期（ok=false/state=EXPIRED）',
+      cReuseDead.ok === false && cReuseDead.state === share.PUBLINK_STATE_EXPIRED,
       `ok=${cReuseDead.ok} state=${cReuseDead.state}`);
 
     const cRenewDefault = await share.createPublishLink({
@@ -311,15 +313,13 @@ async function main() {
     const newAlive = await share.resolvePublishLink(cNew.link, B.net);
     check('L16', '新链接可取文件', newAlive.ok, `ok=${newAlive.ok} saved=${newAlive.savedPath}`);
 
-    // 目录路径：52 不校验类型（服务端会建链接），54 取回失败
+    // 目录路径：REQ-AUDIT-001 R4 起 52 拒绝为目录创建链接（旧「不校验类型、取回才失败」前提过期）
     const dirName = `dir_${ts}`;
     const mk = await drive.makeDirectory(`${ROOT}/${USER_A}`, dirName, A.net);
     check('L17', '准备目录用于类型负例', mk === true, `mkdir=${mk}`);
     const cDir = await share.createPublishLink({ relativePath: dirName }, A.net);
-    const rDir = await share.resolvePublishLink(cDir.link, B.net);
-    check('L18', '目录链接可创建但取回失败（55 ok=false）',
-      cDir.ok && cDir.link.startsWith(share.PUBLINK_PREFIX) && rDir.ok === false,
-      `create=${cDir.ok} resolve=${rDir.ok}`);
+    check('L18', '目录链接创建被拒（AUDIT-001：仅本人根内非目录条目）',
+      cDir.ok === false && !cDir.link, `create=${cDir.ok} link=${cDir.link}`);
 
     // 同名不同对象：接收者「分享链接」已有同名文件 → (1) 后缀 + 内容为第二个源
     const subDir = `sub_${ts}`;
@@ -338,11 +338,10 @@ async function main() {
         `size=${got2.size}`);
     } else { check('L20', '(1) 副本内容等于第二个源', false, '跳过：L19 失败'); }
 
-    // 路径逃逸：分享路径指到他人根（52 不校验，54 必须拒绝）
+    // 路径逃逸：分享路径指到他人根——REQ-AUDIT-001 R4 起创建阶段即拒绝（旧「54 才拒绝」前提过期）
     const cEscape = await share.createPublishLink({ relativePath: `../${USER_B}/${fileName}` }, A.net);
-    const rEscape = await share.resolvePublishLink(cEscape.link, B.net);
-    check('L21', '外链源路径逃逸出分享人根时取回失败',
-      cEscape.ok && rEscape.ok === false, `create=${cEscape.ok} resolve=${rEscape.ok}`);
+    check('L21', '外链源路径逃逸出分享人根：创建被拒且不落库',
+      cEscape.ok === false && !cEscape.link, `create=${cEscape.ok}`);
   } finally {
     for (const s of [A, B, C]) s.close();
   }
@@ -354,4 +353,5 @@ async function main() {
   }
 }
 
-await main();
+// 不用 process.exit 强制退出：Node 26 下 WS 关闭 handle 未落定时强退会触发 libuv 断言崩溃
+main().catch((e) => { console.error('[share_e2e] 异常:', e); process.exitCode = 2; });

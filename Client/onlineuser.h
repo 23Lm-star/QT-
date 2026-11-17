@@ -50,6 +50,7 @@ private:
     // REQ-PAGE-FETCH-002 搜索与封顶状态
     QString m_keyword;      // 当前搜索词（空=不过滤）
     bool m_capped=false;    // 结果总量超 LIST_TOTAL_CAP
+    bool m_inFlight=false;  // 有请求在途：搜索/加载更多拦截，防连续搜索混页与双击重复页
 };
 
 #endif // ONLINEUSER_H

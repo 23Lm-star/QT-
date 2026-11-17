@@ -48,12 +48,13 @@ void Friend::requestFriendPage(uint offset)
     const uint limit=50;
     memcpy(pdu->caData+FRIEND_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
     memcpy(pdu->caData+FRIEND_REQ_OFFSET_OFFSET,&offset,sizeof(offset));
+    m_friendInFlight=true;
     Client::getinstance().seedMsg(pdu);
 }
 
 void Friend::on_loadMore_PB_clicked()
 {
-    if(!m_friendHasMore) return;
+    if(!m_friendHasMore || m_friendInFlight) return;
     requestFriendPage(uint(m_friendList.size()));
 }
 
@@ -83,6 +84,7 @@ void Friend::flushFriend_LW(const QStringList& q, uint total, bool hasMore, bool
     m_friendTotal=total;
     m_friendHasMore=hasMore;
     m_friendCapped=capped;
+    m_friendInFlight=false;
     ui->loadMore_PB->setHidden(!hasMore);
     m_pendingUiRefresh = true;
     scheduleUiRefresh();

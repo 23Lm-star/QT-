@@ -75,13 +75,10 @@ export async function register(net, { username, password, captcha }) {
   const ret = readI32(resp.caData, 0);
   const result = { ret };
   if (ret === LoginRet.LOCKED) result.remaining = readI32(resp.caData, 4);
-  // 注册成功：ret 非 0 且非 -2/-3/-4；caData[32..63]=注册名。
-  if (ret !== 0 && ret !== -2 && ret !== -3 && ret !== -4) {
-    result.name = readFixedString(resp.caData, 32, 32);
-    result.success = true;
-  } else {
-    result.success = false;
-  }
+  // REQ-PROTO-CODE-001 标准码：0=成功（旧「ret 非 0 即成功」判定与服务端标准码相反，
+  // 导致网页注册对标准码服务端必失败——002 回归时发现并修复）；caData[32..63]=注册名。
+  result.success = ret === LoginRet.SUCCESS;
+  if (result.success) result.name = readFixedString(resp.caData, 32, 32);
   return result;
 }
 
