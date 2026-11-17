@@ -13,7 +13,9 @@ int main(int argc, char *argv[])
 
     // 默认安静：debug 级不输出。排查时设 QT_LOGGING_RULES="xmu.*.debug=true" 打开全部，
     // 或单类 "xmu.db.debug=true"。Qt 5.14 实测环境变量优先于程序化规则，无需守卫。
-    QLoggingCategory::setFilterRules(QStringLiteral("xmu.*.debug=false"));
+    // REQ-AUDIT-FULL-001：PDU 报文日志默认开启（终端+文件，供纠错排查；环境变量可覆盖）。
+    QLoggingCategory::setFilterRules(QStringLiteral("xmu.*.debug=false\nxmu.net.pdu.debug=true"));
+    installFileLogging(QStringLiteral("server"));
 
     // 显式初始化服务端（加载配置+监听端口），失败时退出
     Server& s = Server::getinstance();

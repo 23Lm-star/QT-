@@ -200,14 +200,50 @@ void File::resetUserPath()
     qCDebug(lcCli)<<"创建用户今日目录:"<<QDate::currentDate().toString("yyyy-MM")<<" "<<dir.mkdir(m_strUserPath+"/"+QString(QDate::currentDate().toString("yyyy-MM")))<<endl;
 }
 
-// 发送 FLUSHFILE：以当前路径为载荷（多留 1 字节 NUL），响应由 Client 路由回 updateCurrfile
+// 发送 FLUSHFILE：caData=limit/offset（REQ-PAGE-FETCH-001），caMsg=当前路径（多留 1 字节 NUL）
 void File::flushfile()
 {
     int curPathLen=m_strCurPath.toUtf8().toStdString().size();//记录当前路径长度(utf8编码)
-    PDU* pdu=mkPDU(curPathLen+1);//留出一个空格来
+    PDU* pdu=mkPDU(uint(curPathLen)+1);//留出一个空格来
     pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
     memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),curPathLen);
+    const uint limit=50;
+    memcpy(pdu->caData+FLUSHFILE_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
+    const uint offset=0;
+    memcpy(pdu->caData+FLUSHFILE_REQ_OFFSET_OFFSET,&offset,sizeof(offset));
+    m_loadedCount=0; m_listTotal=0; m_listHasMore=false;   // 第 0 页：重置分页状态
     Client::getinstance().seedMsg(pdu);
+}
+
+// 加载更多：按已加载条数请求下一页（路径与第 0 页一致）
+void File::on_loadMore_PB_clicked()
+{
+    if(!m_listHasMore) return;
+    int curPathLen=m_strCurPath.toUtf8().toStdString().size();
+    PDU* pdu=mkPDU(uint(curPathLen)+1);
+    pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
+    memcpy(pdu->caMsg,m_strCurPath.toUtf8().toStdString().c_str(),curPathLen);
+    const uint limit=50;
+    memcpy(pdu->caData+FLUSHFILE_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
+    memcpy(pdu->caData+FLUSHFILE_REQ_OFFSET_OFFSET,&m_loadedCount,sizeof(m_loadedCount));
+    Client::getinstance().seedMsg(pdu);
+}
+
+// REQ-PAGE-FETCH-001：分页接收目录列表；已加载为 0 时替换旧数据，否则追加
+void File::updateCurrfilePage(QList<FileInfo *> qFileinfolist, uint total, bool hasMore){
+    if(m_loadedCount==0){
+        foreach(FileInfo* fileInfos,m_fileInfoList){
+            delete fileInfos;
+        }
+        m_fileInfoList.clear();
+    }
+    m_fileInfoList.append(qFileinfolist);          // File 接管新条目所有权
+    m_loadedCount+=uint(qFileinfolist.size());
+    m_listTotal=total;
+    m_listHasMore=hasMore;
+    qCDebug(lcCli) << "[File] updateCurrfilePage: 累计" << m_loadedCount << "/" << m_listTotal;
+    m_pendingUiRefresh=true;
+    scheduleUiRefresh();
 }
 
 // 接管服务端目录列表：释放旧条目、保存新列表，仅登记刷新需求（不立即重建控件）
@@ -238,6 +274,11 @@ void File::rebuildFileList(){
         pItem->setText(m_fileInfoList[i]->caName);
         qCDebug(lcCli)<<"pFileInfo->caName:"<<m_fileInfoList[i]->caName<<" qFileinfolist[i]->uiType"<<m_fileInfoList[i]->uiType<<" ";
         ui->file_LW->addItem(pItem);
+    }
+    // REQ-PAGE-FETCH-001：有下一页才显示「加载更多」，并回显加载进度
+    ui->loadMore_PB->setHidden(!m_listHasMore);
+    if(m_listHasMore){
+        ui->loadMore_PB->setText(QStringLiteral("加载更多（已加载 %1/共 %2）").arg(uint(m_loadedCount)).arg(uint(m_listTotal)));
     }
     m_pendingUiRefresh=false;
 }
@@ -356,6 +397,9 @@ void File::on_file_LW_itemDoubleClicked(QListWidgetItem *item)
         this->m_strCurPath+="/"+triName->text().toUtf8();//将目录切换到选中文件目录
         ui->currPath_LE->setText(m_strCurPath);
         //刷新文件
+        // 导航请求与刷新同口径重置分页状态：响应端按 m_loadedCount==0 才清列表，
+        // 不重置会把新目录条目追加进旧列表（幽灵行/串目录，2026-11-14 GUI 实测）
+        m_loadedCount=0; m_listTotal=0; m_listHasMore=false;
         PDU* pdu=mkPDU(m_strCurPath.toStdString().size()+1);
         pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
         memcpy(pdu->caMsg,this->m_strCurPath.toStdString().c_str(),this->m_strCurPath.toStdString().size());
@@ -383,6 +427,8 @@ void File::on_back_PB_clicked()
     m_strCurPath.remove(cnt,m_strCurPath.size()-cnt);
     ui->currPath_LE->setText(m_strCurPath);
     //刷新文件
+    // 导航请求与刷新同口径重置分页状态（见 on_file_LW_itemDoubleClicked）
+    m_loadedCount=0; m_listTotal=0; m_listHasMore=false;
     PDU* pdu=mkPDU(m_strCurPath.toStdString().size()+1);
     pdu->uiType=ENUM_MSG_TYPE_FLUSHFILE_REQUEST;
     memcpy(pdu->caMsg,this->m_strCurPath.toStdString().c_str(),this->m_strCurPath.toStdString().size());

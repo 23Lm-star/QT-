@@ -205,7 +205,8 @@ public:
 	}
 
 	//������ + Ͱ�Ķ�����(+8��+16��+128...)->��ϣͰ����
-	// 档位公式：ceil(bytes / 2^AlignIndex) - 1；AlignIndex 即对齐字节数的 log2。
+	// 档位公式：ceil((bytes - 区间下界) / 2^AlignIndex) - 1 + 区间起始桶偏移。
+	// 偏移必须加：否则五个区间的首档都落在桶 8，不同尺寸混用同一桶会把小块当大块借出。
 	static inline size_t _Index(size_t bytes, size_t AlignIndex)//��2��ָ������
 {
 		//        -1Ҳ��Ϊ����8�����λ���ֲ���    ֻʣ���λ     
@@ -220,16 +221,16 @@ public:
 			return _Index(bytes, 3);
 		}
 		else if (bytes <= 1024){
-			return _Index(bytes, 4);
+			return _Index(bytes - 128, 4) + 16;
 		}
 		else if (bytes <= 8 * 1024){
-			return _Index(bytes, 7);
+			return _Index(bytes - 1024, 7) + 72;
 		}
 		else if (bytes <= 64 * 1024){
-			return _Index(bytes, 10);
+			return _Index(bytes - 8 * 1024, 10) + 128;
 		}
 		else if (bytes <= 256 * 1024){
-			return _Index(bytes, 13);
+			return _Index(bytes - 64 * 1024, 13) + 184;
 		}
 		else{
 			assert(false);

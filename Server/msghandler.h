@@ -145,6 +145,9 @@ public:
     void chatDeliveredAck();
     // 113/114：本人仍待处理的好友申请（离线期间登记的也在内）
     PDU* listPendingFriendRequests();
+    // ===== REQ-PAGE-FETCH-001：117/118 聊天历史分页（桌面端专用；17/18 网页端语义不变） =====
+    PDU* chatHistory();
+
     // 115：拒绝好友申请（只清本人收到的 pending 行，无响应）
     void rejectFriendRequest();
     // 取验证码：成功则生成新码并从 caMsg 返回，锁定/冷却中只回状态码与剩余秒数。

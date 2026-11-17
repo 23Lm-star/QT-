@@ -13,6 +13,8 @@ void* ConCurrentAlloc(size_t size){
 		PageCache::GetInstance()->GetMutex().lock();
 		span* Span = PageCache::GetInstance()->NewSpan(page);
 		Span->_FreeKnowSize = align;
+		// 大对象 span 同样要标记在用：否则相邻空闲 span 释放时会把这块活内存当空闲块合并走。
+		Span->_IsUse = true;
 		PageCache::GetInstance()->GetMutex().unlock();
 
 		// Page_Adder 是页号，左移还原为内存地址。

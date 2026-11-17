@@ -681,6 +681,54 @@ bool OperateDB::deleteFriendMessages(const QString &userA, const QString &userB)
     return ok;
 }
 
+// REQ-AUDIT-FULL-001：删除好友与清理双方私聊记录同事务。
+// 改前 handleDeleteFriend 提交后另起连接 deleteFriendMessages，消息清理失败不回滚，
+// 可能留下"非好友但历史仍在"的窗口。任一步失败整体回滚，不会只删一半。
+bool OperateDB::deleteFriendCascade(const QString &userA, const QString &userB)
+{
+    if(userA.isEmpty() || userB.isEmpty() || userA == userB){
+        return false;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return false;
+    }
+    QSqlDatabase db = connection.database();
+    if(!db.transaction()){
+        qCWarning(lcDb)<<"deleteFriendCascade 事务开启失败:"<<db.lastError().text();
+        return false;
+    }
+    QSqlQuery q(db);
+    q.prepare("DELETE FROM friend WHERE (name = ? AND friendName = ?) OR (name = ? AND friendName = ?)");
+    q.addBindValue(userA);
+    q.addBindValue(userB);
+    q.addBindValue(userB);
+    q.addBindValue(userA);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"deleteFriendCascade 删好友失败:"<<q.lastError().text();
+        db.rollback();
+        return false;
+    }
+    q.prepare("DELETE FROM message_info WHERE (seed_name = ? AND rev_name = ?) OR (seed_name = ? AND rev_name = ?)");
+    q.addBindValue(userA);
+    q.addBindValue(userB);
+    q.addBindValue(userB);
+    q.addBindValue(userA);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"deleteFriendCascade 清聊天记录失败:"<<q.lastError().text();
+        db.rollback();
+        return false;
+    }
+    if(!db.commit()){
+        qCWarning(lcDb)<<"deleteFriendCascade 提交失败:"<<db.lastError().text();
+        db.rollback();
+        return false;
+    }
+    return true;
+}
+
+
+
 // 登录：校验 md5(客户端哈希+盐) 后原子分配 login_version、写登录档案并置 online=1。
 // 返回 1 成功 / 0 系统失败（连接、事务、SQL）/ -1 用户名或密码错误。
 // 成功时 outVersion 为本次事务内分配的版本号；失败时保证为 0。
@@ -814,42 +862,74 @@ int OperateDB::handleFindUser(const char *userName)
     q.prepare("select * from user_info where name = ?");
     q.addBindValue(QString::fromUtf8(userName));
     qCDebug(lcDb)<<"find user:"<<QString::fromUtf8(userName);
-    q.exec();
+    // REQ-AUDIT-FULL-001：查询失败回 -1（数据库不可用），不再误报"用户不存在"
+    if(!q.exec()){
+        qCWarning(lcDb)<<"handleFindUser exec failed:"<<q.lastError().text();
+        return -1;
+    }
     if(q.next()){
         return q.value(3).toInt();
     }
     return 2;
 }
 
-// 在线陌生人列表：排除自己，也排除任一方向已成好友的用户。
-// 连接失败返回空列表（与"确实没有在线用户"不可区分，调用方按空处理）。
-QStringList OperateDB::handleOnlineUsers(const QString &strname)
+// 所有用户分页（含离线；排除自己，也排除任一方向已成好友的用户）。
+// 按名字字典序稳定排序；调用方保证 limit∈[1,200]、offset 为分页起点。
+// totalOut 回带符合条件总数；hasMoreOut=还有下一页；连接失败返回空列表。
+QVector<QPair<QString,bool>> OperateDB::handleAllUsers(const QString &strname, uint limit, uint offset,
+                                                       uint *totalOut, bool *hasMoreOut)
 {
+    QVector<QPair<QString,bool>> ret;
+    if(totalOut!=nullptr) *totalOut=0;
+    if(hasMoreOut!=nullptr) *hasMoreOut=false;
+    if(strname.isEmpty()){
+        return ret;
+    }
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()){
-        return QStringList();
+        return ret;
     }
     QSqlDatabase db = connection.database();
     QSqlQuery q(db);
 
-    // 查询在线且不是自己，且不在好友表中的用户
-    q.prepare(R"(SELECT name FROM user_info 
-                 WHERE online = 1 AND name != ? 
-                 AND name NOT IN (
-                     SELECT friendName FROM friend WHERE name = ?
-                     UNION
-                     SELECT name FROM friend WHERE friendName = ?
-                 ))");
+    const QString baseWhere = QLatin1String(
+        "name != ? AND name NOT IN ("
+        " SELECT friendName FROM friend WHERE name = ?"
+        " UNION"
+        " SELECT name FROM friend WHERE friendName = ?)");
+    q.prepare("SELECT COUNT(*) FROM user_info WHERE "+baseWhere);
     q.addBindValue(strname);
     q.addBindValue(strname);
     q.addBindValue(strname);
-    qCDebug(lcDb)<<"online users query for:"<<strname;
-    q.exec();
+    if(q.exec() && q.next()){
+        if(totalOut!=nullptr) *totalOut=q.value(0).toUInt();
+    }
 
-    QStringList ret;
+    // REQ-PAGE-FETCH-001：limit==0 视为旧全量语义（网页端/旧脚本不发分页字段），不设 LIMIT
+    if(limit==0){
+        q.prepare("SELECT name, online FROM user_info WHERE "+baseWhere+" ORDER BY name ASC");
+        q.addBindValue(strname);
+        q.addBindValue(strname);
+        q.addBindValue(strname);
+    }else{
+        q.prepare("SELECT name, online FROM user_info WHERE "+baseWhere+
+                  " ORDER BY name ASC LIMIT ? OFFSET ?");
+        q.addBindValue(strname);
+        q.addBindValue(strname);
+        q.addBindValue(strname);
+        q.addBindValue(limit);
+        q.addBindValue(offset);
+    }
+    qCDebug(lcDb)<<"all users query for:"<<strname<<"limit"<<limit<<"offset"<<offset;
+    if(!q.exec()){
+        return ret;
+    }
     while(q.next())
     {
-        ret.append(q.value(0).toString());
+        ret.append(qMakePair(q.value(0).toString(), q.value(1).toInt()==1));
+    }
+    if(hasMoreOut!=nullptr){
+        *hasMoreOut = (limit!=0) && ((offset + uint(ret.size())) < (totalOut!=nullptr? *totalOut : 0));
     }
     return ret;
 }
@@ -965,8 +1045,10 @@ int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
 }
 
 // 好友列表：UNION 合并两个方向并自动去重；连接失败返回空列表
-QStringList OperateDB::handleFlushFriend(const QString &strname)
+QStringList OperateDB::handleFlushFriend(const QString &strname, bool *truncatedOut)
 {
+    QStringList ret;
+    if(truncatedOut!=nullptr) *truncatedOut=false;
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()){
         return QStringList();
@@ -975,16 +1057,28 @@ QStringList OperateDB::handleFlushFriend(const QString &strname)
     QSqlQuery q(db);
 
     // 查询 name=strname 时的 friendName，以及 friendName=strname 时的 name
-    q.prepare(R"(SELECT friendName FROM friend WHERE name = ? 
-                 UNION 
-                 SELECT name FROM friend WHERE friendName = ?)");
+    // REQ-PAGE-FETCH-001：多取一条判定截断，至多回 PAGE_MAX_LIMIT 条
+    q.prepare(R"(SELECT friendName FROM friend WHERE name = ?
+                 UNION
+                 SELECT name FROM friend WHERE friendName = ?
+                 LIMIT ?)");
     q.addBindValue(strname);
     q.addBindValue(strname);
-    q.exec();
+    q.addBindValue(uint(PAGE_MAX_LIMIT) + 1);
+    // REQ-AUDIT-FULL-001：查询失败显式告警，不再静默当作"无好友"
+    if(!q.exec()){
+        qCWarning(lcDb)<<"handleFlushFriend exec failed:"<<q.lastError().text();
+        return QStringList();
+    }
 
-    QStringList ret;
     while(q.next()){
         ret.append(q.value(0).toString());
+    }
+    if(truncatedOut!=nullptr){
+        *truncatedOut = ret.size() > int(PAGE_MAX_LIMIT);
+    }
+    if(ret.size() > int(PAGE_MAX_LIMIT)){
+        ret = ret.mid(0, int(PAGE_MAX_LIMIT));
     }
     return ret;
 }
@@ -1068,9 +1162,10 @@ bool OperateDB::seedchatMsg(char *seedName, char *revName, QString msg, QString 
 // 拉取未送达私聊消息（issuccess=0），只读不标记（REQ-AUDIT-001 R2）。
 // 返回扁平列表，每条消息依次为 msg、seed_time；idOut 回带对应主键（供写出成功后标记）。
 // 返回空也可能是确实没有消息。按主键升序＝接收顺序。
-QStringList OperateDB::getchatMsg(char *seedName, char *revName, QVector<qlonglong> *idOut)
+QStringList OperateDB::getchatMsg(char *seedName, char *revName, QVector<qlonglong> *idOut, bool *truncatedOut)
 {
     QStringList ret;
+    if(truncatedOut != nullptr) *truncatedOut=false;
     if(idOut != nullptr) idOut->clear();
     if(seedName==nullptr||revName==nullptr){
         return ret;
@@ -1083,10 +1178,12 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName, QVector<qlonglo
     QSqlDatabase db = connection.database();
 
     QSqlQuery q(db);
+    // REQ-PAGE-FETCH-001：单批最多 PAGE_MAX_LIMIT 条（多取一条判定截断），仍按主键升序取最旧的一批
     q.prepare("select id,msg,seed_time from message_info "
-              "where seed_name = ? and rev_name = ? and issuccess = 0 order by id asc");
+              "where seed_name = ? and rev_name = ? and issuccess = 0 order by id asc limit ?");
     q.addBindValue(QString::fromUtf8(seedName));
     q.addBindValue(QString::fromUtf8(revName));
+    q.addBindValue(uint(PAGE_MAX_LIMIT) + 1);
     qCDebug(lcDb)<<"getchatMsg for:"<<QString::fromUtf8(seedName)<<"->"<<QString::fromUtf8(revName);
     if(!q.exec()){
         qCWarning(lcDb)<<"getchatMsg select failed:"<<q.lastError().text();
@@ -1097,7 +1194,78 @@ QStringList OperateDB::getchatMsg(char *seedName, char *revName, QVector<qlonglo
         ret.append(q.value(1).toString());   // msg
         ret.append(q.value(2).toString());   // seed_time
     }
+    if(truncatedOut != nullptr){
+        *truncatedOut = ret.size() > int(PAGE_MAX_LIMIT) * 2;
+    }
+    if(ret.size() > int(PAGE_MAX_LIMIT) * 2){
+        ret = ret.mid(0, int(PAGE_MAX_LIMIT) * 2);    // 超上限截断，剩余确认后可再拉
+        if(idOut != nullptr) idOut->resize(int(PAGE_MAX_LIMIT));
+    }
     return ret;
+}
+
+// REQ-PAGE-FETCH-001：聊天历史分页（双方全部历史，含已送达；只读不改 issuccess）。
+// cursorId=0 从最新一页开始，>0 只取 id<cursorId 的更早消息；按 id 降序取 limit+1 条判定 has_more。
+QVector<OperateDB::ChatHistoryRow> OperateDB::getChatHistoryPage(const QString &self, const QString &peer,
+                                                                 qint64 cursorId, uint limit,
+                                                                 uint *totalOut, bool *hasMoreOut,
+                                                                 qint64 *oldestOut)
+{
+    QVector<ChatHistoryRow> rows;
+    if(totalOut!=nullptr) *totalOut=0;
+    if(hasMoreOut!=nullptr) *hasMoreOut=false;
+    if(oldestOut!=nullptr) *oldestOut=0;
+    if(self.isEmpty() || peer.isEmpty() || limit==0){
+        return rows;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return rows;
+    }
+    QSqlDatabase db = connection.database();
+    QSqlQuery q(db);
+    const QString pairWhere = QLatin1String(
+        "(seed_name = ? AND rev_name = ?) OR (seed_name = ? AND rev_name = ?)");
+    q.prepare("SELECT COUNT(*) FROM message_info WHERE "+pairWhere);
+    q.addBindValue(self); q.addBindValue(peer);
+    q.addBindValue(peer); q.addBindValue(self);
+    if(q.exec() && q.next()){
+        if(totalOut!=nullptr) *totalOut=q.value(0).toUInt();
+    }
+    // 注意括号：pairWhere 含 OR，游标条件必须约束整个双方组合，不能只约束后半段
+    QString sql=QStringLiteral("SELECT id, seed_name, msg, seed_time FROM message_info WHERE (")
+            + pairWhere + QLatin1String(")");
+    if(cursorId>0){
+        sql+=QLatin1String(" AND id < ?");
+    }
+    sql+=QLatin1String(" ORDER BY id DESC LIMIT ?");
+    q.prepare(sql);
+    q.addBindValue(self); q.addBindValue(peer);
+    q.addBindValue(peer); q.addBindValue(self);
+    if(cursorId>0) q.addBindValue(cursorId);
+    q.addBindValue(limit+1);
+    if(!q.exec()){
+        qCWarning(lcDb)<<"getChatHistoryPage failed:"<<q.lastError().text();
+        return rows;
+    }
+    while(q.next()){
+        ChatHistoryRow r;
+        r.id=q.value(0).toLongLong();
+        r.fromSelf=(q.value(1).toString()==self);
+        r.msg=q.value(2).toString();
+        r.time=q.value(3).toString();
+        rows.append(r);
+    }
+    if(hasMoreOut!=nullptr){
+        *hasMoreOut = rows.size() > int(limit);
+    }
+    if(rows.size() > int(limit)){
+        rows = rows.mid(0, int(limit));               // 丢弃多取的判定行
+    }
+    if(!rows.isEmpty() && oldestOut!=nullptr){
+        *oldestOut = rows.last().id;                  // id 降序 → 末条最旧
+    }
+    return rows;
 }
 
 // 标记已送达：只更新仍为未送达的行，重复调用无副作用。
@@ -1158,9 +1326,10 @@ bool OperateDB::markChatDeliveredFor(const QString &rev, const QVector<qlonglong
 }
 
 // REQ-CHAT-ACK-001 R10：本人仍待处理的好友申请，按登记时间倒序（早的先处理）
-QStringList OperateDB::listPendingFriendRequests(const QString &target)
+QStringList OperateDB::listPendingFriendRequests(const QString &target, bool *truncatedOut)
 {
     QStringList ret;
+    if(truncatedOut!=nullptr) *truncatedOut=false;
     if(target.isEmpty()){
         return ret;
     }
@@ -1169,15 +1338,24 @@ QStringList OperateDB::listPendingFriendRequests(const QString &target)
         return ret;
     }
     QSqlQuery q(connection.database());
+    // REQ-PAGE-FETCH-001：只取最近 PAGE_TRUNCATE_DAYS 天内的 pending 申请，至多 PAGE_MAX_LIMIT 条
     q.prepare("select requester_name from friend_request "
-              "where target_name = ? and status = 'pending' order by created_at asc, id asc");
+              "where target_name = ? and status = 'pending' "
+              "and created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) "
+              "order by created_at asc, id asc limit ?");
     q.addBindValue(target);
+    q.addBindValue(uint(PAGE_TRUNCATE_DAYS));
+    q.addBindValue(uint(PAGE_MAX_LIMIT));
     if(!q.exec()){
         qCWarning(lcDb)<<"listPendingFriendRequests failed:"<<q.lastError().text();
         return ret;
     }
     while(q.next()){
         ret.append(q.value(0).toString());
+    }
+    if(truncatedOut!=nullptr){
+        // 窗口内条数已达上限即视为截断（窗口外更早的申请不再提示）
+        *truncatedOut = ret.size() >= int(PAGE_MAX_LIMIT);
     }
     return ret;
 }
@@ -1555,10 +1733,12 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
 
     // ---- 只读分支：群列表（仅 active 成员，最近更新的群在前） ----
     if (request.operation == GroupList) {
+        // REQ-PAGE-FETCH-001：多取一条判定截断，body 末尾追加 u8 truncated（旧端多出 1 字节不读）
         q.prepare("SELECT gi.group_id,gi.group_name,gi.status,gm.role,gi.version "
                   "FROM group_member gm JOIN group_info gi ON gi.group_id=gm.group_id "
-                  "WHERE gm.user_name=? AND gm.status='active' ORDER BY gi.updated_at DESC");
+                  "WHERE gm.user_name=? AND gm.status='active' ORDER BY gi.updated_at DESC LIMIT ?");
         q.addBindValue(actor);
+        q.addBindValue(uint(PAGE_MAX_LIMIT) + 1);
         if (!q.exec()) return groupFailure(-1007);
         QByteArray body;
         QList<QByteArray> rows;
@@ -1568,8 +1748,11 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
                               q.value(2).toString(), q.value(3).toString(), q.value(4).toULongLong());
             rows.append(row);
         }
+        bool truncated = rows.size() > int(PAGE_MAX_LIMIT);
+        if (truncated) rows = rows.mid(0, int(PAGE_MAX_LIMIT));
         groupAppendU32(body, quint32(rows.size()));
         for (const QByteArray &row : rows) body.append(row);
+        body.append(char(truncated ? 1 : 0));
         result = groupFailure(0);
         result.responseBody = body;
         return result;
@@ -1577,11 +1760,16 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
 
     // ---- 只读分支：我收到的、仍 pending 的邀请 ----
     if (request.operation == GroupQueryInvitations) {
+        // REQ-PAGE-FETCH-001：只取最近 PAGE_TRUNCATE_DAYS 天内，至多 PAGE_MAX_LIMIT 条
         q.prepare("SELECT i.invitation_id,i.group_id,gi.group_name,i.inviter_name,i.status,"
                   "UNIX_TIMESTAMP(i.expires_at) FROM group_invitation i "
                   "JOIN group_info gi ON gi.group_id=i.group_id "
-                  "WHERE i.target_name=? AND i.status='pending' ORDER BY i.created_at DESC");
+                  "WHERE i.target_name=? AND i.status='pending' "
+                  "AND i.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) "
+                  "ORDER BY i.created_at DESC LIMIT ?");
         q.addBindValue(actor);
+        q.addBindValue(uint(PAGE_TRUNCATE_DAYS));
+        q.addBindValue(uint(PAGE_MAX_LIMIT) + 1);
         if (!q.exec()) return groupFailure(-1008);
         QList<QByteArray> rows;
         while (q.next()) {
@@ -1594,9 +1782,12 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
             groupAppendU64(row, q.value(5).toULongLong());
             rows.append(row);
         }
+        bool truncated = rows.size() > int(PAGE_MAX_LIMIT);
+        if (truncated) rows = rows.mid(0, int(PAGE_MAX_LIMIT));
         QByteArray body;
         groupAppendU32(body, quint32(rows.size()));
         for (const QByteArray &row : rows) body.append(row);
+        body.append(char(truncated ? 1 : 0));
         result = groupFailure(0);
         result.responseBody = body;
         return result;
@@ -1626,8 +1817,11 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
         const QString groupStatus = q.value(0).toString();
         if (groupRole(db, groupId, actor).isEmpty()) return groupFailure(-1012);
         if (request.operation == GroupListMembers) {
-            q.prepare("SELECT user_name,role,status FROM group_member WHERE group_id=? AND status='active' ORDER BY joined_at");
+            // REQ-PAGE-FETCH-001：多取一条判定截断，body 末尾追加 u8 truncated
+            q.prepare("SELECT user_name,role,status FROM group_member WHERE group_id=? AND status='active' "
+                      "ORDER BY joined_at LIMIT ?");
             q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+            q.addBindValue(uint(PAGE_MAX_LIMIT) + 1);
             if (!q.exec()) return groupFailure(-1013);
             QList<QByteArray> rows;
             while (q.next()) {
@@ -1637,9 +1831,12 @@ OperateDB::GroupResult OperateDB::handleGroupOperation(const GroupRequest &reque
                 groupAppendString(row, q.value(2).toString().toUtf8());
                 rows.append(row);
             }
+            bool truncated = rows.size() > int(PAGE_MAX_LIMIT);
+            if (truncated) rows = rows.mid(0, int(PAGE_MAX_LIMIT));
             QByteArray body;
             groupAppendU32(body, quint32(rows.size()));
             for (const QByteArray &row : rows) body.append(row);
+            body.append(char(truncated ? 1 : 0));
             result = groupFailure(0);
             result.groupId = groupId;
             result.responseBody = body;

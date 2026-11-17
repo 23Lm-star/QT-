@@ -28,11 +28,26 @@ function twoNameCaData(first, second) {
   return caData;
 }
 
-// 在线用户列表（7→8）。服务端已排除请求者本人；此处再过滤一次兜底。
+// REQ-PAGE-FETCH-001：所有用户列表（7→8，原"在线用户"）。
+// 响应载荷为 N×33 字节条目：名字[32] + online(u8)；含离线用户，服务端已排除自己与好友。
+export function parseUserEntries(caMsg, uiMsgLen) {
+  const n = Math.floor(uiMsgLen / 33);
+  const entries = [];
+  for (let i = 0; i < n; i++) {
+    const base = i * 33;
+    entries.push({
+      name: readFixedString(caMsg, base, 32),
+      online: caMsg[base + 32] === 1,
+    });
+  }
+  return entries;
+}
+
 // net 可选：缺省用共享单例；e2e 双用户场景显式传各自会话。
+// 服务端 limit=0 保持旧全量语义：这里不发分页字段，一次取回全部。
 export async function fetchOnlineUsers(myName, net = getNet()) {
   const resp = await net.request(T.ONLINEUSER_REQUEST, T.ONLINEUSER_RESPOND);
-  return parseNameArray(resp.caMsg, resp.uiMsgLen).filter((n) => n !== myName);
+  return parseUserEntries(resp.caMsg, resp.uiMsgLen).filter((e) => e.name !== myName);
 }
 
 // 好友列表（11→12）。

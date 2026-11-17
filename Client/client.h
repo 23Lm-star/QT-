@@ -85,10 +85,14 @@ public:
     // 剩余秒数；>0 时禁止再次请求验证码
     int m_captchaCooldownSec;
     bool m_captchaLocked;   // 账号已锁定（10分钟）：注册/登录/获取验证码均在客户端拦截
+    // 登录失败（验证码错/过期）后置位：立即补拉一次；若服务端冷却中，倒计时归零自动再拉
+    bool m_captchaAutoRefresh = false;
     // 启动倒计时；sec<=0 时普通冷却取 60s、锁定取 600s。locked=true 同时禁用注册/登录。
     void startCaptchaCooldown(int sec, bool locked = false);
     // 定时器槽：递减剩余秒数，归零时恢复按钮并解除锁定。
     void onCaptchaCooldownTick();
+    // 登录验证码失败后自动换新验证码（见 m_captchaAutoRefresh）
+    void requestCaptchaAutoRefresh();
     // 周期发送心跳 PING，并据此判断服务端是否失联。
     void sendHeartbeat();
     // 心跳开关（调试/模拟僵尸用，true=正常发PING，false=停发模拟假死）
@@ -157,6 +161,9 @@ private:
     bool m_serverLostShown;     // 重连窗口是否已弹出（去重，避免重复弹）
     qint64 m_lastPongMs;        // 最后收到 PONG 的时间(ms)
     bool m_loggedIn;            // 是否已登录（未登录不弹窗，避免登录界面误报）
+    // PDU 分发重入闸：模态弹窗会开嵌套事件循环，readyRead 重入 recvmsg 时只收不处理，
+    // 防止嵌套 remove 使外层指向 m_pdulist 的裸指针失效（0xC0000374 堆损坏）
+    bool m_dispatchingPdu = false;
     // 失联/被踢时显示的模态重连窗，parent=this
     ReconnectDialog* m_reconnectDlg;
     //构造函数设定为私有

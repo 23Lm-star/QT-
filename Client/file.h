@@ -28,10 +28,16 @@ public:
     QString m_strShareFileName;//分享文件名
     // 本类持有条目所有权，刷新时先释放旧列表
     QList<FileInfo*>m_fileInfoList;//当前路径文件信息
+    // REQ-PAGE-FETCH-001 目录分页状态
+    uint m_loadedCount=0;     // 当前已加载条数（下一页起点）
+    uint m_listTotal=0;       // 服务端条目总数
+    bool m_listHasMore=false; // 还有下一页
     // 好友分享弹窗（懒显示，常驻）
     ShareFile* m_shareFile;
-    void flushfile();//刷新当前文件->引导刷新
+    void flushfile();//刷新当前文件->引导刷新（REQ-PAGE-FETCH-001：从第 0 页拉取）
     void updateCurrfile(QList<FileInfo*>qFileinfolist);//利用文件信息列表刷新文件信息
+    // REQ-PAGE-FETCH-001：分页接收目录列表（追加或替换由已加载状态决定）
+    void updateCurrfilePage(QList<FileInfo*>qFileinfolist, uint total, bool hasMore);
     // 把 m_strCurPath 同步到路径输入框
     void flushCurrLE();
     //按当前登录身份重算用户根与当前路径（每次登录成功必须调用；未登录时空转）
@@ -47,6 +53,8 @@ public:
 protected:
     void showEvent(QShowEvent *event) override;//页面变为可见时重建待刷新列表
 private slots:
+    // REQ-PAGE-FETCH-001：加载更多（按已加载条数请求下一页）
+    void on_loadMore_PB_clicked();
     void errnoMsg(const QString& Msg);
     //创建目录槽函数
     void on_credit_PB_clicked();

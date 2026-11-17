@@ -8,5 +8,9 @@
 // 决策 D3：客户端单分类，与 Server 对称建文件并登记 Client.pro
 // 声明日志分类对象；定义在 logging.cpp。
 Q_DECLARE_LOGGING_CATEGORY(lcCli)   // 客户端全部日志
+Q_DECLARE_LOGGING_CATEGORY(lcPdu)   // REQ-AUDIT-FULL-001：PDU 报文日志（收发内容，默认开启）
+
+// 安装"终端+文件"双路日志输出：stderr + <exe目录>/logs/client-pdu.log（10MB 轮转）
+void installFileLogging(const QString &appTag);
 
 #endif // CLI_LOGGING_H

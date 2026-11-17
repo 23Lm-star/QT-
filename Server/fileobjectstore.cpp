@@ -613,6 +613,23 @@ QList<FileObjectStore::EntryInfo> FileObjectStore::listEntries(
     return out;
 }
 
+QSet<QString> FileObjectStore::deletedDisplayNames(
+        const QString& owner, const QString& rawParentPath) const
+{
+    QSet<QString> out;
+    if (owner.isEmpty()) return out;
+    const QString parent = normalizeParent(owner, rawParentPath);
+    PooledSqlConnection conn = DatabaseConnectionPool::instance().acquire();
+    if (!conn.isValid()) return out;
+    QSqlQuery q(conn.database());
+    q.prepare("SELECT display_name FROM user_file WHERE owner_name=? AND parent_path=? AND status='deleted'");
+    q.addBindValue(owner);
+    q.addBindValue(parent);
+    if (!q.exec()) return out;
+    while (q.next()) out.insert(q.value(0).toString());
+    return out;
+}
+
 // 精确查单条目；未命中返回 fileId=-1 的默认值。
 FileObjectStore::EntryInfo FileObjectStore::entryByPath(
         const QString& owner, const QString& rawParentPath, const QString& displayName) const

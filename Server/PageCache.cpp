@@ -118,6 +118,8 @@ void PageCache::ReleaseSpanToPageCache(span* Span){
 	// 超过桶上限的大 span 不参与合并，直接归还系统并回收 span 节点。
 	if (Span->_n > MaxPage - 1){
 		//系统申请的用系统调用释放(将Span的页号切换成首地址)
+		// 大 span 只登记过首页映射；释放前清掉，避免地址被系统再分配后查到已回收的 span 对象。
+		_PageToSpan.set(Span->Page_Adder, nullptr);
 		SystemFree((void*)(Span->Page_Adder << PageShift));
 		//delete Span;回收Span管理对象            
   		_pool.Delete(Span); 
@@ -179,7 +181,10 @@ void PageCache::ReleaseSpanToPageCache(span* Span){
 	//将合并之后的span插入到它对应的页数桶当中去准备分配
 	_PageList[Span->_n].InsertFront(Span);
 	//设计好span的左右页号到Span的映射
-	_PageToSpan.set(Span->Page_Adder, Span);
-	_PageToSpan.set(Span->Page_Adder + Span->_n - 1, Span);
+	// 合并后必须重登记覆盖的每一页：被吸收 span 的内部页映射仍指向它，
+	// 而它马上被对象池回收复用，只登记首尾页会让后续查找命中脏 span。
+	for (Page_t i = Span->Page_Adder; i < Span->Page_Adder + Span->_n; i++){
+		_PageToSpan.set(i, Span);
+	}
 }
 

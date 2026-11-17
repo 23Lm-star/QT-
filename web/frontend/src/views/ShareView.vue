@@ -37,7 +37,8 @@ async function refreshFriends() {
   await friends.loadFriends();
   await friends.loadOnlineUsers();
 }
-function isOnline(name) { return friends.onlineUsers.includes(name); }
+// REQ-PAGE-FETCH-001：onlineUsers 已改为条目数组，按名字匹配用 onlineNames
+function isOnline(name) { return friends.onlineNames.includes(name); }
 function toggleFriend(name) {
   const i = selectedFriends.value.indexOf(name);
   if (i >= 0) selectedFriends.value.splice(i, 1);

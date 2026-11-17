@@ -149,9 +149,11 @@ public:
     //查找用户
     // 返回 online（0 离线/1 在线）；用户不存在返回 2；参数或连接失败返回 -1
     int handleFindUser(const char* userName);
-    //获取所有用户
-    // 返回在线、非自己且尚未成为好友的用户名（用于陌生人列表）
-    QStringList handleOnlineUsers(const QString& strname);
+    // REQ-PAGE-FETCH-001：所有用户分页（含离线；排除自己与双向好友；用于陌生人列表）
+    // 按名字字典序稳定排序；limit 已由调用方钳制（1-200）；offset 为分页起点（0 起）。
+    // totalOut 回带符合条件总数；hasMoreOut=还有下一页；成对返回 <名字, online>。
+    QVector<QPair<QString,bool>> handleAllUsers(const QString& strname,uint limit,uint offset,
+                                                uint* totalOut=nullptr,bool* hasMoreOut=nullptr);
     //添加好友操作，查找
     // REQ-AUDIT-001 R4：目标在线返回 1 并登记 (请求方,目标) 待处理邀请；离线/不存在返回 0；
     // 参数或连接失败返回 -1
@@ -161,7 +163,8 @@ public:
     int handleAddFriendFin(char* usrname,char* tarname);
     //刷新好友操作，
     // 返回与 strname 相关的双向好友名（UNION 去重）
-    QStringList handleFlushFriend(const QString&strname);
+    // REQ-PAGE-FETCH-001：至多返回 PAGE_MAX_LIMIT 条；truncatedOut=1 表示超限截断
+    QStringList handleFlushFriend(const QString&strname,bool* truncatedOut=nullptr);
     //删除好友操作
     // 事务内删除两个方向的好友行
     bool handleDeleteFriend(char*userName,char*tarName);
@@ -177,14 +180,28 @@ public:
     //获取聊天信息
     // REQ-AUDIT-001 R2：只读不标记；未送达消息在响应真正写出后由 markChatDelivered 置 1。
     // 返回扁平列表（每行依次为 msg、seed_time），按主键升序＝接收顺序；idOut 回带对应主键。
-    QStringList getchatMsg(char*seedName,char *revName,QVector<qlonglong>* idOut=nullptr);
+    // REQ-PAGE-FETCH-001：单次最多返回 PAGE_MAX_LIMIT 条（取最旧的一批），
+    // truncatedOut=1 表示仍有未送达消息，客户端确认后可再次拉取。
+    QStringList getchatMsg(char*seedName,char *revName,QVector<qlonglong>* idOut=nullptr,bool* truncatedOut=nullptr);
+
+    // REQ-PAGE-FETCH-001：聊天历史分页（双方全部历史，含已送达；网页端 17/18 语义不变）
+    // cursorId=0 表示从最新一页开始；>0 时只取 id<cursorId 的更早消息。按 id 降序取 limit 条，
+    // totalOut 回带双方历史总条数；hasMoreOut=更早还有；oldestOut 回带本页最旧消息 ID（下一页游标）。
+    struct ChatHistoryRow { qint64 id; bool fromSelf; QString msg; QString time; };
+    QVector<ChatHistoryRow> getChatHistoryPage(const QString& self,const QString& peer,qint64 cursorId,
+                                               uint limit,uint* totalOut=nullptr,
+                                               bool* hasMoreOut=nullptr,qint64* oldestOut=nullptr);
     // REQ-AUDIT-001 R1/R2：把指定消息标记为已送达（幂等，只更新仍为未送达的行）
     bool markChatDelivered(const QVector<qlonglong> &ids);
     // REQ-CHAT-ACK-001：客户端确认收货时按「消息 ID + 收件人」双条件标记，
     // 防止伪造 ID 把别人的消息标成已送达。rev=当前认证账号。
     bool markChatDeliveredFor(const QString &rev, const QVector<qlonglong> &ids);
     // REQ-CHAT-ACK-001 R10：本人待处理的好友申请（status='pending'），按时间倒序
-    QStringList listPendingFriendRequests(const QString &target);
+    // REQ-AUDIT-FULL-001：删除好友与清理双方私聊记录同一事务；任一步失败整体回滚
+    bool deleteFriendCascade(const QString &userA, const QString &userB);
+    // REQ-PAGE-FETCH-001：只返回最近 PAGE_TRUNCATE_DAYS 天内、至多 PAGE_MAX_LIMIT 条；
+    // truncatedOut=1 表示超限截断（客户端提示「已截断」）
+    QStringList listPendingFriendRequests(const QString &target,bool* truncatedOut=nullptr);
     // 拒绝好友申请：只把本人收到的 pending 行置为 rejected，不建立关系
     bool rejectFriendRequest(const QString &requester, const QString &target);
     //获取用户信息

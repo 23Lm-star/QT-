@@ -11,5 +11,9 @@ Q_DECLARE_LOGGING_CATEGORY(lcDb)    // 数据库层：SQL、连接池
 Q_DECLARE_LOGGING_CATEGORY(lcFs)    // 文件系统：上传/下载/删除/重命名/分享链接
 Q_DECLARE_LOGGING_CATEGORY(lcAuth)  // 认证：登录/注册/注销/验证码
 Q_DECLARE_LOGGING_CATEGORY(lcApp)   // 应用生命周期：配置、启动
+Q_DECLARE_LOGGING_CATEGORY(lcPdu)   // REQ-AUDIT-FULL-001：PDU 报文日志（收发内容，默认开启）
+
+// 安装"终端+文件"双路日志输出：stderr + <exe目录>/logs/server-pdu.log（10MB 轮转）
+void installFileLogging(const QString &appTag);
 
 #endif // LOGGING_H
