@@ -260,6 +260,21 @@ static const int LIST_TRUNC_RESP_TRUNCATED_OFFSET = 4; // u8 1=超上限截断
 static const int LIST_TRUNC_RESP_COUNT_OFFSET     = 8; // u32 返回条数
 // 78/79、80/81、82/83 群信封响应：body 末尾追加 u8 truncated（旧端多出 1 字节不读，兼容）
 
+// ===== REQ-PAGE-FETCH-002：搜索与结果总量上限、好友真分页（两端逐字节一致，只追加） =====
+static const uint LIST_TOTAL_CAP = 1000;     // 查询结果总量上限（所有用户/好友共用，含 limit=0 全量路径，可调）
+
+// ---- 7/8 所有用户：关键词搜索与总量封顶 ----
+static const int ALLUSER_REQ_KEYWORD_OFFSET = 8;   // 关键词槽 caData[8,40)：32B 定长（UTF-8 ≤31+NUL），空=不过滤
+static const int ALLUSER_REQ_KEYWORD_BYTES  = 32;
+static const int ALLUSER_RESP_CAPPED_OFFSET = 16;  // u8 1=符合条件总数超 LIST_TOTAL_CAP，total 已封顶
+
+// ---- 11/12 好友真分页（取代 001 数量截断；truncated 字段保留恒 0） ----
+static const int FRIEND_REQ_LIMIT_OFFSET  = 0;     // u32 每页条数（1-200）；0=旧全量语义（受总量上限保护）
+static const int FRIEND_REQ_OFFSET_OFFSET = 4;     // u32 分页起点（0 起）
+static const int FRIEND_RESP_TOTAL_OFFSET   = 12;  // u32 符合条件总数（封顶后）
+static const int FRIEND_RESP_HASMORE_OFFSET = 16;  // u8 1=还有下一页
+static const int FRIEND_RESP_CAPPED_OFFSET  = 17;  // u8 1=符合条件总数超上限
+
 // ===== REQ-EXT-GROUP-003：群文件 PDU 布局常量（两端逐字节一致，只追加） =====
 // 全部载荷以 GROUP-001/002 的 20B 群信封开头（version|envelope_length|request_id|group_id），
 // 其后为 code(u32) 与业务字段；偏移相对完整载荷（caMsg 起始）。

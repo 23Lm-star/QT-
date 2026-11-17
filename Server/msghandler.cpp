@@ -433,15 +433,17 @@ PDU *MsgHandler::finduser(){
 PDU *MsgHandler::onlineuser(const QString &myname)
 {
     // REQ-PAGE-FETCH-001：所有用户分页（含离线、排除自己与双向好友）。
-    // 请求 caData：limit(u32)、offset(u32)；limit=0 视为默认页大小（兼容空请求）。
+    // REQ-PAGE-FETCH-002：关键词搜索（caData[8,40)）与结果总量封顶（capped）。
+    // 请求 caData：limit(u32)、offset(u32)、keyword[32]；limit=0 保留旧全量语义（兼容空请求，≤总量上限）。
     uint limit=0, offset=0;
     memcpy(&limit,pdu->caData+ALLUSER_REQ_LIMIT_OFFSET,sizeof(limit));
     memcpy(&offset,pdu->caData+ALLUSER_REQ_OFFSET_OFFSET,sizeof(offset));
     if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;   // limit==0 保留旧全量语义（网页端/旧脚本）
-    uint total=0; bool hasMore=false;
-    const QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,limit,offset,&total,&hasMore);
-    qCDebug(lcNet)<<"所有用户个数"<<total<<"本页"<<users.size()<<"offset"<<offset;
-    // 响应 caData：标准码、total、has_more、count；载荷每条 33B=名字[32]+online(u8)
+    const QString keyword=fixedString(pdu->caData+ALLUSER_REQ_KEYWORD_OFFSET,ALLUSER_REQ_KEYWORD_BYTES);
+    uint total=0; bool hasMore=false; bool capped=false;
+    const QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,keyword,limit,offset,&total,&hasMore,&capped);
+    qCDebug(lcNet)<<"所有用户个数"<<total<<"本页"<<users.size()<<"offset"<<offset<<"关键词"<<keyword<<"封顶"<<capped;
+    // 响应 caData：标准码、total、has_more、count、capped；载荷每条 33B=名字[32]+online(u8)
     PDU* respdu=mkPDU(uint(users.size())*ALLUSER_ENTRY_BYTES);
     respdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_RESPOND;
     const int ok=ENUM_PROTOCOL_CODE_OK;
@@ -451,6 +453,8 @@ PDU *MsgHandler::onlineuser(const QString &myname)
     memcpy(respdu->caData+ALLUSER_RESP_HASMORE_OFFSET,&more,sizeof(more));
     const quint32 count=quint32(users.size());
     memcpy(respdu->caData+ALLUSER_RESP_COUNT_OFFSET,&count,sizeof(count));
+    const quint8 cp=capped?1:0;
+    memcpy(respdu->caData+ALLUSER_RESP_CAPPED_OFFSET,&cp,sizeof(cp));
     for(int i=0;i<users.size();i++){
         char* entry=respdu->caMsg+i*ALLUSER_ENTRY_BYTES;
         const QByteArray nameBytes=users[i].first.toUtf8();
@@ -529,22 +533,29 @@ PDU *MsgHandler::addfriendFin()
 
 PDU *MsgHandler::flushfriend(const QString &username)
 {
-    // REQ-PAGE-FETCH-001：服务端数量截断（无时间列只限条数），超限置 truncated 标志
-    bool truncated=false;
-    QStringList ret=OperateDB::instance().handleFlushFriend(username,&truncated);
-    qCDebug(lcNet)<<"ret.size()="<<ret.size();
-    for(int i=0;i<ret.size();i++){
-        qCDebug(lcNet)<<ret[i]<<" ";
-    }qCDebug(lcNet)<<endl;
+    // REQ-PAGE-FETCH-002：好友真分页（limit/offset＋名字字典序）取代 001 数量截断；
+    // truncated 字段保留恒 0（旧端解析兼容），总量封顶走 capped。limit=0 保留旧全量语义（≤上限）。
+    uint limit=0, offset=0;
+    memcpy(&limit,pdu->caData+FRIEND_REQ_LIMIT_OFFSET,sizeof(limit));
+    memcpy(&offset,pdu->caData+FRIEND_REQ_OFFSET_OFFSET,sizeof(offset));
+    if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;
+    uint total=0; bool hasMore=false; bool capped=false;
+    QStringList ret=OperateDB::instance().handleFlushFriend(username,limit,offset,&total,&hasMore,&capped);
+    qCDebug(lcNet)<<"好友总数"<<total<<"本页"<<ret.size()<<"offset"<<offset<<"封顶"<<capped;
     // 载荷同样为 N*32 字节的定长好友名数组。
     PDU* respdu=mkPDU(uint(ret.size())*32);
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND;
     const int ok=ENUM_PROTOCOL_CODE_OK;
     memcpy(respdu->caData+LIST_TRUNC_RESP_RET_OFFSET,&ok,sizeof(ok));
-    const quint8 tr=truncated?1:0;
+    const quint8 tr=0;   // 截断语义已被分页取代
     memcpy(respdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,&tr,sizeof(tr));
     const quint32 count=quint32(ret.size());
     memcpy(respdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,&count,sizeof(count));
+    memcpy(respdu->caData+FRIEND_RESP_TOTAL_OFFSET,&total,sizeof(total));
+    const quint8 more=hasMore?1:0;
+    memcpy(respdu->caData+FRIEND_RESP_HASMORE_OFFSET,&more,sizeof(more));
+    const quint8 cp=capped?1:0;
+    memcpy(respdu->caData+FRIEND_RESP_CAPPED_OFFSET,&cp,sizeof(cp));
     for(int i=0;i<ret.size();i++){
         // REQ-AUDIT-FULL-001：定长槽按实际长度拷贝（≤31 保留 NUL），避免对短源串越界读
         const QByteArray nameBytes=ret[i].toUtf8();

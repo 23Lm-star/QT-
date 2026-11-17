@@ -874,14 +874,18 @@ int OperateDB::handleFindUser(const char *userName)
 }
 
 // 所有用户分页（含离线；排除自己，也排除任一方向已成好友的用户）。
-// 按名字字典序稳定排序；调用方保证 limit∈[1,200]、offset 为分页起点。
-// totalOut 回带符合条件总数；hasMoreOut=还有下一页；连接失败返回空列表。
-QVector<QPair<QString,bool>> OperateDB::handleAllUsers(const QString &strname, uint limit, uint offset,
-                                                       uint *totalOut, bool *hasMoreOut)
+// REQ-PAGE-FETCH-002：keyword 非空时按名字子串匹配（LIKE 通配符以 ! 转义按字面）；
+// 结果总量受 LIST_TOTAL_CAP 封顶（totalOut 回带封顶后总数，cappedOut=1 表示实际超限）。
+// 按名字字典序稳定排序；调用方保证 limit∈[1,200]，0=全量（≤上限）；offset 为分页起点。
+// hasMoreOut=还有下一页；连接失败返回空列表。
+QVector<QPair<QString,bool>> OperateDB::handleAllUsers(const QString &strname, const QString &keyword,
+                                                       uint limit, uint offset,
+                                                       uint *totalOut, bool *hasMoreOut, bool *cappedOut)
 {
     QVector<QPair<QString,bool>> ret;
     if(totalOut!=nullptr) *totalOut=0;
     if(hasMoreOut!=nullptr) *hasMoreOut=false;
+    if(cappedOut!=nullptr) *cappedOut=false;
     if(strname.isEmpty()){
         return ret;
     }
@@ -892,36 +896,54 @@ QVector<QPair<QString,bool>> OperateDB::handleAllUsers(const QString &strname, u
     QSqlDatabase db = connection.database();
     QSqlQuery q(db);
 
-    const QString baseWhere = QLatin1String(
+    QString baseWhere = QLatin1String(
         "name != ? AND name NOT IN ("
         " SELECT friendName FROM friend WHERE name = ?"
         " UNION"
         " SELECT name FROM friend WHERE friendName = ?)");
+    // 关键词中的 %/_/! 按字面转义，不允许用户输入改变匹配语义；预编译绑定防注入
+    QString likePattern;
+    if(!keyword.isEmpty()){
+        QString escaped=keyword;
+        escaped.replace(QLatin1Char('!'),QLatin1String("!!"))
+               .replace(QLatin1Char('%'),QLatin1String("!%"))
+               .replace(QLatin1Char('_'),QLatin1String("!_"));
+        likePattern=QLatin1Char('%')+escaped+QLatin1Char('%');
+        baseWhere+=QLatin1String(" AND name LIKE ? ESCAPE '!'");
+    }
     q.prepare("SELECT COUNT(*) FROM user_info WHERE "+baseWhere);
     q.addBindValue(strname);
     q.addBindValue(strname);
     q.addBindValue(strname);
+    if(!likePattern.isEmpty()) q.addBindValue(likePattern);
+    uint actualTotal=0;
     if(q.exec() && q.next()){
-        if(totalOut!=nullptr) *totalOut=q.value(0).toUInt();
+        actualTotal=q.value(0).toUInt();
     }
+    const bool capped = actualTotal > LIST_TOTAL_CAP;
+    if(cappedOut!=nullptr) *cappedOut=capped;
+    const uint total = capped ? LIST_TOTAL_CAP : actualTotal;
+    if(totalOut!=nullptr) *totalOut=total;
 
-    // REQ-PAGE-FETCH-001：limit==0 视为旧全量语义（网页端/旧脚本不发分页字段），不设 LIMIT
-    if(limit==0){
-        q.prepare("SELECT name, online FROM user_info WHERE "+baseWhere+" ORDER BY name ASC");
-        q.addBindValue(strname);
-        q.addBindValue(strname);
-        q.addBindValue(strname);
-    }else{
-        q.prepare("SELECT name, online FROM user_info WHERE "+baseWhere+
-                  " ORDER BY name ASC LIMIT ? OFFSET ?");
-        q.addBindValue(strname);
-        q.addBindValue(strname);
-        q.addBindValue(strname);
-        q.addBindValue(limit);
-        q.addBindValue(offset);
+    // REQ-PAGE-FETCH-002：offset≥封顶总数回空页（封顶内容不可翻达）；
+    // limit==0 保留旧全量语义但受上限保护；单页有效 limit 钳制不越界
+    if(offset >= total){
+        return ret;
     }
-    qCDebug(lcDb)<<"all users query for:"<<strname<<"limit"<<limit<<"offset"<<offset;
+    const uint remain = total - offset;
+    const uint effLimit = (limit==0) ? remain : qMin(limit, remain);
+    q.prepare("SELECT name, online FROM user_info WHERE "+baseWhere+
+              " ORDER BY name ASC LIMIT ? OFFSET ?");
+    q.addBindValue(strname);
+    q.addBindValue(strname);
+    q.addBindValue(strname);
+    if(!likePattern.isEmpty()) q.addBindValue(likePattern);
+    q.addBindValue(effLimit);
+    q.addBindValue(offset);
+    qCDebug(lcDb)<<"all users query for:"<<strname<<"keyword"<<keyword
+                 <<"limit"<<effLimit<<"offset"<<offset<<"total"<<total<<"capped"<<capped;
     if(!q.exec()){
+        qCWarning(lcDb)<<"handleAllUsers exec failed:"<<q.lastError().text();
         return ret;
     }
     while(q.next())
@@ -929,7 +951,7 @@ QVector<QPair<QString,bool>> OperateDB::handleAllUsers(const QString &strname, u
         ret.append(qMakePair(q.value(0).toString(), q.value(1).toInt()==1));
     }
     if(hasMoreOut!=nullptr){
-        *hasMoreOut = (limit!=0) && ((offset + uint(ret.size())) < (totalOut!=nullptr? *totalOut : 0));
+        *hasMoreOut = (offset + uint(ret.size())) < total;
     }
     return ret;
 }
@@ -1044,11 +1066,19 @@ int OperateDB::handleAddFriendFin(char *usrname, char *tarname)
     return 1;
 }
 
-// 好友列表：UNION 合并两个方向并自动去重；连接失败返回空列表
-QStringList OperateDB::handleFlushFriend(const QString &strname, bool *truncatedOut)
+// 好友列表：UNION 合并两个方向并自动去重。
+// REQ-PAGE-FETCH-002：真分页取代 001 数量截断——按名字字典序稳定排序，limit/offset 分页
+// （调用方保证 limit∈[1,200]，0=全量≤上限）；总量受 LIST_TOTAL_CAP 封顶。连接失败返回空列表。
+QStringList OperateDB::handleFlushFriend(const QString &strname, uint limit, uint offset,
+                                         uint *totalOut, bool *hasMoreOut, bool *cappedOut)
 {
     QStringList ret;
-    if(truncatedOut!=nullptr) *truncatedOut=false;
+    if(totalOut!=nullptr) *totalOut=0;
+    if(hasMoreOut!=nullptr) *hasMoreOut=false;
+    if(cappedOut!=nullptr) *cappedOut=false;
+    if(strname.isEmpty()){
+        return ret;
+    }
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()){
         return QStringList();
@@ -1056,29 +1086,49 @@ QStringList OperateDB::handleFlushFriend(const QString &strname, bool *truncated
     QSqlDatabase db = connection.database();
     QSqlQuery q(db);
 
-    // 查询 name=strname 时的 friendName，以及 friendName=strname 时的 name
-    // REQ-PAGE-FETCH-001：多取一条判定截断，至多回 PAGE_MAX_LIMIT 条
-    q.prepare(R"(SELECT friendName FROM friend WHERE name = ?
-                 UNION
-                 SELECT name FROM friend WHERE friendName = ?
-                 LIMIT ?)");
+    // 查询 name=strname 时的 friendName，以及 friendName=strname 时的 name（UNION 去重）
+    const QString unionSql = QLatin1String(
+        "SELECT friendName AS n FROM friend WHERE name = ?"
+        " UNION"
+        " SELECT name AS n FROM friend WHERE friendName = ?");
+    q.prepare("SELECT COUNT(*) FROM ("+unionSql+") t");
     q.addBindValue(strname);
     q.addBindValue(strname);
-    q.addBindValue(uint(PAGE_MAX_LIMIT) + 1);
+    uint actualTotal=0;
     // REQ-AUDIT-FULL-001：查询失败显式告警，不再静默当作"无好友"
+    if(q.exec() && q.next()){
+        actualTotal=q.value(0).toUInt();
+    }else{
+        qCWarning(lcDb)<<"handleFlushFriend count failed:"<<q.lastError().text();
+        return QStringList();
+    }
+    const bool capped = actualTotal > LIST_TOTAL_CAP;
+    if(cappedOut!=nullptr) *cappedOut=capped;
+    const uint total = capped ? LIST_TOTAL_CAP : actualTotal;
+    if(totalOut!=nullptr) *totalOut=total;
+
+    // offset≥封顶总数回空页；limit==0 旧全量语义受上限保护；单页有效 limit 钳制不越界
+    if(offset >= total){
+        return ret;
+    }
+    const uint remain = total - offset;
+    const uint effLimit = (limit==0) ? remain : qMin(limit, remain);
+    q.prepare("SELECT n FROM ("+unionSql+") t ORDER BY n ASC LIMIT ? OFFSET ?");
+    q.addBindValue(strname);
+    q.addBindValue(strname);
+    q.addBindValue(effLimit);
+    q.addBindValue(offset);
+    qCDebug(lcDb)<<"friend page for:"<<strname<<"limit"<<effLimit<<"offset"<<offset
+                 <<"total"<<total<<"capped"<<capped;
     if(!q.exec()){
         qCWarning(lcDb)<<"handleFlushFriend exec failed:"<<q.lastError().text();
         return QStringList();
     }
-
     while(q.next()){
         ret.append(q.value(0).toString());
     }
-    if(truncatedOut!=nullptr){
-        *truncatedOut = ret.size() > int(PAGE_MAX_LIMIT);
-    }
-    if(ret.size() > int(PAGE_MAX_LIMIT)){
-        ret = ret.mid(0, int(PAGE_MAX_LIMIT));
+    if(hasMoreOut!=nullptr){
+        *hasMoreOut = (offset + uint(ret.size())) < total;
     }
     return ret;
 }
