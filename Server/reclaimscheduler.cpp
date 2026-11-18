@@ -2,8 +2,8 @@
 #include "reclaimscheduler.h"
 #include "databaseconnectionpool.h"
 #include "server.h"
+#include "fileobjectstore.h"
 
-#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -12,6 +12,8 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QVariant>
+#include <QCoreApplication>
+#include <QRandomGenerator>
 
 #include <algorithm>
 
@@ -38,6 +40,9 @@ ReclaimScheduler& ReclaimScheduler::instance()
 ReclaimScheduler::ReclaimScheduler(QObject* parent)
     : QObject(parent)
 {
+    m_claimOwner = QStringLiteral("reclaim-%1-%2")
+            .arg(QCoreApplication::applicationPid())
+            .arg(QString::number(QRandomGenerator::system()->generate64(), 16));
 }
 
 // 解析简单的 key=value 配置；#/; 开头为注释。任何非法值都不放大删除力度。
@@ -73,6 +78,8 @@ ReclaimScheduler::Config ReclaimScheduler::loadConfig() const
         else if (key == "per_round_limit"    && ok && n > 0) c.perRoundLimit = n;
         else if (key == "staging_ttl_hours"  && ok && n > 0) c.stagingTtlHours = n;
         else if (key == "grace_hours"        && ok && n > 0) c.graceHours = n;
+        else if (key == "directory_retry_minutes" && ok && n > 0) c.directoryRetryMinutes = n;
+        else if (key == "directory_lease_seconds" && ok && n > 0) c.directoryLeaseSeconds = n;
         else qCWarning(lcFs) << "[RECLAIM] reclaim.cfg 忽略无法识别的行:" << line;
     }
     return c;
@@ -101,6 +108,8 @@ void ReclaimScheduler::start()
                     << "轮次间隔=" << m_cfg.intervalMinutes << "分钟"
                     << "暂存TTL=" << m_cfg.stagingTtlHours << "小时"
                     << "宽限期=" << m_cfg.graceHours << "小时"
+                    << "目录补偿重试=" << m_cfg.directoryRetryMinutes << "分钟"
+                    << "目录租约=" << m_cfg.directoryLeaseSeconds << "秒"
                     << "dry_run=" << m_cfg.dryRun;
 }
 
@@ -140,6 +149,10 @@ void ReclaimScheduler::onTick()
     }
     if (budget > 0) {
         used += harvestStagingFiles(cfg, budget, m_roundStats);
+        budget = cfg.perTick - used;
+    }
+    if (budget > 0) {
+        used += harvestDirectoryCompensations(cfg, budget, m_roundStats);
     }
     m_roundProcessed += used;
 
@@ -170,6 +183,8 @@ ReclaimScheduler::Stats ReclaimScheduler::runRound(const Config& cfg)
         int used = harvestReclaimObjects(cfg, budget, st);
         budget -= used;
         if (budget > 0) used += harvestStagingFiles(cfg, budget, st);
+        budget = qMin(cfg.perTick, cfg.perRoundLimit - processed) - used;
+        if (budget > 0) used += harvestDirectoryCompensations(cfg, budget, st);
         if (used == 0) break;
         processed += used;
     }
@@ -177,6 +192,197 @@ ReclaimScheduler::Stats ReclaimScheduler::runRound(const Config& cfg)
     m_lastRoundStartMs = t0;      // 手动跑过就不再让定时轮次紧接着重复一遍
     logWatermark(cfg, st);
     return st;
+}
+
+int ReclaimScheduler::harvestDirectoryCompensations(const Config& cfg, int budget, Stats& st)
+{
+    if (budget <= 0) return 0;
+    const QVector<OperateDB::DirectoryCompensationTask> tasks = cfg.dryRun
+            ? OperateDB::instance().peekDirectoryCompensations(budget)
+            : OperateDB::instance().claimDirectoryCompensations(
+                  m_claimOwner, cfg.directoryLeaseSeconds, budget);
+    if (tasks.isEmpty()) return 0;
+    if (!cfg.dryRun) st.directoryClaimed += tasks.size();
+    int consumed = 0;
+    for (const OperateDB::DirectoryCompensationTask& task : tasks) {
+        QString error;
+        if (cfg.dryRun) {
+            qCInfo(lcFs) << "[DIR-COMP][dry-run] task=" << task.taskId
+                         << "type=" << task.operationType << "account=" << task.account;
+            ++consumed;
+            continue;
+        }
+        if (executeDirectoryCompensation(task, error)) {
+            if (OperateDB::instance().completeDirectoryCompensation(task.taskId, m_claimOwner)) {
+                ++st.directoryCompleted;
+            } else {
+                ++st.directoryClaimFailed;
+            }
+        } else {
+            const QDateTime next = QDateTime::currentDateTime().addSecs(
+                cfg.directoryRetryMinutes * 60);
+            if (OperateDB::instance().retryDirectoryCompensation(
+                    task.taskId, m_claimOwner, next, error)) {
+                ++st.directoryRetried;
+            } else {
+                ++st.directoryClaimFailed;
+            }
+        }
+        ++consumed;
+    }
+    return consumed;
+}
+
+bool ReclaimScheduler::executeDirectoryCompensation(
+        const OperateDB::DirectoryCompensationTask& task, QString& error) const
+{
+    const auto resolvePath = [&error](const QString& relative) {
+        if (relative.isEmpty()) return QString();
+        if (relative == QStringLiteral("__INVALID_PATH__")) {
+            error = QStringLiteral("补偿路径在入队前已越界");
+            return QString();
+        }
+        if (QFileInfo(relative).isAbsolute() || relative.contains("..")) {
+            error = QStringLiteral("补偿路径不安全: %1").arg(relative);
+            return QString();
+        }
+        const QString root = QDir(Server::getinstance().filesPath).absolutePath();
+        const QString absolute = QDir::cleanPath(QDir(root).absoluteFilePath(relative));
+        if (absolute != root && !absolute.startsWith(root + '/')) {
+            error = QStringLiteral("补偿路径越出存储根: %1").arg(relative);
+            return QString();
+        }
+        return absolute;
+    };
+    const QString source = resolvePath(task.sourcePath);
+    const QString target = resolvePath(task.targetPath);
+    if ((!task.sourcePath.isEmpty() && source.isEmpty())
+        || (!task.targetPath.isEmpty() && target.isEmpty())) return false;
+    const QString storageRoot = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString userRoot = QDir(storageRoot).absoluteFilePath(task.account);
+    const auto isInside = [](const QString& path, const QString& root) {
+        return !path.isEmpty() && (path == root || path.startsWith(root + '/'));
+    };
+    const QString& typeForScope = task.operationType;
+    const bool userScoped = typeForScope == QStringLiteral("create_user_root")
+            || typeForScope == QStringLiteral("delete_user_root")
+            || typeForScope == QStringLiteral("quarantine_user_root")
+            || typeForScope == QStringLiteral("create_directory")
+            || typeForScope == QStringLiteral("delete_directory")
+            || typeForScope == QStringLiteral("rename_directory")
+            || typeForScope == QStringLiteral("rename_file")
+            || typeForScope == QStringLiteral("move_directory")
+            || typeForScope == QStringLiteral("move_file")
+            || typeForScope == QStringLiteral("ensure_directory_parent")
+            || typeForScope == QStringLiteral("receive_shared_file")
+            || typeForScope == QStringLiteral("repair_directory_entries")
+            || typeForScope == QStringLiteral("cleanup_orphan_directory");
+    if (userScoped) {
+        if ((source.isEmpty() && !task.sourcePath.isEmpty())
+            || (target.isEmpty() && !task.targetPath.isEmpty())
+            || (!source.isEmpty() && !isInside(source, userRoot))
+            || (!target.isEmpty() && !isInside(target, userRoot)
+                && typeForScope != QStringLiteral("quarantine_user_root"))) {
+            error = QStringLiteral("补偿路径不在账号根目录内");
+            return false;
+        }
+    }
+    if (typeForScope == QStringLiteral("quarantine_user_root")) {
+        const QString quarantineRoot = QDir(storageRoot).absoluteFilePath(".deleted");
+        if (!isInside(source, userRoot) || !isInside(target, quarantineRoot)) {
+            error = QStringLiteral("用户目录隔离路径不安全");
+            return false;
+        }
+    }
+    const auto ensureParent = [&error](const QString& path) {
+        const QString parent = QFileInfo(path).absolutePath();
+        if (QDir().mkpath(parent)) return true;
+        error = QStringLiteral("创建父目录失败: %1").arg(parent);
+        return false;
+    };
+    const auto removeDirectory = [&error](const QString& path) {
+        if (!QFileInfo::exists(path)) return true;
+        if (QDir(path).removeRecursively()) return true;
+        error = QStringLiteral("删除目录失败: %1").arg(path);
+        return false;
+    };
+    const auto movePath = [&error](const QString& from, const QString& to) {
+        if (!QFileInfo::exists(from) && QFileInfo::exists(to)) return true;
+        if (!QFileInfo::exists(from)) {
+            error = QStringLiteral("源路径不存在: %1").arg(from);
+            return false;
+        }
+        if (QFileInfo::exists(to)) {
+            error = QStringLiteral("目标路径已存在: %1").arg(to);
+            return false;
+        }
+        if (!QDir().rename(from, to)) {
+            error = QStringLiteral("移动或重命名失败: %1 -> %2").arg(from, to);
+            return false;
+        }
+        return true;
+    };
+
+    const QString& type = task.operationType;
+    if (type == QStringLiteral("create_storage_root")
+        || type == QStringLiteral("create_user_root")
+        || type == QStringLiteral("create_quarantine_root")
+        || type == QStringLiteral("create_directory")
+        || type == QStringLiteral("ensure_directory_parent")
+        || type == QStringLiteral("create_staging_directory")
+        || type == QStringLiteral("create_object_directory")) {
+        const QString path = target.isEmpty() ? source : target;
+        if (path.isEmpty() || QDir(path).exists() || QDir().mkpath(path)) return true;
+        error = QStringLiteral("创建目录失败: %1").arg(path);
+        return false;
+    }
+    if (type == QStringLiteral("delete_directory")
+        || type == QStringLiteral("delete_user_root")
+        || type == QStringLiteral("cleanup_orphan_directory")
+        || type == QStringLiteral("cleanup_quarantine_entry")) {
+        return removeDirectory(source.isEmpty() ? target : source);
+    }
+    if (type == QStringLiteral("delete_staging_file")
+        || type == QStringLiteral("delete_object_file")) {
+        const QString path = source.isEmpty() ? target : source;
+        if (!QFileInfo::exists(path) || QFile::remove(path)) return true;
+        error = QStringLiteral("删除文件失败: %1").arg(path);
+        return false;
+    }
+    if (type == QStringLiteral("quarantine_user_root")) {
+        if (!QFileInfo::exists(source)) return true;
+        if (!ensureParent(target)) return false;
+        return movePath(source, target);
+    }
+    if (type == QStringLiteral("rename_directory")
+        || type == QStringLiteral("rename_file")
+        || type == QStringLiteral("move_directory")
+        || type == QStringLiteral("move_file")
+        || type == QStringLiteral("migrate_legacy_path")
+        || type == QStringLiteral("commit_staged_file")
+        || type == QStringLiteral("rollback_staged_file")) {
+        if (!ensureParent(target)) return false;
+        return movePath(source, target);
+    }
+    if (type == QStringLiteral("receive_shared_file")) {
+        return target.isEmpty() || QDir(target).exists() || QDir().mkpath(target);
+    }
+    if (type == QStringLiteral("repair_directory_entries")) {
+        if (target.isEmpty() || !QDir(target).exists()) {
+            error = QStringLiteral("待修复目录不存在");
+            return false;
+        }
+        const QFileInfo info(target);
+        QString repairError;
+        if (FileObjectStore::instance().insertDirEntry(
+                task.account, info.absolutePath(),
+                task.targetName.isEmpty() ? info.fileName() : task.targetName,
+                repairError)) return true;
+        error = repairError.isEmpty() ? QStringLiteral("目录条目修复失败") : repairError;
+        return false;
+    }
+    error = QStringLiteral("不支持的目录补偿类型: %1").arg(type);
+    return false;
 }
 
 // 抢权 → unlink → 删记录全程同步，所以轮次之间本进程不可能有在途抢权：
@@ -502,6 +708,10 @@ void ReclaimScheduler::logWatermark(const Config& cfg, const Stats& st) const
                  << "unlink失败=" << st.unlinkFailed
                  << "崩溃残留=" << st.recovered
                  << "越界拒绝=" << st.skippedUnsafe
+                 << "目录补偿抢占=" << st.directoryClaimed
+                 << "目录补偿完成=" << st.directoryCompleted
+                 << "目录补偿重试=" << st.directoryRetried
+                 << "目录补偿失败=" << st.directoryClaimFailed
                  << "用时=" << st.elapsedMs << "ms"
                  << (cfg.dryRun ? "【dry-run：未做任何写】" : "");
 }

@@ -15,6 +15,7 @@
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QVariant>
 #include <QVector>
 
 // OperateDB 实现：全部业务 SQL 集中在本文件。每条路径先向连接池借连接（RAII 自动归还），
@@ -103,7 +104,8 @@ bool OperateDB::checkSchemaVersion()
                          << q.lastError().text()
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
                             "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
-                            "migrate_ext_reclaim_001.sql 与 migrate_friend_req_001.sql";
+                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql 与 "
+                            "migrate_dir_comp_001.sql";
         return false;
     }
     int version = 0;
@@ -116,12 +118,13 @@ bool OperateDB::checkSchemaVersion()
                                    qMax(kGroupMessageSchemaVersion,
                                         qMax(kFastUploadSchemaVersion,
                                              qMax(kGroupFileSchemaVersion,
-                                                  qMax(kReclaimSchemaVersion, kFriendRequestSchemaVersion))))));
+                                                  qMax(kReclaimSchemaVersion, qMax(kFriendRequestSchemaVersion, kDirectoryCompensationSchemaVersion)))))));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
                             "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
-                            "migrate_ext_reclaim_001.sql 与 migrate_friend_req_001.sql";
+                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql 与 "
+                            "migrate_dir_comp_001.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -147,6 +150,7 @@ bool OperateDB::enqueueDirectoryCompensation(const QString& operationType,
     const QByteArray fingerprint = (operationType + QChar('\x1f') + account + QChar('\x1f')
                                     + sourcePath + QChar('\x1f') + targetPath + QChar('\x1f')
                                     + QString::number(entryId) + QChar('\x1f')
+                                    + sourceName + QChar('\x1f') + targetName + QChar('\x1f')
                                     + QString::number(operationVersion)).toUtf8();
     const QString dedupeKey = QString::fromLatin1(
         QCryptographicHash::hash(fingerprint, QCryptographicHash::Sha256).toHex());
@@ -233,6 +237,40 @@ OperateDB::claimDirectoryCompensations(const QString& claimOwner, int leaseSecon
     if (!db.commit()) {
         out.clear();
         return out;
+    }
+    return out;
+}
+
+QVector<OperateDB::DirectoryCompensationTask>
+OperateDB::peekDirectoryCompensations(int limit)
+{
+    QVector<DirectoryCompensationTask> out;
+    if (limit <= 0) return out;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return out;
+    QSqlQuery q(connection.database());
+    const QString sql = QStringLiteral(
+        "SELECT task_id,operation_type,account,COALESCE(source_path,''),COALESCE(target_path,''),"
+        "COALESCE(entry_id,0),COALESCE(source_name,''),COALESCE(target_name,''),operation_version,"
+        "retry_count,next_retry_at,COALESCE(last_error,''),COALESCE(claim_owner,''),claim_until "
+        "FROM directory_operation_compensation WHERE status='pending' AND next_retry_at<=NOW() "
+        "ORDER BY next_retry_at ASC,created_at ASC LIMIT %1").arg(limit);
+    if (!q.exec(sql)) return out;
+    while (q.next()) {
+        DirectoryCompensationTask task;
+        task.taskId = q.value(0).toLongLong();
+        task.operationType = q.value(1).toString();
+        task.account = q.value(2).toString();
+        task.sourcePath = q.value(3).toString();
+        task.targetPath = q.value(4).toString();
+        task.entryId = q.value(5).toLongLong();
+        task.sourceName = q.value(6).toString();
+        task.targetName = q.value(7).toString();
+        task.operationVersion = q.value(8).toLongLong();
+        task.retryCount = q.value(9).toInt();
+        task.nextRetryAt = q.value(10).toDateTime();
+        task.lastError = q.value(11).toString();
+        out.append(task);
     }
     return out;
 }
@@ -2578,4 +2616,3 @@ OperateDB::GroupFileResult OperateDB::handleGroupFileOperation(GroupFileRequest 
     result.code = -2103;
     return result;
 }
-

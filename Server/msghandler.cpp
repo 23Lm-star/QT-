@@ -15,6 +15,7 @@
 
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QTime>
 #include <QThreadPool>
 #include <QVector>
@@ -25,6 +26,30 @@
 inline void setProtocolCode(PDU *pdu, int code)
 {
     memcpy(pdu->caData, &code, PROTOCOL_CODE_SIZE);
+}
+
+namespace {
+QString compensationPath(const QString& path)
+{
+    if (path.isEmpty()) return QString();
+    const QString root = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString rel = QDir(root).relativeFilePath(QFileInfo(path).absoluteFilePath());
+    return (rel.startsWith("..") || rel.startsWith('/'))
+            ? QStringLiteral("__INVALID_PATH__") : rel;
+}
+
+void enqueueDirectoryFailure(const QString& type, const QString& account,
+                             const QString& source, const QString& target,
+                             const QString& error, qint64 entryId = 0,
+                             const QString& sourceName = QString(),
+                             const QString& targetName = QString(),
+                             qint64 operationVersion = 0)
+{
+    if (account.isEmpty()) return;
+    OperateDB::instance().enqueueDirectoryCompensation(
+        type, account, compensationPath(source), compensationPath(target),
+        entryId, sourceName, targetName, operationVersion, error);
+}
 }
 
 #include <cstring>
@@ -166,10 +191,19 @@ PDU *MsgHandler::logoff(bool &revoked)
             if(!removed){
                 // REQ-AUDIT-001 R3：删不掉就移出用户根，避免同名重注册看到前账号的目录残留。
                 const QString quarantine=QString("%1/.deleted").arg(Server::getinstance().filesPath);
-                QDir().mkpath(quarantine);
+                if (!QDir().mkpath(quarantine)) {
+                    enqueueDirectoryFailure(QStringLiteral("create_quarantine_root"), actor,
+                                             QString(), quarantine, QStringLiteral("创建用户目录隔离根失败"));
+                }
                 const QString target=QString("%1/%2-%3").arg(quarantine).arg(actor)
                         .arg(QDateTime::currentMSecsSinceEpoch());
                 const bool moved=QDir().rename(userDir,target);
+                if (!moved) {
+                    enqueueDirectoryFailure(QStringLiteral("delete_user_root"), actor,
+                                             userDir, QString(), QStringLiteral("删除用户目录及隔离均失败"));
+                    enqueueDirectoryFailure(QStringLiteral("quarantine_user_root"), actor,
+                                             userDir, target, QStringLiteral("用户目录隔离失败"));
+                }
                 qCWarning(lcAuth)<<"logoff: 用户目录删除失败，隔离结果:"<<moved<<" dir:"<<userDir;
             }
             qCDebug(lcAuth)<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
@@ -330,6 +364,17 @@ PDU *MsgHandler::rigist()
         QDir dir;
         bool ret1=dir.mkdir(QString("%1").arg(Server::getinstance().filesPath));
         bool ret2=dir.mkdir(QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname));
+        if (!ret1 && !QDir(Server::getinstance().filesPath).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("create_storage_root"), strname,
+                                     QString(), Server::getinstance().filesPath,
+                                     QStringLiteral("注册时创建存储根目录失败"));
+        }
+        const QString registeredUserRoot = QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname);
+        if (!ret2 && !QDir(registeredUserRoot).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("create_user_root"), strname,
+                                     QString(), QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname),
+                                     QStringLiteral("注册时创建用户根目录失败"));
+        }
         qCDebug(lcAuth)<<"创建用户目录:"<<"ret1 "<<ret1<<" "<<QString("%1").arg(Server::getinstance().filesPath)<<endl;
         qCDebug(lcAuth)<<"创建用户目录:"<<"ret2 "<<ret2<<" "<<QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname)<<endl;
     }
@@ -395,8 +440,15 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
         const QString fsRoot = Server::getinstance().filesPath;
         if(!fsRoot.isEmpty()){
             QDir dir;
-            dir.mkpath(fsRoot);
-            dir.mkpath(QString("%1/%2").arg(fsRoot).arg(username));
+            if (!dir.mkpath(fsRoot)) {
+                enqueueDirectoryFailure(QStringLiteral("create_storage_root"), username,
+                                         QString(), fsRoot, QStringLiteral("登录时补齐存储根目录失败"));
+            }
+            const QString userRoot = QString("%1/%2").arg(fsRoot).arg(username);
+            if (!dir.mkpath(userRoot)) {
+                enqueueDirectoryFailure(QStringLiteral("create_user_root"), username,
+                                         QString(), userRoot, QStringLiteral("登录时补齐用户根目录失败"));
+            }
         }
     }else{
         loginVersion=0;
@@ -695,12 +747,25 @@ PDU *MsgHandler::MKDIR(){
         QDir dir;
         ret1=dir.mkdir(QString("%1").arg(path));
         ret2=dir.mkdir(QString("%1/%2").arg(path).arg(dirName));
+        if (!ret1 && !QDir(path).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("ensure_directory_parent"), m_actorName,
+                                     QString(), path, QStringLiteral("创建目录父路径失败"));
+        }
+        const QString createdDirPath = QString("%1/%2").arg(path).arg(dirName);
+        if (!ret2 && !QDir(createdDirPath).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("create_directory"), m_actorName,
+                                     QString(), QString("%1/%2").arg(path).arg(dirName),
+                                     QStringLiteral("创建目录失败"));
+        }
         // REQ-EXT-FILE-001 D5/T3：目录条目与物理 mkdir 同步建立（条目为权威展示源）。
         // 条目失败不回滚物理结果——flushfile 物理回退保证可见，日志留痕。
         if(ret2 && !m_actorName.isEmpty()){
             QString dirErr;
             if(!FileObjectStore::instance().insertDirEntry(m_actorName, path, dirName, dirErr)){
                 qCWarning(lcFs)<<"[MKDIR] 目录条目建立失败 conn="<<m_connId<<":"<<dirErr;
+                enqueueDirectoryFailure(QStringLiteral("repair_directory_entries"), m_actorName,
+                                         path, QString("%1/%2").arg(path).arg(dirName), dirErr,
+                                         0, QString(), dirName, 0);
             }
         }
     } else {
@@ -757,6 +822,10 @@ PDU *MsgHandler::deldir(const QString& loginName)
             // 目录条目软删不落盘，同名重建前需要清掉物理残留，故保留目录物理删除与子条目级联。
             QDir dir(delFilePath);
             ans=dir.removeRecursively();
+            if (!ans) {
+                enqueueDirectoryFailure(QStringLiteral("delete_directory"), loginName,
+                                         delFilePath, QString(), QStringLiteral("删除物理残留目录失败"));
+            }
             if(ans){
                 QString relErr;
                 if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr, shareRel)){
@@ -991,6 +1060,10 @@ PDU *MsgHandler::renamefile(const QString& loginName)
                     bool physOk = serverIsDir ? QDir().rename(oldFilePath,newFilePath)
                                               : QFile().rename(oldFilePath,newFilePath);
                     if(!physOk){
+                        enqueueDirectoryFailure(serverIsDir ? QStringLiteral("rename_directory")
+                                                           : QStringLiteral("rename_file"),
+                                                 loginName, oldFilePath, newFilePath,
+                                                 QStringLiteral("重命名物理实体失败"));
                         qCWarning(lcFs)<<"[renamefile] 物理实体同步改名失败（条目为准）conn="<<m_connId<<":"<<oldFilePath;
                     }
                 }
@@ -1004,6 +1077,10 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         else if(serverIsDir){//目录物理残留：物理改名 + 子树条目前缀级联，防幽灵键
             QDir dir;
             ret=dir.rename(oldFilePath,newFilePath);
+            if (!ret) {
+                enqueueDirectoryFailure(QStringLiteral("rename_directory"), loginName,
+                                         oldFilePath, newFilePath, QStringLiteral("残留目录改名失败"));
+            }
             if(ret){
                 QString casErr;
                 if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr,
@@ -1255,6 +1332,10 @@ PDU *MsgHandler::movefile(const QString& loginName)
                             : (QFile::rename(srcPath, physDst)
                                || (QFile::copy(srcPath, physDst) && QFile::remove(srcPath)));
                     if(!physOk){
+                        enqueueDirectoryFailure(mvEntry.isDir ? QStringLiteral("move_directory")
+                                                            : QStringLiteral("move_file"),
+                                                 loginName, srcPath, physDst,
+                                                 QStringLiteral("物理实体移动失败"));
                         qCWarning(lcFs)<<"movefile 物理实体同步搬移失败（条目为准）conn="<<m_connId<<":"<<srcPath;
                     }
                 }
@@ -2660,7 +2741,10 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                 // 目标目录：服务端【请求者】用户目录下的“分享链接”文件夹
                 QString userRoot = QDir(Server::getinstance().filesPath).filePath(loginName);
                 QString shareDir = QDir(userRoot).filePath("分享链接");
-                QDir().mkpath(shareDir);
+                if (!QDir().mkpath(shareDir)) {
+                    enqueueDirectoryFailure(QStringLiteral("create_directory"), loginName,
+                                             QString(), shareDir, QStringLiteral("创建分享链接目录失败"));
+                }
                 // 引用同一对象（零复制）；同名安置/幂等复用 attachExistingObject 语义
                 const FileObjectStore::AttachResult attached =
                     FileObjectStore::instance().attachExistingObject(

@@ -41,7 +41,8 @@ public:
     static const int kReclaimSchemaVersion = 2026100701;
     // REQ-AUDIT-001 R4：好友邀请持久化（friend_request 表）。
     // 接受好友必须命中该表里的 pending 行，请求方由服务端保存，客户端字段不作授权依据。
-    static const int kFriendRequestSchemaVersion = 2026111201;    // REQ-DIR-COMP-001：目录操作失败补偿队列迁移版本。
+    static const int kFriendRequestSchemaVersion = 2026111201;
+    // REQ-DIR-COMP-001：目录操作失败补偿队列迁移版本。
     static const int kDirectoryCompensationSchemaVersion = 2026111801;
 
     struct DirectoryCompensationTask {
@@ -73,6 +74,7 @@ public:
     QVector<DirectoryCompensationTask> claimDirectoryCompensations(const QString& claimOwner,
                                                                     int leaseSeconds,
                                                                     int limit);
+    QVector<DirectoryCompensationTask> peekDirectoryCompensations(int limit);
     bool completeDirectoryCompensation(qint64 taskId, const QString& claimOwner);
     bool retryDirectoryCompensation(qint64 taskId, const QString& claimOwner,
                                     const QDateTime& nextRetryAt, const QString& error);
