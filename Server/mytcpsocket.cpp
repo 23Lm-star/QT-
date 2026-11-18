@@ -5,6 +5,7 @@
 // 内存约定：本文件产生的 PDU 一律由 memalloc 分配、memfree 释放，不得与 malloc/free 混用。
 #include "logging.h"
 #include "mytcpsocket.h"
+#include "redisstore.h"
 #include "operatedb.h"
 #include "protocol.h"
 #include "mytcpserver.h"
@@ -197,6 +198,12 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
                 // REQ-EXT-SESSION-001：绑定用户域登录版本——先登记再踢旧
                 // （被踢方断开时登记表已指向新版，clientOffLine 守卫走 stale 分支）
                 m_loginVersion=loginVersion;
+                if (RedisStore::instance().enabled()) {
+                    const QString key = QStringLiteral("online:%1").arg(m_strLoginName);
+                    if (!RedisStore::instance().setEx(key, 90, QByteArray::number(m_loginVersion))) {
+                        qCWarning(lcAuth) << "Redis 在线态写入失败，保留数据库在线态";
+                    }
+                }
                 m_MsgHandler->m_actorName=this->m_strLoginName;
                 MyTcpServer::getinstance().setLoginVersion(this->m_strLoginName, loginVersion);
                 MyTcpServer::getinstance().closeStaleSockets(this->m_strLoginName);
@@ -377,6 +384,12 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
     }
     case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:{
         m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
+        if (m_actorAuthenticated && RedisStore::instance().enabled()) {
+            const QString key = QStringLiteral("online:%1").arg(m_strLoginName);
+            if (!RedisStore::instance().setEx(key, 90, QByteArray::number(m_loginVersion))) {
+                qCWarning(lcAuth) << "Redis 在线态续期失败 user=" << m_strLoginName;
+            }
+        }
         qCDebug(lcNet) << "[HEARTBEAT] recv PING from" << m_strLoginName << "-> send PONG";
         PDU* hRespdu = mkPDU();
         hRespdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_RESPOND;
@@ -930,6 +943,12 @@ void MyTcpSocket::clientOffLine(){
     }
     if(authoritative){
         OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
+        if(m_actorAuthenticated && RedisStore::instance().enabled()){
+            const QString key = QStringLiteral("online:%1").arg(m_strLoginName);
+            if(!RedisStore::instance().evalCompareDelete(key, QByteArray::number(m_loginVersion))){
+                qCWarning(lcAuth) << "Redis 在线态 CAS 删除失败 user=" << m_strLoginName;
+            }
+        }
         if(m_actorAuthenticated){
             MyTcpServer::getinstance().removeLoginVersion(m_strLoginName);
         }

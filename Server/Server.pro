@@ -53,6 +53,7 @@ SOURCES += \
     chatbounds.cpp \
     captchaimage.cpp \
     reclaimscheduler.cpp \
+    redisstore.cpp \
     resumableuploadsession.cpp \
     server.cpp \
     sharelinkservice.cpp \
@@ -76,6 +77,7 @@ HEADERS += \
     chatbounds.h \
     captchaimage.h \
     reclaimscheduler.h \
+    redisstore.h \
     resumableuploadsession.h \
     server.h \
     sharelinkservice.h \

@@ -21,6 +21,7 @@
 #include <QVector>
 #include <QSet>
 #include <cerrno>
+#include "redisstore.h"
 
 // REQ-PROTO-CODE-001：统一把标准码写入响应 caData[0,4)
 inline void setProtocolCode(PDU *pdu, int code)
@@ -29,6 +30,18 @@ inline void setProtocolCode(PDU *pdu, int code)
 }
 
 namespace {
+QString captchaIdentity(const PDU* request, quint64 connId)
+{
+    if (request != nullptr && request->uiMsgLen > 0 && request->uiMsgLen <= 64) {
+        const QByteArray raw(request->caMsg, int(request->uiMsgLen));
+        for (char c : raw) {
+            if (c < 0x21 || c > 0x7e) return QString::number(connId);
+        }
+        if (!raw.isEmpty()) return QString::fromLatin1(raw);
+    }
+    return QString::number(connId);
+}
+
 QString compensationPath(const QString& path)
 {
     if (path.isEmpty()) return QString();
@@ -103,6 +116,38 @@ QString MsgHandler::generateCaptchaCode(int length)
 
 int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remainingSec)
 {
+    if (RedisStore::instance().enabled()) {
+        const QString prefix = QStringLiteral("cap:%1:").arg(captchaIdentity(pdu, m_connId));
+        QByteArray code;
+        if (!RedisStore::instance().get(prefix + QStringLiteral("lock"), code) &&
+            !RedisStore::instance().get(prefix + QStringLiteral("code"), code)) {
+            qCWarning(lcAuth) << "Redis 验证码状态读取失败，回退连接内存状态";
+        } else {
+            QByteArray lock;
+            if (RedisStore::instance().get(prefix + QStringLiteral("lock"), lock)) {
+                remainingSec = lock.toInt();
+                return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
+            }
+            const QString userInput = QString::fromUtf8(caMsg, int(uiMsgLen)).trimmed();
+            if (uiMsgLen < 4 || code.isEmpty()) return ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED;
+            if (userInput != QString::fromUtf8(code)) {
+                qint64 fails = 0;
+                if (RedisStore::instance().incr(prefix + QStringLiteral("fail"), fails)) {
+                    RedisStore::instance().setEx(prefix + QStringLiteral("fail"), CAPTCHA_LOCKOUT_SEC, QByteArray::number(fails));
+                    if (fails >= CAPTCHA_MAX_FAILS) {
+                        RedisStore::instance().setEx(prefix + QStringLiteral("lock"), CAPTCHA_LOCKOUT_SEC, QByteArray::number(CAPTCHA_LOCKOUT_SEC));
+                        RedisStore::instance().del(prefix + QStringLiteral("code"));
+                        remainingSec = CAPTCHA_LOCKOUT_SEC;
+                        return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
+                    }
+                }
+                return ENUM_PROTOCOL_CODE_CAPTCHA_WRONG;
+            }
+            RedisStore::instance().del(prefix + QStringLiteral("code"));
+            RedisStore::instance().del(prefix + QStringLiteral("fail"));
+            return 0;
+        }
+    }
     remainingSec = 0;
     QDateTime now = QDateTime::currentDateTime();
 
@@ -300,6 +345,12 @@ PDU *MsgHandler::captcha()
         m_captchaNextAllowed = now.addSecs(CAPTCHA_COOLDOWN_SEC);
         remaining = CAPTCHA_COOLDOWN_SEC;   // 成功时回传正常冷却时长
         status = 0;
+        if (RedisStore::instance().enabled()) {
+            const QString prefix = QStringLiteral("cap:%1:").arg(captchaIdentity(pdu, m_connId));
+            const bool stored = RedisStore::instance().setEx(prefix + QStringLiteral("code"), CAPTCHA_EXPIRE_SEC, m_captchaCode.toUtf8()) &&
+                    RedisStore::instance().setEx(prefix + QStringLiteral("cool"), CAPTCHA_COOLDOWN_SEC, QByteArray::number(CAPTCHA_COOLDOWN_SEC));
+            if (!stored) qCWarning(lcAuth) << "Redis 验证码状态写入失败，保留连接内存状态";
+        }
         // REQ-AUDIT-001 R8：文本答案只留在本连接状态里，不进日志、不回传
         qCDebug(lcAuth) << "生成验证码（图片，文本不外发）过期时间:" << m_captchaExpiry;
     }
@@ -493,7 +544,16 @@ PDU *MsgHandler::onlineuser(const QString &myname)
     if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;   // limit==0 保留旧全量语义（网页端/旧脚本）
     const QString keyword=fixedString(pdu->caData+ALLUSER_REQ_KEYWORD_OFFSET,ALLUSER_REQ_KEYWORD_BYTES);
     uint total=0; bool hasMore=false; bool capped=false;
-    const QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,keyword,limit,offset,&total,&hasMore,&capped);
+    QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,keyword,limit,offset,&total,&hasMore,&capped);
+    if (RedisStore::instance().enabled()) {
+        for (int i = 0; i < users.size(); ++i) {
+            QByteArray version;
+            const QString key = QStringLiteral("online:%1").arg(users[i].first);
+            if (RedisStore::instance().get(key, version)) {
+                users[i].second = !version.isEmpty();
+            }
+        }
+    }
     qCDebug(lcNet)<<"所有用户个数"<<total<<"本页"<<users.size()<<"offset"<<offset<<"关键词"<<keyword<<"封顶"<<capped;
     // 响应 caData：标准码、total、has_more、count、capped；载荷每条 33B=名字[32]+online(u8)
     PDU* respdu=mkPDU(uint(users.size())*ALLUSER_ENTRY_BYTES);
