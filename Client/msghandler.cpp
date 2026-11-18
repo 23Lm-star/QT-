@@ -120,10 +120,12 @@ QString MsgHandler::handllogin()
 
 void MsgHandler::handlonlineuser(){
       // REQ-PAGE-FETCH-001：所有用户分页响应（caData 码/total/has_more/count，载荷每条 33B）
-      uint total=0; quint8 hasMore=0; quint32 count=0;
+      // REQ-PAGE-FETCH-002：capped=1 表示结果总量超上限（total 已封顶）
+      uint total=0; quint8 hasMore=0; quint32 count=0; quint8 capped=0;
       memcpy(&total,pdu->caData+ALLUSER_RESP_TOTAL_OFFSET,sizeof(total));
       memcpy(&hasMore,pdu->caData+ALLUSER_RESP_HASMORE_OFFSET,sizeof(hasMore));
       memcpy(&count,pdu->caData+ALLUSER_RESP_COUNT_OFFSET,sizeof(count));
+      memcpy(&capped,pdu->caData+ALLUSER_RESP_CAPPED_OFFSET,sizeof(capped));
       const uint cap=uint(pdu->uiMsgLen/ALLUSER_ENTRY_BYTES);
       if(count>cap) count=cap;
       QVector<QPair<QString,bool>> entries;
@@ -135,7 +137,7 @@ void MsgHandler::handlonlineuser(){
           const bool online=pdu->caMsg[base+ALLUSER_ENTRY_NAME_BYTES]==1;
           entries.append(qMakePair(QString::fromUtf8(userName),online));
       }
-      Index::getinstance().getFriend()->m_onlineUser->updateOnlineUser(entries,total,hasMore==1,true);
+      Index::getinstance().getFriend()->m_onlineUser->updateOnlineUser(entries,total,hasMore==1,true,capped==1);
 }
 
 void MsgHandler::handlAddFriend()
@@ -187,10 +189,13 @@ void MsgHandler::handlAddFriendAgree(const QString &myName)
 // 好友列表：caMsg 是 32 字节定长用户名数组，数量 = uiMsgLen/32。
 void MsgHandler::handlFlushFriend()
 {
-    // REQ-PAGE-FETCH-001：好友列表服务端数量截断（至多 PAGE_MAX_LIMIT 条），超限提示
-    quint8 truncated=0; quint32 count=0;
-    memcpy(&truncated,pdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,sizeof(truncated));
+    // REQ-PAGE-FETCH-002：好友真分页响应（码/truncated 恒 0/count/total/has_more/capped）；
+    // 截断语义已被分页取代，编号跨页连续由 Friend::flushFriend_LW 追加
+    quint32 count=0, total=0; quint8 hasMore=0, capped=0;
     memcpy(&count,pdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,sizeof(count));
+    memcpy(&total,pdu->caData+FRIEND_RESP_TOTAL_OFFSET,sizeof(total));
+    memcpy(&hasMore,pdu->caData+FRIEND_RESP_HASMORE_OFFSET,sizeof(hasMore));
+    memcpy(&capped,pdu->caData+FRIEND_RESP_CAPPED_OFFSET,sizeof(capped));
     const uint cap=uint(pdu->uiMsgLen/32);
     if(count==0) count=cap;                        // 兼容空 caData（旧响应/测试桩）
     if(count>cap) count=cap;
@@ -198,13 +203,9 @@ void MsgHandler::handlFlushFriend()
     for(uint i=0;i<count;i++){
         char userName[32]={'\0'};
         memcpy(userName,pdu->caMsg+i*32,32);//取出每一个用户的用户名
-        userNamelist.append(QString("%1.%2").arg(i+1).arg(userName));//将编号还有用户名都统一加进去
+        userNamelist.append(QString::fromUtf8(userName));
     }
-    Index::getinstance().getFriend()->flushFriend_LW(userNamelist);
-    if(truncated){
-        QMessageBox::information(Index::getinstance().getFriend(),QStringLiteral("提示"),
-            QStringLiteral("好友数量较多，已截断显示最近 %1 条").arg(uint(count)));
-    }
+    Index::getinstance().getFriend()->flushFriend_LW(userNamelist,total,hasMore==1,capped==1);
 }
 //删除好友
 void MsgHandler::handlDeleteFriend()

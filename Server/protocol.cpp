@@ -273,10 +273,11 @@ QString decodePdu(const PDU *pdu)
     case ENUM_MSG_TYPE_findUser_RESPOND:
         f.i32("结果码", d, 0, dl); f.u32("在线(1=在线)", d, 4, dl); break;
     case ENUM_MSG_TYPE_ONLINEUSER_REQUEST:
-        f.u32("每页条数(0=全量)", d, 0, dl); f.u32("分页起点", d, 4, dl); break;
+        f.u32("每页条数(0=全量)", d, 0, dl); f.u32("分页起点", d, 4, dl);
+        f.str("搜索关键词(空=不过滤)", d, 8, dl); break;
     case ENUM_MSG_TYPE_ONLINEUSER_RESPOND: {
-        f.i32("结果码", d, 0, dl); f.u32("符合条件总数", d, 4, dl);
-        f.raw(QStringLiteral("还有下一页=%1 本页条数=%2").arg(int(d[8])).arg(u32at(d, 12, dl)));
+        f.i32("结果码", d, 0, dl); f.u32("符合条件总数(封顶后)", d, 4, dl);
+        f.raw(QStringLiteral("还有下一页=%1 本页条数=%2 总量封顶=%3").arg(int(d[8])).arg(u32at(d, 12, dl)).arg(int(d[16])));
         const int cnt = qMin(u32at(d, 12, dl), quint32(ml / 33));
         for (int i = 0; i < qMin(cnt, 3); ++i)
             f.raw(QStringLiteral("  条目[%1] 名=\"%2\" 在线=%3").arg(i)
@@ -288,12 +289,16 @@ QString decodePdu(const PDU *pdu)
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
         f.i32("结果码", d, 0, dl); f.str("账号A", d, 0, dl); f.str("账号B", d, 32, dl); break;
     case ENUM_MSG_TYPE_FLUSHFRIEND_REQUEST:
+        // REQ-PAGE-FETCH-002：好友真分页请求（旧端空 caData 即 limit=0 全量语义）
+        f.u32("每页条数(0=全量)", d, 0, dl); f.u32("分页起点", d, 4, dl); break;
     case ENUM_MSG_TYPE_LIST_PENDING_FRIEND_REQUEST:
     case ENUM_MSG_TYPE_CAPTCHA_REQUEST:
     case ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY:
         f.raw(QStringLiteral("空请求")); break;
     case ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND: {
-        f.i32("结果码", d, 0, dl); f.raw(QStringLiteral("已截断=%1 本页条数=%2").arg(int(d[4])).arg(u32at(d, 8, dl)));
+        f.i32("结果码", d, 0, dl);
+        f.raw(QStringLiteral("本页条数=%1 好友总数(封顶后)=%2 还有下一页=%3 总量封顶=%4")
+              .arg(u32at(d, 8, dl)).arg(u32at(d, 12, dl)).arg(int(d[16])).arg(int(d[17])));
         const int cnt = qMin(u32at(d, 8, dl), quint32(ml / 32));
         for (int i = 0; i < qMin(cnt, 3); ++i) f.raw(QStringLiteral("  好友[%1] \"%2\"").arg(i).arg(fixedStr(m, i * 32, ml)));
         if (cnt > 3) f.raw(QStringLiteral("  …共 %1 条").arg(cnt));

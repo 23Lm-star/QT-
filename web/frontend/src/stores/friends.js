@@ -11,7 +11,12 @@ export const useFriendsStore = defineStore('friends', {
   state: () => ({
     friends: [],
     onlineUsers: [],        // REQ-PAGE-FETCH-001：{name, online} 条目数组
-    onlineNames: [],        // 名字数组（ShareView 等旧消费点）
+    onlineNames: [],        // 名字数组（ShareView 等旧消费点；分页后为已加载页并集）
+    // REQ-PAGE-FETCH-002：所有用户服务端真分页＋搜索状态
+    onlineTotal: 0,         // 符合条件总数（封顶后）
+    onlineHasMore: false,   // 还有下一页
+    onlineCapped: false,    // 结果总量超 LIST_TOTAL_CAP
+    onlineKeyword: '',      // 当前搜索词（空=不过滤）
     incomingRequest: null, // { requester } 待处理的好友申请（push 9）
     hint: '',
     hintType: 'info',
@@ -60,17 +65,47 @@ export const useFriendsStore = defineStore('friends', {
     },
 
     async loadFriends() {
-      try { this.friends = await friendCmd.fetchFriends(); }
-      catch (e) { this.setHint(e.message || '获取好友列表失败', 'error'); }
-    },
-    async loadOnlineUsers() {
-      const auth = useAuthStore();
       try {
-        // REQ-PAGE-FETCH-001：条目含在线状态；onlineNames 供旧消费点按名匹配
-        const entries = await friendCmd.fetchOnlineUsers(auth.loginName);
-        this.onlineUsers = entries;
-        this.onlineNames = entries.map((e) => e.name);
+        // REQ-PAGE-FETCH-002 D-web：数据层保持全量拉取（limit=0，≤总量上限），
+        // 供会话校验/分享/isFriend 等全量成员消费点；FriendPanel 展示层本地分页。
+        const page = await friendCmd.fetchFriendsPage({ limit: 0, offset: 0 });
+        this.friends = page.names;
+        if (page.capped) {
+          this.setHint(`好友总数超过 ${friendCmd.LIST_TOTAL_CAP} 条，仅显示前 ${friendCmd.LIST_TOTAL_CAP} 条`, 'info');
+        }
+      } catch (e) { this.setHint(e.message || '获取好友列表失败', 'error'); }
+    },
+    // REQ-PAGE-FETCH-002：刷新入口＝第 0 页重置（保留当前搜索词）；服务端排除自己与好友
+    async loadOnlineUsers() {
+      try {
+        const page = await friendCmd.fetchOnlineUsersPage({ limit: 50, offset: 0, keyword: this.onlineKeyword });
+        this.onlineUsers = page.entries;
+        this.onlineNames = page.entries.map((e) => e.name);
+        this.onlineTotal = page.total;
+        this.onlineHasMore = page.hasMore;
+        this.onlineCapped = page.capped;
       } catch (e) { this.setHint(e.message || '获取在线用户失败', 'error'); }
+    },
+    // REQ-PAGE-FETCH-002：加载更多＝按已加载条数取下一页（携带搜索词；按名去重防 offset 漂移重复）
+    async loadMoreOnlineUsers() {
+      if (!this.onlineHasMore) return;
+      try {
+        const page = await friendCmd.fetchOnlineUsersPage({
+          limit: 50, offset: this.onlineUsers.length, keyword: this.onlineKeyword,
+        });
+        const seen = new Set(this.onlineNames);
+        const fresh = page.entries.filter((e) => !seen.has(e.name));
+        this.onlineUsers = this.onlineUsers.concat(fresh);
+        this.onlineNames = this.onlineUsers.map((e) => e.name);
+        this.onlineTotal = page.total;
+        this.onlineHasMore = page.hasMore;
+        this.onlineCapped = page.capped;
+      } catch (e) { this.setHint(e.message || '加载更多失败', 'error'); }
+    },
+    // REQ-PAGE-FETCH-002：更换/清空搜索词从第 0 页重拉
+    searchOnlineUsers(keyword) {
+      this.onlineKeyword = (keyword || '').trim();
+      return this.loadOnlineUsers();
     },
     // 发送好友申请（9）：发送即忘，结果经 push 10 异步到达。
     addFriend(target) {
@@ -113,6 +148,10 @@ export const useFriendsStore = defineStore('friends', {
       this.friends = [];
       this.onlineUsers = [];
       this.onlineNames = [];
+      this.onlineTotal = 0;
+      this.onlineHasMore = false;
+      this.onlineCapped = false;
+      this.onlineKeyword = '';
       this.incomingRequest = null;
       this.hint = '';
       this.hintType = 'info';

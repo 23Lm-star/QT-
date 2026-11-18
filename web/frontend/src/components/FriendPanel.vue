@@ -1,6 +1,8 @@
 <script setup>
 // 好友面板：左侧好友列表 + 工具条 + 提示条，右侧聊天区。
-import { ref } from 'vue';
+// REQ-PAGE-FETCH-002 D-web：数据层全量（store.friends，≤总量上限，供会话校验/分享消费），
+// 展示层本地分页——首屏 50 条，「加载更多」揭示后续，与桌面端分页体验等价。
+import { ref, computed } from 'vue';
 import { useFriendsStore } from '../stores/friends.js';
 import { useChatStore } from '../stores/chat.js';
 import ChatPanel from './ChatPanel.vue';
@@ -9,6 +11,10 @@ import OnlineUserDialog from './OnlineUserDialog.vue';
 const friends = useFriendsStore();
 const chat = useChatStore();
 const showOnline = ref(false);
+const revealCount = ref(50);
+const visibleFriends = computed(() => friends.friends.slice(0, revealCount.value));
+const hasMoreLocal = computed(() => revealCount.value < friends.friends.length);
+function loadMoreLocal() { revealCount.value += 50; }
 
 function onFriendClick(name) { chat.openChat(name); }
 
@@ -32,13 +38,17 @@ function onDeleteFriend() {
       <div v-if="friends.hint" class="hint" :class="friends.hintType">{{ friends.hint }}</div>
       <ul class="list">
         <li v-if="friends.friends.length === 0" class="empty">暂无好友，点击"在线用户"添加</li>
-        <li v-for="name in friends.friends" :key="name"
+        <li v-for="name in visibleFriends" :key="name"
             class="item" :class="{ active: chat.activePeer === name }" @click="onFriendClick(name)">
           <span class="avatar">{{ name.slice(0, 1).toUpperCase() }}</span>
           <span class="name">{{ name }}</span>
           <span v-if="chat.unread[name]" class="badge">{{ chat.unread[name] }}</span>
         </li>
       </ul>
+      <div v-if="friends.friends.length > 0" class="list-foot">
+        <span>已显示 {{ visibleFriends.length }}/{{ friends.friends.length }}</span>
+        <button v-if="hasMoreLocal" @click="loadMoreLocal">加载更多</button>
+      </div>
     </aside>
     <section class="chat-area">
       <ChatPanel v-if="chat.activePeer" :peer="chat.activePeer" />
@@ -63,6 +73,8 @@ function onDeleteFriend() {
 .hint.error { background: #fef2f2; color: #b91c1c; }
 .list { flex: 1; overflow-y: auto; margin: 0; padding: 6px; list-style: none; }
 .list .empty { padding: 16px 10px; font-size: 12px; color: #9ca3af; text-align: center; }
+.list-foot { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-top: 1px solid #f3f4f6; font-size: 12px; color: #6b7280; }
+.list-foot button { border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 3px 10px; font-size: 12px; cursor: pointer; color: #374151; }
 .item { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; cursor: pointer; }
 .item:hover { background: #f9fafb; }
 .item.active { background: #eff6ff; }

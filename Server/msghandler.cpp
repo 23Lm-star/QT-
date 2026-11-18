@@ -15,6 +15,7 @@
 
 #include <QFile>
 #include <QFileInfo>
+#include <QDir>
 #include <QTime>
 #include <QThreadPool>
 #include <QVector>
@@ -25,6 +26,30 @@
 inline void setProtocolCode(PDU *pdu, int code)
 {
     memcpy(pdu->caData, &code, PROTOCOL_CODE_SIZE);
+}
+
+namespace {
+QString compensationPath(const QString& path)
+{
+    if (path.isEmpty()) return QString();
+    const QString root = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString rel = QDir(root).relativeFilePath(QFileInfo(path).absoluteFilePath());
+    return (rel.startsWith("..") || rel.startsWith('/'))
+            ? QStringLiteral("__INVALID_PATH__") : rel;
+}
+
+void enqueueDirectoryFailure(const QString& type, const QString& account,
+                             const QString& source, const QString& target,
+                             const QString& error, qint64 entryId = 0,
+                             const QString& sourceName = QString(),
+                             const QString& targetName = QString(),
+                             qint64 operationVersion = 0)
+{
+    if (account.isEmpty()) return;
+    OperateDB::instance().enqueueDirectoryCompensation(
+        type, account, compensationPath(source), compensationPath(target),
+        entryId, sourceName, targetName, operationVersion, error);
+}
 }
 
 #include <cstring>
@@ -166,10 +191,19 @@ PDU *MsgHandler::logoff(bool &revoked)
             if(!removed){
                 // REQ-AUDIT-001 R3：删不掉就移出用户根，避免同名重注册看到前账号的目录残留。
                 const QString quarantine=QString("%1/.deleted").arg(Server::getinstance().filesPath);
-                QDir().mkpath(quarantine);
+                if (!QDir().mkpath(quarantine)) {
+                    enqueueDirectoryFailure(QStringLiteral("create_quarantine_root"), actor,
+                                             QString(), quarantine, QStringLiteral("创建用户目录隔离根失败"));
+                }
                 const QString target=QString("%1/%2-%3").arg(quarantine).arg(actor)
                         .arg(QDateTime::currentMSecsSinceEpoch());
                 const bool moved=QDir().rename(userDir,target);
+                if (!moved) {
+                    enqueueDirectoryFailure(QStringLiteral("delete_user_root"), actor,
+                                             userDir, QString(), QStringLiteral("删除用户目录及隔离均失败"));
+                    enqueueDirectoryFailure(QStringLiteral("quarantine_user_root"), actor,
+                                             userDir, target, QStringLiteral("用户目录隔离失败"));
+                }
                 qCWarning(lcAuth)<<"logoff: 用户目录删除失败，隔离结果:"<<moved<<" dir:"<<userDir;
             }
             qCDebug(lcAuth)<<"logoff: remove user dir"<<userDir<<"result:"<<removed;
@@ -330,6 +364,17 @@ PDU *MsgHandler::rigist()
         QDir dir;
         bool ret1=dir.mkdir(QString("%1").arg(Server::getinstance().filesPath));
         bool ret2=dir.mkdir(QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname));
+        if (!ret1 && !QDir(Server::getinstance().filesPath).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("create_storage_root"), strname,
+                                     QString(), Server::getinstance().filesPath,
+                                     QStringLiteral("注册时创建存储根目录失败"));
+        }
+        const QString registeredUserRoot = QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname);
+        if (!ret2 && !QDir(registeredUserRoot).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("create_user_root"), strname,
+                                     QString(), QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname),
+                                     QStringLiteral("注册时创建用户根目录失败"));
+        }
         qCDebug(lcAuth)<<"创建用户目录:"<<"ret1 "<<ret1<<" "<<QString("%1").arg(Server::getinstance().filesPath)<<endl;
         qCDebug(lcAuth)<<"创建用户目录:"<<"ret2 "<<ret2<<" "<<QString("%1/%2").arg(Server::getinstance().filesPath).arg(strname)<<endl;
     }
@@ -395,8 +440,15 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
         const QString fsRoot = Server::getinstance().filesPath;
         if(!fsRoot.isEmpty()){
             QDir dir;
-            dir.mkpath(fsRoot);
-            dir.mkpath(QString("%1/%2").arg(fsRoot).arg(username));
+            if (!dir.mkpath(fsRoot)) {
+                enqueueDirectoryFailure(QStringLiteral("create_storage_root"), username,
+                                         QString(), fsRoot, QStringLiteral("登录时补齐存储根目录失败"));
+            }
+            const QString userRoot = QString("%1/%2").arg(fsRoot).arg(username);
+            if (!dir.mkpath(userRoot)) {
+                enqueueDirectoryFailure(QStringLiteral("create_user_root"), username,
+                                         QString(), userRoot, QStringLiteral("登录时补齐用户根目录失败"));
+            }
         }
     }else{
         loginVersion=0;
@@ -433,15 +485,17 @@ PDU *MsgHandler::finduser(){
 PDU *MsgHandler::onlineuser(const QString &myname)
 {
     // REQ-PAGE-FETCH-001：所有用户分页（含离线、排除自己与双向好友）。
-    // 请求 caData：limit(u32)、offset(u32)；limit=0 视为默认页大小（兼容空请求）。
+    // REQ-PAGE-FETCH-002：关键词搜索（caData[8,40)）与结果总量封顶（capped）。
+    // 请求 caData：limit(u32)、offset(u32)、keyword[32]；limit=0 保留旧全量语义（兼容空请求，≤总量上限）。
     uint limit=0, offset=0;
     memcpy(&limit,pdu->caData+ALLUSER_REQ_LIMIT_OFFSET,sizeof(limit));
     memcpy(&offset,pdu->caData+ALLUSER_REQ_OFFSET_OFFSET,sizeof(offset));
     if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;   // limit==0 保留旧全量语义（网页端/旧脚本）
-    uint total=0; bool hasMore=false;
-    const QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,limit,offset,&total,&hasMore);
-    qCDebug(lcNet)<<"所有用户个数"<<total<<"本页"<<users.size()<<"offset"<<offset;
-    // 响应 caData：标准码、total、has_more、count；载荷每条 33B=名字[32]+online(u8)
+    const QString keyword=fixedString(pdu->caData+ALLUSER_REQ_KEYWORD_OFFSET,ALLUSER_REQ_KEYWORD_BYTES);
+    uint total=0; bool hasMore=false; bool capped=false;
+    const QVector<QPair<QString,bool>> users=OperateDB::instance().handleAllUsers(myname,keyword,limit,offset,&total,&hasMore,&capped);
+    qCDebug(lcNet)<<"所有用户个数"<<total<<"本页"<<users.size()<<"offset"<<offset<<"关键词"<<keyword<<"封顶"<<capped;
+    // 响应 caData：标准码、total、has_more、count、capped；载荷每条 33B=名字[32]+online(u8)
     PDU* respdu=mkPDU(uint(users.size())*ALLUSER_ENTRY_BYTES);
     respdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_RESPOND;
     const int ok=ENUM_PROTOCOL_CODE_OK;
@@ -451,6 +505,8 @@ PDU *MsgHandler::onlineuser(const QString &myname)
     memcpy(respdu->caData+ALLUSER_RESP_HASMORE_OFFSET,&more,sizeof(more));
     const quint32 count=quint32(users.size());
     memcpy(respdu->caData+ALLUSER_RESP_COUNT_OFFSET,&count,sizeof(count));
+    const quint8 cp=capped?1:0;
+    memcpy(respdu->caData+ALLUSER_RESP_CAPPED_OFFSET,&cp,sizeof(cp));
     for(int i=0;i<users.size();i++){
         char* entry=respdu->caMsg+i*ALLUSER_ENTRY_BYTES;
         const QByteArray nameBytes=users[i].first.toUtf8();
@@ -529,22 +585,29 @@ PDU *MsgHandler::addfriendFin()
 
 PDU *MsgHandler::flushfriend(const QString &username)
 {
-    // REQ-PAGE-FETCH-001：服务端数量截断（无时间列只限条数），超限置 truncated 标志
-    bool truncated=false;
-    QStringList ret=OperateDB::instance().handleFlushFriend(username,&truncated);
-    qCDebug(lcNet)<<"ret.size()="<<ret.size();
-    for(int i=0;i<ret.size();i++){
-        qCDebug(lcNet)<<ret[i]<<" ";
-    }qCDebug(lcNet)<<endl;
+    // REQ-PAGE-FETCH-002：好友真分页（limit/offset＋名字字典序）取代 001 数量截断；
+    // truncated 字段保留恒 0（旧端解析兼容），总量封顶走 capped。limit=0 保留旧全量语义（≤上限）。
+    uint limit=0, offset=0;
+    memcpy(&limit,pdu->caData+FRIEND_REQ_LIMIT_OFFSET,sizeof(limit));
+    memcpy(&offset,pdu->caData+FRIEND_REQ_OFFSET_OFFSET,sizeof(offset));
+    if(limit>PAGE_MAX_LIMIT) limit=PAGE_MAX_LIMIT;
+    uint total=0; bool hasMore=false; bool capped=false;
+    QStringList ret=OperateDB::instance().handleFlushFriend(username,limit,offset,&total,&hasMore,&capped);
+    qCDebug(lcNet)<<"好友总数"<<total<<"本页"<<ret.size()<<"offset"<<offset<<"封顶"<<capped;
     // 载荷同样为 N*32 字节的定长好友名数组。
     PDU* respdu=mkPDU(uint(ret.size())*32);
     respdu->uiType=ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND;
     const int ok=ENUM_PROTOCOL_CODE_OK;
     memcpy(respdu->caData+LIST_TRUNC_RESP_RET_OFFSET,&ok,sizeof(ok));
-    const quint8 tr=truncated?1:0;
+    const quint8 tr=0;   // 截断语义已被分页取代
     memcpy(respdu->caData+LIST_TRUNC_RESP_TRUNCATED_OFFSET,&tr,sizeof(tr));
     const quint32 count=quint32(ret.size());
     memcpy(respdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,&count,sizeof(count));
+    memcpy(respdu->caData+FRIEND_RESP_TOTAL_OFFSET,&total,sizeof(total));
+    const quint8 more=hasMore?1:0;
+    memcpy(respdu->caData+FRIEND_RESP_HASMORE_OFFSET,&more,sizeof(more));
+    const quint8 cp=capped?1:0;
+    memcpy(respdu->caData+FRIEND_RESP_CAPPED_OFFSET,&cp,sizeof(cp));
     for(int i=0;i<ret.size();i++){
         // REQ-AUDIT-FULL-001：定长槽按实际长度拷贝（≤31 保留 NUL），避免对短源串越界读
         const QByteArray nameBytes=ret[i].toUtf8();
@@ -684,12 +747,25 @@ PDU *MsgHandler::MKDIR(){
         QDir dir;
         ret1=dir.mkdir(QString("%1").arg(path));
         ret2=dir.mkdir(QString("%1/%2").arg(path).arg(dirName));
+        if (!ret1 && !QDir(path).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("ensure_directory_parent"), m_actorName,
+                                     QString(), path, QStringLiteral("创建目录父路径失败"));
+        }
+        const QString createdDirPath = QString("%1/%2").arg(path).arg(dirName);
+        if (!ret2 && !QDir(createdDirPath).exists()) {
+            enqueueDirectoryFailure(QStringLiteral("create_directory"), m_actorName,
+                                     QString(), QString("%1/%2").arg(path).arg(dirName),
+                                     QStringLiteral("创建目录失败"));
+        }
         // REQ-EXT-FILE-001 D5/T3：目录条目与物理 mkdir 同步建立（条目为权威展示源）。
         // 条目失败不回滚物理结果——flushfile 物理回退保证可见，日志留痕。
         if(ret2 && !m_actorName.isEmpty()){
             QString dirErr;
             if(!FileObjectStore::instance().insertDirEntry(m_actorName, path, dirName, dirErr)){
                 qCWarning(lcFs)<<"[MKDIR] 目录条目建立失败 conn="<<m_connId<<":"<<dirErr;
+                enqueueDirectoryFailure(QStringLiteral("repair_directory_entries"), m_actorName,
+                                         path, QString("%1/%2").arg(path).arg(dirName), dirErr,
+                                         0, QString(), dirName, 0);
             }
         }
     } else {
@@ -746,6 +822,10 @@ PDU *MsgHandler::deldir(const QString& loginName)
             // 目录条目软删不落盘，同名重建前需要清掉物理残留，故保留目录物理删除与子条目级联。
             QDir dir(delFilePath);
             ans=dir.removeRecursively();
+            if (!ans) {
+                enqueueDirectoryFailure(QStringLiteral("delete_directory"), loginName,
+                                         delFilePath, QString(), QStringLiteral("删除物理残留目录失败"));
+            }
             if(ans){
                 QString relErr;
                 if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr, shareRel)){
@@ -980,6 +1060,10 @@ PDU *MsgHandler::renamefile(const QString& loginName)
                     bool physOk = serverIsDir ? QDir().rename(oldFilePath,newFilePath)
                                               : QFile().rename(oldFilePath,newFilePath);
                     if(!physOk){
+                        enqueueDirectoryFailure(serverIsDir ? QStringLiteral("rename_directory")
+                                                           : QStringLiteral("rename_file"),
+                                                 loginName, oldFilePath, newFilePath,
+                                                 QStringLiteral("重命名物理实体失败"));
                         qCWarning(lcFs)<<"[renamefile] 物理实体同步改名失败（条目为准）conn="<<m_connId<<":"<<oldFilePath;
                     }
                 }
@@ -993,6 +1077,10 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         else if(serverIsDir){//目录物理残留：物理改名 + 子树条目前缀级联，防幽灵键
             QDir dir;
             ret=dir.rename(oldFilePath,newFilePath);
+            if (!ret) {
+                enqueueDirectoryFailure(QStringLiteral("rename_directory"), loginName,
+                                         oldFilePath, newFilePath, QStringLiteral("残留目录改名失败"));
+            }
             if(ret){
                 QString casErr;
                 if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr,
@@ -1244,6 +1332,10 @@ PDU *MsgHandler::movefile(const QString& loginName)
                             : (QFile::rename(srcPath, physDst)
                                || (QFile::copy(srcPath, physDst) && QFile::remove(srcPath)));
                     if(!physOk){
+                        enqueueDirectoryFailure(mvEntry.isDir ? QStringLiteral("move_directory")
+                                                            : QStringLiteral("move_file"),
+                                                 loginName, srcPath, physDst,
+                                                 QStringLiteral("物理实体移动失败"));
                         qCWarning(lcFs)<<"movefile 物理实体同步搬移失败（条目为准）conn="<<m_connId<<":"<<srcPath;
                     }
                 }
@@ -2649,7 +2741,10 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                 // 目标目录：服务端【请求者】用户目录下的“分享链接”文件夹
                 QString userRoot = QDir(Server::getinstance().filesPath).filePath(loginName);
                 QString shareDir = QDir(userRoot).filePath("分享链接");
-                QDir().mkpath(shareDir);
+                if (!QDir().mkpath(shareDir)) {
+                    enqueueDirectoryFailure(QStringLiteral("create_directory"), loginName,
+                                             QString(), shareDir, QStringLiteral("创建分享链接目录失败"));
+                }
                 // 引用同一对象（零复制）；同名安置/幂等复用 attachExistingObject 语义
                 const FileObjectStore::AttachResult attached =
                     FileObjectStore::instance().attachExistingObject(

@@ -6,6 +6,8 @@
 #include <QString>
 #include <QTimer>
 
+#include "operatedb.h"
+
 // reclaimscheduler.h — 延迟删除的后台收割者：清理废弃 .part 与引用归零的物理对象。
 // 运行在主线程 QTimer 上，按拍切片以限制阻塞；删除前用条件状态迁移与复活方抢权互斥。
 // 配置文件为可执行文件同目录的 reclaim.cfg，缺失或非法值一律回退保守默认。
@@ -70,6 +72,8 @@ public:
         // 这种倍数，单位不换、语义不变。
         int stagingTtlHours = 6;     // 废弃暂存文件保留期
         int graceHours = 6;          // 待回收对象宽限期（复活窗口）
+        int directoryRetryMinutes = 5;   // 目录补偿失败后的固定重试间隔
+        int directoryLeaseSeconds = 120; // 多实例目录补偿租约
     };
 
     struct Stats {
@@ -81,6 +85,10 @@ public:
         qint64 unlinkFailed = 0;
         qint64 recovered = 0;        // 崩溃残留的 reclaiming 行
         qint64 skippedUnsafe = 0;    // storage_path 越界/仍有活跃引用，拒绝落地
+        qint64 directoryClaimed = 0;
+        qint64 directoryCompleted = 0;
+        qint64 directoryRetried = 0;
+        qint64 directoryClaimFailed = 0;
         qint64 elapsedMs = 0;
     };
 
@@ -109,6 +117,9 @@ private:
     void recoverStaleClaims(const Config& cfg, Stats& st);
     int harvestReclaimObjects(const Config& cfg, int budget, Stats& st);
     int harvestStagingFiles(const Config& cfg, int budget, Stats& st);
+    int harvestDirectoryCompensations(const Config& cfg, int budget, Stats& st);
+    bool executeDirectoryCompensation(const OperateDB::DirectoryCompensationTask& task,
+                                      QString& error) const;
     void logWatermark(const Config& cfg, const Stats& st) const;
 
     // storage_path → 绝对路径。越界、空、未完成对象一律返回空串：
@@ -134,6 +145,7 @@ private:
     // 本轮已失败的条目，避免"最老的那条一直失败"把预算烧光、轮次永不结束。
     QSet<qint64> m_roundFailedObjects;
     QSet<QString> m_roundFailedStaging;
+    QString m_claimOwner;
 };
 
 #endif // RECLAIMSCHEDULER_H

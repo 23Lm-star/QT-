@@ -35,7 +35,7 @@ void OnlineUser::setHint(const QString &text)
     ui->hintLabel->setText(text);
 }
 
-void OnlineUser::updateOnlineUser(const QVector<QPair<QString,bool>>& entries, uint total, bool hasMore, bool append)
+void OnlineUser::updateOnlineUser(const QVector<QPair<QString,bool>>& entries, uint total, bool hasMore, bool append, bool capped)
 {
     // REQ-PAGE-FETCH-001：append=false 整页替换，append=true 追加下一页
     if(!append){
@@ -51,38 +51,69 @@ void OnlineUser::updateOnlineUser(const QVector<QPair<QString,bool>>& entries, u
     m_offset+=uint(entries.size());
     m_total=total;
     m_hasMore=hasMore;
+    m_capped=capped;
+    m_inFlight=false;
     ui->loadMore_PB->setHidden(!hasMore);
     if(m_offset==0){
-        ui->hintLabel->setText(QStringLiteral("当前没有可添加的用户"));
+        ui->hintLabel->setText(m_keyword.isEmpty()?QStringLiteral("当前没有可添加的用户")
+                                                 :QStringLiteral("没有匹配的用户"));
     }else{
-        ui->hintLabel->setText(QStringLiteral("已显示 %1/%2 人 · 单击选中，双击添加好友").arg(m_offset).arg(m_total));
+        // REQ-PAGE-FETCH-002：提示条带搜索词与总量封顶说明
+        QString hint=QStringLiteral("已显示 %1/%2 人 · 单击选中，双击添加好友").arg(m_offset).arg(m_total);
+        if(!m_keyword.isEmpty()) hint+=QStringLiteral(" · 搜索：%1").arg(m_keyword);
+        if(m_capped) hint+=QStringLiteral(" · 结果超过 %1 条，仅显示前 %1 条").arg(LIST_TOTAL_CAP);
+        ui->hintLabel->setText(hint);
     }
 }
 
-// 从第 0 页重新拉取：清空已加载状态再发 7
-void OnlineUser::resetAndRequest()
+// REQ-PAGE-FETCH-002：按 limit=50 与当前搜索词请求指定偏移页（关键词槽 caData[8,40)）
+void OnlineUser::requestPage(uint offset)
 {
-    ui->listWidget->clear();                       // 刷新入口即清空旧列表，响应统一追加
-    m_offset=0; m_total=0; m_hasMore=false;
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_REQUEST;
     const uint limit=50;
     memcpy(pdu->caData+ALLUSER_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
-    const uint offset=0;
     memcpy(pdu->caData+ALLUSER_REQ_OFFSET_OFFSET,&offset,sizeof(offset));
+    copyFixedField(pdu->caData+ALLUSER_REQ_KEYWORD_OFFSET,ALLUSER_REQ_KEYWORD_BYTES,m_keyword.toUtf8());
+    m_inFlight=true;
     Client::getinstance().seedMsg(pdu);
 }
 
-// 加载更多：按已加载条数请求下一页
+// 从第 0 页重新拉取：清空已加载状态与搜索词再发 7
+void OnlineUser::resetAndRequest()
+{
+    ui->listWidget->clear();                       // 刷新入口即清空旧列表，响应统一追加
+    ui->search_LE->clear();
+    m_keyword.clear();
+    m_offset=0; m_total=0; m_hasMore=false; m_capped=false;
+    requestPage(0);
+}
+
+// 加载更多：按已加载条数请求下一页（携带当前搜索词）
 void OnlineUser::on_loadMore_PB_clicked()
 {
-    if(!m_hasMore) return;
-    PDU* pdu=mkPDU();
-    pdu->uiType=ENUM_MSG_TYPE_ONLINEUSER_REQUEST;
-    const uint limit=50;
-    memcpy(pdu->caData+ALLUSER_REQ_LIMIT_OFFSET,&limit,sizeof(limit));
-    memcpy(pdu->caData+ALLUSER_REQ_OFFSET_OFFSET,&m_offset,sizeof(m_offset));
-    Client::getinstance().seedMsg(pdu);
+    if(!m_hasMore || m_inFlight) return;
+    requestPage(m_offset);
+}
+
+// REQ-PAGE-FETCH-002：搜索/清空关键词均从第 0 页重拉；超限关键词客户端拦截不发送
+void OnlineUser::on_search_PB_clicked()
+{
+    if(m_inFlight) return;   // 在途拦截：防连续搜索响应交错混页（重开窗口走 resetAndRequest 强制恢复）
+    const QString kw=ui->search_LE->text().trimmed();
+    if(kw.toUtf8().size()>ALLUSER_REQ_KEYWORD_BYTES-1){
+        ui->hintLabel->setText(QStringLiteral("关键词过长（UTF-8 须 ≤31 字节），请缩短后重试"));
+        return;
+    }
+    m_keyword=kw;
+    ui->listWidget->clear();
+    m_offset=0; m_total=0; m_hasMore=false; m_capped=false;
+    requestPage(0);
+}
+
+void OnlineUser::on_search_LE_returnPressed()
+{
+    on_search_PB_clicked();
 }
 
 // REQ-UX-001 A1：单击必须有可见反馈（旧实现只有双击槽，单击完全无响应）

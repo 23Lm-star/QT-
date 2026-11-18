@@ -19,6 +19,7 @@
 - [ ] 【缺陷｜目录删除后幽灵残留】MKDIR 建立的目录被删除请求（25）按条目路径软删（`releaseSubtree` 纯 DB 操作）后，物理空目录未删除，flushfile 的"物理回退合并"又把它列出来：客户端提示删除成功但目录仍出现在列表，需第二次删除（此时无条目、走物理 `removeRecursively` 分支）才消失。REQ-WEB-001 M3 e2e（`web/tests/drive_e2e.mjs` 删除断言，2026-10-24）实证复现；桌面客户端同样受影响，网页端按服务端零改动约束如实镜像。修复方向候选：deldir 条目分支软删成功后同步删除物理目录，或 flushfile 合并时跳过已软删条目对应的物理目录。位置：`Server/msghandler.cpp` deldir、`Server/fileobjectstore.cpp` releaseSubtree。
 - [x] 【已修｜外链取文件与对象存储】（2026-10-25，REQ-WEB-001 M5b）54 外链解析原只认物理实体：`Server/msghandler.cpp` 的 resolvePublishLink 用 `QFileInfo(srcPath).exists()/isFile()` 判定、`QFile::copy` 复制；REQ-EXT-FILE-001 之后上传、好友分享接收、群文件都只有逻辑条目（内容在 `filesys/objects/<sha2>/<oid>`），用户路径无物理文件 → 55 恒 ok=false。已按用户批准修复：条目优先 `FileObjectStore::attachExistingObject`（零复制，同名同对象幂等、不同对象 `(n)`）+ 旧物理文件复制回退 + 归一后限定分享人根内；重建 `dist/Server.exe`，分享 e2e 32/32、REQ-EXT-SHARE-001 25/25。证据：[变更记录](docs/changes/REQ-WEB-001/记录.md) M5b 节。
 - [ ] 【缺陷｜服务端主线程大文件复制】REQ-EXT-FILE-001 T6 存量迁移转正走 `commitUpload(copyOnly=true)`，整文件 `QFile::copy` 在服务端主线程执行，大文件迁移期间阻塞所有连接（与 REQ-EXT-PERF-002 已修的复算阻塞同类）。位置：`Server/fileobjectstore.cpp` commitUpload、`Server/operatedb.cpp` 迁移调用点。修复方向：复制移入 QThreadPool 后回主线程落条目；先确认存量迁移在当前的实际触发频率再排期。来源：REQ-EXT-PERF-002 方案共审（2026-10-27），本轮不实施。
+- [ ] 【缺陷｜网页分享页好友在线状态恒离线】`web/frontend/src/views/ShareView.vue` 的 `isOnline(name)` 用 `friends.onlineNames` 判定，但「所有用户」列表（7/8）自始排除好友——好友永远不在 onlineNames 里，分享页好友在线点恒灰。REQ-PAGE-FETCH-002 分页后 onlineNames 只含已加载页，不改变该缺陷性质（对好友本就恒 false）。修复方向：好友在线状态走 46/47 逐个查询或 11/12 载荷追加在线字段（布局变更需共审），不借所有用户列表判定。来源：002 网页消费点核查（2026-11-17），本轮不实施。
 
 - [ ] 【验证缺口｜私聊界面最后一轮修复未复验】REQ-CLI-MSGSTORE-001 收尾时用户确认不再复验：私聊自发消息的乐观显示、私聊窗口「清空本地记录」独立成行、群窗口「加载更早」按钮行修复，均只有编译与链接证据，没有 GUI 证据。下次动到私聊界面时顺路验掉，别当作已通过。
 - [ ] 【验证缺口｜私聊 16 的客户端不入库分支】服务端侧已可动态验证：REQ-CLI-MSGBND-001 让超限/畸形正文被拒后 16 回 `stored=false`，`project-docs/evidence/REQ-CLI-MSGBND-001/boundary_e2e.py` 的 B2–B5 已断言「不入库、不转发、连接存活」，不再需要侵入式故障注入。**仍缺的是客户端一侧**：收到 `stored=false` 后确实不写本地库，只有代码路径依据（`Chat::handleSendAck` 仅在 `stored` 为真时 `persist`），没有动态断言，需要 GUI 或存储层探针配合才能验。原条目登记的「缺少不侵入的 INSERT 故障注入手段」这一阻塞已解除。
@@ -58,7 +59,12 @@
 - [ ] 【想法｜好友分享与普通链接扩展】离线分享、批量结果、接收目录选择、撤回、文件夹分享与权限；普通链接已有创建/复制/解析/续期基础，扩展逐项核对。删除源文件后的失效行为必须明确。
 - [ ] 【想法｜账户生命周期】注销前数据统计、删除清单、聊天/文件导出、冷静期与恢复、到期后台清理、会话与传输撤销、授权收束、残留检查及受控管理员恢复；当前直接注销能力不能当作这些流程已完成。
 - [ ] 【想法｜运营约束】按账户/群/任务实施限流、容量与空间配额、指标观测、临时任务清理、通知与审计；已有回收调度器应复用，不能重新宣称上传从不清理。
-- [ ] 【想法｜架构演进，EXP-ARC-02/03】仅在实际容量和压测证明瓶颈后评估领域服务拆分、文件服务/传输服务独立、对象存储和 Redis（内存数据服务）会话/在线状态/限流缓存；不是当前初始化的实现范围。
+- [ ] 【想法｜架构演进，EXP-ARC-02/03】仅在实际容量和压测证明瓶颈后评估领域服务拆分、文件服务/传输服务独立、对象存储和 Redis（内存数据服务）会话/在线状态/限流缓存；不是当前初始化的实现范围。Redis 子域已于 2026-11-18 盘点最小落点，见下条；盘点不构成排期授权。
+- [ ] 【想法｜Redis 最小引入面（2026-11-18 盘点，细化 EXP-ARC-02/03 的 Redis 部分）】三处候选，按改动量从小到大，均为纯服务端内部存储替换（协议、桌面端、网页端零改动）：
+  ① 验证码冷却与失败锁定：现按连接存内存（`Server/msghandler.cpp` `captcha()`/`validateCaptcha()` 的 `m_captchaCode`/`m_captchaExpiry`/`m_captchaNextAllowed`/`m_captchaFailCount`/`m_captchaLockUntil`）；Redis `SETEX` 天然替代过期判断、`INCR+EXPIRE` 替代计数与锁定；键改按用户名可顺带修掉「失败计数按连接隔离、换连接即重置冷却」的已知限制（REQ-AUDIT-001 残余项）。
+  ② 在线状态：现为 `user_info.online` 列＋启动期对账兜底（REQ-EXT-SESSION-002，`reconcile_online_e2e.py`）；`SETEX online:{user}` 心跳续期、断开 `DEL`，崩溃幽灵靠 TTL 自动消失，不再依赖重启对账。
+  ③ 秒传存在性缓存：`FileObjectStore::findObjectBySha` 查询做读穿缓存（`SET sha256:{hex} {fileId}`），回收器删对象时 `DEL`；缓存脏最多退化为一次 DB 查询，无正确性风险。
+  共同成本与边界：Qt 5.14/MinGW 无现成 Redis 驱动，需引入 hiredis＋本机 redis-server；服务端单线程事件循环下同步命令会阻塞心跳（与 REQ-EXT-PERF-002 已修的复算阻塞同型），实施须走线程池或极短超时＋DB 回退；本项不改变「多实例共享库尚未支持」的既有结论。建议顺序：①＋② 先做（价值最高、协议零变更），③ 作后续加分项。
 
 ## 已接受风险与暂不采用
 

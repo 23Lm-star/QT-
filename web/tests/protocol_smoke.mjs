@@ -158,6 +158,50 @@ function ok(name) { pass++; console.log(`  ok  ${name}`); }
   ok('N×32 定长用户名数组解析（含中文）');
 }
 
+// 10b) REQ-PAGE-FETCH-002：7/8 搜索＋总量封顶、11/12 好友真分页布局（与两端 protocol.h 一致）。
+{
+  // 7 请求：limit u32@0、offset u32@4、关键词槽 [8,40)
+  const req = friend.buildOnlineUsersRequest(50, 100, 'zzs');
+  assert.strictEqual(fields.readU32(req, 0), 50);
+  assert.strictEqual(fields.readU32(req, 4), 100);
+  assert.strictEqual(fields.readFixedString(req, 8, 32), 'zzs');
+  const emptyReq = friend.buildOnlineUsersRequest(0, 0, '');
+  assert.strictEqual(fields.readFixedString(emptyReq, 8, 32), '');
+  // 8 响应：码@0、total@4、has_more@8、count@12、capped@16，载荷 33B 条目
+  const ca = new Uint8Array(64);
+  const dv = new DataView(ca.buffer);
+  dv.setInt32(0, 0, true); dv.setUint32(4, 1000, true); ca[8] = 0; dv.setUint32(12, 1, true); ca[16] = 1;
+  const e1 = new Uint8Array(33); fields.writeFixedStringNul(e1, 0, 32, 'zc0001'); e1[32] = 1;
+  const p8 = friend.parseOnlineUsersResponse({ caData: ca, caMsg: e1, uiMsgLen: 33 });
+  assert.strictEqual(p8.code, 0);
+  assert.strictEqual(p8.total, 1000);
+  assert.strictEqual(p8.hasMore, false);
+  assert.strictEqual(p8.capped, true);
+  assert.deepStrictEqual(p8.entries, [{ name: 'zc0001', online: true }]);
+  // 11 请求：limit u32@0、offset u32@4
+  const req11 = friend.buildFriendsRequest(50, 50);
+  assert.strictEqual(fields.readU32(req11, 0), 50);
+  assert.strictEqual(fields.readU32(req11, 4), 50);
+  // 12 响应：码@0、truncated@4（恒 0）、count@8、total@12、has_more@16、capped@17，载荷 N×32
+  const ca12 = new Uint8Array(64);
+  const dv12 = new DataView(ca12.buffer);
+  dv12.setInt32(0, 0, true); ca12[4] = 0; dv12.setUint32(8, 2, true);
+  dv12.setUint32(12, 251, true); ca12[16] = 1; ca12[17] = 0;
+  const n1 = new Uint8Array(32); fields.writeFixedStringNul(n1, 0, 32, 'p2b');
+  const n2 = new Uint8Array(32); fields.writeFixedStringNul(n2, 0, 32, 'zf001');
+  const msg12 = fields.concatBytes(n1, n2);
+  const p12 = friend.parseFriendsResponse({ caData: ca12, caMsg: msg12, uiMsgLen: msg12.length });
+  assert.strictEqual(p12.truncated, false);
+  assert.strictEqual(p12.count, 2);
+  assert.strictEqual(p12.total, 251);
+  assert.strictEqual(p12.hasMore, true);
+  assert.strictEqual(p12.capped, false);
+  assert.deepStrictEqual(p12.names, ['p2b', 'zf001']);
+  assert.strictEqual(friend.LIST_TOTAL_CAP, 1000);
+  assert.strictEqual(friend.PAGE_MAX_LIMIT, 200);
+  ok('002 布局：7 搜索槽/8 capped/11 分页/12 total·has_more·capped（truncated 恒 0）');
+}
+
 // ===== M3：云盘/传输帧布局（drive.js）=====
 
 // 11) isValidFileName 镜像桌面端（trim/字节限长/禁用字符/结尾规则）。

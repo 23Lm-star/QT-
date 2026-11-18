@@ -27,6 +27,25 @@ const int kNameSuffixCap  = 100;   // "(N)" 递推上限
 
 QString clampUtf8(const QString& s, int maxBytes);
 
+QString compensationPath(const QString& path)
+{
+    if (path.isEmpty()) return QString();
+    const QString root = QDir(Server::getinstance().filesPath).absolutePath();
+    const QString rel = QDir(root).relativeFilePath(QFileInfo(path).absoluteFilePath());
+    return (rel.startsWith("..") || rel.startsWith('/'))
+            ? QStringLiteral("__INVALID_PATH__") : rel;
+}
+
+void enqueueStorageFailure(const QString& type, const QString& owner,
+                           const QString& source, const QString& target,
+                           const QString& error)
+{
+    if (owner.isEmpty()) return;
+    OperateDB::instance().enqueueDirectoryCompensation(
+        type, owner, compensationPath(source), compensationPath(target),
+        0, QString(), QString(), 0, error);
+}
+
 // 拆分扩展名：最后一个 '.' 之后为 ext；点位于首位或不存在时整体视为 base。
 void splitName(const QString& name, QString& base, QString& ext)
 {
@@ -273,7 +292,10 @@ FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
         r.error = "复算大小与登记不符，拒绝转正";
         qCWarning(lcFs) << "[commitUpload] conn-owner" << owner
                         << "expected" << expectedSize << "actual" << size;
-        if (!copyOnly) QFile::remove(stagingPath);   // T6：迁移源=用户旧文件，绝不删除（验收5）
+        if (!copyOnly && QFileInfo::exists(stagingPath) && !QFile::remove(stagingPath)) {
+            enqueueStorageFailure(QStringLiteral("delete_staging_file"), owner,
+                                  stagingPath, QString(), QStringLiteral("复算大小失败后的暂存清理失败"));
+        }   // T6：迁移源=用户旧文件，绝不删除（验收5）
         return r;
     }
     // REQ-EXT-FILE-002 D2：客户端声明的摘要只用于命中判定，这里是执行事实——
@@ -283,7 +305,10 @@ FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
         r.error = "复算摘要与登记不符，拒绝转正";
         qCWarning(lcFs) << "[commitUpload] 摘要不符 owner" << owner
                         << "expected" << expectedSha << "actual" << sha;
-        if (!copyOnly) QFile::remove(stagingPath);
+        if (!copyOnly && QFileInfo::exists(stagingPath) && !QFile::remove(stagingPath)) {
+            enqueueStorageFailure(QStringLiteral("delete_staging_file"), owner,
+                                  stagingPath, QString(), QStringLiteral("复算摘要失败后的暂存清理失败"));
+        }
         return r;
     }
 
@@ -325,14 +350,25 @@ FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
             if (!q.exec()) { r.error = q.lastError().text(); break; }
             const QString absRoot = QDir(Server::getinstance().filesPath).absolutePath();
             createdFinalAbs = QDir(absRoot).absoluteFilePath(rel);
-            QDir().mkpath(QFileInfo(createdFinalAbs).absolutePath());
+            if (!QDir().mkpath(QFileInfo(createdFinalAbs).absolutePath())) {
+                r.error = "对象目录创建失败";
+                enqueueStorageFailure(QStringLiteral("create_object_directory"), owner,
+                                      QString(), QFileInfo(createdFinalAbs).absolutePath(), r.error);
+                break;
+            }
             const bool moved = copyOnly
                     ? QFile::copy(stagingPath, createdFinalAbs)   // T6：旧实体复制为对象，源永不删除
                     : QFile::rename(stagingPath, createdFinalAbs);
             if (!moved) {
                 r.error = copyOnly ? "对象转正 copy 失败" : "对象转正 rename 失败";
+                enqueueStorageFailure(QStringLiteral("commit_staged_file"), owner,
+                                      stagingPath, createdFinalAbs, r.error);
                 qCWarning(lcFs) << "[commitUpload]" << r.error << createdFinalAbs;
-                if (copyOnly) QFile::remove(createdFinalAbs);     // 清理半成品副本
+                if (copyOnly && QFileInfo::exists(createdFinalAbs)
+                        && !QFile::remove(createdFinalAbs)) {
+                    enqueueStorageFailure(QStringLiteral("rollback_staged_file"), owner,
+                                          createdFinalAbs, QString(), QStringLiteral("清理对象半成品失败"));
+                }     // 清理半成品副本
                 createdFinalAbs.clear();
                 break;
             }
@@ -392,7 +428,11 @@ FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
                     r.objectId = oid;
                     r.dedupHit = true;
                     if (!db.commit()) { r.error = db.lastError().text(); break; }
-                    if (!objectCreated && !copyOnly) QFile::remove(stagingPath);
+                    if (!objectCreated && !copyOnly && QFileInfo::exists(stagingPath)
+                            && !QFile::remove(stagingPath)) {
+                        enqueueStorageFailure(QStringLiteral("delete_staging_file"), owner,
+                                              stagingPath, QString(), QStringLiteral("删除重复上传暂存文件失败"));
+                    }
                     r.ok = true;
                     done = true;
                     break;
@@ -433,7 +473,10 @@ FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
             break;
         }
         if (!objectCreated && !copyOnly) {
-            QFile::remove(stagingPath);                           // 内容已在既有对象——物理只留一份（验收1）
+            if (QFileInfo::exists(stagingPath) && !QFile::remove(stagingPath)) {
+                enqueueStorageFailure(QStringLiteral("delete_staging_file"), owner,
+                                      stagingPath, QString(), QStringLiteral("删除已转正暂存文件失败"));
+            }                           // 内容已在既有对象——物理只留一份（验收1）
         }
         r.fileId = fileId;
         r.objectId = oid;
@@ -445,8 +488,15 @@ FileObjectStore::CommitResult FileObjectStore::commitUploadPreHashed(
     if (!done) {
         db.rollback();
         if (objectCreated && !createdFinalAbs.isEmpty()) {
-            if (copyOnly) QFile::remove(createdFinalAbs);          // T6：清理本事务产生的副本，源不动
-            else QFile::rename(createdFinalAbs, stagingPath);      // 尽力回退搬移，孤儿对象可恢复
+            if (copyOnly) {
+                if (QFileInfo::exists(createdFinalAbs) && !QFile::remove(createdFinalAbs)) {
+                    enqueueStorageFailure(QStringLiteral("rollback_staged_file"), owner,
+                                          createdFinalAbs, QString(), QStringLiteral("清理转正半成品失败"));
+                }
+            } else if (!QFile::rename(createdFinalAbs, stagingPath)) {
+                enqueueStorageFailure(QStringLiteral("rollback_staged_file"), owner,
+                                      createdFinalAbs, stagingPath, QStringLiteral("转正失败后的回退搬移失败"));
+            }      // 尽力回退搬移，孤儿对象可恢复
         }
         qCWarning(lcFs) << "[commitUpload] 失败回滚 owner" << owner << r.error;
     }

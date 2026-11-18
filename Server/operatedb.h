@@ -42,6 +42,42 @@ public:
     // REQ-AUDIT-001 R4：好友邀请持久化（friend_request 表）。
     // 接受好友必须命中该表里的 pending 行，请求方由服务端保存，客户端字段不作授权依据。
     static const int kFriendRequestSchemaVersion = 2026111201;
+    // REQ-DIR-COMP-001：目录操作失败补偿队列迁移版本。
+    static const int kDirectoryCompensationSchemaVersion = 2026111801;
+
+    struct DirectoryCompensationTask {
+        qint64 taskId = 0;
+        QString operationType;
+        QString account;
+        QString sourcePath;
+        QString targetPath;
+        qint64 entryId = 0;
+        QString sourceName;
+        QString targetName;
+        qint64 operationVersion = 0;
+        int retryCount = 0;
+        QDateTime nextRetryAt;
+        QString lastError;
+        QString claimOwner;
+        QDateTime claimUntil;
+    };
+
+    bool enqueueDirectoryCompensation(const QString& operationType,
+                                      const QString& account,
+                                      const QString& sourcePath,
+                                      const QString& targetPath,
+                                      qint64 entryId,
+                                      const QString& sourceName,
+                                      const QString& targetName,
+                                      qint64 operationVersion,
+                                      const QString& error);
+    QVector<DirectoryCompensationTask> claimDirectoryCompensations(const QString& claimOwner,
+                                                                    int leaseSeconds,
+                                                                    int limit);
+    QVector<DirectoryCompensationTask> peekDirectoryCompensations(int limit);
+    bool completeDirectoryCompensation(qint64 taskId, const QString& claimOwner);
+    bool retryDirectoryCompensation(qint64 taskId, const QString& claimOwner,
+                                    const QDateTime& nextRetryAt, const QString& error);
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
@@ -150,10 +186,14 @@ public:
     // 返回 online（0 离线/1 在线）；用户不存在返回 2；参数或连接失败返回 -1
     int handleFindUser(const char* userName);
     // REQ-PAGE-FETCH-001：所有用户分页（含离线；排除自己与双向好友；用于陌生人列表）
-    // 按名字字典序稳定排序；limit 已由调用方钳制（1-200）；offset 为分页起点（0 起）。
-    // totalOut 回带符合条件总数；hasMoreOut=还有下一页；成对返回 <名字, online>。
-    QVector<QPair<QString,bool>> handleAllUsers(const QString& strname,uint limit,uint offset,
-                                                uint* totalOut=nullptr,bool* hasMoreOut=nullptr);
+    // REQ-PAGE-FETCH-002：keyword 非空时按名字子串匹配（LIKE 通配符转义按字面）；
+    // 结果总量受 LIST_TOTAL_CAP 封顶（totalOut 回带封顶后总数，cappedOut=1 表示实际超限）。
+    // 按名字字典序稳定排序；limit 已由调用方钳制（1-200），0=全量（≤上限）；offset 为分页起点（0 起）。
+    // hasMoreOut=还有下一页；成对返回 <名字, online>。
+    QVector<QPair<QString,bool>> handleAllUsers(const QString& strname,const QString& keyword,
+                                                uint limit,uint offset,
+                                                uint* totalOut=nullptr,bool* hasMoreOut=nullptr,
+                                                bool* cappedOut=nullptr);
     //添加好友操作，查找
     // REQ-AUDIT-001 R4：目标在线返回 1 并登记 (请求方,目标) 待处理邀请；离线/不存在返回 0；
     // 参数或连接失败返回 -1
@@ -163,8 +203,12 @@ public:
     int handleAddFriendFin(char* usrname,char* tarname);
     //刷新好友操作，
     // 返回与 strname 相关的双向好友名（UNION 去重）
-    // REQ-PAGE-FETCH-001：至多返回 PAGE_MAX_LIMIT 条；truncatedOut=1 表示超限截断
-    QStringList handleFlushFriend(const QString&strname,bool* truncatedOut=nullptr);
+    // REQ-PAGE-FETCH-002：真分页取代 001 数量截断——按名字字典序升序，limit/offset 分页，
+    // limit 已由调用方钳制（1-200），0=全量（≤LIST_TOTAL_CAP）；totalOut 回带封顶后总数，
+    // hasMoreOut=还有下一页，cappedOut=1 表示实际总数超上限。
+    QStringList handleFlushFriend(const QString&strname,uint limit,uint offset,
+                                  uint* totalOut=nullptr,bool* hasMoreOut=nullptr,
+                                  bool* cappedOut=nullptr);
     //删除好友操作
     // 事务内删除两个方向的好友行
     bool handleDeleteFriend(char*userName,char*tarName);
@@ -329,3 +373,4 @@ signals:
 };
 
 #endif // OPERATEDB_H
+
