@@ -41,7 +41,41 @@ public:
     static const int kReclaimSchemaVersion = 2026100701;
     // REQ-AUDIT-001 R4：好友邀请持久化（friend_request 表）。
     // 接受好友必须命中该表里的 pending 行，请求方由服务端保存，客户端字段不作授权依据。
-    static const int kFriendRequestSchemaVersion = 2026111201;
+    static const int kFriendRequestSchemaVersion = 2026111201;    // REQ-DIR-COMP-001：目录操作失败补偿队列迁移版本。
+    static const int kDirectoryCompensationSchemaVersion = 2026111801;
+
+    struct DirectoryCompensationTask {
+        qint64 taskId = 0;
+        QString operationType;
+        QString account;
+        QString sourcePath;
+        QString targetPath;
+        qint64 entryId = 0;
+        QString sourceName;
+        QString targetName;
+        qint64 operationVersion = 0;
+        int retryCount = 0;
+        QDateTime nextRetryAt;
+        QString lastError;
+        QString claimOwner;
+        QDateTime claimUntil;
+    };
+
+    bool enqueueDirectoryCompensation(const QString& operationType,
+                                      const QString& account,
+                                      const QString& sourcePath,
+                                      const QString& targetPath,
+                                      qint64 entryId,
+                                      const QString& sourceName,
+                                      const QString& targetName,
+                                      qint64 operationVersion,
+                                      const QString& error);
+    QVector<DirectoryCompensationTask> claimDirectoryCompensations(const QString& claimOwner,
+                                                                    int leaseSeconds,
+                                                                    int limit);
+    bool completeDirectoryCompensation(qint64 taskId, const QString& claimOwner);
+    bool retryDirectoryCompensation(qint64 taskId, const QString& claimOwner,
+                                    const QDateTime& nextRetryAt, const QString& error);
     //启动检查：schema_version 达标返回 true；库不可达/表缺失/版本低返回 false 并打日志
     bool checkSchemaVersion();
 
@@ -337,3 +371,4 @@ signals:
 };
 
 #endif // OPERATEDB_H
+

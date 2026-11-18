@@ -128,6 +128,141 @@ bool OperateDB::checkSchemaVersion()
     return true;
 }
 
+// ===== REQ-DIR-COMP-001：目录操作失败补偿队列 =====
+bool OperateDB::enqueueDirectoryCompensation(const QString& operationType,
+                                             const QString& account,
+                                             const QString& sourcePath,
+                                             const QString& targetPath,
+                                             qint64 entryId,
+                                             const QString& sourceName,
+                                             const QString& targetName,
+                                             qint64 operationVersion,
+                                             const QString& error)
+{
+    if (operationType.trimmed().isEmpty() || account.trimmed().isEmpty()) return false;
+    if (sourcePath.contains("..") || targetPath.contains("..")
+        || sourcePath.startsWith('/') || targetPath.startsWith('/')) return false;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return false;
+    const QByteArray fingerprint = (operationType + QChar('\x1f') + account + QChar('\x1f')
+                                    + sourcePath + QChar('\x1f') + targetPath + QChar('\x1f')
+                                    + QString::number(entryId) + QChar('\x1f')
+                                    + QString::number(operationVersion)).toUtf8();
+    const QString dedupeKey = QString::fromLatin1(
+        QCryptographicHash::hash(fingerprint, QCryptographicHash::Sha256).toHex());
+    QSqlQuery q(connection.database());
+    q.prepare("INSERT INTO directory_operation_compensation "
+              "(dedupe_key,operation_type,account,source_path,target_path,entry_id,"
+              "source_name,target_name,operation_version,status,retry_count,next_retry_at,last_error) "
+              "VALUES (?,?,?,?,?,?, ?,?,?, 'pending',0,NOW(),?) "
+              "ON DUPLICATE KEY UPDATE last_error=VALUES(last_error),updated_at=NOW()");
+    q.addBindValue(dedupeKey);
+    q.addBindValue(operationType);
+    q.addBindValue(account);
+    q.addBindValue(sourcePath.isEmpty() ? QVariant() : QVariant(sourcePath));
+    q.addBindValue(targetPath.isEmpty() ? QVariant() : QVariant(targetPath));
+    q.addBindValue(entryId > 0 ? QVariant(entryId) : QVariant());
+    q.addBindValue(sourceName.isEmpty() ? QVariant() : QVariant(sourceName));
+    q.addBindValue(targetName.isEmpty() ? QVariant() : QVariant(targetName));
+    q.addBindValue(operationVersion);
+    q.addBindValue(error.left(1024));
+    if (!q.exec()) {
+        qCWarning(lcDb) << "[dir-comp] 入队失败:" << q.lastError().text()
+                        << "type=" << operationType << "account=" << account;
+        return false;
+    }
+    return true;
+}
+
+QVector<OperateDB::DirectoryCompensationTask>
+OperateDB::claimDirectoryCompensations(const QString& claimOwner, int leaseSeconds, int limit)
+{
+    QVector<DirectoryCompensationTask> out;
+    if (claimOwner.trimmed().isEmpty() || leaseSeconds <= 0 || limit <= 0) return out;
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return out;
+    QSqlDatabase db = connection.database();
+    if (!db.transaction()) return out;
+    QSqlQuery q(db);
+    const QString sql = QStringLiteral(
+        "SELECT task_id,operation_type,account,COALESCE(source_path,''),COALESCE(target_path,''),"
+        "COALESCE(entry_id,0),COALESCE(source_name,''),COALESCE(target_name,''),operation_version,"
+        "retry_count,next_retry_at,COALESCE(last_error,''),COALESCE(claim_owner,''),claim_until "
+        "FROM directory_operation_compensation "
+        "WHERE (status='pending' AND next_retry_at<=NOW()) "
+        "OR (status='claimed' AND claim_until<NOW()) "
+        "ORDER BY next_retry_at ASC,created_at ASC LIMIT %1 FOR UPDATE").arg(limit);
+    if (!q.exec(sql)) {
+        db.rollback();
+        qCWarning(lcDb) << "[dir-comp] 抢占查询失败:" << q.lastError().text();
+        return out;
+    }
+    QVector<qint64> ids;
+    while (q.next()) {
+        DirectoryCompensationTask task;
+        task.taskId = q.value(0).toLongLong();
+        task.operationType = q.value(1).toString();
+        task.account = q.value(2).toString();
+        task.sourcePath = q.value(3).toString();
+        task.targetPath = q.value(4).toString();
+        task.entryId = q.value(5).toLongLong();
+        task.sourceName = q.value(6).toString();
+        task.targetName = q.value(7).toString();
+        task.operationVersion = q.value(8).toLongLong();
+        task.retryCount = q.value(9).toInt();
+        task.nextRetryAt = q.value(10).toDateTime();
+        task.lastError = q.value(11).toString();
+        task.claimOwner = claimOwner;
+        ids.append(task.taskId);
+        out.append(task);
+    }
+    for (qint64 id : ids) {
+        QSqlQuery u(db);
+        u.prepare("UPDATE directory_operation_compensation SET status='claimed',claim_owner=?,"
+                  "claim_until=DATE_ADD(NOW(),INTERVAL ? SECOND),updated_at=NOW() "
+                  "WHERE task_id=? AND (status='pending' OR claim_until<NOW())");
+        u.addBindValue(claimOwner);
+        u.addBindValue(leaseSeconds);
+        u.addBindValue(id);
+        if (!u.exec() || u.numRowsAffected() != 1) {
+            db.rollback();
+            out.clear();
+            return out;
+        }
+    }
+    if (!db.commit()) {
+        out.clear();
+        return out;
+    }
+    return out;
+}
+
+bool OperateDB::completeDirectoryCompensation(qint64 taskId, const QString& claimOwner)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("DELETE FROM directory_operation_compensation WHERE task_id=? AND status='claimed' AND claim_owner=?");
+    q.addBindValue(taskId);
+    q.addBindValue(claimOwner);
+    return q.exec() && q.numRowsAffected() == 1;
+}
+
+bool OperateDB::retryDirectoryCompensation(qint64 taskId, const QString& claimOwner,
+                                           const QDateTime& nextRetryAt, const QString& error)
+{
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if (!connection.isValid()) return false;
+    QSqlQuery q(connection.database());
+    q.prepare("UPDATE directory_operation_compensation SET status='pending',claim_owner=NULL,"
+              "claim_until=NULL,retry_count=retry_count+1,next_retry_at=?,last_error=?,updated_at=NOW() "
+              "WHERE task_id=? AND status='claimed' AND claim_owner=?");
+    q.addBindValue(nextRetryAt);
+    q.addBindValue(error.left(1024));
+    q.addBindValue(taskId);
+    q.addBindValue(claimOwner);
+    return q.exec() && q.numRowsAffected() == 1;
+}
 // ===== REQ-EXT-SESSION-002：启动期在线态对账 =====
 // 为什么需要：online 的唯一权威来源是本进程的活连接——置 1 在 handleLogin，置 0 只在
 // handleOffLine。服务端被 kill / 崩溃 / 断电时，当时在线的人没有任何机会走 handleOffLine，
@@ -2443,3 +2578,4 @@ OperateDB::GroupFileResult OperateDB::handleGroupFileOperation(GroupFileRequest 
     result.code = -2103;
     return result;
 }
+
