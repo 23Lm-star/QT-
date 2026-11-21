@@ -109,6 +109,12 @@ export const T = Object.freeze({
   GROUP_FILE_DOWNLOAD_RESPOND: 106,
   UPLOADFILE_ABORT_REQUEST: 107,
   UPLOADFILE_ABORT_RESPOND: 108,
+  // REQ-AUTH-CONNECTION-001：会话生命周期（只追加，旧号不变）
+  SESSION_LOGOUT_REQUEST: 119,
+  SESSION_LOGOUT_RESPOND: 120,
+  SESSION_RESUME_REQUEST: 121,
+  SESSION_RESUME_RESPOND: 122,
+  SESSION_INVALIDATED_EVENT: 123,
 });
 
 // REQ-PROTO-CODE-001：与两端 protocol.h 的 ENUM_PROTOCOL_CODE 对齐（0=成功，负数=失败原因）。
@@ -133,6 +139,7 @@ const CODE_TEXT = Object.freeze({
   1: '已受理，等待对方确认',
   [-1001]: '未登录或会话已失效',
   [-1002]: '数据库不可用',
+  [-1003]: '会话存储不可用，请稍后重试',
   [-2011]: '账号或密码错误',
   [-2012]: '账号已存在',
   [-2013]: '目标不存在',
@@ -157,6 +164,10 @@ const CODE_TEXT = Object.freeze({
   [-3012]: '验证码已过期，请重新获取',
   [-3013]: '获取验证码过于频繁，请稍后再试',
   [-3014]: '验证码错误次数过多，账号已锁定',
+  [-3015]: '客户端标识非法',
+  [-3016]: '会话恢复凭据错误',
+  [-3017]: '会话已失效，请重新登录',
+  [-3018]: '会话状态写入失败',
   [-4001]: '文件不存在',
   [-4002]: '目录不存在',
   [-4003]: '创建失败',

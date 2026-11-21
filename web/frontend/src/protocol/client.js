@@ -7,6 +7,7 @@
 import { encodePDU, decodePDU } from './pdu.js';
 import { Framer } from './framer.js';
 import { T } from './msgtypes.js';
+import { buildSessionCaData } from './session.js';
 
 const DEFAULT_TIMEOUT_MS = 8000;
 const HEARTBEAT_INTERVAL_MS = 30000; // 对齐桌面端 30s
@@ -28,6 +29,7 @@ export class NetClient {
     this._hbWorker = null;   // 心跳 Worker（后台标签页防节流）
     this.lastPongMs = 0;
     this.connected = false;
+    this.heartbeatCaData = null;
   }
 
   // 建立连接。resolve 于 WS open；reject 于连接失败。
@@ -69,6 +71,11 @@ export class NetClient {
     this.connected = false;
   }
 
+  // 设置心跳请求的 clientId 槽。未设置时保留旧客户端的空载荷兼容行为。
+  setHeartbeatClientId(clientId) {
+    this.heartbeatCaData = clientId ? buildSessionCaData(clientId) : null;
+  }
+
   _onMessage(data) {
     const chunk = data instanceof ArrayBuffer
       ? new Uint8Array(data)
@@ -101,6 +108,7 @@ export class NetClient {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('未连接');
     }
+    if (uiType === T.HEARTBEAT_REQUEST && caData == null) caData = this.heartbeatCaData;
     this.ws.send(encodePDU(uiType, caData, msg));
   }
 
@@ -145,7 +153,7 @@ export class NetClient {
     // ≥1 分钟，超过服务端 90s 存活阈值会被踢线；Worker 定时器不受该节流影响。
     const tick = () => {
       if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        try { this.sendFrame(T.HEARTBEAT_REQUEST); } catch { /* ignore */ }
+        try { this.sendFrame(T.HEARTBEAT_REQUEST, this.heartbeatCaData); } catch { /* ignore */ }
       }
     };
     try {

@@ -6,6 +6,7 @@
 #include "logging.h"
 #include "mytcpsocket.h"
 #include "redisstore.h"
+#include "sessionstore.h"
 #include "operatedb.h"
 #include "protocol.h"
 #include "mytcpserver.h"
@@ -190,7 +191,9 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
          case ENUM_MSG_TYPE_LOGIN_REQUEST :{
             bool authOk=false;
             quint64 loginVersion=0;
-            respdu=m_MsgHandler->login(this->m_strLoginName,authOk,loginVersion);
+            QString loginClientId, resumeToken;
+            respdu=m_MsgHandler->login(this->m_strLoginName,authOk,loginVersion,
+                                       loginClientId,resumeToken);
             if(authOk){
                 // REQ-EXT-SEC-001 T1：登录成功，绑定连接级 actor_context
                 m_actorAuthenticated=true;
@@ -198,10 +201,15 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
                 // REQ-EXT-SESSION-001：绑定用户域登录版本——先登记再踢旧
                 // （被踢方断开时登记表已指向新版，clientOffLine 守卫走 stale 分支）
                 m_loginVersion=loginVersion;
-                if (RedisStore::instance().enabled()) {
-                    const QString key = QStringLiteral("online:%1").arg(m_strLoginName);
-                    if (!RedisStore::instance().setEx(key, 90, QByteArray::number(m_loginVersion))) {
-                        qCWarning(lcAuth) << "Redis 在线态写入失败，保留数据库在线态";
+                // REQ-AUTH-CONNECTION-001：绑定逻辑会话上下文（旧客户端 loginClientId 为空，
+                // 连接可认证但不可恢复；token 明文只经响应回传一次，服务端不留存）
+                m_clientId=loginClientId;
+                m_sessionBound=!loginClientId.isEmpty();
+                if (SessionStore::instance().redisEnabled()) {
+                    const int onlineRc = SessionStore::instance().setOnline(
+                        m_strLoginName, qint64(m_loginVersion));
+                    if (onlineRc != ENUM_PROTOCOL_CODE_OK) {
+                        qCWarning(lcAuth) << "Redis 在线态写入失败，保留数据库在线态" << onlineRc;
                     }
                 }
                 m_MsgHandler->m_actorName=this->m_strLoginName;
@@ -373,8 +381,22 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
             // 同用户其它存活连接下次请求会因登记值为 0 ≠ 自身版本被踢，不再保留访问权。
             // 必须在 m_strLoginName.clear() 之前调用（释放按用户名定位）。
             MyTcpServer::getinstance().removeLoginVersion(m_strLoginName);
+            // REQ-AUTH-CONNECTION-001：数据库提交后撤销账号全部 Redis 会话与在线态。
+            // 目录清理仍走既有补偿/隔离；撤销失败只告警（账号已删，会话键 TTL 自然收敛）。
+            if (SessionStore::instance().redisEnabled()) {
+                int removed = 0;
+                const int rvRc = SessionStore::instance().revokeAllForUser(m_strLoginName, removed);
+                if (rvRc != ENUM_PROTOCOL_CODE_OK) {
+                    qCWarning(lcAuth) << "[LOGOFF] Redis 会话全量撤销失败 user=" << m_strLoginName << rvRc;
+                }
+                bool onlineDeleted = false;
+                SessionStore::instance().deleteOnlineIfVersion(
+                    m_strLoginName, qint64(m_loginVersion), onlineDeleted);
+            }
             m_actorAuthenticated=false;
             ++m_actorSessionVersion;
+            m_clientId.clear();
+            m_sessionBound=false;
             m_strLoginName.clear();
             m_MsgHandler->m_actorName.clear();
             qCWarning(lcAuth)<<"[AUTH] 注销撤销业务访问（连接保留）conn="<<m_connectionId
@@ -382,18 +404,88 @@ PDU *MyTcpSocket::handlMsg(PDU *pdu)
         }
         break;
     }
-    case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:{
-        m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
-        if (m_actorAuthenticated && RedisStore::instance().enabled()) {
-            const QString key = QStringLiteral("online:%1").arg(m_strLoginName);
-            if (!RedisStore::instance().setEx(key, 90, QByteArray::number(m_loginVersion))) {
-                qCWarning(lcAuth) << "Redis 在线态续期失败 user=" << m_strLoginName;
+    case ENUM_MSG_TYPE_SESSION_LOGOUT_REQUEST:{
+        // REQ-AUTH-CONNECTION-001：119 退出登录——撤销当前逻辑会话，连接转匿名。
+        // 入口门已保证认证（119 非公开类型）；版本门已保证 m_loginVersion 为登记现值。
+        int loCode = ENUM_PROTOCOL_CODE_OK;
+        if (m_sessionBound) {
+            const QByteArray reqCid(pdu->caData + SESSION_CLIENT_ID_OFFSET, AUTH_CLIENT_ID_HEX_LEN);
+            if (QString::fromLatin1(reqCid) != m_clientId) {
+                loCode = ENUM_PROTOCOL_CODE_BAD_CLIENT_ID;
+            } else {
+                bool revoked = false;
+                const int rc = SessionStore::instance().revokeSessionByVersion(
+                    m_clientId, m_strLoginName, qint64(m_loginVersion), revoked);
+                if (rc != ENUM_PROTOCOL_CODE_OK) loCode = rc;   // Redis 故障失败关闭，连接保持认证
             }
         }
-        qCDebug(lcNet) << "[HEARTBEAT] recv PING from" << m_strLoginName << "-> send PONG";
-        PDU* hRespdu = mkPDU();
-        hRespdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_RESPOND;
-        return hRespdu;
+        if (loCode == ENUM_PROTOCOL_CODE_OK) {
+            OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
+            if (SessionStore::instance().redisEnabled()) {
+                bool onlineDeleted = false;
+                SessionStore::instance().deleteOnlineIfVersion(
+                    m_strLoginName, qint64(m_loginVersion), onlineDeleted);
+            }
+            MyTcpServer::getinstance().removeLoginVersion(m_strLoginName);
+            m_actorAuthenticated=false;
+            m_loginVersion=0;
+            m_clientId.clear();
+            m_sessionBound=false;
+            ++m_actorSessionVersion;
+            m_strLoginName.clear();
+            m_MsgHandler->m_actorName.clear();
+            qCDebug(lcAuth) << "[AUTH] 退出登录，连接转匿名 conn=" << m_connectionId;
+        }
+        PDU* loRespdu = mkPDU();
+        loRespdu->uiType = ENUM_MSG_TYPE_SESSION_LOGOUT_RESPOND;
+        memcpy(loRespdu->caData + SESSION_RESP_CODE_OFFSET, &loCode, sizeof(loCode));
+        respdu = loRespdu;
+        break;
+    }
+    case ENUM_MSG_TYPE_SESSION_RESUME_REQUEST:{
+        respdu = handleSessionResume(pdu);
+        break;
+    }
+    case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:{
+        m_lastActiveMs = QDateTime::currentMSecsSinceEpoch();
+        // REQ-AUTH-CONNECTION-001：绑定会话的连接心跳先校验 clientId 与会话，成功才续期。
+        // 51 响应 caData[0,4)=结果码（旧客户端不读该区，PONG 语义不变）。
+        int hbCode = ENUM_PROTOCOL_CODE_OK;
+        if (m_actorAuthenticated && m_sessionBound) {
+            const QByteArray reqCid(pdu->caData + SESSION_CLIENT_ID_OFFSET, AUTH_CLIENT_ID_HEX_LEN);
+            if (QString::fromLatin1(reqCid) != m_clientId) {
+                hbCode = ENUM_PROTOCOL_CODE_BAD_CLIENT_ID;
+            } else {
+                hbCode = SessionStore::instance().touchSession(m_clientId);
+            }
+        }
+        if (hbCode == ENUM_PROTOCOL_CODE_OK) {
+            // 在线态展示性续期（90s）：失败只记日志，不阻断 PONG
+            if (m_actorAuthenticated && SessionStore::instance().redisEnabled()) {
+                const int onlineRc = SessionStore::instance().setOnline(
+                    m_strLoginName, qint64(m_loginVersion));
+                if (onlineRc != ENUM_PROTOCOL_CODE_OK) {
+                    qCWarning(lcAuth) << "Redis 在线态续期失败 user=" << m_strLoginName << onlineRc;
+                }
+            }
+            qCDebug(lcNet) << "[HEARTBEAT] recv PING from" << m_strLoginName << "-> send PONG";
+            PDU* hRespdu = mkPDU();
+            hRespdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_RESPOND;
+            memcpy(hRespdu->caData, &hbCode, sizeof(hbCode));
+            return hRespdu;
+        }
+        // 会话已失效（被撤销/过期）：回标准码后切断；Redis 瞬时故障只回码不切断、不续期
+        PDU* hFail = mkPDU();
+        hFail->uiType = ENUM_MSG_TYPE_HEARTBEAT_RESPOND;
+        memcpy(hFail->caData, &hbCode, sizeof(hbCode));
+        if (hbCode == ENUM_PROTOCOL_CODE_SESSION_INVALID) {
+            qCWarning(lcAuth) << "[HEARTBEAT] 会话已失效，切断 conn=" << m_connectionId
+                              << " user=" << m_strLoginName;
+            sendAndRelease(hFail);
+            abort();
+            return nullptr;
+        }
+        return hFail;
     }
     case ENUM_MSG_TYPE_CREATE_PUBLINK_REQUEST:{
         respdu=m_MsgHandler->createPublishLink(this->m_strLoginName);
@@ -943,13 +1035,20 @@ void MyTcpSocket::clientOffLine(){
     }
     if(authoritative){
         OperateDB::instance().handleOffLine(m_strLoginName.toStdString().c_str());
-        if(m_actorAuthenticated && RedisStore::instance().enabled()){
-            const QString key = QStringLiteral("online:%1").arg(m_strLoginName);
-            if(!RedisStore::instance().evalCompareDelete(key, QByteArray::number(m_loginVersion))){
-                qCWarning(lcAuth) << "Redis 在线态 CAS 删除失败 user=" << m_strLoginName;
+        if(m_actorAuthenticated && SessionStore::instance().redisEnabled()){
+            bool onlineDeleted = false;
+            const int delRc = SessionStore::instance().deleteOnlineIfVersion(
+                m_strLoginName, qint64(m_loginVersion), onlineDeleted);
+            if(delRc != ENUM_PROTOCOL_CODE_OK){
+                qCWarning(lcAuth) << "Redis 在线态 CAS 删除失败 user=" << m_strLoginName << delRc;
+            } else if(!onlineDeleted){
+                qCDebug(lcAuth) << "在线态版本不匹配，保留新会话在线键 user=" << m_strLoginName;
             }
         }
-        if(m_actorAuthenticated){
+        // REQ-AUTH-CONNECTION-001：绑定可恢复会话的连接断线只释放物理传输——
+        // 保留登记表版本（121 恢复须与登记现值一致）与 Redis 会话键（30 分钟恢复窗口，
+        // TTL 自然收敛）；在线键按版本条件删除。旧兼容连接无恢复能力，照旧移除登记。
+        if(m_actorAuthenticated && !m_sessionBound){
             MyTcpServer::getinstance().removeLoginVersion(m_strLoginName);
         }
     }else{
@@ -959,6 +1058,8 @@ void MyTcpSocket::clientOffLine(){
     // REQ-EXT-SEC-001 T1：断线即撤销连接级 actor_context
     m_actorAuthenticated=false;
     m_loginVersion=0;
+    m_clientId.clear();
+    m_sessionBound=false;
     ++m_actorSessionVersion;
     m_MsgHandler->m_actorName.clear();
     m_strLoginName.clear();
@@ -966,7 +1067,79 @@ void MyTcpSocket::clientOffLine(){
     qCDebug(lcNet)<<"用户已经退出登录，业务访问已撤销 conn="<<m_connectionId<<endl;
 }
 
+// REQ-AUTH-CONNECTION-001：121 会话恢复（公开类型，匿名连接可用）。
+// 成功=校验 clientId/tokenHash/state/TTL + 登记版本一致后绑定本连接并接管旧物理传输；
+// 失败只回 122 区分码（-3015/-3016/-3017/-1003），不改登录版本、不产生半认证连接。
+PDU* MyTcpSocket::handleSessionResume(PDU* request)
+{
+    int code = ENUM_PROTOCOL_CODE_OK;
+    SessionInfo info;
+    QString cidStr;
+    const QByteArray cid(request->caData + SESSION_CLIENT_ID_OFFSET, AUTH_CLIENT_ID_HEX_LEN);
+    if (!isValidClientIdBytes(cid.constData(), cid.size())) {
+        code = ENUM_PROTOCOL_CODE_BAD_CLIENT_ID;
+    } else if (!SessionStore::instance().redisEnabled()) {
+        // 未配置 Redis：不存在可恢复会话语义，失败关闭（无内存认证旁路）；
+        // 旧兼容登录仍可用，但恢复能力整体不可用。
+        code = ENUM_PROTOCOL_CODE_REDIS_SESSION_UNAVAILABLE;
+    } else if (m_actorAuthenticated) {
+        code = ENUM_PROTOCOL_CODE_NOT_ALLOWED;   // 已认证连接不得再恢复（先退出或重新登录）
+    } else if (request->uiMsgLen != uint(SESSION_RESUME_MSG_LEN)) {
+        code = ENUM_PROTOCOL_CODE_BAD_RESUME_TOKEN;
+    } else {
+        const QByteArray token(request->caMsg, AUTH_RESUME_TOKEN_HEX_LEN);
+        if (!isValidResumeTokenBytes(token.constData(), token.size())) {
+            code = ENUM_PROTOCOL_CODE_BAD_RESUME_TOKEN;
+        } else {
+            cidStr = QString::fromLatin1(cid);
+            code = SessionStore::instance().validateResume(
+                cidStr, QString::fromLatin1(token), info);
+            if (code == ENUM_PROTOCOL_CODE_OK) {
+                // 最新版本校验：登记表无记录（服务端重启）或版本落后（已被新登录取代）→ 拒绝。
+                // Redis 会话可能比登记表活得久，必须以本进程登记表为准。
+                const quint64 cur = MyTcpServer::getinstance().currentLoginVersion(info.user);
+                if (cur != quint64(info.loginVersion)) {
+                    qCWarning(lcAuth) << "[RESUME] 版本不符拒绝 conn=" << m_connectionId
+                                      << " user=" << info.user << " sessionVer=" << info.loginVersion
+                                      << " registry=" << cur;
+                    code = ENUM_PROTOCOL_CODE_SESSION_INVALID;
+                }
+            }
+        }
+    }
+    if (code == ENUM_PROTOCOL_CODE_OK) {
+        // 接管：关闭同用户旧物理连接（含同版本残留），再绑定本连接
+        MyTcpServer::getinstance().closeUserSockets(info.user, this);
+        m_strLoginName = info.user;
+        m_actorAuthenticated = true;
+        ++m_actorSessionVersion;
+        m_loginVersion = quint64(info.loginVersion);
+        m_clientId = cidStr;
+        m_sessionBound = true;
+        m_MsgHandler->m_actorName = info.user;
+        MyTcpServer::getinstance().setLoginVersion(info.user, m_loginVersion);
+        OperateDB::instance().handleOnLine(info.user.toUtf8().data());
+        const int onlineRc = SessionStore::instance().setOnline(info.user, qint64(m_loginVersion));
+        if (onlineRc != ENUM_PROTOCOL_CODE_OK) {
+            qCWarning(lcAuth) << "[RESUME] 在线态写入失败（展示性）user=" << info.user << onlineRc;
+        }
+        qCDebug(lcAuth) << "[RESUME] 会话恢复成功 conn=" << m_connectionId
+                        << " user=" << info.user << " ver=" << m_loginVersion;
+    }
+    PDU* r = mkPDU();
+    r->uiType = ENUM_MSG_TYPE_SESSION_RESUME_RESPOND;
+    memcpy(r->caData + SESSION_RESP_CODE_OFFSET, &code, sizeof(code));
+    if (code == ENUM_PROTOCOL_CODE_OK) {
+        authAppendI64(r->caData + SESSION_RESP_VERSION_OFFSET, qint64(m_loginVersion));
+        const QByteArray nameBytes = m_strLoginName.toUtf8();
+        memcpy(r->caData + SESSION_RESP_USER_OFFSET, nameBytes.constData(),
+               size_t(qMin(nameBytes.size(), 31)));
+    }
+    return r;
+}
+
 // REQ-EXT-SEC-001：白名单——注册/登录/验证码/心跳可在未认证状态使用
+// REQ-AUTH-CONNECTION-001：121 恢复也是公开类型（匿名连接重连后使用）
 bool MyTcpSocket::isPublicRequestType(uint uiType)
 {
     switch(uiType){
@@ -974,6 +1147,7 @@ bool MyTcpSocket::isPublicRequestType(uint uiType)
     case ENUM_MSG_TYPE_LOGIN_REQUEST:
     case ENUM_MSG_TYPE_CAPTCHA_REQUEST:
     case ENUM_MSG_TYPE_HEARTBEAT_REQUEST:
+    case ENUM_MSG_TYPE_SESSION_RESUME_REQUEST:
         return true;
     default:
         return false;
@@ -1016,7 +1190,7 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return reject(ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND);
     case ENUM_MSG_TYPE_DELETEFRIEND_REQUEST:
         return reject(ENUM_MSG_TYPE_DELETEFRIEND_RESPOND);
-    case ENUM_MSG_TYPE_GETCHATMSG_REQUEST:
+    case ENUM_MSG_TYPE_GETCHATMSG_REQUEST:
         return reject(ENUM_MSG_TYPE_GETCHATMSG_RESPOND);
     case ENUM_MSG_TYPE_CHAT_HISTORY_REQUEST:
         return reject(ENUM_MSG_TYPE_CHAT_HISTORY_RESPOND);
@@ -1109,6 +1283,10 @@ PDU* MyTcpSocket::authRejectPdu(uint uiType)
         return groupReject(ENUM_MSG_TYPE_GROUP_FILE_DELETE_RESPOND);
     case ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_REQUEST:
         return groupReject(ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND);
+    case ENUM_MSG_TYPE_SESSION_LOGOUT_REQUEST:
+        return reject(ENUM_MSG_TYPE_SESSION_LOGOUT_RESPOND);   // REQ-AUTH-CONNECTION-001：未认证退出回 -1001
+    case ENUM_MSG_TYPE_SESSION_RESUME_REQUEST:
+        return reject(ENUM_MSG_TYPE_SESSION_RESUME_RESPOND);   // REQ-AUTH-CONNECTION-001：版本门切断前尽力回 -1001（不得静默无响应）
     case ENUM_MSG_TYPE_CHAT_REQUEST:
     case ENUM_MSG_TYPE_ADDFRIEND_RESPOND:
         return nullptr; // 无响应语义的投递型请求，拒绝仅落审计日志
@@ -1137,4 +1315,25 @@ bool MyTcpSocket::seedMsg(PDU *respdu){
     memfree(respdu);
     respdu=nullptr;
     return written;
+}
+
+// REQ-AUTH-CONNECTION-001：123 会话失效事件——abort 前尽力送达。
+// caData[0,4)=原因码（统一 -3017），[4,12)=失效版本；caMsg=短原因文本。
+// 同步 flush 保证事件先于断线到达；发送失败不阻断踢旧（旧连接下一请求仍被版本门拒绝）。
+void MyTcpSocket::seedInvalidatedEvent(quint64 staleVersion, const QString& reasonText)
+{
+    const QByteArray reason = reasonText.toUtf8();
+    PDU* ev = mkPDU(uint(reason.size() + 1));
+    ev->uiType = ENUM_MSG_TYPE_SESSION_INVALIDATED_EVENT;
+    authAppendI32(ev->caData + SESSION_RESP_CODE_OFFSET, ENUM_PROTOCOL_CODE_SESSION_INVALID);
+    authAppendI64(ev->caData + SESSION_RESP_VERSION_OFFSET, qint64(staleVersion));
+    memcpy(ev->caMsg, reason.constData(), size_t(reason.size()));
+    ev->caMsg[reason.size()] = '\0';
+    logPduFrame("S->C", ev);
+    const bool ok = this->write((char*)ev, ev->uiTotalLen) == qint64(ev->uiTotalLen)
+            && this->waitForBytesWritten(200);
+    memfree(ev);
+    if(!ok){
+        qCWarning(lcAuth) << "[KICK] 123 失效事件发送失败，版本门兜底 conn=" << m_connectionId;
+    }
 }

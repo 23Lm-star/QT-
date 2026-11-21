@@ -22,6 +22,7 @@
 #include <QSet>
 #include <cerrno>
 #include "redisstore.h"
+#include "sessionstore.h"
 
 // REQ-PROTO-CODE-001：统一把标准码写入响应 caData[0,4)
 inline void setProtocolCode(PDU *pdu, int code)
@@ -30,16 +31,61 @@ inline void setProtocolCode(PDU *pdu, int code)
 }
 
 namespace {
+// REQ-AUTH-CONNECTION-001：严格提取请求携带的 clientId。
+// 44：caData[0,32)=clientId；1/3：caMsg 首个 NUL 之后 32B。只接受通过校验的小写十六进制；
+// 旧客户端（无/非法 clientId）返回空，验证码状态退回连接级标识，且不可建立可恢复会话。
+QByteArray requestClientId(const PDU* request)
+{
+    if (request == nullptr) return QByteArray();
+    QByteArray cid;
+    if (request->uiType == ENUM_MSG_TYPE_CAPTCHA_REQUEST) {
+        cid = QByteArray(request->caData, AUTH_CLIENT_ID_HEX_LEN);
+    } else if (request->uiType == ENUM_MSG_TYPE_REGIST_REQUEST
+            || request->uiType == ENUM_MSG_TYPE_LOGIN_REQUEST) {
+        const int len = int(request->uiMsgLen);
+        const int fixed = AUTH_CLIENT_ID_HEX_LEN + 1;   // NUL + 32B 附加区
+        if (len >= fixed) cid = QByteArray(request->caMsg + (len - AUTH_CLIENT_ID_HEX_LEN),
+                                           AUTH_CLIENT_ID_HEX_LEN);
+    }
+    if (isValidClientIdBytes(cid.constData(), cid.size())) return cid;
+    return QByteArray();
+}
+
+// 验证码状态归属：升级客户端按 clientId 跨连接一致；旧端保持连接级（connId）。
+// 旧实现曾接受 caMsg 可打印文本作标识（键名可被任意注入），现废除。
 QString captchaIdentity(const PDU* request, quint64 connId)
 {
-    if (request != nullptr && request->uiMsgLen > 0 && request->uiMsgLen <= 64) {
-        const QByteArray raw(request->caMsg, int(request->uiMsgLen));
-        for (char c : raw) {
-            if (c < 0x21 || c > 0x7e) return QString::number(connId);
-        }
-        if (!raw.isEmpty()) return QString::fromLatin1(raw);
-    }
+    const QByteArray cid = requestClientId(request);
+    if (!cid.isEmpty()) return QString::fromLatin1(cid);
     return QString::number(connId);
+}
+
+// 验证码输入：取首个 NUL 之前的文本（升级客户端在 NUL 后附加 clientId）。
+QByteArray captchaUserInput(const char* caMsg, uint uiMsgLen)
+{
+    QByteArray input(caMsg, int(uiMsgLen));
+    const int nul = input.indexOf('\0');
+    if (nul >= 0) input.truncate(nul);
+    return input.trimmed();
+}
+
+// 1/3 请求 caMsg 附加区（首个 NUL 之后）判定：
+// Absent=旧帧无附加区（兼容路径）；Valid=outCid 填 32 位十六进制；
+// Invalid=有附加区但格式非法 —— 拒绝 -3015，不静默降级为旧端。
+enum class TailCid { Absent, Valid, Invalid };
+TailCid classifyTailClientId(const PDU* request, QByteArray& outCid)
+{
+    outCid.clear();
+    if (request == nullptr || request->uiMsgLen == 0) return TailCid::Absent;
+    const QByteArray raw(request->caMsg, int(request->uiMsgLen));
+    const int nul = raw.indexOf('\0');
+    if (nul < 0 || nul == raw.size() - 1) return TailCid::Absent;
+    const QByteArray tail = raw.mid(nul + 1);
+    if (tail.size() == AUTH_CLIENT_ID_HEX_LEN && isValidClientIdBytes(tail.constData(), tail.size())) {
+        outCid = tail;
+        return TailCid::Valid;
+    }
+    return TailCid::Invalid;
 }
 
 QString compensationPath(const QString& path)
@@ -116,39 +162,45 @@ QString MsgHandler::generateCaptchaCode(int length)
 
 int MsgHandler::validateCaptcha(const char* caMsg, uint uiMsgLen, int& remainingSec)
 {
-    if (RedisStore::instance().enabled()) {
-        const QString prefix = QStringLiteral("cap:%1:").arg(captchaIdentity(pdu, m_connId));
-        QByteArray code;
-        if (!RedisStore::instance().get(prefix + QStringLiteral("lock"), code) &&
-            !RedisStore::instance().get(prefix + QStringLiteral("code"), code)) {
-            qCWarning(lcAuth) << "Redis 验证码状态读取失败，回退连接内存状态";
-        } else {
-            QByteArray lock;
-            if (RedisStore::instance().get(prefix + QStringLiteral("lock"), lock)) {
-                remainingSec = lock.toInt();
-                return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
-            }
-            const QString userInput = QString::fromUtf8(caMsg, int(uiMsgLen)).trimmed();
-            if (uiMsgLen < 4 || code.isEmpty()) return ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED;
-            if (userInput != QString::fromUtf8(code)) {
-                qint64 fails = 0;
-                if (RedisStore::instance().incr(prefix + QStringLiteral("fail"), fails)) {
-                    RedisStore::instance().setEx(prefix + QStringLiteral("fail"), CAPTCHA_LOCKOUT_SEC, QByteArray::number(fails));
-                    if (fails >= CAPTCHA_MAX_FAILS) {
-                        RedisStore::instance().setEx(prefix + QStringLiteral("lock"), CAPTCHA_LOCKOUT_SEC, QByteArray::number(CAPTCHA_LOCKOUT_SEC));
-                        RedisStore::instance().del(prefix + QStringLiteral("code"));
-                        remainingSec = CAPTCHA_LOCKOUT_SEC;
-                        return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
-                    }
-                }
-                return ENUM_PROTOCOL_CODE_CAPTCHA_WRONG;
-            }
-            RedisStore::instance().del(prefix + QStringLiteral("code"));
-            RedisStore::instance().del(prefix + QStringLiteral("fail"));
-            return 0;
-        }
-    }
     remainingSec = 0;
+    if (RedisStore::instance().enabled()) {
+        // REQ-AUTH-CONNECTION-001：Lua 原子消费/失败计数；Redis 故障失败关闭，
+        // 不静默回退连接内存认证（旧端未携带 clientId 时仍可用 connId 状态登录，但不可恢复会话）。
+        const QString prefix = QStringLiteral("cap:%1:").arg(captchaIdentity(pdu, m_connId));
+        const QByteArray input = captchaUserInput(caMsg, uiMsgLen);
+        int outcome = -1;
+        if (!RedisStore::instance().evalCaptchaConsume(prefix, input, outcome)) {
+            qCWarning(lcAuth) << "验证码原子校验 Redis 不可用，失败关闭 conn=" << m_connId;
+            return ENUM_PROTOCOL_CODE_REDIS_SESSION_UNAVAILABLE;
+        }
+        switch (outcome) {
+        case 0:
+            qCDebug(lcAuth) << "验证码校验成功（Redis 原子消费）";
+            return ENUM_PROTOCOL_CODE_OK;
+        case 2:
+            return ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED;
+        case 3: {
+            qint64 ttl = 0;
+            if (!RedisStore::instance().keyTtl(prefix + QStringLiteral("lock"), ttl) || ttl <= 0)
+                ttl = CAPTCHA_LOCKOUT_SEC;
+            remainingSec = int(ttl);
+            return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
+        }
+        default: break;   // 1=输入不符 → 失败计数
+        }
+        bool locked = false;
+        if (!RedisStore::instance().evalCaptchaFailure(prefix, CAPTCHA_MAX_FAILS,
+                CAPTCHA_LOCKOUT_SEC, CAPTCHA_LOCKOUT_SEC, locked)) {
+            qCWarning(lcAuth) << "验证码失败计数 Redis 不可用，失败关闭 conn=" << m_connId;
+            return ENUM_PROTOCOL_CODE_REDIS_SESSION_UNAVAILABLE;
+        }
+        if (locked) {
+            remainingSec = CAPTCHA_LOCKOUT_SEC;
+            qCWarning(lcAuth) << "验证码连续错误达上限，锁定" << CAPTCHA_LOCKOUT_SEC << "秒";
+            return ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED;
+        }
+        return ENUM_PROTOCOL_CODE_CAPTCHA_WRONG;
+    }
     QDateTime now = QDateTime::currentDateTime();
 
     // 若之前锁定且已过期，恢复正常（冷却回到 1 分钟逻辑）
@@ -324,35 +376,73 @@ bool captchaTextEchoForTests()
 
 PDU *MsgHandler::captcha()
 {
+    // REQ-AUTH-CONNECTION-001：caData[0,32) 非空但非法 → -3015 拒绝；全零=旧端空载荷兼容路径
+    {
+        const QByteArray cidSlot(pdu->caData + SESSION_CLIENT_ID_OFFSET, AUTH_CLIENT_ID_HEX_LEN);
+        const bool allZero = (cidSlot == QByteArray(AUTH_CLIENT_ID_HEX_LEN, '\0'));
+        if (!allZero && !isValidClientIdBytes(cidSlot.constData(), cidSlot.size())) {
+            PDU* badPdu = mkPDU();
+            badPdu->uiType = ENUM_MSG_TYPE_CAPTCHA_RESPOND;
+            setProtocolCode(badPdu, ENUM_PROTOCOL_CODE_BAD_CLIENT_ID);
+            qCWarning(lcAuth) << "验证码请求拒绝：clientId 非法 conn=" << m_connId;
+            return badPdu;
+        }
+    }
     QDateTime now = QDateTime::currentDateTime();
     int status = 0;
     int remaining = 0;
-
-    // 锁定中：禁止获取新码
-    if (m_captchaLockUntil.isValid() && now < m_captchaLockUntil) {
-        status = -6;
-        remaining = now.secsTo(m_captchaLockUntil);
-    }
-    // 正常冷却中：拒绝并回传剩余秒数
-    else if (now < m_captchaNextAllowed) {
-        status = -5;
-        remaining = now.secsTo(m_captchaNextAllowed);
-    }
-    else {
-        // 覆盖式单码：直接覆盖，旧码自然失效
-        m_captchaCode = generateCaptchaCode(6);
-        m_captchaExpiry = now.addSecs(CAPTCHA_EXPIRE_SEC);
-        m_captchaNextAllowed = now.addSecs(CAPTCHA_COOLDOWN_SEC);
-        remaining = CAPTCHA_COOLDOWN_SEC;   // 成功时回传正常冷却时长
-        status = 0;
-        if (RedisStore::instance().enabled()) {
-            const QString prefix = QStringLiteral("cap:%1:").arg(captchaIdentity(pdu, m_connId));
-            const bool stored = RedisStore::instance().setEx(prefix + QStringLiteral("code"), CAPTCHA_EXPIRE_SEC, m_captchaCode.toUtf8()) &&
-                    RedisStore::instance().setEx(prefix + QStringLiteral("cool"), CAPTCHA_COOLDOWN_SEC, QByteArray::number(CAPTCHA_COOLDOWN_SEC));
-            if (!stored) qCWarning(lcAuth) << "Redis 验证码状态写入失败，保留连接内存状态";
+    // REQ-AUTH-CONNECTION-001：Redis 模式下冷却/锁定状态以 cap:{clientId}:cool/lock 为准
+    // （跨连接共享，TTL 即剩余秒数）；连接本地时间状态只服务未配置 Redis 的旧兼容路径。
+    const bool useRedis = RedisStore::instance().enabled();
+    const QString prefix = QStringLiteral("cap:%1:").arg(captchaIdentity(pdu, m_connId));
+    if (useRedis) {
+        qint64 lockTtl = 0, coolTtl = 0;
+        if (!RedisStore::instance().keyTtl(prefix + QStringLiteral("lock"), lockTtl)
+                || !RedisStore::instance().keyTtl(prefix + QStringLiteral("cool"), coolTtl)) {
+            qCWarning(lcAuth) << "Redis 验证码状态读取失败，按存储不可用关闭 conn=" << m_connId;
+            status = -7;
+        } else if (lockTtl > 0) {
+            status = -6;
+            remaining = int(lockTtl);
+        } else if (coolTtl > 0) {
+            status = -5;
+            remaining = int(coolTtl);
         }
-        // REQ-AUDIT-001 R8：文本答案只留在本连接状态里，不进日志、不回传
-        qCDebug(lcAuth) << "生成验证码（图片，文本不外发）过期时间:" << m_captchaExpiry;
+    } else {
+        // 锁定中：禁止获取新码
+        if (m_captchaLockUntil.isValid() && now < m_captchaLockUntil) {
+            status = -6;
+            remaining = now.secsTo(m_captchaLockUntil);
+        }
+        // 正常冷却中：拒绝并回传剩余秒数
+        else if (now < m_captchaNextAllowed) {
+            status = -5;
+            remaining = now.secsTo(m_captchaNextAllowed);
+        }
+    }
+    if (status == 0) {
+        // 覆盖式单码：直接覆盖，旧码自然失效
+        const QString newCode = generateCaptchaCode(6);
+        if (useRedis) {
+            // REQ-AUTH-CONNECTION-001：写入失败即失败关闭，不假装发码、不退回内存态
+            const bool stored = RedisStore::instance().setEx(prefix + QStringLiteral("code"), CAPTCHA_EXPIRE_SEC, newCode.toUtf8()) &&
+                    RedisStore::instance().setEx(prefix + QStringLiteral("cool"), CAPTCHA_COOLDOWN_SEC, QByteArray::number(CAPTCHA_COOLDOWN_SEC));
+            if (!stored) {
+                qCWarning(lcAuth) << "Redis 验证码状态写入失败，按存储不可用关闭 conn=" << m_connId;
+                status = -7;
+                remaining = 0;
+            }
+        }
+        if (status == 0) {
+            m_captchaCode = newCode;   // 供响应载荷（PNG/测试文本）使用
+            if (!useRedis) {
+                m_captchaExpiry = now.addSecs(CAPTCHA_EXPIRE_SEC);
+                m_captchaNextAllowed = now.addSecs(CAPTCHA_COOLDOWN_SEC);
+            }
+            remaining = CAPTCHA_COOLDOWN_SEC;   // 成功时回传正常冷却时长
+            // REQ-AUDIT-001 R8：文本答案只留在本连接状态里，不进日志、不回传
+            qCDebug(lcAuth) << "生成验证码（图片，文本不外发）";
+        }
     }
 
     PDU* respdu;
@@ -384,7 +474,8 @@ PDU *MsgHandler::captcha()
     const int captchaCode = (status == 0) ? ENUM_PROTOCOL_CODE_OK
             : (status == -5 ? ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN
                             : (status == -6 ? ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED
-                                            : ENUM_PROTOCOL_CODE_INTERNAL));
+                                            : (status == -7 ? ENUM_PROTOCOL_CODE_REDIS_SESSION_UNAVAILABLE
+                                                             : ENUM_PROTOCOL_CODE_INTERNAL)));
     setProtocolCode(respdu, captchaCode);
     memcpy(respdu->caData + 4, &remaining, sizeof(remaining));
     return respdu;
@@ -393,6 +484,16 @@ PDU *MsgHandler::captcha()
 //处理注册请求
 PDU *MsgHandler::rigist()
 {
+    // REQ-AUTH-CONNECTION-001：附加区 clientId 非法即 -3015 拒绝（先于验证码，不消费码）；
+    // 无附加区=旧帧兼容路径。注册响应布局不变，目录补偿状态不进响应。
+    QByteArray regCid;
+    if (classifyTailClientId(pdu, regCid) == TailCid::Invalid) {
+        PDU* badPdu = mkPDU();
+        badPdu->uiType = ENUM_MSG_TYPE_REGIST_RESPOND;
+        setProtocolCode(badPdu, ENUM_PROTOCOL_CODE_BAD_CLIENT_ID);
+        qCWarning(lcAuth) << "注册拒绝：clientId 附加区非法 conn=" << m_connId;
+        return badPdu;
+    }
     // 验证码不通过时直接回注册失败码；-4（锁定）额外回传锁定剩余秒数。
     int remaining = 0;
     int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen, remaining);
@@ -441,10 +542,24 @@ PDU *MsgHandler::rigist()
 // REQ-EXT-SEC-001：authOk 仅在服务端凭据校验通过时为 true，由连接层据此绑定 actor_context
 // REQ-EXT-SESSION-001 D1：客户端唯一 ID 走登录 caMsg 验证码 NUL 之后的附加区（零协议改动）；
 // loginVersion=服务端事务内分配的版本号，由连接层绑定为权威会话版本
-PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
+PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion,
+                       QString &outClientId, QString &outResumeToken)
 {
     authOk = false;
     loginVersion = 0;
+    outClientId.clear();
+    outResumeToken.clear();
+    // REQ-AUTH-CONNECTION-001：附加区 clientId 格式先于验证码检查——非法即 -3015 拒绝，
+    // 不消费验证码、不静默降级为旧端兼容路径。
+    QByteArray strictCid;
+    const TailCid tailCid = classifyTailClientId(pdu, strictCid);
+    if (tailCid == TailCid::Invalid) {
+        PDU* badPdu = mkPDU();
+        badPdu->uiType = ENUM_MSG_TYPE_LOGIN_RESPOND;
+        setProtocolCode(badPdu, ENUM_PROTOCOL_CODE_BAD_CLIENT_ID);
+        qCWarning(lcAuth) << "登录拒绝：clientId 附加区非法 conn=" << m_connId;
+        return badPdu;
+    }
     // 验证码先于凭据校验；失败时不触碰数据库，-4 时回传锁定剩余秒数。
     int remaining = 0;
     int captchaRet = validateCaptcha(pdu->caMsg, pdu->uiMsgLen, remaining);
@@ -460,28 +575,33 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
     //取出用户名和密码
     QString username=fixedString(pdu->caData,32);
     QString userpwd=fixedString(pdu->caData+32,32);
-    // D1：验证码串（首个 NUL 前，NUL 必在 uiMsgLen 界内查找）之后的剩余字节=客户端 ID；
-    // 无附加区/越界=空 ID（老客户端兼容）；只保留可打印 ASCII，截断 64（DB 列宽）
-    QString clientId;
-    {
-        const uint cap=pdu->uiMsgLen;
-        uint nul=0;
-        while(nul<cap && pdu->caMsg[nul]!='\0'){ ++nul; }
-        if(nul<cap && cap>nul+1){
-            QByteArray raw(pdu->caMsg+nul+1, static_cast<int>(cap-nul-1));
-            QByteArray clean;
-            for(char c: raw){
-                if(c=='\0'){ break; }
-                if(c>=0x21 && c<=0x7e){ clean.append(c); }
-                if(clean.size()>=64){ break; }
-            }
-            clientId=QString::fromUtf8(clean);
-        }
-    }
+    // REQ-AUTH-CONNECTION-001：clientId 已在入口严格判定 —— Valid=32位十六进制；
+    // Absent=旧帧无附加区（兼容登录，不建可恢复会话）。DB 登录档案记录两者之一。
+    const QString clientId = (tailCid == TailCid::Valid) ? QString::fromLatin1(strictCid) : QString();
     //在数据库中检查用户名和密码是否一致或有问题
     int ret=OperateDB::instance().handleLogin(username.toUtf8().data(),userpwd.toUtf8().data(),clientId,loginVersion);
     qCDebug(lcAuth)<<"login ret"<<ret<<endl;
+    QString resumeToken;
     if(ret==1){//记录已登录的用户名
+        // REQ-AUTH-CONNECTION-001：升级客户端先建 Redis 会话再生效连接认证。
+        // 会话写入失败（Redis 故障）→ 登录失败关闭并回写 DB 在线态防幽灵；
+        // login_version 已递增无害，下次登录 CAS 取更大值。
+        if (!clientId.isEmpty()) {
+            resumeToken = SessionStore::generateResumeToken();
+            const int sRc = SessionStore::instance().createSession(
+                clientId, username, qint64(loginVersion), resumeToken);
+            if (sRc != ENUM_PROTOCOL_CODE_OK) {
+                qCWarning(lcAuth) << "登录会话建立失败，登录关闭 conn=" << m_connId << sRc;
+                resumeToken.clear();
+                OperateDB::instance().handleOffLine(username.toUtf8().data());
+                PDU* failPdu = mkPDU();
+                failPdu->uiType = ENUM_MSG_TYPE_LOGIN_RESPOND;
+                setProtocolCode(failPdu, sRc);
+                return failPdu;
+            }
+            outClientId = clientId;
+            outResumeToken = resumeToken;
+        }
         strname=username;
         authOk=true;
         // REQ-UX-001 A2：登录即幂等确保 actor 个人目录存在。
@@ -505,13 +625,22 @@ PDU *MsgHandler::login(QString &strname, bool &authOk, quint64 &loginVersion)
         loginVersion=0;
     }
     //将登录结果打包进响应报文并返回
-    PDU* respdu=mkPDU();
+    // REQ-AUTH-CONNECTION-001：会话建立成功时 caMsg 回传一次性恢复凭据（64位hex+NUL），
+    // 只此一次；旧客户端/未建会话响应保持零正文，旧端不受影响。
+    const QByteArray tokenBytes = resumeToken.toLatin1();
+    PDU* respdu = mkPDU(resumeToken.isEmpty() ? 0 : uint(tokenBytes.size() + 1));
     respdu->uiType=ENUM_MSG_TYPE_LOGIN_RESPOND;
+    // OperateDB::handleLogin 返回 -1 表示账号或密码错误，0 表示数据库故障。
+    // 不能把所有负数统一映射为数据库不可用，否则错误密码会泄露错误域并破坏三端标准码语义。
     const int loginCode = (ret == 1) ? ENUM_PROTOCOL_CODE_OK
-            : (ret < 0 ? ENUM_PROTOCOL_CODE_DB_UNAVAILABLE : ENUM_PROTOCOL_CODE_BAD_CREDENTIALS);
+            : (ret == -1 ? ENUM_PROTOCOL_CODE_BAD_CREDENTIALS : ENUM_PROTOCOL_CODE_DB_UNAVAILABLE);
     setProtocolCode(respdu, loginCode);
     QByteArray usernameBytes=username.toUtf8();
     memcpy(respdu->caData+32,usernameBytes.constData(),qMin(usernameBytes.size(),31));
+    if(!resumeToken.isEmpty()){
+        memcpy(respdu->caMsg, tokenBytes.constData(), size_t(tokenBytes.size()));
+        respdu->caMsg[tokenBytes.size()] = '\0';
+    }
     return respdu;
 }
 //查找用户

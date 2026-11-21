@@ -361,6 +361,30 @@ void MyTcpServer::closeStaleSockets(const QString& user)
     for (MyTcpSocket* s : stale) {
         qCWarning(lcAuth) << "[KICK] 登录版本过期，关闭旧连接 conn=" << s->m_connectionId
                           << " user=" << user << " ver=" << s->m_loginVersion << " latest=" << cur;
+        // REQ-AUTH-CONNECTION-001：先发 123 失效事件再按版本关闭；事件丢失时版本门仍拒绝后续业务
+        s->seedInvalidatedEvent(s->m_loginVersion, QStringLiteral("账号在其他设备登录"));
+        s->abort();
+    }
+}
+
+// REQ-AUTH-CONNECTION-001：恢复接管关闭同用户旧物理连接（含同版本）。
+// 先置 m_loginVersion=0：clientOffLine 的权威判定走 stale 分支，跳过下线写与登记表移除，
+// 否则旧连接的断线回调会清掉刚恢复会话的在线键与登记版本。
+void MyTcpServer::closeUserSockets(const QString& user, MyTcpSocket* keep)
+{
+    QList<MyTcpSocket*> victims;
+    {
+        QMutexLocker locker(&m_tcpsocketlistMutex);
+        for (MyTcpSocket* s : tcpsocketlist) {
+            if (s != keep && s->m_actorAuthenticated && s->m_strLoginName == user) {
+                victims.append(s);
+            }
+        }
+    }
+    for (MyTcpSocket* s : victims) {
+        qCWarning(lcAuth) << "[RESUME] 恢复接管，关闭同用户旧连接 conn=" << s->m_connectionId
+                          << " user=" << user;
+        s->m_loginVersion = 0;   // 强制 stale 分支，保护新绑定的逻辑会话
         s->abort();
     }
 }

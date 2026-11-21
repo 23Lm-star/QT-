@@ -107,6 +107,8 @@ public:
     void setCurrentUser(const QString& name);
     // 程序退出前落盘（把内存中非终态任务写进快照）
     void saveSnapshotNow();
+    // REQ-AUTH-CONNECTION-001：账号注销后清除该用户内存任务与落盘快照（同名重注册不复用）
+    void dropCurrentUser();
     // 本次会话恢复出的任务数（面板提示用）
     int restoredCount() const { return m_restoredCount; }
     QString currentUser() const { return m_currentUser; }

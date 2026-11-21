@@ -182,6 +182,9 @@ public:
     //下线
     // 断线时把 online 置 0；SQL 失败静默（启动期 reconcileOnlineFlags 兜底）
     void handleOffLine(const char* strname);
+    // REQ-AUTH-CONNECTION-001：会话恢复成功把 online 置 1（不递增 login_version）；
+    // SQL 失败静默（在线态展示性，权威以 Redis 会话与版本门为准）
+    void handleOnLine(const char* strname);
     //查找用户
     // 返回 online（0 离线/1 在线）；用户不存在返回 2；参数或连接失败返回 -1
     int handleFindUser(const char* userName);

@@ -69,3 +69,10 @@ void Index::on_pushButton_clicked()
     // 注销：Client 处理回包后负责断开连接并回到登录界面
     Client::getinstance().sendLogoffRequest();
 }
+
+// REQ-AUTH-CONNECTION-001：退出登录（119）——只撤销当前会话，账号保留；
+// 与"注销"（48，永久删除账号）严格区分。成功后 socket 保持匿名可重新登录。
+void Index::on_logout_PB_clicked()
+{
+    Client::getinstance().sendSessionLogout();
+}

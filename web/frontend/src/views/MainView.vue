@@ -1,6 +1,6 @@
 <script setup>
 // 主布局：顶部状态栏 + 四个页签（好友/云盘/群聊/分享）+ 全局邀请弹窗。
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth.js';
 import { useFriendsStore } from '../stores/friends.js';
@@ -51,8 +51,12 @@ onBeforeUnmount(() => {
   friends.stopSync();
 });
 
-function onLogout() {
-  auth.logout();
+watch(() => auth.loggedIn, (loggedIn) => {
+  if (!loggedIn) router.replace({ name: 'login' });
+});
+
+async function onLogout() {
+  if (!(await auth.logout())) return;
   friends.reset();
   chat.reset();
   drv.reset();
@@ -61,6 +65,10 @@ function onLogout() {
   grpChat.reset();
   share.reset();
   router.push({ name: 'login' });
+}
+
+async function onReconnect() {
+  await auth.reconnect();
 }
 </script>
 
@@ -73,6 +81,9 @@ function onLogout() {
       <span v-if="auth.connectState !== 'open' && auth.lastClose" class="closeinfo" :title="`code=${auth.lastClose.code} reason=${auth.lastClose.reason}`">
         {{ auth.lastClose.text }}
       </span>
+      <button v-if="auth.connectState !== 'open'" class="reconnect" :disabled="auth.resumePending" @click="onReconnect">
+        {{ auth.resumePending ? '恢复中…' : '重新连接' }}
+      </button>
       <button class="logout" @click="onLogout">退出登录</button>
     </header>
 
@@ -106,6 +117,8 @@ function onLogout() {
 .bar .conn.open { background: #166534; }
 .bar .closeinfo { font-size: 12px; color: #fca5a5; max-width: 46%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar .logout { margin-left: auto; padding: 6px 14px; border-radius: 6px; border: none; background: #ef4444; color: #fff; cursor: pointer; font-size: 13px; }
+.bar .reconnect { padding: 6px 12px; border-radius: 6px; border: 1px solid #9ca3af; background: transparent; color: #f9fafb; cursor: pointer; font-size: 12px; }
+.bar .reconnect:disabled { opacity: .6; cursor: wait; }
 .tabs { display: flex; gap: 4px; padding: 8px 16px 0; background: #fff; border-bottom: 1px solid #e5e7eb; flex: none; }
 .tab { position: relative; padding: 8px 18px; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; background: transparent; cursor: pointer; font-size: 14px; color: #4b5563; }
 .tab.active { background: #f3f4f6; border-color: #e5e7eb; color: #111827; font-weight: 600; }

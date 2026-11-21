@@ -214,6 +214,26 @@ void TransferManager::saveSnapshotNow()
     saveSnapshot();
 }
 
+// REQ-AUTH-CONNECTION-001：注销清用户——内存任务/队列/快照一并清除，恢复标记复位。
+void TransferManager::dropCurrentUser()
+{
+    const QString user = m_currentUser.isEmpty() ? m_lastKnownUser : m_currentUser;
+    m_tasks.clear();
+    m_idToKey.clear();
+    m_uploadQueue.clear();
+    m_downloadQueue.clear();
+    m_fastcheckQueue.clear();
+    m_fastcheckInFlight = 0;
+    m_fastcheckInFlightToken.clear();
+    m_activeUploads = 0;
+    m_activeDownloads = 0;
+    m_currentUser.clear();
+    m_lastKnownUser.clear();
+    m_restoredUser.clear();
+    if (!user.isEmpty()) QFile::remove(snapshotPath(user));
+    emit tasksChanged();
+}
+
 QString TransferManager::stateText(State s)
 {
     switch (s) {

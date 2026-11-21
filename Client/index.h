@@ -45,6 +45,9 @@ private slots:
     // 注销当前账号
     void on_pushButton_clicked();
 
+    // REQ-AUTH-CONNECTION-001：退出登录（119，账号保留，与注销严格区分）
+    void on_logout_PB_clicked();
+
 private:
     // 由 index.ui 生成的控件树（含三个子页与 stackedWidget）
     Ui::Index *ui;

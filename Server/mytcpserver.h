@@ -66,6 +66,10 @@ public:
     // 关闭该用户名下已认证且版本≠登记表现值的全部存量连接（锁内快照、出锁 abort，仿僵尸扫描纪律；
     // 现值取单调登记表，并发下自含式正确：低版本登录者也会把自己关掉）
     void closeStaleSockets(const QString& user);
+    // REQ-AUTH-CONNECTION-001：121 恢复接管——关闭该用户除 keep 外的全部已认证连接
+    // （含同版本的旧物理传输）。被关连接先置 m_loginVersion=0 走 stale 分支，
+    // 不得触发下线写/在线键删除/登记表移除，保护刚恢复的逻辑会话。
+    void closeUserSockets(const QString& user, MyTcpSocket* keep);
 public slots:
     void handleUploadWriteFinished(quint64 connectionId, quint64 transferId,
                                    qint64 offset, qint64 length, bool success);

@@ -7,6 +7,12 @@ import {
   writeFixedStringNul, writeBytes, concatBytes,
   readFixedString, readI32, textEncoder, utf8Length,
 } from '../fields.js';
+// REQ-AUTH-CONNECTION-001：会话域（119/120、121/122、123）编解码与校验
+import {
+  isValidClientId, isValidResumeToken,
+  buildSessionCaData, buildResumeMsg,
+  parseLogoutRespond, parseResumeRespond,
+} from '../session.js';
 
 // 组装 caData[64]：[0..31]=用户名(NUL 补零)，[32..63]=UTF-8 明文密码。
 function buildAuthCaData(username, password) {
@@ -22,9 +28,11 @@ export function validateCredentials(username, password) {
   return null;
 }
 
-// 验证码请求(44)：空 PDU。返回响应解析结果。
-export async function requestCaptcha(net) {
-  const resp = await net.request(T.CAPTCHA_REQUEST, T.CAPTCHA_RESPOND);
+// 验证码请求(44)：REQ-AUTH-CONNECTION-001 升级后 caData[0,32)=clientId；
+// 无 clientId（旧客户端兼容路径）保持空载荷。返回响应解析结果。
+export async function requestCaptcha(net, clientId = null) {
+  const caData = isValidClientId(clientId) ? buildSessionCaData(clientId) : null;
+  const resp = await net.request(T.CAPTCHA_REQUEST, T.CAPTCHA_RESPOND, caData);
   const status = readI32(resp.caData, 0);
   const remaining = readI32(resp.caData, 4);
   // REQ-AUDIT-001 R8：默认载荷是 PNG 图片（文本答案只在服务端）。
@@ -46,7 +54,8 @@ export async function requestCaptcha(net) {
   return { status, remaining, image, code };
 }
 
-// 登录请求(3)：caMsg = 验证码 + NUL + 32B clientId。
+// 登录请求(3)：caMsg = 验证码 + NUL + 32B clientId（旧端缺附加区走兼容路径）。
+// 成功时服务端 caMsg 回传一次性恢复凭据（64 位十六进制 + NUL），旧服务端无此区。
 export async function login(net, { username, password, captcha, clientId }) {
   const err = validateCredentials(username, password);
   if (err) throw new Error(err);
@@ -59,18 +68,38 @@ export async function login(net, { username, password, captcha, clientId }) {
   const ret = readI32(resp.caData, 0);
   const result = { ret };
   if (ret === LoginRet.LOCKED) result.remaining = readI32(resp.caData, 4);
-  if (ret === LoginRet.SUCCESS) result.loginName = readFixedString(resp.caData, 32, 32);
+  if (ret === LoginRet.SUCCESS) {
+    result.loginName = readFixedString(resp.caData, 32, 32);
+    const raw = resp.uiMsgLen > 0 ? readFixedString(resp.caMsg, 0, resp.uiMsgLen) : '';
+    // 仅接受合法格式的恢复凭据；格式异常按无凭据处理，不得当作可用 token 保存
+    result.resumeToken = isValidResumeToken(raw) ? raw : '';
+  }
   return result;
 }
 
-// 注册请求(1)：caMsg = 验证码 + NUL（无 clientId）。
-export async function register(net, { username, password, captcha }) {
+// 退出登录请求(119)：caData[0,32)=clientId，不携带账号名；成功后连接转匿名。
+export async function sessionLogout(net, clientId) {
+  const resp = await net.request(T.SESSION_LOGOUT_REQUEST, T.SESSION_LOGOUT_RESPOND,
+    buildSessionCaData(clientId));
+  return parseLogoutRespond(resp);
+}
+
+// 会话恢复请求(121)：caData=clientId，caMsg=恢复凭据+NUL；成功后回账号与登录版本。
+export async function sessionResume(net, clientId, token) {
+  const resp = await net.request(T.SESSION_RESUME_REQUEST, T.SESSION_RESUME_RESPOND,
+    buildSessionCaData(clientId), buildResumeMsg(token));
+  return parseResumeRespond(resp);
+}
+
+// 注册请求(1)：caMsg = 验证码 + NUL [+ 32B clientId]（REQ-AUTH-CONNECTION-001，旧端保持旧帧）。
+export async function register(net, { username, password, captcha, clientId }) {
   const err = validateCredentials(username, password);
   if (err) throw new Error(err);
   if (!captcha) throw new Error('请输入验证码');
   const caData = buildAuthCaData(username, password);
   const captchaBytes = textEncoder.encode(captcha);
-  const msg = concatBytes(captchaBytes, new Uint8Array(1)); // +NUL
+  let msg = concatBytes(captchaBytes, new Uint8Array(1)); // +NUL
+  if (isValidClientId(clientId)) msg = concatBytes(msg, textEncoder.encode(clientId));
   const resp = await net.request(T.REGIST_REQUEST, T.REGIST_RESPOND, caData, msg);
   const ret = readI32(resp.caData, 0);
   const result = { ret };

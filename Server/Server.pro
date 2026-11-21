@@ -55,6 +55,7 @@ SOURCES += \
     reclaimscheduler.cpp \
     redisstore.cpp \
     resumableuploadsession.cpp \
+    sessionstore.cpp \
     server.cpp \
     sharelinkservice.cpp \
     staginghashtask.cpp \
@@ -79,6 +80,7 @@ HEADERS += \
     reclaimscheduler.h \
     redisstore.h \
     resumableuploadsession.h \
+    sessionstore.h \
     server.h \
     sharelinkservice.h \
     staginghashtask.h \

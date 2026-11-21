@@ -14,6 +14,7 @@
 #include <QFileInfo>
 #include <QTimer>
 #include "index.h"
+#include "transfertask.h"
 MsgHandler::MsgHandler()
 {
 }
@@ -80,32 +81,13 @@ QString MsgHandler::handllogin()
         return QString();
     }
     if(code==ENUM_PROTOCOL_CODE_OK){
-        // 成功：先同步取名字返回，UI 切换延后 1.5s。
+        // REQ-AUTH-CONNECTION-001：成功只同步取名字返回；凭据保存与主界面切换/传输恢复/能力声明
+        // 收敛到 Client::enterLoggedInSession（登录与 122 恢复共用同一入口，消除双路径漂移）。
         Client::getinstance().showLoadingAnimation(true);
         char lName[32]={'\0'};
         memcpy(lName,pdu->caData+32,sizeof(lName));
         QString loginName=QString(lName);
-        // R-1：名字同步返回给调用方（Client::handlMsg 的 LOGIN_RESPOND 分支先落 m_LoginName
-        // 再 setCurrentUser）；本定时器此后只负责 UI 切换与既有延迟刷新。
-        QTimer::singleShot(1500,[loginName](){
-            qCDebug(lcCli)<<"登录账号成功，用户名为:"<<loginName;
-            // REQ-EXT-GROUP-004：新会话丢弃上一会话的群读状态（换账号登录不得继承旧游标）
-            Client::getinstance().resetGroupStates();
-            // 文件页的用户根按本次登录身份重算——重连路径下 File 可能先于登录被构造，
-            // 那次构造拿到的空登录名会让文件页停在存储根目录
-            Index::getinstance().getFile()->resetUserPath();
-            Index::getinstance().show();
-            Client::getinstance().hide();
-            // 主界面完全构造并显示后，在事件循环下一轮触发初始刷新（仅好友列表）
-            QTimer::singleShot(0, [](){
-                Index::getinstance().getFriend()->flushfriend();
-                // REQ-EXT-GROUP-004：这里是全客户端唯一的"会话已建立"时点，一次取回全部群的
-                // 未读锚点（群水位 + 我的已读游标）。不能再早——actor 未建立，摘要必被拒；
-                // 不能再晚——等到第一次打开群聊窗口才取，会让没打开过的群一直空着。
-                Index::getinstance().getGroup()->initializeSession();
-                // 文件列表刷新延迟到用户首次点击"文件"页时
-            });
-        });
+        qCDebug(lcCli)<<"登录账号成功，用户名为:"<<loginName;
         return loginName;
     }
     else{
@@ -649,6 +631,11 @@ void MsgHandler::handlLogoff()
     qCDebug(lcCli)<<"handlLogoff code:"<<code;
     if(code==ENUM_PROTOCOL_CODE_OK){
         QMessageBox::information(&Index::getinstance(),"提示","账户已成功注销，即将返回登录界面。");
+        // REQ-AUTH-CONNECTION-001：注销后账号全部会话已被服务端撤销，本地凭据/任务必须清除
+        Client::getinstance().clearResumeToken();
+        Client::getinstance().resetGroupStates();
+        TransferManager::instance().dropCurrentUser();
+        Client::getinstance().logoutLocalStateReset();
         // REQ-CLI-MSGSTORE-001：账号注销后本地消息（含水位）一并清除，同名重注册不复用
         Client::getinstance().msgStore().removeUser();
         // 关闭主界面，返回登录界面

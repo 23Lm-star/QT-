@@ -46,6 +46,11 @@ public:
     quint64 m_actorSessionVersion = 0;
     // REQ-EXT-SESSION-001：登录时服务端事务分配的用户域版本（0=未认证），每请求处理前比对登记表
     quint64 m_loginVersion = 0;
+    // REQ-AUTH-CONNECTION-001：逻辑会话上下文（仅服务端登录/恢复/退出/断线时写入）
+    // 32 位小写十六进制设备标识；空=旧客户端兼容路径（连接可认证但无恢复能力）
+    QString m_clientId;
+    // 本连接是否绑定了 Redis 可恢复会话（登录成功建会话或 121 恢复成功时置位）
+    bool m_sessionBound = false;
     //存储传输的pdu字节流
     // 历史遗留计数（未参与逻辑），保留以兼容旧代码/调试。
     int a;
@@ -107,6 +112,11 @@ public:
     // REQ-EXT-SEC-001：统一入口门——公开类型白名单 + 未认证拒绝响应
     static bool isPublicRequestType(uint uiType);
     PDU* authRejectPdu(uint uiType);
+    // REQ-AUTH-CONNECTION-001：尽力发送 123 会话失效事件（abort 前调用；发送失败由版本门兜底）
+    void seedInvalidatedEvent(quint64 staleVersion, const QString& reasonText);
+    // REQ-AUTH-CONNECTION-001：121 会话恢复——校验 clientId/token/会话状态/最新版本后绑定本连接；
+    // 失败只回 122 区分码，不改登录版本、不产生半认证连接
+    PDU* handleSessionResume(PDU* request);
     // 所有权规则：
     // - 返回非空 PDU → 由 recvmsg() 调用 seedMsg() 写入并释放
     // - 返回 nullptr   → PDU 已由 handlMsg() 内部发送并释放（如下载流），或无需响应
