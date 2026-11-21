@@ -1683,6 +1683,13 @@ PDU *MsgHandler::uploadfileinit()
                     const FileObjectStore::CommitResult cr = finalizeUploadOnComplete();
                     if (cr.deferred) {
                         deferred30 = true;
+                    } else {
+                        // REQ-RESUME-AUDIT-001 残留收口：finalize 非 deferred 早退=拒绝转正
+                        // （上下文缺失），30 不得沿用"已在尾部"的 OK+满偏移假完成——
+                        // 客户端按 resumeOffset>=total 判完成，与 32 通道失败收口同口径。
+                        ret = false;
+                        resumeOffset = 0;
+                        complete = false;
                     }
                 }
             }
