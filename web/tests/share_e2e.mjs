@@ -296,7 +296,7 @@ async function main() {
       `ok=${cRenew1.ok} state=${cRenew1.state}`);
     await sleep(2200);
     const qExpired = await share.queryPublishLink({ owner: USER_A, relativePath: rel }, A.net);
-    check('L11', '57 过期后 state=1', qExpired.exists && qExpired.state === share.PUBLINK_STATE_EXPIRED,
+    check('L11', '57 过期后 state=-2017', qExpired.exists && qExpired.state === share.PUBLINK_STATE_EXPIRED,
       `state=${qExpired.state}`);
 
     const cReuseDead = await share.createPublishLink({ relativePath: rel }, A.net);

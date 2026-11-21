@@ -307,7 +307,7 @@ try:
     exec_sql("UPDATE share_link SET expire_time=%s WHERE owner_name=%s AND file_id=%s",
              ((datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"), OWNER, fid()))
     e2, s2, _ = query(c, REL)
-    check("A6 过期后查询 state=EXPIRED(1)", e2 is True and s2 == ST_EXPIRED, "state=%s" % s2)
+    check("A6 过期后查询 state=EXPIRED(-2017)", e2 is True and s2 == ST_EXPIRED, "state=%s" % s2)
 
     ok, st, _ = cpl(c, REL)
     check("A7 过期时旧语义创建不再谎报有效：ok=true 但 state=EXPIRED",
@@ -330,7 +330,7 @@ try:
     exec_sql("UPDATE share_link SET revoked=1 WHERE owner_name=%s AND file_id=%s", (OWNER, fid()))
     e3, s3, _ = query(c, REL)
     ok, st, _ = cpl(c, REL, ACTION_RENEW, 7 * 24 * 3600)
-    check("B5 撤销后查询 state=REVOKED(2)", e3 is True and s3 == ST_REVOKED, "state=%s" % s3)
+    check("B5 撤销后查询 state=REVOKED(-2018)", e3 is True and s3 == ST_REVOKED, "state=%s" % s3)
     check("B6 已撤销链接续期被拒（续期不让作废链接复活，失败回写失败码）",
           ok is False and st == ST_WRITE_FAILED, "ok=%s state=%s" % (ok, st))
 

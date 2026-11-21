@@ -8,3 +8,7 @@ CREATE TABLE IF NOT EXISTS share_link (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   KEY idx_owner_file (owner_name, file_id)
 );
+
+-- 全新库：建表即达版本门槛（对已迁移旧库无害，INSERT IGNORE 幂等）。
+-- 旧库升级仍须执行 migrate_share_entryid_001.sql（清空存量 + 改列）。
+INSERT IGNORE INTO schema_version (version) VALUES (2026112101);

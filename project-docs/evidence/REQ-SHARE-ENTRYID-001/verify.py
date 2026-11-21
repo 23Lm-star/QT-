@@ -279,7 +279,7 @@ try:
 
     # ---------------- E3 目录删除级联失效 ----------------
     print("=== E3 目录删除级联失效 ===")
-    r = A.ask(pdu(T_DEL, msg=("./filesys/" + OWNER + "/sub").encode(), dat=u32(1)), T_DEL_R)
+    r = A.ask(pdu(T_DEL, msg=("./filesys/" + OWNER + "/sub").encode(), dat=u32(0)), T_DEL_R)
     check("E3.0 删除子目录成功", code_of(r, T_DEL_R) == 0)
     rows = q1("SELECT COUNT(*) FROM share_link WHERE owner_name=%s", (OWNER,))[0]
     check("E3.1 链接行已随子树软删清理", rows == 0, "rows=%s" % rows)
