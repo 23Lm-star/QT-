@@ -633,10 +633,9 @@ void MyTcpSocket::handleUploadWriteFinished(quint64 transferId, qint64 offset, q
     if(complete){
         // REQ-EXT-FILE-001 T4：末块写完→服务端复算转正+建条目+引用计数（会释放上下文）
         m_MsgHandler->m_currentTransferId=transferId;
-        // REQ-EXT-PERF-002：登记 32 迟到补发参数（success/偏移取写落定时的值，与改前同），
+        // REQ-EXT-PERF-002：登记 32 迟到补发参数（偏移取写落定时的值，成败以提交结果为准），
         // 整文件复算转线程池，32 由 handleStagingHashFinished 在转正落定后补发。
         cp->deferredRespond = MsgHandler::DeferredDataAck32;
-        cp->deferredAckSuccess = success;
         cp->deferredAckOffset = ackOffset;
         const FileObjectStore::CommitResult r = m_MsgHandler->finalizeUploadOnComplete();
         if (r.deferred) {

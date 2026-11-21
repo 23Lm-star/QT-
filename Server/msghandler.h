@@ -53,8 +53,7 @@ public:
         bool     hashInFlight = false;
         // 复算落定后要迟到补发的应答类型（DeferredRespond）。
         quint8   deferredRespond = 0;
-        // 32：末块写落定时的 success/下一偏移（M3 后 32 成败以提交结果为准，本字段仅留档）。
-        bool     deferredAckSuccess = false;
+        // 32：末块写落定时的下一偏移（成功时回带；M3 后 32 成败以提交结果为准）。
         qint64   deferredAckOffset = 0;
         // 98：回带的 97 请求标识 + 命中时的续传起点（=文件总大小）。
         QByteArray deferredReqId;
