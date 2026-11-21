@@ -124,10 +124,9 @@ bool OperateDB::checkSchemaVersion()
                                                                  kShareEntryIdSchemaVersion))))))));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
-                         << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
-                            "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
-                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql、"
-                            "migrate_dir_comp_001.sql 与 migrate_share_entryid_001.sql";
+                         << "— 全新库请按 README 顺序执行 init_test_data.sql 与 Server/migrate_*.sql"
+                            "（share_link 新表由 Server/share_link.sql 建立）；已装旧结构库请执行"
+                            " Server/migrate_share_entryid_001.sql 完成分享链接改列升级";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;

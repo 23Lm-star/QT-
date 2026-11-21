@@ -296,6 +296,14 @@ void MyTcpServer::addPendingShare(const QString& receiver, const QString& sharer
             m_pendingShares.removeAt(i);
         }
     }
+    // 同键（接收者,分享人,邀请名）重复登记以最新邀请为准：删后重建再分享时
+    // 旧登记指向已删 fileId，不清理会遮蔽新邀请直至 TTL 过期
+    for(int i=m_pendingShares.size()-1;i>=0;--i){
+        if(m_pendingShares[i].receiver==receiver && m_pendingShares[i].sharer==sharer
+                && m_pendingShares[i].invitedName==invitedName){
+            m_pendingShares.removeAt(i);
+        }
+    }
     while(m_pendingShares.size() >= PENDING_SHARE_MAX){
         m_pendingShares.removeFirst();
     }
