@@ -38,8 +38,9 @@ UPLOAD_MAGIC = 0x5253554d   # "RSUM"
 
 OWNER, OTHER = "sh1user", "sh1other"
 REL = "sh1.bin"
-PUBLINK_STATE_OFFSET = 8
-ST_VALID, ST_EXPIRED, ST_REVOKED = 0, 1, 2
+# REQ-PROTO-CODE-001：53/55/57 状态并入标准码（caData[0,4)）：0=可用，-2017=过期，-2018=吊销
+ST_VALID, ST_EXPIRED, ST_REVOKED = 0, -2017, -2018
+ST_LINK_INVALID, ST_WRITE_FAILED = -2019, -4006
 ACTION_NEW, ACTION_RENEW = "new", "renew"
 
 RESULTS = []
@@ -71,13 +72,13 @@ def upload_file(c, name, data, tid=901):
     dat[40:44] = u32(UPLOAD_MAGIC)
     dat[48:56] = u64(tid)
     r = c.ask(pdu(T_UP_INIT, msg=("./filesys/" + OWNER).encode(), dat=bytes(dat)), T_UP_INIT_R)
-    assert r and r[0][1][0], "29 init rejected"
+    assert r and struct.unpack("<i", r[0][1][:4])[0] == 0, "29 init rejected"   # PROTO-CODE-001 标准码
     d = bytearray(64)
     d[0:8] = struct.pack("<q", 0)
     d[40:44] = u32(UPLOAD_MAGIC)
     d[48:56] = u64(tid)
     r = c.ask(pdu(T_UP_DATA, msg=data, dat=bytes(d)), T_UP_DATA_R, timeout=30)
-    assert r and r[0][1][0], "31 upload rejected"
+    assert r and struct.unpack("<i", r[0][1][:4])[0] == 0, "31 upload rejected"   # PROTO-CODE-001 标准码
 
 
 def entry_exists(owner, saved_path):
@@ -178,7 +179,7 @@ def login(name):
     r = c.ask(pdu(T_LOGIN, msg=code + b"\0",
                   dat=f32(name) + hashlib.md5(PWD.encode()).hexdigest().encode()), T_LOGIN_R)
     ret = struct.unpack("<i", r[0][1][:4])[0] if r else -99
-    if ret != 1:
+    if ret != 0:   # PROTO-CODE-001 起标准成功码=0（本套件基线过期修正）
         c.close()
         return None
     return c
@@ -194,25 +195,26 @@ def cpl(c, rel, action=None, seconds=0):
     r = c.ask(pkt, T_CPL_R)
     if not r:
         return None, None, ""
-    ok = struct.unpack("<?", r[0][1][:1])[0]
-    state = struct.unpack("<I", r[0][1][PUBLINK_STATE_OFFSET:PUBLINK_STATE_OFFSET + 4])[0]
-    return ok, state, r[0][2].split(b"\0")[0].decode()
+    code = struct.unpack("<i", r[0][1][:4])[0]
+    # PROTO-CODE-001：0=可用、-2017=过期、-2018=吊销（三者=记录操作成功并携带状态）；其余=失败
+    ok = code in (ST_VALID, ST_EXPIRED, ST_REVOKED)
+    return ok, code, r[0][2].split(b"\0")[0].decode()
 
 
 def query(c, rel):
     r = c.ask(pdu(T_QUERY, dat=f32(OWNER), msg=rel.encode()), T_QUERY_R)
     if not r:
         return None, None, ""
-    exists = struct.unpack("<?", r[0][1][:1])[0]
-    state = struct.unpack("<I", r[0][1][PUBLINK_STATE_OFFSET:PUBLINK_STATE_OFFSET + 4])[0]
-    return exists, state, r[0][2].split(b"\0")[0].decode()
+    code = struct.unpack("<i", r[0][1][:4])[0]
+    exists = code != ST_LINK_INVALID
+    return exists, code, r[0][2].split(b"\0")[0].decode()
 
 
 def resolve(c, token):
     r = c.ask(pdu(T_RES, msg=token.encode()), T_RES_R)
     if not r:
         return None, ""
-    ok = struct.unpack("<?", r[0][1][:1])[0]
+    ok = struct.unpack("<i", r[0][1][:4])[0] == 0   # PROTO-CODE-001：标准码判成功
     return ok, r[0][2].split(b"\0")[0].decode()
 
 
@@ -231,10 +233,16 @@ def landed(json_txt):
     return FS / OWNER / m.group(1) if m else None
 
 
+def fid():
+    """REQ-SHARE-ENTRYID-001：share_link 源定位已改为条目标识；夹具文件在 owner 根下唯一"""
+    return q1("SELECT file_id FROM user_file WHERE owner_name=%s AND display_name=%s "
+              "AND status='active' ORDER BY file_id LIMIT 1", (OWNER, REL))[0]
+
+
 def row():
     return q1("SELECT token_hash, expire_time, revoked FROM share_link "
-              "WHERE owner_name=%s AND relative_path=%s ORDER BY created_at DESC, id DESC LIMIT 1",
-              (OWNER, REL))
+              "WHERE owner_name=%s AND file_id=%s ORDER BY created_at DESC, id DESC LIMIT 1",
+              (OWNER, fid()))
 
 
 # ---------------- 静态 ----------------
@@ -251,10 +259,9 @@ bc = block(REPO / "Client" / "protocol.h")
 bs = block(REPO / "Server" / "protocol.h")
 check("S1-same-block :: 两端 protocol.h 的 REQ-EXT-SHARE-001 常量块逐字节一致",
       bc is not None and bc == bs, "len=%d" % len(bc or ""))
-check("S2-consts :: 块内含状态字偏移/三态常量/两个动作字面量/续期缺省",
-      all(k in (bc or "") for k in ("PUBLINK_STATE_OFFSET = 8", "PUBLINK_STATE_EXPIRED",
-                                    "PUBLINK_STATE_REVOKED", '"new"', '"renew"',
-                                    "PUBLINK_RENEW_DEFAULT_SECONDS")))
+check("S2-consts :: 块内含两个动作字面量/续期缺省/标准码口径说明",
+      all(k in (bc or "") for k in ('"new"', '"renew"', "PUBLINK_RENEW_DEFAULT_SECONDS",
+                                    "0=链接可用，-2017=已过期，-2018=已吊销")))
 
 # ---------------- 环境 ----------------
 ctl = server_ctl.ServerCtl(str(EXE), str(DIST))
@@ -297,10 +304,10 @@ try:
           ok is True and saved and entry_exists(OWNER, landed(saved).name if landed(saved) else ""),
           "ok=%s %s" % (ok, saved))
 
-    exec_sql("UPDATE share_link SET expire_time=%s WHERE owner_name=%s AND relative_path=%s",
-             ((datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"), OWNER, REL))
+    exec_sql("UPDATE share_link SET expire_time=%s WHERE owner_name=%s AND file_id=%s",
+             ((datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S"), OWNER, fid()))
     e2, s2, _ = query(c, REL)
-    check("A6 过期后查询 state=EXPIRED(1)", e2 is True and s2 == ST_EXPIRED, "state=%s" % s2)
+    check("A6 过期后查询 state=EXPIRED(-2017)", e2 is True and s2 == ST_EXPIRED, "state=%s" % s2)
 
     ok, st, _ = cpl(c, REL)
     check("A7 过期时旧语义创建不再谎报有效：ok=true 但 state=EXPIRED",
@@ -320,12 +327,12 @@ try:
     ok, _ = resolve(c, tok1)
     check("B4 续期后原 token 重新可用", ok is True, "ok=%s" % ok)
 
-    exec_sql("UPDATE share_link SET revoked=1 WHERE owner_name=%s AND relative_path=%s", (OWNER, REL))
+    exec_sql("UPDATE share_link SET revoked=1 WHERE owner_name=%s AND file_id=%s", (OWNER, fid()))
     e3, s3, _ = query(c, REL)
     ok, st, _ = cpl(c, REL, ACTION_RENEW, 7 * 24 * 3600)
-    check("B5 撤销后查询 state=REVOKED(2)", e3 is True and s3 == ST_REVOKED, "state=%s" % s3)
-    check("B6 已撤销链接续期被拒（续期不让作废链接复活）",
-          ok is False and st == ST_REVOKED, "ok=%s state=%s" % (ok, st))
+    check("B5 撤销后查询 state=REVOKED(-2018)", e3 is True and s3 == ST_REVOKED, "state=%s" % s3)
+    check("B6 已撤销链接续期被拒（续期不让作废链接复活，失败回写失败码）",
+          ok is False and st == ST_WRITE_FAILED, "ok=%s state=%s" % (ok, st))
 
     # ---------------- 重新生成 ----------------
     print("=== 重新生成（action=new） ===")
@@ -351,7 +358,7 @@ try:
 
     # ---------------- 向后兼容面 ----------------
     print("=== 向后兼容 ===")
-    exec_sql("DELETE FROM share_link WHERE owner_name=%s AND relative_path=%s", (OWNER, REL))
+    exec_sql("DELETE FROM share_link WHERE owner_name=%s AND file_id=%s", (OWNER, fid()))
     ok, st, link0 = cpl(c, REL)   # 无动作区的旧请求，无记录 → 新建
     check("D1 无动作区的旧请求在零记录时仍走新建路径", ok is True and st == ST_VALID and len(token_of(link0)) == 22)
     ok, st, link2 = cpl(c, REL)

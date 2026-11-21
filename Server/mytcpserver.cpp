@@ -282,10 +282,12 @@ void MyTcpServer::broadcastGroupMessage(const QStringList& users, PDU *pdu)
     }
 }
 
-// REQ-EXT-SEC-001 M-1：分享握手登记（仅主线程访问）
-void MyTcpServer::addPendingShare(const QString& receiver, const QString& canonicalSource)
+// REQ-EXT-SEC-001 M-1：分享握手登记（仅主线程访问）；REQ-SHARE-ENTRYID-001 起按
+// (接收者, 分享人, 邀请时条目名) 键登记源条目标识，邀请期间改名/移动不破坏握手。
+void MyTcpServer::addPendingShare(const QString& receiver, const QString& sharer,
+                                  const QString& invitedName, qint64 fileId)
 {
-    if(receiver.isEmpty() || canonicalSource.isEmpty()){
+    if(receiver.isEmpty() || sharer.isEmpty() || invitedName.isEmpty() || fileId < 0){
         return;
     }
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -294,26 +296,42 @@ void MyTcpServer::addPendingShare(const QString& receiver, const QString& canoni
             m_pendingShares.removeAt(i);
         }
     }
+    // 同键（接收者,分享人,邀请名）重复登记以最新邀请为准：删后重建再分享时
+    // 旧登记指向已删 fileId，不清理会遮蔽新邀请直至 TTL 过期
+    for(int i=m_pendingShares.size()-1;i>=0;--i){
+        if(m_pendingShares[i].receiver==receiver && m_pendingShares[i].sharer==sharer
+                && m_pendingShares[i].invitedName==invitedName){
+            m_pendingShares.removeAt(i);
+        }
+    }
     while(m_pendingShares.size() >= PENDING_SHARE_MAX){
         m_pendingShares.removeFirst();
     }
-    m_pendingShares.append(PendingShare{receiver, canonicalSource, now});
+    m_pendingShares.append(PendingShare{receiver, sharer, invitedName, fileId, now});
+    qCDebug(lcNet) << "[pendingShare] 登记 receiver=" << receiver << " sharer=" << sharer
+                   << " invited=" << invitedName << " fileId=" << fileId
+                   << " total=" << m_pendingShares.size();
 }
 
-bool MyTcpServer::hasPendingShare(const QString& receiver, const QString& canonicalSource) const
+qint64 MyTcpServer::hasPendingShare(const QString& receiver, const QString& sharer,
+                                    const QString& invitedName) const
 {
+    qCDebug(lcNet) << "[pendingShare] 查询 receiver=" << receiver << " sharer=" << sharer
+                   << " invited=" << invitedName << " table=" << m_pendingShares.size();
     for(const PendingShare& ps : m_pendingShares){
-        if(ps.receiver==receiver && ps.canonicalSource==canonicalSource){
-            return true;
+        if(ps.receiver==receiver && ps.sharer==sharer && ps.invitedName==invitedName){
+            return ps.fileId;
         }
     }
-    return false;
+    return -1;
 }
 
-void MyTcpServer::consumePendingShare(const QString& receiver, const QString& canonicalSource)
+void MyTcpServer::consumePendingShare(const QString& receiver, const QString& sharer,
+                                      const QString& invitedName)
 {
     for(int i=0;i<m_pendingShares.size();++i){
-        if(m_pendingShares[i].receiver==receiver && m_pendingShares[i].canonicalSource==canonicalSource){
+        if(m_pendingShares[i].receiver==receiver && m_pendingShares[i].sharer==sharer
+                && m_pendingShares[i].invitedName==invitedName){
             m_pendingShares.removeAt(i);
             return;
         }

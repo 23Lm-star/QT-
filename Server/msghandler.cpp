@@ -989,22 +989,14 @@ PDU *MsgHandler::deldir(const QString& loginName)
         const QFileInfo delInfo(delFilePath);
         const QString delParent = FileObjectStore::normalizeParent(loginName, delInfo.absolutePath());
         const QString delName = delInfo.fileName();
-        // REQ-AUDIT-001 R7：链接清理随条目操作同事务，先算相对路径再进门
-        QString shareRel;
-        {
-            const QString userRoot = QDir(Server::getinstance().filesPath).absoluteFilePath(loginName);
-            const QString rel = QDir(userRoot).relativeFilePath(delInfo.absoluteFilePath());
-            if(!rel.startsWith("..") && !rel.startsWith('/') && !rel.isEmpty()){
-                shareRel = rel;
-            }
-        }
+        // REQ-SHARE-ENTRYID-001：链接清理随条目软删同事务按条目标识执行，无需先算相对路径
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, delParent, delName);
         if(e.valid()){
             if(e.isDir){
-                ans = FileObjectStore::instance().releaseSubtree(e.fileId, loginName, shareRel);
+                ans = FileObjectStore::instance().releaseSubtree(e.fileId, loginName);
             } else {
-                ans = FileObjectStore::instance().releaseEntry(e.fileId, loginName, shareRel);
+                ans = FileObjectStore::instance().releaseEntry(e.fileId, loginName);
             }
         } else if(delFileType==0){
             // REQ-MIG-001：文件一律经逻辑条目释放；此分支只剩"无条目的残留物理目录"回收。
@@ -1017,7 +1009,7 @@ PDU *MsgHandler::deldir(const QString& loginName)
             }
             if(ans){
                 QString relErr;
-                if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr, shareRel)){
+                if(!FileObjectStore::instance().releaseSubtreeByPath(loginName, delFilePath, relErr)){
                     qCWarning(lcFs)<<"[deldir] 子树条目级联软删失败 conn="<<m_connId<<":"<<relErr;
                 }
             }
@@ -1196,23 +1188,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
         // REQ-EXT-FILE-001 D5：条目优先。有条目→只动逻辑键（目录条目级联子树，同事务），
         // 目录物理实体若存在则同步改名防幽灵；无条目目录走物理改名+条目级联，无条目文件一律拒绝。
         const QString renParent = FileObjectStore::normalizeParent(loginName, dirPath);
-        // REQ-AUDIT-001 R7：链接平移与条目改名同一事务——先算出旧/新相对路径
-        QString shareRelDir = dirPath;
-        {
-            const QString userRootRel = QDir(Server::getinstance().filesPath).filePath(loginName);
-            const QString userRootAbs = QDir(Server::getinstance().filesPath).absoluteFilePath(loginName);
-            if (shareRelDir.startsWith(userRootRel)) {
-                shareRelDir = shareRelDir.mid(userRootRel.length());
-                if (shareRelDir.startsWith('/')) shareRelDir = shareRelDir.mid(1);
-            } else {
-                shareRelDir = QDir(userRootAbs).relativeFilePath(QFileInfo(dirPath).absoluteFilePath());
-            }
-            if (shareRelDir.startsWith("..") || shareRelDir.startsWith('/') || shareRelDir == ".") {
-                shareRelDir.clear();
-            }
-        }
-        const QString oldShareRel = shareRelDir.isEmpty() ? oldName : shareRelDir + "/" + oldName;
-        const QString newShareRel = shareRelDir.isEmpty() ? newName : shareRelDir + "/" + newName;
+        // REQ-SHARE-ENTRYID-001：链接按条目标识定位，改名/移动不再联动 share_link
         const FileObjectStore::EntryInfo e =
                 FileObjectStore::instance().entryByPath(loginName, renParent, oldName);
         // REQ-EXT-SEC-002：类型权威=服务端（条目 is_dir 优先，无条目查物理）；客户端声明只做对照告警
@@ -1242,7 +1218,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
             } else {
                 QString relErr;
                 ret = FileObjectStore::instance().relocateEntry(e.fileId, loginName, renParent, newName,
-                                                                relErr, oldShareRel, newShareRel);
+                                                                relErr);
                 if(!ret){
                     qCWarning(lcFs)<<"[renamefile] 条目改名失败 conn="<<m_connId<<":"<<relErr;
                 } else if(oldPhys.exists()){
@@ -1272,8 +1248,7 @@ PDU *MsgHandler::renamefile(const QString& loginName)
             }
             if(ret){
                 QString casErr;
-                if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr,
-                                                                  oldShareRel, newShareRel)){
+                if(!FileObjectStore::instance().renameEntriesDir(loginName, oldFilePath, newFilePath, casErr)){
                     qCWarning(lcFs)<<"[renamefile] 旧目录改名条目级联失败 conn="<<m_connId<<":"<<casErr;
                 }
             }
@@ -1310,28 +1285,23 @@ PDU *MsgHandler::sharefile()
     memcpy(resendpdu->caData,seedName,32);
     memcpy(resendpdu->caMsg,pdu->caMsg+32*revUserCnt,resendpdu->uiMsgLen);
     qCDebug(lcFs)<<"resendpdu->caMsg"<<resendpdu->caMsg<<endl;
-    // REQ-EXT-SEC-001 M-1：分享源以服务端 canonical 登记为对每位接收者的握手授权；
-    // 接收者同意移动时仅放行有登记的源，伪造 AGREE_RESPOND 拿不到未分享给自己的文件
+    // REQ-EXT-SEC-001 M-1 + REQ-SHARE-ENTRYID-001：分享源以服务端解析出的逻辑条目登记为
+    // 对每位接收者的握手授权，键=(接收者, 分享人, 邀请时条目名)、值=条目标识；
+    // 接收者同意移动时仅放行有登记的条目（邀请期间改名/移动不破坏握手，条目已删才拒绝），
+    // 伪造 AGREE_RESPOND 拿不到未分享给自己的文件。
     int sharePathLen = int(pdu->uiMsgLen) - 32*revUserCnt;
     if(sharePathLen < 0){
         sharePathLen = 0;
     }
     const QByteArray sharePathBytes(pdu->caMsg+32*revUserCnt, sharePathLen);
     const QString shareSrcRaw = QString::fromUtf8(sharePathBytes).trimmed();
-    const QString shareCanonicalSrc = QFileInfo(shareSrcRaw).canonicalFilePath();
-    // REQ-EXT-FILE-001 D5：对象文件无物理实体（canonical 为空）。握手键统一为
-    // "canonical 存在用 canonical，否则用词法绝对路径"，sharefilemove 侧同式计算；
-    // 归属仍由登记门（分享人本人条目/本人用户根）断言。
-    const QString shareKey = !shareCanonicalSrc.isEmpty()
-            ? shareCanonicalSrc
-            : QDir::cleanPath(QFileInfo(shareSrcRaw).absoluteFilePath());
     const QFileInfo srcRawInfo(shareSrcRaw);
     const FileObjectStore::EntryInfo srcEntry = FileObjectStore::instance().entryByPath(
         m_actorName, FileObjectStore::normalizeParent(m_actorName, srcRawInfo.absolutePath()), srcRawInfo.fileName());
-    // B-1 修复（增量复审）：分享源必须落在分享人本人用户根内——只能分享自己的文件；
-    // 源不存在或属他人时不登记握手也不转发邀请，杜绝"自我登记+自我同意"复制他人文件
-    const bool sourceOwned = (srcEntry.valid() && !srcEntry.isDir && logicPathInActorRoot(shareSrcRaw))
-            || (!shareCanonicalSrc.isEmpty() && pathInActorRoot(shareSrcRaw));
+    // B-1 修复（增量复审）：分享源必须是分享人本人用户根内的文件条目——只能分享自己的文件；
+    // 源不存在、是目录或属他人时不登记握手也不转发邀请，杜绝"自我登记+自我同意"复制他人文件
+    const bool sourceOwned = srcEntry.valid() && !srcEntry.isDir
+            && logicPathInActorRoot(shareSrcRaw);
     if(!sourceOwned){
         qCWarning(lcFs)<<"[sharefile] 拒绝：分享源不属于分享人，不登记不转发 conn="<<m_connId<<" 源:"<<shareSrcRaw;
     }
@@ -1339,7 +1309,9 @@ PDU *MsgHandler::sharefile()
         char revName[32]={'\0'};
         memcpy(revName,pdu->caMsg+32*i,32);
         qCDebug(lcFs)<<"revName"<<revName<<" ";
-        MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(), shareKey);
+        // 邀请名取请求路径的文件名（= entryByPath 的匹配名；该查询不回填 displayName）
+        MyTcpServer::getinstance().addPendingShare(QString::fromUtf8(revName).trimmed(),
+                                                   m_actorName, srcRawInfo.fileName(), srcEntry.fileId);
         MyTcpServer::getinstance().reseed(revName,resendpdu);
     }
     memfree(resendpdu);
@@ -1381,21 +1353,27 @@ PDU *MsgHandler::sharefilemove()
         qCWarning(lcFs)<<"[sharefilemove] 拒绝越权目标目录 conn="<<m_connId<<":"<<recvDir;
     } else if(fileName.contains('\\') || fileName.contains('/')){
         qCWarning(lcFs)<<"[sharefilemove] 拒绝含路径分隔符的目标名 conn="<<m_connId;
-    } else if(!MyTcpServer::getinstance().hasPendingShare(recvName, srcKey)){
-        // REQ-EXT-SEC-001 M-1 + FILE-001 D5: 无握手登记的键一律拒绝（登记门已断言源属分享人本人根/本人条目）
-        qCWarning(lcFs)<<"[sharefilemove] 拒绝：源无分享握手登记 conn="<<m_connId<<":"<<sourcePath;
     } else {
+        // REQ-SHARE-ENTRYID-001：握手键=(接收者, 分享人, 邀请时条目名)。分享人从提交路径
+        // 的 fsRoot 后首段解析（与登记侧 m_actorName 同源）；邀请期间源条目改名/移动
+        // 不破坏匹配——条目标识不受逻辑键变化影响。
         const QString fsRoot = QDir(Server::getinstance().filesPath).absolutePath();
         const QString rel = QDir(fsRoot).relativeFilePath(srcKey);
-        FileObjectStore::EntryInfo e;
-        if(!rel.startsWith("..")
+        QString sharerName;
+        if(!rel.startsWith("..") && !rel.isEmpty()
            && QDir::cleanPath(QDir(fsRoot).filePath(rel)) == srcKey){
-            const QFileInfo ki(srcKey);
-            e = FileObjectStore::instance().entryByPath(
-                    rel.section('/',0,0),
-                    FileObjectStore::normalizeParent(rel.section('/',0,0), ki.absolutePath()), ki.fileName());
+            sharerName = rel.section('/',0,0);
         }
-        if(e.valid() && !e.isDir){
+        const qint64 pendingFileId = sharerName.isEmpty()
+                ? -1 : MyTcpServer::getinstance().hasPendingShare(recvName, sharerName, fileName);
+        FileObjectStore::EntryInfo e;
+        if(pendingFileId >= 0){
+            e = FileObjectStore::instance().entryById(pendingFileId, sharerName);
+        }
+        if(pendingFileId < 0){
+            // REQ-EXT-SEC-001 M-1: 无握手登记的键一律拒绝（登记门已断言源属分享人本人条目）
+            qCWarning(lcFs)<<"[sharefilemove] 拒绝：源无分享握手登记 conn="<<m_connId<<":"<<sourcePath;
+        } else if(e.valid() && !e.isDir){
             // 条目优先：接收者新条目引用同一 object（+1 引用，物理零复制）；
             // 同名已占（物理或条目）→ (n) 后缀安置，与 movefile 规则一致
             QString base=fileName, ext;
@@ -1412,12 +1390,14 @@ PDU *MsgHandler::sharefilemove()
             if(!ret){
                 qCWarning(lcFs)<<"[sharefilemove] 接收者条目建立失败 conn="<<m_connId<<":"<<attachErr;
             } else {
-                MyTcpServer::getinstance().consumePendingShare(recvName, srcKey);
-                qCDebug(lcFs)<<"[sharefilemove] 条目引用完成（物理零复制）fileId="<<newFileId<<" objId="<<e.objectId;
+                MyTcpServer::getinstance().consumePendingShare(recvName, sharerName, fileName);
+                qCDebug(lcFs)<<"[sharefilemove] 条目引用完成（物理零复制）fileId="<<newFileId
+                             <<" srcFileId="<<pendingFileId<<" objId="<<e.objectId;
             }
         } else {
-            // REQ-MIG-001：文件只经逻辑条目分享引用，旧物理文件复制回退已移除
-            qCWarning(lcFs)<<"[sharefilemove] 拒绝：源文件无逻辑条目 conn="<<m_connId<<":"<<sourcePath;
+            // 邀请后源条目被删除（或不再是文件）：条目标识无法解引用，握手随失效拒绝
+            qCWarning(lcFs)<<"[sharefilemove] 拒绝：源条目已删除或非文件 conn="<<m_connId
+                           <<" srcFileId="<<pendingFileId<<" 源:"<<sourcePath;
         }
     }
     PDU* respdu=mkPDU();
@@ -1504,11 +1484,9 @@ PDU *MsgHandler::movefile(const QString& loginName)
                 finalName=QString("%1(%2)%3").arg(base).arg(n).arg(ext);
             }
             QString relErr;
-            // REQ-AUDIT-001 R7：链接平移与条目移动同一事务
-            const QString newShareRel = dstRel.isEmpty() ? finalName : (dstRel + "/" + finalName);
+            // REQ-SHARE-ENTRYID-001：链接按条目标识定位，移动不再联动 share_link
             ret = FileObjectStore::instance().relocateEntry(mvEntry.fileId, loginName,
-                                                            dstNorm, finalName, relErr,
-                                                            srcRel, newShareRel);
+                                                            dstNorm, finalName, relErr);
             if(!ret){
                 qCWarning(lcFs)<<"movefile 条目移动失败 conn="<<m_connId<<":"<<relErr;
             } else {
@@ -2756,13 +2734,15 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
     // ===== REQ-AUDIT-001 R5：创建/续期/重新生成的前置授权门 =====
     // 解析侧已按 owner 根校验来源；创建侧必须同源，否则会产生越界或指向不存在对象的
     // 无效记录与对外死链。只允许：本人用户根内、真实存在、非目录的条目。
+    // REQ-SHARE-ENTRYID-001：门内解析出条目标识，落库与后续查询都以 fileId 为源定位。
+    qint64 linkFileId = -1;
     {
         bool pathOk = !relativePath.isEmpty()
                 && relativePath.toUtf8().size() <= 480
                 && !relativePath.contains(QChar('\0'))
                 && !relativePath.startsWith(QLatin1Char('/'))
                 && !relativePath.contains(QLatin1Char(':'));
-        // 拒绝 "." / ".." 段：share_link 必须保存规范相对路径，否则 R7 的链接平移匹配不到
+        // 拒绝 "." / ".." 段：源定位必须落到规范逻辑条目，路径段异常一律拒绝
         if(pathOk){
             const QStringList segs = relativePath.split(QLatin1Char('/'), Qt::SkipEmptyParts);
             for(const QString& seg : segs){
@@ -2779,6 +2759,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
                 const FileObjectStore::EntryInfo e =
                         FileObjectStore::instance().entryByPath(ownerName, parent, fi.fileName());
                 pathOk = e.valid() && !e.isDir;
+                if(pathOk) linkFileId = e.fileId;
             }
         }
         if(!pathOk){
@@ -2792,7 +2773,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
     }
 
     OperateDB::ShareLinkInfo existing;
-    const bool hasExisting = OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, existing);
+    const bool hasExisting = OperateDB::instance().getShareLinkInfoByFile(ownerName, linkFileId, existing);
     int stateCode = ENUM_PROTOCOL_CODE_OK;
     if(hasExisting){
         const bool expired = QDateTime::currentDateTime() >= existing.expireTime;
@@ -2807,7 +2788,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
         // 插入失败时旧链接保持有效（不再出现"旧链接已作废、新链接没建"）。
         const QString token = ShareLinkService::generateToken();
         ok = OperateDB::instance().replaceShareLink(ShareLinkService::hashToken(token), ownerName,
-                                                    relativePath, ShareLinkService::defaultExpireTime());
+                                                    linkFileId, ShareLinkService::defaultExpireTime());
         if(ok){
             linkValue = token;
             stateCode = ENUM_PROTOCOL_CODE_OK;
@@ -2819,7 +2800,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
             // 没有记录可续期 → 等同首次创建，按请求的时长生效
             const QString token = ShareLinkService::generateToken();
             ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName,
-                                                       relativePath,
+                                                       linkFileId,
                                                        QDateTime::currentDateTime().addSecs(renewSeconds));
             if(ok){
                 linkValue = token;
@@ -2829,7 +2810,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
             stateCode = ENUM_PROTOCOL_CODE_LINK_REVOKED;
             qCWarning(lcFs) << "[createPublishLink] 拒绝续期：链接已撤销 owner=" << ownerName;
         } else {
-            ok = OperateDB::instance().renewShareLink(ownerName, relativePath,
+            ok = OperateDB::instance().renewShareLink(ownerName, linkFileId,
                                                       QDateTime::currentDateTime().addSecs(renewSeconds));
             if(ok){
                 linkValue = existing.tokenHash;   // 续期不改 token，链接文本不变、只是重新可用
@@ -2846,7 +2827,7 @@ PDU* MsgHandler::createPublishLink(const QString& loginName) {
     } else {
         const QString token = ShareLinkService::generateToken();
         ok = OperateDB::instance().createShareLink(ShareLinkService::hashToken(token), ownerName,
-                                                   relativePath, ShareLinkService::defaultExpireTime());
+                                                   linkFileId, ShareLinkService::defaultExpireTime());
         if(ok){
             linkValue = token;
         } else {
@@ -2900,7 +2881,7 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
     QString savedRelPath; // 形如 "分享链接/2.pdf"，返回给客户端展示
     if (OperateDB::instance().getShareLinkByHash(hash, info)) {
         qCDebug(lcFs) << "[resolvePublishLink] 命中记录: owner=" << info.ownerName
-                 << " relativePath=" << info.relativePath
+                 << " fileId=" << info.fileId
                  << " revoked=" << info.revoked
                  << " expireTime=" << info.expireTime.toString("yyyy-MM-dd HH:mm:ss");
         if (info.revoked) {
@@ -2910,24 +2891,12 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
             resultCode = ENUM_PROTOCOL_CODE_LINK_EXPIRED;
             qCWarning(lcFs) << "[resolvePublishLink] 链接已过期，拒绝";
         } else {
-            QString ownerRoot = QDir(Server::getinstance().filesPath).filePath(info.ownerName);
-            QString srcPath = QDir(ownerRoot).filePath(info.relativePath);
-            QFileInfo srcFi(srcPath);
-            // REQ-EXT-FILE-001 D5：条目优先。对象文件只有逻辑条目、用户路径无物理实体，
-            // 原实现按 QFileInfo.exists 判定会一律失败；归属仍以归一后的绝对路径断言。
-            const QString cleanOwnerRoot = QDir::cleanPath(QFileInfo(ownerRoot).absoluteFilePath());
-            const QString cleanSrcPath = QDir::cleanPath(srcFi.absoluteFilePath());
-            const bool inOwnerRoot = cleanSrcPath.startsWith(cleanOwnerRoot + QLatin1Char('/'));
-            FileObjectStore::EntryInfo srcEntry;
-            if (inOwnerRoot) {
-                const QFileInfo cleanSrcFi(cleanSrcPath);
-                srcEntry = FileObjectStore::instance().entryByPath(
-                    info.ownerName,
-                    FileObjectStore::normalizeParent(info.ownerName, cleanSrcFi.absolutePath()),
-                    cleanSrcFi.fileName());
-            }
-            if (inOwnerRoot && srcEntry.valid() && !srcEntry.isDir) {
-                // 目标目录：服务端【请求者】用户目录下的“分享链接”文件夹
+            // REQ-SHARE-ENTRYID-001：按条目标标识取源条目（owner 归属断言内含）；
+            // 改名/移动不影响解析，条目删除（链接随软删清理）后自然失效。
+            const FileObjectStore::EntryInfo srcEntry =
+                    FileObjectStore::instance().entryById(info.fileId, info.ownerName);
+            if (srcEntry.valid() && !srcEntry.isDir) {
+                // 目标目录：服务端【请求者】用户目录下的"分享链接"文件夹
                 QString userRoot = QDir(Server::getinstance().filesPath).filePath(loginName);
                 QString shareDir = QDir(userRoot).filePath("分享链接");
                 if (!QDir().mkpath(shareDir)) {
@@ -2936,23 +2905,25 @@ PDU* MsgHandler::resolvePublishLink(const QString& loginName) {
                 }
                 // 引用同一对象（零复制）；同名安置/幂等复用 attachExistingObject 语义
                 const FileObjectStore::AttachResult attached =
-                    FileObjectStore::instance().attachExistingObject(
-                        loginName, shareDir, QFileInfo(cleanSrcPath).fileName(), srcEntry.objectId, -1);
+                        FileObjectStore::instance().attachExistingObject(
+                            loginName, shareDir, srcEntry.displayName, srcEntry.objectId, -1);
                 if (attached.ok) {
                     resultCode = ENUM_PROTOCOL_CODE_OK;
                     savedRelPath = QString("分享链接/%1").arg(attached.displayName);
                     qCDebug(lcFs) << "[resolvePublishLink] 条目引用完成 fileId=" << attached.fileId
+                             << " srcFileId=" << info.fileId
                              << " objId=" << srcEntry.objectId
                              << " name=" << attached.displayName
                              << " idempotent=" << attached.idempotent;
                 } else {
                     resultCode = ENUM_PROTOCOL_CODE_WRITE_FAILED;
                     qCWarning(lcFs) << "[resolvePublishLink] 条目安置失败:" << attached.error
-                             << " src=" << srcPath;
+                             << " srcFileId=" << info.fileId;
                 }
             } else {
-                // REQ-MIG-001：只按逻辑条目解析分享源；旧物理文件复制回退已移除
-                qCWarning(lcFs) << "[resolvePublishLink] 源无逻辑条目: " << srcPath;
+                // 源条目已删除或非文件：链接记录本应随软删清理，此处兜底判无效
+                qCWarning(lcFs) << "[resolvePublishLink] 源条目已删除或非文件: fileId=" << info.fileId
+                                << " owner=" << info.ownerName;
             }
         }
     } else {
@@ -2977,8 +2948,22 @@ PDU* MsgHandler::queryFilePublishLink() {
     if(fixedString(pdu->caData, 32) != ownerName){
         qCWarning(lcFs)<<"[queryFilePublishLink] owner 字段与连接身份不符，按连接身份查询 conn="<<m_connId;
     }
-    
-    QString token = OperateDB::instance().getShareLinkByPath(ownerName, relativePath);
+
+    // REQ-SHARE-ENTRYID-001：请求仍携路径（协议零变更），服务端解析为条目标识后按条目查链接；
+    // 条目不存在（含已删除）视为无链接。
+    qint64 queryFileId = -1;
+    {
+        const QString userRoot = QDir(Server::getinstance().filesPath).absoluteFilePath(ownerName);
+        const QString absPath = QDir(userRoot).absoluteFilePath(relativePath);
+        if(!relativePath.isEmpty() && logicPathInActorRoot(absPath)){
+            const QFileInfo fi(absPath);
+            const FileObjectStore::EntryInfo e = FileObjectStore::instance().entryByPath(
+                        ownerName, FileObjectStore::normalizeParent(ownerName, fi.absolutePath()), fi.fileName());
+            if(e.valid() && !e.isDir) queryFileId = e.fileId;
+        }
+    }
+    QString token = queryFileId >= 0
+            ? OperateDB::instance().getShareLinkByFile(ownerName, queryFileId) : QString();
 
     // 响应：caData[0,4)=标准码（0 有效 / -2017 过期 / -2018 吊销 / -2019 无链接）；有效时 caMsg 为外链文本。
     PDU* respdu = mkPDU(128);
@@ -2987,7 +2972,7 @@ PDU* MsgHandler::queryFilePublishLink() {
     int resultCode = exists ? ENUM_PROTOCOL_CODE_OK : ENUM_PROTOCOL_CODE_LINK_INVALID;
     if(exists){
         OperateDB::ShareLinkInfo info;
-        if(OperateDB::instance().getShareLinkInfoByPath(ownerName, relativePath, info)){
+        if(OperateDB::instance().getShareLinkInfoByFile(ownerName, queryFileId, info)){
             const bool expired = QDateTime::currentDateTime() >= info.expireTime;
             resultCode = info.revoked ? ENUM_PROTOCOL_CODE_LINK_REVOKED
                        : (expired ? ENUM_PROTOCOL_CODE_LINK_EXPIRED : ENUM_PROTOCOL_CODE_OK);
