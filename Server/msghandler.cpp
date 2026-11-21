@@ -1700,6 +1700,12 @@ PDU *MsgHandler::uploadfileinit()
         m_pendingFastcheck.active = false;   // 一次 29 之后失效（无论是否采纳）
         if (!ret) {
             m_uploads.remove(tid);   // 未成功不保留空上下文
+            // 审计非阻塞建议收尾：adoptedFastcheck 仅在 beginStaged 成功、97 会话/摘要
+            // 已转入本槽后置位——此时 29 失败（含 finalize 早退收口）同样释放 id=0 占位，
+            // 暂存句柄已由 finalize/releaseOtherStagingHandles 释放，仅剩映射残留。
+            if (adoptedFastcheck) {
+                m_uploads.remove(TRANSFER_ID_INVALID);
+            }
         } else if (adoptedFastcheck) {
             // AUD-1：97 的暂存已被本次 29 采纳（会话/摘要已转入本槽），id=0 占位不再需要——
             // 释放以免残留条目长期滞留、并与真实槽重复引用同一 upload_session 行。
