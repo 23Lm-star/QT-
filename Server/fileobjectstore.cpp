@@ -1138,7 +1138,20 @@ FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
     bool done = false;
     do {
         QSqlQuery q(db);
-        // 0) 对象存在且大小相符（FOR UPDATE，与 commitUpload / attachExistingObject 同源口径）
+        // 0) 安置时刻群状态/成员复核（审计修复二）：101 init 的 P1/P2/P3 只在上传初始化时判定，
+        // 非秒传最终安置发生在分钟级～TTL 3600s 之后，窗口内解散/失权在此同事务关死
+        // （group_info FOR UPDATE 与解散 UPDATE 串行化）。失败统一走"群引用失败→撤销个人条目"
+        // 路径回 -2105（用户裁决，不细分 -2101/-2102）；置于群内同名幂等命中之前——解散群不出成功回执。
+        q.prepare("SELECT status FROM group_info WHERE group_id=? FOR UPDATE");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        if (!q.exec() || !q.next()) { r.error = "群不存在"; break; }
+        if (q.value(0).toString() != "active") { r.error = "群已解散或不可写"; break; }
+        q.prepare("SELECT role FROM group_member WHERE group_id=? AND user_name=? AND status='active'");
+        q.addBindValue(QVariant::fromValue<qulonglong>(groupId));
+        q.addBindValue(owner);
+        if (!q.exec() || !q.next()) { r.error = "上传者已不是群成员"; break; }
+
+        // 1) 对象存在且大小相符（FOR UPDATE，与 commitUpload / attachExistingObject 同源口径）
         q.prepare("SELECT size_bytes FROM file_object WHERE object_id=? FOR UPDATE");
         q.addBindValue(objectId);
         if (!q.exec() || !q.next()) { r.error = "对象不存在"; break; }
@@ -1146,7 +1159,7 @@ FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
         const qint64 size = sizeBytes >= 0 ? sizeBytes : objSize;
         if (objSize != size) { r.error = "对象大小与声明不符"; break; }
 
-        // 1) 上传者个人根逻辑条目（可选）：群文件与个人根命名空间解耦，仅为逻辑文件标识。
+        // 2) 上传者个人根逻辑条目（可选）：群文件与个人根命名空间解耦，仅为逻辑文件标识。
         qint64 fileId = existingFileId;
         if (createUserEntry) {
             const QString parent = normalizeParent(owner, QStringLiteral("/"));
@@ -1214,7 +1227,7 @@ FileObjectStore::GroupAttachResult FileObjectStore::attachGroupFile(
         }
         r.fileId = fileId;
 
-        // 2) 群目录条目：群内同名按 uk_group_file_name 去重，同名同对象幂等
+        // 3) 群目录条目：群内同名按 uk_group_file_name 去重，同名同对象幂等
         QString gName = clampUtf8(wantedName, kMaxNameBytes);
         bool gSuffix = false;
         q.prepare("SELECT object_id,status FROM group_file WHERE group_id=? AND display_name=?");
