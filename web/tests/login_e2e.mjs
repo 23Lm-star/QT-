@@ -18,7 +18,10 @@ const GW_URL = process.env.GW_URL || 'ws://127.0.0.1:8080/ws';
 const TCP_HOST = '127.0.0.1';
 const TCP_PORT = parseInt(process.env.TCP_PORT || '5000', 10);
 const PASSWORD = '123456';
-const CLIENT_ID = 'c0ffeec0ffeec0ffeec0ffeec0ffee00'; // 32 hex
+const CLIENT_ID_REG = 'c0ffeec0ffeec0ffeec0ffeec0ffee00'; // 32 hex
+const CLIENT_ID_LOGIN = 'c0ffeec0ffeec0ffeec0ffeec0ffee01'; // 32 hex
+const CLIENT_ID_TCP = 'c0ffeec0ffeec0ffeec0ffeec0ffee02'; // 32 hex
+const CLIENT_ID_BAD = 'c0ffeec0ffeec0ffeec0ffeec0ffee03'; // 32 hex
 const USER = process.env.E2E_USER || ('webt_' + Math.floor(Date.now() / 1000)); // 唯一测试用户（编排脚本负责清理）
 
 let passCount = 0;
@@ -82,34 +85,34 @@ async function main() {
 
   // 1) 经网关：验证码 -> 注册新用户
   const reg = await withNet(async (n) => {
-    const cap = await account.requestCaptcha(n);
+    const cap = await account.requestCaptcha(n, CLIENT_ID_REG);
     check('验证码', '经网关获取验证码 status=0 且非空', cap.status === 0 && cap.code.length > 0, `status=${cap.status} code=${cap.code}`);
-    return account.register(n, { username: USER, password: PASSWORD, captcha: cap.code });
+    return account.register(n, { username: USER, password: PASSWORD, captcha: cap.code, clientId: CLIENT_ID_REG });
   });
   check('注册', '经网关注册新用户成功', reg.success === true, `ret=${reg.ret} name=${reg.name || ''}`);
 
-  // 2) 经网关：正确密码登录 -> ret=1（M1 底线）
+  // 2) 经网关：正确密码登录 -> ret=0（标准成功码）
   const gwLogin = await withNet(async (n) => {
-    const cap = await account.requestCaptcha(n);
-    return account.login(n, { username: USER, password: PASSWORD, captcha: cap.code, clientId: CLIENT_ID });
+    const cap = await account.requestCaptcha(n, CLIENT_ID_LOGIN);
+    return account.login(n, { username: USER, password: PASSWORD, captcha: cap.code, clientId: CLIENT_ID_LOGIN });
   });
-  check('网关登录', '经网关正确密码登录 ret=1 且回带登录名', gwLogin.ret === 1 && gwLogin.loginName === USER, `ret=${gwLogin.ret} name=${gwLogin.loginName || ''}`);
+  check('网关登录', '经网关正确密码登录 ret=0 且回带登录名', gwLogin.ret === 0 && gwLogin.loginName === USER, `ret=${gwLogin.ret} name=${gwLogin.loginName || ''}`);
 
-  // 3) 经网关：错误密码登录 -> ret=-1（证明不是恒真通过）
+  // 3) 经网关：错误密码登录 -> -2011（证明不是恒真通过）
   const badLogin = await withNet(async (n) => {
-    const cap = await account.requestCaptcha(n);
-    return account.login(n, { username: USER, password: 'wrong-pass', captcha: cap.code, clientId: CLIENT_ID });
+    const cap = await account.requestCaptcha(n, CLIENT_ID_BAD);
+    return account.login(n, { username: USER, password: 'wrong-pass', captcha: cap.code, clientId: CLIENT_ID_BAD });
   });
-  check('网关错密码', '经网关错误密码登录 ret=-1', badLogin.ret === -1, `ret=${badLogin.ret}`);
+  check('网关错密码', '经网关错误密码登录 ret=-2011', badLogin.ret === -2011, `ret=${badLogin.ret}`);
 
-  // 4) 直连 TCP：同一 account.js 代码、同一用户登录 -> ret=1，且与网关结果一致（透明性）
+  // 4) 直连 TCP：同一 account.js 代码、同一用户登录 -> ret=0，且与网关结果一致（透明性）
   const tcp = await connectRawTcp();
   let tcpLogin;
   try {
-    const cap = await account.requestCaptcha(tcp);
-    tcpLogin = await account.login(tcp, { username: USER, password: PASSWORD, captcha: cap.code, clientId: CLIENT_ID });
+    const cap = await account.requestCaptcha(tcp, CLIENT_ID_TCP);
+    tcpLogin = await account.login(tcp, { username: USER, password: PASSWORD, captcha: cap.code, clientId: CLIENT_ID_TCP });
   } finally { tcp.close(); }
-  check('直连登录', '直连 TCP 同代码登录 ret=1', tcpLogin.ret === 1, `ret=${tcpLogin.ret}`);
+  check('直连登录', '直连 TCP 同代码登录 ret=0', tcpLogin.ret === 0, `ret=${tcpLogin.ret}`);
   check('透明性', '网关与直连 TCP 登录结果一致（ret 与登录名相同）',
     tcpLogin.ret === gwLogin.ret && tcpLogin.loginName === gwLogin.loginName,
     `gw=(${gwLogin.ret},${gwLogin.loginName}) tcp=(${tcpLogin.ret},${tcpLogin.loginName})`);

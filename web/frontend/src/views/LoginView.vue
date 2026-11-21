@@ -44,7 +44,8 @@ async function onRegister() {
 onMounted(async () => {
   auth.init();
   const ok = await auth.connect();
-  if (ok) await auth.refreshCaptcha();
+  if (auth.loggedIn) router.replace({ name: 'main' });
+  else if (ok) await auth.refreshCaptcha();
 });
 onBeforeUnmount(() => { if (cooldownTimer) clearInterval(cooldownTimer); });
 </script>

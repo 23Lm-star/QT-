@@ -152,7 +152,12 @@ const char *const kPduTypeNames[] = {
 "REJECT_FRIEND_REQUEST",
 "CHAT_ACK_CAPABILITY",
 "CHAT_HISTORY_REQUEST",
-"CHAT_HISTORY_RESPOND"
+"CHAT_HISTORY_RESPOND",
+"SESSION_LOGOUT_REQUEST",
+"SESSION_LOGOUT_RESPOND",
+"SESSION_RESUME_REQUEST",
+"SESSION_RESUME_RESPOND",
+"SESSION_INVALIDATED_EVENT"
 };
 
 // ---- 安全读取助手（全部带边界钳制，杜绝日志器自身越界） ----
@@ -267,7 +272,11 @@ QString decodePdu(const PDU *pdu)
         break;
     case ENUM_MSG_TYPE_LOGIN_RESPOND:
         f.i32("结果码", d, 0, dl);
-        if (i32at(d, 0, dl) == -4004) f.i32("锁定剩余秒", d, 4, dl); break;
+        if (i32at(d, 0, dl) == -4004) f.i32("锁定剩余秒", d, 4, dl);
+        // REQ-AUTH-CONNECTION-001：成功时 caMsg=64位十六进制恢复凭据+NUL（敏感，不回显）
+        if (i32at(d, 0, dl) == ENUM_PROTOCOL_CODE_OK && ml > 0)
+            f.raw(QStringLiteral("恢复凭据=***(%1B)").arg(ml));
+        break;
     case ENUM_MSG_TYPE_findUser_REQUEST:
         f.str("目标用户", d, 0, dl); break;
     case ENUM_MSG_TYPE_findUser_RESPOND:
@@ -292,9 +301,11 @@ QString decodePdu(const PDU *pdu)
         // REQ-PAGE-FETCH-002：好友真分页请求（旧端空 caData 即 limit=0 全量语义）
         f.u32("每页条数(0=全量)", d, 0, dl); f.u32("分页起点", d, 4, dl); break;
     case ENUM_MSG_TYPE_LIST_PENDING_FRIEND_REQUEST:
-    case ENUM_MSG_TYPE_CAPTCHA_REQUEST:
     case ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY:
         f.raw(QStringLiteral("空请求")); break;
+    case ENUM_MSG_TYPE_CAPTCHA_REQUEST:
+        // REQ-AUTH-CONNECTION-001：升级请求 caData[0,32)=clientId；旧端空载荷走兼容路径
+        f.str("客户端ID(兼容:空=旧端)", d, SESSION_CLIENT_ID_OFFSET, dl); break;
     case ENUM_MSG_TYPE_FLUSHFRIEND_RESPOND: {
         f.i32("结果码", d, 0, dl);
         f.raw(QStringLiteral("本页条数=%1 好友总数(封顶后)=%2 还有下一页=%3 总量封顶=%4")
@@ -475,6 +486,22 @@ QString decodePdu(const PDU *pdu)
             f.u32("本页条数", m, 8, ml);
         }
         break; }
+    case ENUM_MSG_TYPE_SESSION_LOGOUT_REQUEST:
+    case ENUM_MSG_TYPE_SESSION_RESUME_REQUEST:
+        f.str("客户端ID", d, SESSION_CLIENT_ID_OFFSET, dl);
+        if (t == ENUM_MSG_TYPE_SESSION_RESUME_REQUEST)
+            f.raw(QStringLiteral("恢复凭据=***(%1B)").arg(ml));   // 敏感，不回显
+        break;
+    case ENUM_MSG_TYPE_SESSION_LOGOUT_RESPOND:
+        f.i32("结果码", d, SESSION_RESP_CODE_OFFSET, dl); break;
+    case ENUM_MSG_TYPE_SESSION_RESUME_RESPOND:
+        f.i32("结果码", d, SESSION_RESP_CODE_OFFSET, dl);
+        f.q64("登录版本", d, SESSION_RESP_VERSION_OFFSET, dl);
+        f.str("账号", d, SESSION_RESP_USER_OFFSET, dl); break;
+    case ENUM_MSG_TYPE_SESSION_INVALIDATED_EVENT:
+        f.i32("失效原因码", d, SESSION_RESP_CODE_OFFSET, dl);
+        f.q64("失效版本", d, SESSION_RESP_VERSION_OFFSET, dl);
+        if (ml > 0) f.raw(QStringLiteral("原因=\"%1\"").arg(fixedStr(m, 0, ml))); break;
     default:
         // 群协议 60-106（含群文件 99-106）：20B 信封（版本|信封长|请求ID|群ID），响应其后跟 code(u32)
         if (t >= ENUM_MSG_TYPE_CREATE_GROUP_REQUEST && t <= ENUM_MSG_TYPE_GROUP_FILE_DOWNLOAD_RESPOND) {

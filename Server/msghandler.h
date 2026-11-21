@@ -109,7 +109,8 @@ public:
     }
     //各种处理函数，进行各种类型请求的处理
     PDU* rigist();//注册
-    PDU* login(QString& strname, bool& authOk, quint64& loginVersion);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context；REQ-EXT-SESSION-001：loginVersion 供连接绑定用户域版本）
+    PDU* login(QString& strname, bool& authOk, quint64& loginVersion,
+               QString& outClientId, QString& outResumeToken);//登录（REQ-EXT-SEC-001：authOk 供连接绑定 actor_context；REQ-EXT-SESSION-001：loginVersion 供连接绑定用户域版本；REQ-AUTH-CONNECTION-001：outClientId=严格校验后的设备标识（空=旧兼容路径），outResumeToken=一次性恢复凭据明文，仅建会话成功时回传）
     PDU* finduser();//查找用户
     PDU *onlineuser(const QString & myname);//在线用户
     PDU* addfriend();//添加用户

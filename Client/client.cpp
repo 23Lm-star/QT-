@@ -62,14 +62,19 @@ Client::Client(QWidget *parent)
     this->m_mhptr=new MsgHandler;
     loadconfig();
     // REQ-EXT-SESSION-001：持久化客户端唯一 ID（首启生成 32hex 落盘，之后复用；登录负载附加区携带）
+    // REQ-AUTH-CONNECTION-001：读回后严格校验格式，历史大写 UUID/损坏值重新生成（旧值不是合法 clientId）
     {
         QSettings st;
         m_clientId = st.value("client/unique_id").toString();
-        if(m_clientId.isEmpty()){
-            m_clientId = QUuid::createUuid().toString(QUuid::Id128);
+        if(!isValidClientId(m_clientId.toLatin1())){
+            if(!m_clientId.isEmpty())
+                qCWarning(lcCli) << "[session] 落盘 clientId 格式非法，重新生成（旧值长度=" << m_clientId.size() << "）";
+            m_clientId = QUuid::createUuid().toString(QUuid::Id128);   // Qt5.14 Id128 输出即 32 位小写 hex
             st.setValue("client/unique_id", m_clientId);
         }
     }
+    // REQ-AUTH-CONNECTION-001：读回上次会话的恢复凭据（重连后优先 121 恢复）
+    loadResumeToken();
     ui->loadingLabel->hide();
     // 验证码冷却：初值 0/未锁定，定时器由 startCaptchaCooldown 按需启动。
     m_captchaCooldownSec=0;
@@ -192,6 +197,8 @@ void Client::sendHeartbeat() {
 
     PDU* pdu = mkPDU();
     pdu->uiType = ENUM_MSG_TYPE_HEARTBEAT_REQUEST;
+    // REQ-AUTH-CONNECTION-001：caData[0,32)=clientId，服务端校验会话归属并续期 1800s/90s
+    authFillClientIdField(pdu->caData, m_clientId.toLatin1().constData());
     qCDebug(lcCli) << "[HEARTBEAT] send PING";
     seedMsg(pdu);
 }
@@ -204,7 +211,26 @@ void Client::handlMsg(PDU *&pdu)
     switch(pdu->uiType){
     case ENUM_MSG_TYPE_HEARTBEAT_RESPOND: {
         m_lastPongMs = QDateTime::currentMSecsSinceEpoch();
-        qCDebug(lcCli) << "[HEARTBEAT] recv PONG";
+        // REQ-AUTH-CONNECTION-001：51 caData[0,4)=标准码（旧服务端零区=0，PONG 语义不变）。
+        // 会话已失效(-3017)：清凭据回登录页（服务端随后切断）；其余失败只记日志。
+        const int hbCode = authReadI32(pdu->caData);
+        if (hbCode != ENUM_PROTOCOL_CODE_OK) {
+            qCWarning(lcCli) << "[HEARTBEAT] PONG 带失败码" << hbCode;
+            if (hbCode == ENUM_PROTOCOL_CODE_SESSION_INVALID && m_loggedIn) {
+                clearResumeToken();
+                m_loggedIn = false;
+                resetGroupStates();
+                TransferManager::instance().saveSnapshotNow();
+                TransferManager::instance().onConnectionLost(QStringLiteral("会话已失效，重新登录后可重试"));
+                Index::getinstance().hide();
+                this->show();
+                flus();
+                QMessageBox::information(this, "会话已失效",
+                    "登录会话已过期或被撤销，请重新登录。");
+            }
+        } else {
+            qCDebug(lcCli) << "[HEARTBEAT] recv PONG";
+        }
         break;
     }
     case ENUM_MSG_TYPE_REGIST_RESPOND:{
@@ -212,28 +238,66 @@ void Client::handlMsg(PDU *&pdu)
         break;
     }
     case ENUM_MSG_TYPE_LOGIN_RESPOND:{
-        // R-1（REQ-EXT-TRANSFER-003）：登录名在同步路径就位——handllogin() 直接返回名字，
-        // 不再等 1.5 s 的 UI 定时器写 m_LoginName（否则首次登录 setCurrentUser 收到空名 →
-        // 快照整轮不落盘；同进程再登录则清表重建 → 在途任务从列表消失）。
+        // R-1（REQ-EXT-TRANSFER-003）：登录名在同步路径就位——handllogin() 直接返回名字。
         const QString loginName = m_mhptr->handllogin();
-        if (!loginName.isEmpty()) m_LoginName = loginName;
-        // 按用户载入未完成传输快照（切用户会先落盘上一个用户的内存任务）
-        TransferManager::instance().setCurrentUser(m_LoginName);
-        // REQ-CLI-MSGSTORE-001：本地消息库随登录就位；打开失败只意味着本次不落盘，不影响登录
-        if (!m_msgStore.open(m_LoginName))
-            qCWarning(lcCli) << "[msgstore] 本地消息库打开失败，本轮消息仅内存展示:" << m_msgStore.lastError();
-        // REQ-EXT-TRANSFER-003 G7/C7：重连登录后恢复调度（不依赖 setCurrentUser 的提前返回——同用户重连会提前返回）
-        TransferManager::instance().onConnectionRestored();
-        m_loggedIn = true;   // 登录过才监控断开，避免登录界面误报
-        // REQ-CHAT-ACK-001：声明本端支持 109/110 私聊接收确认（服务端据此决定投递方式）
-        {
-            PDU* cap = mkPDU();
-            cap->uiType = ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY;
-            seedMsg(cap);
+        if (!loginName.isEmpty()) {
+            // REQ-AUTH-CONNECTION-001：成功响应 caMsg=一次性恢复凭据（64hex+NUL）；
+            // 旧服务端零正文 → 无凭据，清除本地残留（旧 token 已被新登录作废）。
+            QString token;
+            if (pdu->uiMsgLen > 0) {
+                const QByteArray raw(pdu->caMsg, int(qMin(pdu->uiMsgLen, uint(AUTH_RESUME_TOKEN_HEX_LEN))));
+                if (isValidResumeToken(raw)) token = QString::fromLatin1(raw);
+            }
+            if (!token.isEmpty()) saveResumeToken(loginName, token);
+            else clearResumeToken();
+            // 会话建立统一入口（与 122 恢复成功共用）：切主界面、恢复传输、声明能力、拉申请
+            enterLoggedInSession(loginName);
         }
-        // REQ-CHAT-ACK-001 R10：登录后拉取离线期间登记的好友申请
-        if (Index::getinstance().getFriend())
-            Index::getinstance().getFriend()->requestPendingFriendRequests();
+        break;
+    }
+    case ENUM_MSG_TYPE_SESSION_LOGOUT_RESPOND:{
+        // REQ-AUTH-CONNECTION-001：119 退出结果。成功才清凭据回登录页（socket 保持匿名，不断开）；
+        // 失败（如 Redis 不可用 -1003）保留当前登录态并提示，用户可重试。
+        const int loCode = authReadI32(pdu->caData + SESSION_RESP_CODE_OFFSET);
+        if (loCode == ENUM_PROTOCOL_CODE_OK) {
+            clearResumeToken();
+            m_loggedIn = false;
+            resetGroupStates();
+            TransferManager::instance().saveSnapshotNow();
+            TransferManager::instance().onConnectionLost(QStringLiteral("已退出登录"));
+            Index::getinstance().hide();
+            this->show();
+            this->raise();
+            this->activateWindow();
+            flus();
+            QMessageBox::information(this, "提示", "已退出登录。");
+        } else {
+            QMessageBox::information(this, "提示",
+                QString("退出登录失败：%1").arg(protocolCodeText(loCode)));
+        }
+        break;
+    }
+    case ENUM_MSG_TYPE_SESSION_RESUME_RESPOND:{
+        // REQ-AUTH-CONNECTION-001：121 恢复结果。成功恢复主界面与任务（沿用原 token）；
+        // 任何失败清 token 回登录页，不留半登录状态。
+        m_resumePending = false;
+        const int rsCode = authReadI32(pdu->caData + SESSION_RESP_CODE_OFFSET);
+        if (rsCode == ENUM_PROTOCOL_CODE_OK) {
+            char uname[33] = {'\0'};
+            memcpy(uname, pdu->caData + SESSION_RESP_USER_OFFSET, 32);
+            const QString user = QString::fromUtf8(uname);
+            qCDebug(lcCli) << "[session] 会话恢复成功 ver="
+                           << authReadI64(pdu->caData + SESSION_RESP_VERSION_OFFSET);
+            enterLoggedInSession(user);
+        } else {
+            qCWarning(lcCli) << "[session] 会话恢复失败 code=" << rsCode;
+            clearResumeToken();
+            forceReLogin();
+        }
+        break;
+    }
+    case ENUM_MSG_TYPE_SESSION_INVALIDATED_EVENT:{
+        handleSessionInvalidated(pdu);
         break;
     }
     case ENUM_MSG_TYPE_findUser_RESPOND:{
@@ -480,7 +544,8 @@ void Client::connectsort(){
         m_reconnectDlg->accept();   // 触发 closeEvent → 停止 spinner
         m_serverLostShown = false;
         m_lastPongMs = QDateTime::currentMSecsSinceEpoch();
-        forceReLogin();             // 服务端重启后需重新登录，否则新连接无身份
+        // REQ-AUTH-CONNECTION-001：优先 121 恢复逻辑会话；无凭据/恢复失败由响应路径回登录页
+        tryResumeSession();
     }
 }
 
@@ -500,6 +565,126 @@ void Client::forceReLogin() {
     flus();                         // 清空账号/密码输入框
     QMessageBox::information(this, "提示",
         "与服务器的连接已恢复。\n由于服务端已重启，请重新登录。");
+}
+
+// ===== REQ-AUTH-CONNECTION-001：恢复凭据持久化与会话生命周期 =====
+// 凭据只存 QSettings（用户级配置），不进日志、不进弹窗文案；覆盖前显式清旧键。
+void Client::saveResumeToken(const QString& user, const QString& token)
+{
+    if (user.isEmpty() || !isValidResumeToken(token.toLatin1())) {
+        qCWarning(lcCli) << "[session] 拒绝保存非法恢复凭据（长度=" << token.size() << "）";
+        return;
+    }
+    QSettings st;
+    st.remove(QStringLiteral("session/resume_user"));
+    st.remove(QStringLiteral("session/resume_token"));
+    st.setValue(QStringLiteral("session/resume_user"), user);
+    st.setValue(QStringLiteral("session/resume_token"), token);
+    m_resumeToken = token;
+    m_tokenUser = user;
+}
+
+void Client::clearResumeToken()
+{
+    m_resumeToken.clear();
+    m_tokenUser.clear();
+    QSettings st;
+    st.remove(QStringLiteral("session/resume_user"));
+    st.remove(QStringLiteral("session/resume_token"));
+}
+
+void Client::loadResumeToken()
+{
+    QSettings st;
+    const QString user = st.value(QStringLiteral("session/resume_user")).toString();
+    const QString token = st.value(QStringLiteral("session/resume_token")).toString();
+    if (user.isEmpty() && token.isEmpty()) return;
+    if (user.isEmpty() || !isValidResumeToken(token.toLatin1())) {
+        qCWarning(lcCli) << "[session] 落盘恢复凭据不完整/格式非法，丢弃";
+        clearResumeToken();
+        return;
+    }
+    m_resumeToken = token;
+    m_tokenUser = user;
+}
+
+// 119 退出登录：请求服务端撤销会话；本地状态清理在 120 成功响应里完成（不用本地断线替代撤销）。
+void Client::sendSessionLogout()
+{
+    if (!m_loggedIn) return;
+    PDU* pdu = mkPDU();
+    pdu->uiType = ENUM_MSG_TYPE_SESSION_LOGOUT_REQUEST;
+    authFillClientIdField(pdu->caData, m_clientId.toLatin1().constData());
+    seedMsg(pdu);
+}
+
+// 重连打开后优先尝试恢复：有合法凭据即发 121；否则回登录页重新鉴权。
+void Client::tryResumeSession()
+{
+    if (m_resumeToken.isEmpty() || m_tokenUser.isEmpty()
+            || !isValidResumeToken(m_resumeToken.toLatin1())) {
+        clearResumeToken();
+        forceReLogin();
+        return;
+    }
+    PDU* pdu = mkPDU(uint(SESSION_RESUME_MSG_LEN));
+    pdu->uiType = ENUM_MSG_TYPE_SESSION_RESUME_REQUEST;
+    authFillClientIdField(pdu->caData, m_clientId.toLatin1().constData());
+    authWriteResumeTokenMsg(pdu->caMsg, SESSION_RESUME_MSG_LEN, m_resumeToken.toLatin1().constData());
+    m_resumePending = true;
+    qCDebug(lcCli) << "[session] 重连后发送会话恢复请求（凭据不回显）";
+    seedMsg(pdu);
+}
+
+// 123 失效事件：新登录互踢/注销/管理员撤销。停业务、清凭据、存快照、回登录页。
+void Client::handleSessionInvalidated(PDU* pdu)
+{
+    const int reason = authReadI32(pdu->caData + SESSION_RESP_CODE_OFFSET);
+    const qint64 staleVer = authReadI64(pdu->caData + SESSION_RESP_VERSION_OFFSET);
+    QString reasonText;
+    if (pdu->uiMsgLen > 0)
+        reasonText = QString::fromUtf8(pdu->caMsg, int(pdu->uiMsgLen)).trimmed();
+    qCWarning(lcCli) << "[session] 收到会话失效事件 reason=" << reason << " ver=" << staleVer;
+    clearResumeToken();                     // 被踢/注销后旧凭据不可再用
+    m_resumePending = false;
+    m_loggedIn = false;
+    resetGroupStates();
+    TransferManager::instance().saveSnapshotNow();   // 在途任务落快照（重登后按键合并恢复）
+    TransferManager::instance().onConnectionLost(QStringLiteral("会话已失效，重新登录后可重试"));
+    Index::getinstance().hide();
+    this->show();
+    this->raise();
+    this->activateWindow();
+    flus();
+    const QString headline = reasonText.isEmpty() ? protocolCodeText(reason) : reasonText;
+    QMessageBox::information(this, "会话已失效",
+        QString("%1\n请重新登录。").arg(headline));
+    // 服务端随后按版本关闭连接；onSocketDisconnected 因 m_loggedIn=false 不再弹重连窗
+}
+
+// 会话建立统一入口：登录成功（4 响应）与恢复成功（122 响应）共用。
+void Client::enterLoggedInSession(const QString& user)
+{
+    m_LoginName = user;
+    TransferManager::instance().setCurrentUser(user);
+    if (!m_msgStore.open(user))
+        qCWarning(lcCli) << "[msgstore] 本地消息库打开失败，本轮消息仅内存展示:" << m_msgStore.lastError();
+    TransferManager::instance().onConnectionRestored();
+    m_loggedIn = true;
+    resetGroupStates();
+    Index::getinstance().getFile()->resetUserPath();
+    Index::getinstance().show();
+    this->hide();
+    // 主界面构造完成后下一轮事件循环做初始刷新与能力声明
+    QTimer::singleShot(0, [this](){
+        Index::getinstance().getFriend()->flushfriend();
+        Index::getinstance().getGroup()->initializeSession();
+        PDU* cap = mkPDU();
+        cap->uiType = ENUM_MSG_TYPE_CHAT_ACK_CAPABILITY;
+        seedMsg(cap);
+        if (Index::getinstance().getFriend())
+            Index::getinstance().getFriend()->requestPendingFriendRequests();
+    });
 }
 
 void Client::recvmsg(){
@@ -549,12 +734,15 @@ void Client::on_register_PB_clicked(){
         return ;
     }
     QByteArray captchaBytes=ui->randcode_LE->text().toUtf8();
-    // caData: [0..31]=用户名，[32..63]=UTF-8 明文密码；caMsg: 验证码（含结尾 NUL）。
-    PDU* pdu=mkPDU(captchaBytes.size()+1);
+    // caData: [0..31]=用户名，[32..63]=UTF-8 明文密码。
+    // REQ-AUTH-CONNECTION-001：caMsg = 验证码 + NUL + 32B clientId（与登录同布局，服务端严格校验）
+    const QByteArray clientIdBytes=m_clientId.toLatin1();
+    PDU* pdu=mkPDU(uint(captchaBytes.size()+1+clientIdBytes.size()));
     pdu->uiType=ENUM_MSG_TYPE_REGIST_REQUEST;
     copyFixedField(pdu->caData,32,strname.toUtf8());
     copyFixedField(pdu->caData+32,32,strpwd.toUtf8());
     memcpy(pdu->caMsg,captchaBytes.constData(),captchaBytes.size()+1);
+    memcpy(pdu->caMsg+captchaBytes.size()+1,clientIdBytes.constData(),clientIdBytes.size());
     seedMsg(pdu);
 }
 
@@ -599,6 +787,8 @@ void Client::on_pushButton_clicked(){
     }
     PDU* pdu=mkPDU();
     pdu->uiType=ENUM_MSG_TYPE_CAPTCHA_REQUEST;
+    // REQ-AUTH-CONNECTION-001：caData[0,32)=clientId，冷却/锁定状态跨连接按设备一致
+    authFillClientIdField(pdu->caData, m_clientId.toLatin1().constData());
     seedMsg(pdu);
 }
 
@@ -730,6 +920,12 @@ void Client::onSocketDisconnected() {
     // REQ-EXT-TRANSFER-003 G7/C8①：连接断开即在途任务收敛（服务端被杀/网络断），
     // 不再让任务永久停在"传输中"占着名额（本地分片与服务端暂存保留，重试即续传）
     TransferManager::instance().onConnectionLost(QStringLiteral("与服务端断开连接，可重试"));
+    // REQ-AUTH-CONNECTION-001：121 已发出但连接被关闭（未等到 122，如服务端拒绝后切断）：
+    // 复位等待标记并给出重连入口，重试仍走恢复优先；凭据留给 122 失败路径统一清除。
+    if (m_resumePending) {
+        m_resumePending = false;
+        m_loggedIn = true;   // 借用既有重连窗路径（会话尚未确认失效，不清凭据）
+    }
     // 已登录才弹窗（未登录在登录界面，连接失败不应弹重连窗口）
     if (m_loggedIn && !m_serverLostShown) {
         // D-1：证书被拒已有「安全连接失败」对话框，这里不再叠加互踢文案；重连窗照常给出

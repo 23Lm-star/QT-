@@ -1018,6 +1018,24 @@ void OperateDB::handleOffLine(const char *strname)
     q.exec();
 }
 
+// REQ-AUTH-CONNECTION-001：恢复成功置 online=1；不动 login_version（版本只在登录事务递增）
+void OperateDB::handleOnLine(const char *strname)
+{
+    if(strname==nullptr){
+        return ;
+    }
+    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
+    if(!connection.isValid()){
+        return ;
+    }
+    QSqlDatabase db = connection.database();
+    QSqlQuery q(db);
+    q.prepare("update user_info set online = 1 where name = ?");
+    q.addBindValue(QString::fromUtf8(strname));
+    qCDebug(lcDb)<<"online update for:"<<QString::fromUtf8(strname);
+    q.exec();
+}
+
 // 查用户在线态：命中返回 online 列（0/1）；不存在返回 2；参数或连接失败返回 -1
 int OperateDB::handleFindUser(const char *userName)
 {

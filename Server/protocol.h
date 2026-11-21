@@ -176,6 +176,14 @@ enum ENUM_MSG_TYPE {
     ENUM_MSG_TYPE_CHAT_HISTORY_REQUEST = 117,        // 历史分页请求（caData=双方名，caMsg 头部分页块）
     ENUM_MSG_TYPE_CHAT_HISTORY_RESPOND = 118,        // 历史分页响应（caData=码/total/has_more，caMsg=页信息+记录）
 
+    // ===== REQ-AUTH-CONNECTION-001：会话生命周期（仅追加，旧编号 1-118 不变） =====
+    // 119 与 48/49 注销账号语义分离：119 只撤销当前逻辑会话，连接转匿名。
+    ENUM_MSG_TYPE_SESSION_LOGOUT_REQUEST = 119,      // 退出登录请求（caData[0,32)=clientId）
+    ENUM_MSG_TYPE_SESSION_LOGOUT_RESPOND = 120,      // 退出登录响应（caData[0,4)=结果码）
+    ENUM_MSG_TYPE_SESSION_RESUME_REQUEST = 121,      // 会话恢复请求（caData=clientId，caMsg=token+NUL）
+    ENUM_MSG_TYPE_SESSION_RESUME_RESPOND = 122,      // 恢复响应（码/登录版本/用户名）
+    ENUM_MSG_TYPE_SESSION_INVALIDATED_EVENT = 123,   // 旧会话失效事件（原因码/失效版本/可选文本）
+
     ENUM_MSG_TYPE_MAX = 99999,
 };
 
@@ -443,6 +451,7 @@ enum ENUM_PROTOCOL_CODE {
     // ===== 认证 / 会话 =====
     ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED = -1001,    // 未认证：无登录上下文或会话已失效
     ENUM_PROTOCOL_CODE_DB_UNAVAILABLE = -1002,       // 数据库不可用
+    ENUM_PROTOCOL_CODE_REDIS_SESSION_UNAVAILABLE = -1003, // Redis 会话存储不可用（REQ-AUTH-CONNECTION-001）
 
     // ===== 业务 / 权限 =====
     ENUM_PROTOCOL_CODE_BAD_CREDENTIALS = -2011,      // 账号或密码错误
@@ -471,6 +480,11 @@ enum ENUM_PROTOCOL_CODE {
     ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED = -3012,      // 验证码已过期
     ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN = -3013,     // 获取过于频繁，仍在冷却
     ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED = -3014,       // 验证码错误次数过多，账号锁定
+    // REQ-AUTH-CONNECTION-001：会话/客户端标识细分码（只追加）
+    ENUM_PROTOCOL_CODE_BAD_CLIENT_ID = -3015,        // clientId 缺失或格式非法
+    ENUM_PROTOCOL_CODE_BAD_RESUME_TOKEN = -3016,     // 会话恢复凭据错误
+    ENUM_PROTOCOL_CODE_SESSION_INVALID = -3017,      // 会话已过期、已撤销或登录版本落后
+    ENUM_PROTOCOL_CODE_SESSION_WRITE_FAILED = -3018, // 会话状态写入失败
 
     // ===== 存储 / 文件 =====
     ENUM_PROTOCOL_CODE_FILE_NOT_FOUND = -4001,       // 文件不存在
@@ -497,6 +511,7 @@ inline QString protocolCodeText(int code)
     case ENUM_PROTOCOL_CODE_ACCEPTED: return QStringLiteral("已受理，等待对方确认");
     case ENUM_PROTOCOL_CODE_NOT_AUTHENTICATED: return QStringLiteral("未登录或会话已失效");
     case ENUM_PROTOCOL_CODE_DB_UNAVAILABLE: return QStringLiteral("数据库不可用");
+    case ENUM_PROTOCOL_CODE_REDIS_SESSION_UNAVAILABLE: return QStringLiteral("会话存储不可用，请稍后重试");
     case ENUM_PROTOCOL_CODE_BAD_CREDENTIALS: return QStringLiteral("账号或密码错误");
     case ENUM_PROTOCOL_CODE_ACCOUNT_EXISTS: return QStringLiteral("账号已存在");
     case ENUM_PROTOCOL_CODE_TARGET_NOT_FOUND: return QStringLiteral("目标不存在");
@@ -521,6 +536,10 @@ inline QString protocolCodeText(int code)
     case ENUM_PROTOCOL_CODE_CAPTCHA_EXPIRED: return QStringLiteral("验证码已过期，请重新获取");
     case ENUM_PROTOCOL_CODE_CAPTCHA_COOLDOWN: return QStringLiteral("获取验证码过于频繁，请稍后再试");
     case ENUM_PROTOCOL_CODE_CAPTCHA_LOCKED: return QStringLiteral("验证码错误次数过多，账号已锁定");
+    case ENUM_PROTOCOL_CODE_BAD_CLIENT_ID: return QStringLiteral("客户端标识非法");
+    case ENUM_PROTOCOL_CODE_BAD_RESUME_TOKEN: return QStringLiteral("会话恢复凭据错误");
+    case ENUM_PROTOCOL_CODE_SESSION_INVALID: return QStringLiteral("会话已失效，请重新登录");
+    case ENUM_PROTOCOL_CODE_SESSION_WRITE_FAILED: return QStringLiteral("会话状态写入失败");
     case ENUM_PROTOCOL_CODE_FILE_NOT_FOUND: return QStringLiteral("文件不存在");
     case ENUM_PROTOCOL_CODE_DIR_NOT_FOUND: return QStringLiteral("目录不存在");
     case ENUM_PROTOCOL_CODE_CREATE_FAILED: return QStringLiteral("创建失败");
@@ -533,6 +552,85 @@ inline QString protocolCodeText(int code)
     case ENUM_PROTOCOL_CODE_INTERNAL: return QStringLiteral("服务端内部错误");
     default: return QStringLiteral("未知错误(%1)").arg(code);
     }
+}
+
+// ===== REQ-AUTH-CONNECTION-001 BEGIN PROBE BLOCK (Qt-free) =====
+// 会话协议布局常量与字段编解码：纯字节逻辑，Server/Client 两份 protocol.h 必须
+// 逐字符一致（protocol_probe.py 会抽取本区块独立编译并做 diff 比对），不得引入 Qt 类型。
+static const int AUTH_CLIENT_ID_HEX_LEN = 32;      // clientId：32 位小写十六进制
+static const int AUTH_RESUME_TOKEN_HEX_LEN = 64;   // 恢复凭据：64 位小写十六进制
+
+static const int SESSION_CLIENT_ID_OFFSET = 0;     // 44/50/119/121 请求 caData[0,32)=clientId
+static const int SESSION_RESP_CODE_OFFSET = 0;     // 120/122 响应、123 事件 caData[0,4)=int32 结果码
+static const int SESSION_RESP_VERSION_OFFSET = 4;  // 122/123 caData[4,12)=qint64 登录版本（小端）
+static const int SESSION_RESP_USER_OFFSET = 32;    // 122 响应 caData[32,64)=用户名（NUL 定长槽）
+static const int SESSION_RESUME_MSG_LEN = AUTH_RESUME_TOKEN_HEX_LEN + 1; // 121 请求 caMsg：token+NUL
+
+// 严格小写十六进制；长度 0 直接拒绝。
+inline bool authIsLowerHex(const char *s, int len)
+{
+    if (len <= 0) return false;
+    for (int i = 0; i < len; ++i) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+inline bool isValidClientIdBytes(const char *s, int len)
+{
+    return len == AUTH_CLIENT_ID_HEX_LEN && authIsLowerHex(s, len);
+}
+inline bool isValidResumeTokenBytes(const char *s, int len)
+{
+    return len == AUTH_RESUME_TOKEN_HEX_LEN && authIsLowerHex(s, len);
+}
+// 44/50/119/121 请求：把 32B clientId 写入 64B caData（其余清零）。调用前须先校验。
+inline void authFillClientIdField(char caData[64], const char *clientId)
+{
+    for (int i = 0; i < 64; ++i) caData[i] = 0;
+    for (int i = 0; i < AUTH_CLIENT_ID_HEX_LEN; ++i) caData[i] = clientId[i];
+}
+// 121 请求 caMsg：写 64 位十六进制 token + NUL，返回写入长度；容量不足返回 -1。
+inline int authWriteResumeTokenMsg(char *out, int outCap, const char *token)
+{
+    if (outCap < SESSION_RESUME_MSG_LEN) return -1;
+    for (int i = 0; i < AUTH_RESUME_TOKEN_HEX_LEN; ++i) out[i] = token[i];
+    out[AUTH_RESUME_TOKEN_HEX_LEN] = '\0';
+    return SESSION_RESUME_MSG_LEN;
+}
+// 显式小端读写（与既有 memcpy 主机序结果一致，但探针可逐字节断言且不依赖平台）。
+inline void authAppendI32(char *out, int value)
+{
+    unsigned int v = static_cast<unsigned int>(value);
+    for (int i = 0; i < 4; ++i) out[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+}
+inline int authReadI32(const char *in)
+{
+    unsigned int v = 0;
+    for (int i = 0; i < 4; ++i) v |= static_cast<unsigned int>(static_cast<unsigned char>(in[i])) << (8 * i);
+    return static_cast<int>(v);
+}
+inline void authAppendI64(char *out, long long value)
+{
+    unsigned long long v = static_cast<unsigned long long>(value);
+    for (int i = 0; i < 8; ++i) out[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+}
+inline long long authReadI64(const char *in)
+{
+    unsigned long long v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<unsigned long long>(static_cast<unsigned char>(in[i])) << (8 * i);
+    return static_cast<long long>(v);
+}
+// ===== REQ-AUTH-CONNECTION-001 END PROBE BLOCK =====
+
+// QByteArray 便捷封装（Qt 侧使用；行为与上面的字节版本一致）。
+inline bool isValidClientId(const QByteArray &v)
+{
+    return isValidClientIdBytes(v.constData(), v.size());
+}
+inline bool isValidResumeToken(const QByteArray &v)
+{
+    return isValidResumeTokenBytes(v.constData(), v.size());
 }
 
 #endif // PROTOCOL_H

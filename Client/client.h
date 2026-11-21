@@ -47,6 +47,30 @@ public:
     QString m_strRootPath;
     // REQ-EXT-SESSION-001：持久化客户端唯一 ID（32hex，随登录负载附加区发送）
     QString m_clientId;
+    // ===== REQ-AUTH-CONNECTION-001：会话恢复凭据（内存持有，QSettings 落盘） =====
+    // 登录成功时服务端一次性回传；恢复成功沿用原 token。退出/注销/被踢/恢复失败即清除。
+    // 不落日志、不进错误提示。
+    QString m_resumeToken;
+    // 凭据归属账号（恢复响应回带的用户名；登录成功即登录名）
+    QString m_tokenUser;
+    // 121 恢复请求已发出、等待 122（期间到达的断线信号不弹重连窗）
+    bool m_resumePending = false;
+    // 恢复凭据持久化（账号+token 成对写入；格式非法按无凭据处理）
+    void saveResumeToken(const QString& user, const QString& token);
+    // 清除内存与落盘凭据（幂等）
+    void clearResumeToken();
+    // 启动时读回凭据；格式非法即丢弃并清落盘
+    void loadResumeToken();
+    // 发送 119 退出登录请求（连接保持匿名，由 120 响应完成本地状态清理）
+    void sendSessionLogout();
+    // 重连打开后优先发 121 恢复（无凭据/格式非法直接走重新登录）
+    void tryResumeSession();
+    // 123 失效事件处理：清凭据、停业务、存传输快照、回登录页并显示原因
+    void handleSessionInvalidated(PDU* pdu);
+    // 会话建立后的统一入口（登录成功/恢复成功共用）：切主界面、恢复传输、声明能力、拉申请
+    void enterLoggedInSession(const QString& user);
+    // 注销成功后复位登录监控（m_loggedIn=false，避免随后主动断线弹重连窗）
+    void logoutLocalStateReset() { m_loggedIn = false; m_resumePending = false; }
     //进行信息处理的对象 指针
     // 裸指针，进程内常驻不释放（随单例一起活到退出）。
     MsgHandler* m_mhptr;
