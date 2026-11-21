@@ -44,6 +44,9 @@ public:
     static const int kFriendRequestSchemaVersion = 2026111201;
     // REQ-DIR-COMP-001：目录操作失败补偿队列迁移版本。
     static const int kDirectoryCompensationSchemaVersion = 2026111801;
+    // REQ-SHARE-ENTRYID-001：分享链接源定位改绑条目标识迁移版本
+    // （share_link.relative_path → file_id；存量行直接清空，不迁移）。
+    static const int kShareEntryIdSchemaVersion = 2026112101;
 
     struct DirectoryCompensationTask {
         qint64 taskId = 0;
@@ -264,47 +267,41 @@ public:
     // 短码查文件路径；未命中或连接失败返回空串
     QString getFilePathByCode(const QString &code);
     
-    // 新增：安全外链分享操作（BUG-ARC-PUBLINK-001）
-    // token_hash 为随机令牌的哈希；同 owner+path 已有记录时直接复用，返回 true
-    bool createShareLink(const QString &hash, const QString &owner, const QString &path, const QDateTime &expire);
-    // 分享链接行：路径为相对 owner 根目录的逻辑键，expire_time 到点即失效
+    // 新增：安全外链分享操作（BUG-ARC-PUBLINK-001；REQ-SHARE-ENTRYID-001 起源定位=所有者+逻辑条目标识）
+    // token_hash 为随机令牌的哈希；同 owner+fileId 已有记录时直接复用，返回 true
+    bool createShareLink(const QString &hash, const QString &owner, qint64 fileId, const QDateTime &expire);
+    // 分享链接行：源=owner 名下的 user_file 逻辑条目标识，expire_time 到点即失效
     struct ShareLinkInfo {
         // 链接创建者
         QString ownerName;
-        // 相对 owner 根的逻辑路径
-        QString relativePath;
+        // 源逻辑条目标识（user_file.file_id）
+        qint64 fileId = -1;
         // 过期时间（库内为秒精度 DATETIME）
         QDateTime expireTime;
         // 是否已作废
         bool revoked;
-        QString tokenHash;      // REQ-EXT-SHARE-001：按路径取信息时回带，供复用/续期拼链接
+        QString tokenHash;      // 按条目取信息时回带，供复用/续期拼链接
     };
     // 按 token 哈希精确查找；未命中返回 false 且不改 outInfo
     bool getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo);
-    // 按 owner+path 取最新一行的 token_hash；未命中/连接失败返回空串
-    QString getShareLinkByPath(const QString &owner, const QString &path);
-    // REQ-EXT-SHARE-001：按 owner+path 取最新一行的完整信息（含 token_hash）
-    bool getShareLinkInfoByPath(const QString &owner, const QString &path, ShareLinkInfo &outInfo);
-    // REQ-EXT-SHARE-001：续期——只改 expire_time，不动 token/相对路径/撤销位；返回是否命中行
-    bool renewShareLink(const QString &owner, const QString &path, const QDateTime &newExpire);
-    // REQ-EXT-SHARE-001：重新生成前作废旧行（精确路径，不含子路径）
-    bool removeShareLinkExact(const QString &owner, const QString &path);
+    // 按 owner+条目标识取最新一行的 token_hash；未命中/连接失败返回空串
+    QString getShareLinkByFile(const QString &owner, qint64 fileId);
+    // 按 owner+条目标识取最新一行的完整信息（含 token_hash）
+    bool getShareLinkInfoByFile(const QString &owner, qint64 fileId, ShareLinkInfo &outInfo);
+    // 续期——只改 expire_time，不动 token/条目标识/撤销位；返回是否命中行
+    bool renewShareLink(const QString &owner, qint64 fileId, const QDateTime &newExpire);
     // REQ-AUDIT-001 R6：作废旧链接 + 写入新令牌在同一事务内完成。
     // 插入失败时整体回滚，旧链接保持有效——不出现"旧链接已作废、新链接没建"。
-    bool replaceShareLink(const QString &hash, const QString &owner, const QString &path,
+    bool replaceShareLink(const QString &hash, const QString &owner, qint64 fileId,
                           const QDateTime &expire);
 
-    // 跨功能联动维护（文件删除/重命名/移动 → 分享链接记录一致性）
-    // 删除 path 自身及其子路径（path/%）的全部链接记录
-    bool deleteShareLinkByPath(const QString &owner, const QString &path);
-    // 把 oldPath 自身与其子路径整体平移到 newPath（两条 UPDATE，任一失败返回 false）
-    bool updateShareLinkPath(const QString &owner, const QString &oldPath, const QString &newPath);
-    // REQ-AUDIT-001 R7：事务内版本——供 FileObjectStore 在"条目变更"同一事务里维护
-    // share_link，使文件删除/重命名/移动与链接记录不再出现部分成功。
+    // 跨功能联动维护（条目删除 → 分享链接记录一致性；REQ-SHARE-ENTRYID-001：
+    // 重命名/移动不再联动——链接按条目标识定位，改名/移动不影响解析）。
     // db 必须处于调用方已开启的事务中；失败由调用方回滚。
-    static bool deleteShareLinkByPathTx(QSqlDatabase &db, const QString &owner, const QString &path);
-    static bool updateShareLinkPathTx(QSqlDatabase &db, const QString &owner,
-                                      const QString &oldPath, const QString &newPath);
+    static bool deleteShareLinkByFileTx(QSqlDatabase &db, const QString &owner, qint64 fileId);
+    // 子树软删：按收集到的条目标识集合清理（空集合=无链接可清，直接成功）
+    static bool deleteShareLinkByFileIdsTx(QSqlDatabase &db, const QString &owner,
+                                           const QList<qint64> &fileIds);
     // 删除好友时清理双方私聊记录
     bool deleteFriendMessages(const QString &userA, const QString &userB);
 

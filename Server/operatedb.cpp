@@ -104,8 +104,8 @@ bool OperateDB::checkSchemaVersion()
                          << q.lastError().text()
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
                             "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
-                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql 与 "
-                            "migrate_dir_comp_001.sql";
+                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql、"
+                            "migrate_dir_comp_001.sql 与 migrate_share_entryid_001.sql";
         return false;
     }
     int version = 0;
@@ -118,13 +118,16 @@ bool OperateDB::checkSchemaVersion()
                                    qMax(kGroupMessageSchemaVersion,
                                         qMax(kFastUploadSchemaVersion,
                                              qMax(kGroupFileSchemaVersion,
-                                                  qMax(kReclaimSchemaVersion, qMax(kFriendRequestSchemaVersion, kDirectoryCompensationSchemaVersion)))))));
+                                                  qMax(kReclaimSchemaVersion,
+                                                       qMax(kFriendRequestSchemaVersion,
+                                                            qMax(kDirectoryCompensationSchemaVersion,
+                                                                 kShareEntryIdSchemaVersion))))))));
     if (version < required) {
         qCCritical(lcDb) << "[checkSchemaVersion] schema 版本" << version << "低于要求的" << required
                          << "— 请先执行 Server/migrate_ext_file_001.sql、migrate_ext_group_001.sql、"
                             "migrate_ext_group_002.sql、migrate_ext_file_002.sql、migrate_ext_group_003.sql、"
-                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql 与 "
-                            "migrate_dir_comp_001.sql";
+                            "migrate_ext_reclaim_001.sql、migrate_friend_req_001.sql、"
+                            "migrate_dir_comp_001.sql 与 migrate_share_entryid_001.sql";
         return false;
     }
     qCDebug(lcDb) << "[checkSchemaVersion] OK, version" << version;
@@ -588,7 +591,7 @@ bool OperateDB::handleRegit(char *strname, char *strpwd)
 
 // 创建安全外链：同 owner+path 已存在则复用（返回 true，不更新令牌/有效期）。
 // token_hash 唯一性由表约束保证；expire 显式格式化为 MySQL DATETIME。
-bool OperateDB::createShareLink(const QString &hash, const QString &owner, const QString &path, const QDateTime &expire)
+bool OperateDB::createShareLink(const QString &hash, const QString &owner, qint64 fileId, const QDateTime &expire)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()){
@@ -596,15 +599,15 @@ bool OperateDB::createShareLink(const QString &hash, const QString &owner, const
         return false;
     }
     QSqlQuery q(connection.database());
-    // 查重：同一 owner + 同一文件若已存在链接，则直接复用，避免重复记录堆积
-    if(!getShareLinkByPath(owner, path).isEmpty()){
-        qCDebug(lcDb) << "[createShareLink] 该文件已存在分享链接，复用已有记录: owner=" << owner << " path=" << path;
+    // 查重：同一 owner + 同一条目若已存在链接，则直接复用，避免重复记录堆积
+    if(!getShareLinkByFile(owner, fileId).isEmpty()){
+        qCDebug(lcDb) << "[createShareLink] 该条目已存在分享链接，复用已有记录: owner=" << owner << " fileId=" << fileId;
         return true;
     }
-    q.prepare("INSERT INTO share_link (token_hash, owner_name, relative_path, expire_time) VALUES (?, ?, ?, ?)");
+    q.prepare("INSERT INTO share_link (token_hash, owner_name, file_id, expire_time) VALUES (?, ?, ?, ?)");
     q.addBindValue(hash);
     q.addBindValue(owner);
-    q.addBindValue(path);
+    q.addBindValue(fileId);
     // 必须显式格式化为 "yyyy-MM-dd HH:mm:ss" 字符串再绑定。
     // 直接绑定 QDateTime 时，Qt MySQL 驱动会序列化成 ISO 8601 格式（带 'T' 分隔符，如
     // 2026-07-29T18:00:00），若时间含毫秒/时区，MySQL 可能拒绝或存错。
@@ -614,23 +617,23 @@ bool OperateDB::createShareLink(const QString &hash, const QString &owner, const
     q.addBindValue(expire.toString("yyyy-MM-dd HH:mm:ss"));
     if(!q.exec()){
         qCWarning(lcDb) << "[createShareLink] 插入分享链接失败:" << q.lastError().text()
-                 << " | hash=" << hash << " owner=" << owner << " path=" << path;
+                 << " | hash=" << hash << " owner=" << owner << " fileId=" << fileId;
         return false;
     }
     return true;
 }
 
-// 按令牌哈希取链接信息；命中时回填 owner/路径/过期时间/撤销位，未命中返回 false
+// 按令牌哈希取链接信息；命中时回填 owner/条目标识/过期时间/撤销位，未命中返回 false
 bool OperateDB::getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
     QSqlQuery q(connection.database());
-    q.prepare("SELECT owner_name, relative_path, expire_time, revoked FROM share_link WHERE token_hash = ?");
+    q.prepare("SELECT owner_name, file_id, expire_time, revoked FROM share_link WHERE token_hash = ?");
     q.addBindValue(hash);
     if(q.exec() && q.next()){
         outInfo.ownerName = q.value(0).toString();
-        outInfo.relativePath = q.value(1).toString();
+        outInfo.fileId = q.value(1).toLongLong();
         outInfo.expireTime = q.value(2).toDateTime();
         outInfo.revoked = q.value(3).toInt();
         return true;
@@ -638,38 +641,38 @@ bool OperateDB::getShareLinkByHash(const QString &hash, ShareLinkInfo &outInfo)
     return false;
 }
 
-// 按 owner+精确路径取最新 token_hash；未命中返回空串（调用方据此判断"无链接"）
-QString OperateDB::getShareLinkByPath(const QString &owner, const QString &path)
+// 按 owner+条目标识取最新 token_hash；未命中返回空串（调用方据此判断"无链接"）
+QString OperateDB::getShareLinkByFile(const QString &owner, qint64 fileId)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return QString();
     QSqlQuery q(connection.database());
     // created_at 是秒精度，同秒两行时排序不稳定；以 id 兜底，保证"同一逻辑行"在
-    // getShareLinkByPath / getShareLinkInfoByPath 两个入口上取值一致
-    q.prepare("SELECT token_hash FROM share_link WHERE owner_name = ? AND relative_path = ? "
+    // getShareLinkByFile / getShareLinkInfoByFile 两个入口上取值一致
+    q.prepare("SELECT token_hash FROM share_link WHERE owner_name = ? AND file_id = ? "
               "ORDER BY created_at DESC, id DESC LIMIT 1");
     q.addBindValue(owner);
-    q.addBindValue(path);
+    q.addBindValue(fileId);
     if(q.exec() && q.next()){
         return q.value(0).toString();
     }
     return QString();
 }
 
-// REQ-EXT-SHARE-001：按 owner+path 取最新一行的完整信息（getShareLinkByPath 只回 hash，
+// 按 owner+条目标识取最新一行的完整信息（getShareLinkByFile 只回 hash，
 // 判断"有效/过期/撤销"还需要 expire_time 与 revoked）
-bool OperateDB::getShareLinkInfoByPath(const QString &owner, const QString &path, ShareLinkInfo &outInfo)
+bool OperateDB::getShareLinkInfoByFile(const QString &owner, qint64 fileId, ShareLinkInfo &outInfo)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
     QSqlQuery q(connection.database());
     q.prepare("SELECT token_hash, expire_time, revoked FROM share_link "
-              "WHERE owner_name = ? AND relative_path = ? ORDER BY created_at DESC, id DESC LIMIT 1");
+              "WHERE owner_name = ? AND file_id = ? ORDER BY created_at DESC, id DESC LIMIT 1");
     q.addBindValue(owner);
-    q.addBindValue(path);
+    q.addBindValue(fileId);
     if(q.exec() && q.next()){
         outInfo.ownerName = owner;
-        outInfo.relativePath = path;
+        outInfo.fileId = fileId;
         outInfo.tokenHash = q.value(0).toString();
         outInfo.expireTime = q.value(1).toDateTime();
         outInfo.revoked = q.value(2).toInt() != 0;
@@ -678,45 +681,28 @@ bool OperateDB::getShareLinkInfoByPath(const QString &owner, const QString &path
     return false;
 }
 
-// REQ-EXT-SHARE-001：续期只延长 expire_time，token 与相对路径不动；
+// 续期只延长 expire_time，token 与条目标识不动；
 // 已撤销的行（revoked=1）不参与，续期不能让一条被作废的链接复活
-bool OperateDB::renewShareLink(const QString &owner, const QString &path, const QDateTime &newExpire)
+bool OperateDB::renewShareLink(const QString &owner, qint64 fileId, const QDateTime &newExpire)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
     if(!connection.isValid()) return false;
     QSqlQuery q(connection.database());
-    q.prepare("UPDATE share_link SET expire_time = ? WHERE owner_name = ? AND relative_path = ? AND revoked = 0");
+    q.prepare("UPDATE share_link SET expire_time = ? WHERE owner_name = ? AND file_id = ? AND revoked = 0");
     q.addBindValue(newExpire.toString("yyyy-MM-dd HH:mm:ss"));
     q.addBindValue(owner);
-    q.addBindValue(path);
+    q.addBindValue(fileId);
     if(!q.exec()){
         qCWarning(lcDb) << "[renewShareLink] 续期失败:" << q.lastError().text()
-                        << " owner=" << owner << " path=" << path;
+                        << " owner=" << owner << " fileId=" << fileId;
         return false;
     }
     return q.numRowsAffected() > 0;
 }
 
-// REQ-EXT-SHARE-001：重新生成前作废旧行（精确路径，不含 path/ 子路径）
-bool OperateDB::removeShareLinkExact(const QString &owner, const QString &path)
-{
-    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
-    if(!connection.isValid()) return false;
-    QSqlQuery q(connection.database());
-    q.prepare("DELETE FROM share_link WHERE owner_name = ? AND relative_path = ?");
-    q.addBindValue(owner);
-    q.addBindValue(path);
-    if(!q.exec()){
-        qCWarning(lcDb) << "[removeShareLinkExact] 作废旧链接失败:" << q.lastError().text()
-                        << " owner=" << owner << " path=" << path;
-        return false;
-    }
-    return true;
-}
-
 // REQ-AUDIT-001 R6：作废旧链接 + 写入新链接同一事务。
 // 任一步失败整体回滚，旧链接保持可用（对齐"重新生成要么换掉、要么保持原样"）。
-bool OperateDB::replaceShareLink(const QString &hash, const QString &owner, const QString &path,
+bool OperateDB::replaceShareLink(const QString &hash, const QString &owner, qint64 fileId,
                                  const QDateTime &expire)
 {
     PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
@@ -727,19 +713,19 @@ bool OperateDB::replaceShareLink(const QString &hash, const QString &owner, cons
         return false;
     }
     QSqlQuery del(db);
-    del.prepare("DELETE FROM share_link WHERE owner_name = ? AND relative_path = ?");
+    del.prepare("DELETE FROM share_link WHERE owner_name = ? AND file_id = ?");
     del.addBindValue(owner);
-    del.addBindValue(path);
+    del.addBindValue(fileId);
     if(!del.exec()){
         qCWarning(lcDb) << "[replaceShareLink] 作废旧链接失败:" << del.lastError().text();
         db.rollback();
         return false;
     }
     QSqlQuery ins(db);
-    ins.prepare("INSERT INTO share_link (token_hash, owner_name, relative_path, expire_time) VALUES (?, ?, ?, ?)");
+    ins.prepare("INSERT INTO share_link (token_hash, owner_name, file_id, expire_time) VALUES (?, ?, ?, ?)");
     ins.addBindValue(hash);
     ins.addBindValue(owner);
-    ins.addBindValue(path);
+    ins.addBindValue(fileId);
     ins.addBindValue(expire.toString("yyyy-MM-dd HH:mm:ss"));
     if(!ins.exec()){
         qCWarning(lcDb) << "[replaceShareLink] 写入新链接失败（已回滚，旧链接保留）:" << ins.lastError().text()
@@ -755,82 +741,39 @@ bool OperateDB::replaceShareLink(const QString &hash, const QString &owner, cons
     return true;
 }
 
-// 跨功能联动：删除文件/目录时，清理对应的分享链接记录
-// path 为相对 owner 根目录的路径；若为目录则同时清理其下所有文件（前缀匹配）
-bool OperateDB::deleteShareLinkByPath(const QString &owner, const QString &path)
-{
-    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
-    if(!connection.isValid()) return false;
-    QSqlDatabase db = connection.database();
-    return deleteShareLinkByPathTx(db, owner, path);
-}
-
-// REQ-AUDIT-001 R7：事务内删除（精确路径 + 子路径前缀）
-bool OperateDB::deleteShareLinkByPathTx(QSqlDatabase &db, const QString &owner, const QString &path)
+// 跨功能联动（REQ-SHARE-ENTRYID-001）：条目删除时按条目标识清理对应链接记录。
+// 重命名/移动不再联动——链接按条目标识定位，改名/移动不影响解析。
+// REQ-AUDIT-001 R7：事务内删除单条目的链接记录（调用方负责提交/回滚）
+bool OperateDB::deleteShareLinkByFileTx(QSqlDatabase &db, const QString &owner, qint64 fileId)
 {
     QSqlQuery q(db);
-    q.prepare("DELETE FROM share_link WHERE owner_name = ? AND (relative_path = ? OR relative_path LIKE ?)");
+    q.prepare("DELETE FROM share_link WHERE owner_name = ? AND file_id = ?");
     q.addBindValue(owner);
-    q.addBindValue(path);
-    q.addBindValue(path + "/%");
+    q.addBindValue(fileId);
     bool ok = q.exec();
     if(!ok){
-        qCWarning(lcDb) << "[deleteShareLinkByPath] 失败:" << q.lastError().text()
-                 << " owner=" << owner << " path=" << path;
+        qCWarning(lcDb) << "[deleteShareLinkByFileTx] 失败:" << q.lastError().text()
+                 << " owner=" << owner << " fileId=" << fileId;
     }
     return ok;
 }
 
-// 跨功能联动：重命名/移动文件时，平移 share_link.relative_path
-// - 精确匹配 oldPath（文件自身）
-// - 前缀匹配 oldPath/（目录下的子文件整体平移）
-bool OperateDB::updateShareLinkPath(const QString &owner, const QString &oldPath, const QString &newPath)
+// 事务内按条目标识集合清理（目录子树软删用；空集合=无链接可清，直接成功）
+bool OperateDB::deleteShareLinkByFileIdsTx(QSqlDatabase &db, const QString &owner,
+                                           const QList<qint64> &fileIds)
 {
-    if(oldPath == newPath) return true;
-    PooledSqlConnection connection = DatabaseConnectionPool::instance().acquire();
-    if(!connection.isValid()) return false;
-    QSqlDatabase db = connection.database();
-    // REQ-AUDIT-001 R7：两条 UPDATE 必须同事务，否则目录平移可能只成功一半。
-    if(!db.transaction()) return false;
-    const bool ok = updateShareLinkPathTx(db, owner, oldPath, newPath);
-    if(ok && db.commit()){
-        return true;
-    }
-    db.rollback();
-    return false;
-}
-
-// REQ-AUDIT-001 R7：事务内平移（调用方负责提交/回滚）
-bool OperateDB::updateShareLinkPathTx(QSqlDatabase &db, const QString &owner,
-                                      const QString &oldPath, const QString &newPath)
-{
-    if(oldPath == newPath) return true;
-    // 1) 文件自身：relative_path = oldPath → newPath
-    QSqlQuery q1(db);
-    q1.prepare("UPDATE share_link SET relative_path = ? WHERE owner_name = ? AND relative_path = ?");
-    q1.addBindValue(newPath);
-    q1.addBindValue(owner);
-    q1.addBindValue(oldPath);
-    bool ok = q1.exec();
+    if(fileIds.isEmpty()) return true;
+    QStringList placeholders;
+    for(int i = 0; i < fileIds.size(); ++i) placeholders << QStringLiteral("?");
+    QSqlQuery q(db);
+    q.prepare(QString("DELETE FROM share_link WHERE owner_name = ? AND file_id IN (%1)")
+                  .arg(placeholders.join(QStringLiteral(","))));
+    q.addBindValue(owner);
+    for(qint64 fid : fileIds) q.addBindValue(fid);
+    bool ok = q.exec();
     if(!ok){
-        qCWarning(lcDb) << "[updateShareLinkPath] 精确更新失败:" << q1.lastError().text()
-                 << " owner=" << owner << " old=" << oldPath << " new=" << newPath;
-    }
-
-    // 2) 目录子文件：oldPath/sub → newPath/sub（仅匹配严格长于 oldPath 的条目）
-    if(!oldPath.isEmpty()){
-        QSqlQuery q2(db);
-        q2.prepare("UPDATE share_link SET relative_path = CONCAT(?, SUBSTRING(relative_path, ?)) "
-                   "WHERE owner_name = ? AND relative_path LIKE ? AND relative_path <> ?");
-        q2.addBindValue(newPath + "/");
-        q2.addBindValue(oldPath.size() + 2);          // 1-based：跳过 "oldPath/" 之后
-        q2.addBindValue(owner);
-        q2.addBindValue(oldPath + "/%");
-        q2.addBindValue(oldPath);
-        if(!q2.exec()){
-            qCWarning(lcDb) << "[updateShareLinkPath] 目录前缀平移失败:" << q2.lastError().text();
-            ok = false;
-        }
+        qCWarning(lcDb) << "[deleteShareLinkByFileIdsTx] 失败:" << q.lastError().text()
+                 << " owner=" << owner << " count=" << fileIds.size();
     }
     return ok;
 }

@@ -53,11 +53,17 @@ public:
     // REQ-EXT-GROUP-002 T3：群消息在线广播——锁内仅收集目标连接快照，锁外逐连接入
     // 每连接有界发送队列；队列满只丢该连接实时投递（拉取兜底），不阻塞事务与其他成员。
     void broadcastGroupMessage(const QStringList& users, PDU* pdu);
-    // REQ-EXT-SEC-001 M-1: 分享握手登记表——分享人发出邀请时登记 (接收者, 服务端 canonical 源路径)，
-    // 接收者同意移动时仅放行有登记的条目并在成功后消费。仅事件循环主线程（socket 处理器）访问，无需加锁。
-    void addPendingShare(const QString& receiver, const QString& canonicalSource);
-    bool hasPendingShare(const QString& receiver, const QString& canonicalSource) const;
-    void consumePendingShare(const QString& receiver, const QString& canonicalSource);
+    // REQ-EXT-SEC-001 M-1: 分享握手登记表——REQ-SHARE-ENTRYID-001 起登记
+    // (接收者, 分享人, 邀请时条目名, 源条目标识)，接收者同意移动时按该键查回条目
+    // 标识并放行（邀请期间源条目改名/移动不破坏握手，条目已删才拒绝），成功后消费。
+    // 仅事件循环主线程（socket 处理器）访问，无需加锁。
+    void addPendingShare(const QString& receiver, const QString& sharer,
+                         const QString& invitedName, qint64 fileId);
+    // 命中返回源条目标识（>=0），未命中返回 -1
+    qint64 hasPendingShare(const QString& receiver, const QString& sharer,
+                           const QString& invitedName) const;
+    void consumePendingShare(const QString& receiver, const QString& sharer,
+                             const QString& invitedName);
     // REQ-EXT-SESSION-001 D3/D5：用户域登录版本内存登记表（权威持久源=库；进程重启
     // 由重连强制登录自然重建）。登录成功先 set 再踢旧；校验=内存比对，热路径零 DB。
     void setLoginVersion(const QString& user, quint64 ver);
@@ -101,8 +107,8 @@ private:
     QTimer* m_sweepTimer;
     void onSweepTimeout();
 
-    // 分享握手记录：接收者 + 服务端规范化后的源路径 + 登记时刻（用于 TTL 惰性清理）。
-    struct PendingShare { QString receiver; QString canonicalSource; qint64 addedMs; };
+    // 分享握手记录：接收者 + 分享人 + 邀请时条目名 + 源条目标识 + 登记时刻（TTL 惰性清理）。
+    struct PendingShare { QString receiver; QString sharer; QString invitedName; qint64 fileId; qint64 addedMs; };
     QList<PendingShare> m_pendingShares;    // 30 分钟过期、上限 1024，添加时惰性清理
     static const qint64 PENDING_SHARE_TTL_MS = 30*60*1000;
     static const int PENDING_SHARE_MAX = 1024;

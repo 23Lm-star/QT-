@@ -25,6 +25,13 @@ const USER_B = process.env.E2E_USER_B || `webts_b_${ts}`;
 const USER_C = process.env.E2E_USER_C || `webts_c_${ts}`;
 const ROOT = './filesys';
 const CID = 'e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5';
+// REQ-AUTH-CONNECTION-001：验证码冷却/锁定按 clientId 跨连接共享，每个取码步骤用独立 32hex
+let CID_SEQ = 0;
+const nextCid = () => {
+  CID_SEQ += 1;
+  const tail = String(CID_SEQ);
+  return CID.slice(0, 32 - tail.length) + tail;
+};
 
 let tidCounter = 0n;
 const allocTid = () => (tidCounter += 1n);
@@ -56,18 +63,21 @@ class Session {
     const n = new NetClient();
     await n.connect(GW_URL);
     try {
-      const cap = await account.requestCaptcha(n);
+      // REQ-AUTH-CONNECTION-001：验证码冷却按 clientId 跨连接共享，每步用独立 clientId
+      const cid = nextCid();
+      const cap = await account.requestCaptcha(n, cid);
       assert.strictEqual(cap.status, 0, `验证码失败 status=${cap.status}`);
-      const r = await account.register(n, { username: this.name, password: PASSWORD, captcha: cap.code });
+      const r = await account.register(n, { username: this.name, password: PASSWORD, captcha: cap.code, clientId: cid });
       assert.ok(r.success, `注册失败 ret=${r.ret}`);
     } finally { n.close(); }
   }
   async login() {
     this.net = new NetClient();
     await this.net.connect(GW_URL);
-    const cap = await account.requestCaptcha(this.net);
+    const cid = nextCid();
+    const cap = await account.requestCaptcha(this.net, cid);
     assert.strictEqual(cap.status, 0, `验证码失败 status=${cap.status}`);
-    const r = await account.login(this.net, { username: this.name, password: PASSWORD, captcha: cap.code, clientId: CID });
+    const r = await account.login(this.net, { username: this.name, password: PASSWORD, captcha: cap.code, clientId: cid });
     assert.strictEqual(r.ret, 0, `登录失败 ret=${r.ret}`);   // 标准码 0=成功（PROTO-CODE-001）
   }
   close() { if (this.net) { this.net.close(); this.net = null; } }
