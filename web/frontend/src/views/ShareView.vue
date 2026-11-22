@@ -7,6 +7,7 @@ import { useDriveStore } from '../stores/drive.js';
 import { useFriendsStore } from '../stores/friends.js';
 import { useShareStore } from '../stores/share.js';
 import { RENEW_DAY_CHOICES, PUBLINK_STATE_REVOKED, PUBLINK_STATE_VALID } from '../protocol/commands/share.js';
+import { getUserInfo } from '../protocol/commands/friend.js';
 import ShareFilePicker from '../components/ShareFilePicker.vue';
 
 const auth = useAuthStore();
@@ -33,12 +34,29 @@ onMounted(async () => {
   if (!drv.userRoot) await drv.enter(auth.loginName);
 });
 
+const friendOnline = ref({});   // {名字: 是否在线}，由 46/47 逐好友查询（勿与 friends.onlineNames 混用）
+
 async function refreshFriends() {
   await friends.loadFriends();
-  await friends.loadOnlineUsers();
+  await refreshFriendOnline();
 }
-// REQ-PAGE-FETCH-001：onlineUsers 已改为条目数组，按名字匹配用 onlineNames
-function isOnline(name) { return friends.onlineNames.includes(name); }
+// TODO（2026-11-17 登记）：好友在线状态不再借「所有用户」列表——7/8 自始排除好友，
+// onlineNames 对好友恒为空 → 在线点恒灰。改走 46/47 逐好友查询（零协议变更、
+// 分享页好友量级小，并发 N 次可接受），与 friends.onlineNames 语义彻底解耦。
+async function refreshFriendOnline() {
+  const results = await Promise.all(friends.friends.map(async (n) => {
+    try {
+      const info = await getUserInfo(n);
+      return [n, info.code === 0 && info.online === 1];
+    } catch {
+      return [n, false];
+    }
+  }));
+  const next = {};
+  for (const [n, on] of results) next[n] = on;
+  friendOnline.value = next;
+}
+function isOnline(name) { return friendOnline.value[name] === true; }
 function toggleFriend(name) {
   const i = selectedFriends.value.indexOf(name);
   if (i >= 0) selectedFriends.value.splice(i, 1);
