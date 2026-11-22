@@ -117,25 +117,38 @@ def check(sid, desc, cond, detail):
 def bf(d, off=0):
     return d[off] != 0
 
+_CID = [0]
+def next_cid():
+    # 验证码/登录身份（AUTH-CONNECTION-001）：空 cid 的 Redis 键前缀落到连接号，跨运行
+    # 冷却/过期串扰；每请求唯一 cid，与 ENTRYID/AUDIT-001 套件同型。
+    _CID[0] += 1
+    return "%032x" % (int(time.time() * 1000) * 16 + (_CID[0] & 0xF))
+
+def code_of(p):
+    """响应包 caData[0,4) 标准码（PROTO-CODE-001 起：0=成功，负数=领域失败）；None=无响应。"""
+    return None if p is None else struct.unpack("<i", p[1][:4])[0]
+
 def fresh_conn():
     return Conn()
 
 def login_conn(name, pwd=PWD):
     c = Conn()
-    r = c.ask(pdu(T_CAP))
+    cid = next_cid()
+    r = c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0")))
     code = r[0][2].split(b"\0")[0]
-    r = c.ask(pdu(T_LOGIN, msg=code + b"\0", dat=creds(name, pwd)))
-    ret = struct.unpack("<i", r[0][1][:4])[0]
+    r = c.ask(pdu(T_LOGIN, msg=code + b"\0" + cid.encode(), dat=creds(name, pwd)))
+    ret = struct.unpack("<i", r[0][1][:4])[0]   # PROTO-CODE-001 起登录成功码为 0
     return c, ret
 
 def ensure_user(name):
     c = Conn()
-    r = c.ask(pdu(T_CAP))
+    cid = next_cid()
+    r = c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0")))
     code = r[0][2].split(b"\0")[0]
-    r = c.ask(pdu(T_REG, msg=code + b"\0", dat=creds(name)))
+    r = c.ask(pdu(T_REG, msg=code + b"\0" + cid.encode(), dat=creds(name)))
     c.close()
     c, ret = login_conn(name)
-    if ret == 1:
+    if ret == 0:
         c.close()
         return
     c.close()
@@ -195,7 +208,7 @@ probes = [
     (T_UPINIT, "upload-init", pdu(T_UPINIT, msg=(f"./filesys/{A}").encode(), dat=f32("g1.bin") + struct.pack("<q", 4)), T_UPINIT_R),
     (T_FLUSH, "flushfile", pdu(T_FLUSH, msg=(f"./filesys/{B}").encode()), T_FLUSH_R),
     (T_DEL, "delfile", pdu(T_DEL, msg=secret.encode(), dat=struct.pack("<I", 1)), T_DEL_R),
-    (T_DOWN, "download", pdu(T_DOWN, msg=secret.encode(), dat=f32("secret.txt")), T_DOWN_R),
+    (T_DOWN, "download", pdu(T_DOWN, msg=secret.encode(), dat=f32("secret.txt") + b"\0" * 16 + struct.pack("<Q", 1)), T_DOWN_R),
     (T_LIST, "listdir", pdu(T_LIST, msg=b"\0"), T_LIST_R),
     (T_QFL, "query-publink", pdu(T_QFL, msg=f32("x.txt"), dat=f32(B)), T_QFL_R),
     (T_ONLINE, "onlineuser", pdu(T_ONLINE), T_ONLINE_R),
@@ -203,7 +216,7 @@ probes = [
 for t, label, pkt, rt in probes:
     c = fresh_conn()
     r = c.ask(pkt)
-    ok = r and r[0][0] == rt and (r[0][2] == b"" or bf(r[0][1]) == False)
+    ok = r and r[0][0] == rt and code_of(r[0]) != 0   # 未认证拒绝=非 0 标准码（旧判读为空载荷/ret 字节）
     check(f"G1-{label}", f"未认证 {label} 被拒且失败响应", ok, f"resp={r[0][0] if r else 'NONE'}")
     c.close()
 c = fresh_conn()
@@ -215,9 +228,9 @@ time.sleep(0.3)
 
 print("=== L1 登录绑定后本人操作正常（验收4回归） ===")
 ca, ret = login_conn(A)
-check("L1a", f"{A} 登录成功 ret=1", ret == 1, f"ret={ret}")
+check("L1a", f"{A} 登录成功", ret == 0, f"ret={ret}")
 r = ca.ask(pdu(T_MKDIR, msg=(f"./filesys/{A}").encode(), dat=f32("workdir")))
-check("L1b", "登录后本人根内 MKDIR 成功", r and r[0][0] == T_MKDIR_R and bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+check("L1b", "登录后本人根内 MKDIR 成功", r and r[0][0] == T_MKDIR_R and code_of(r[0]) == 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 r = ca.ask(pdu(T_FLUSH, msg=(f"./filesys/{A}").encode()))
 check("L1c", "登录后本人根 FLUSHFILE 有条目", r and r[0][0] == T_FLUSH_R and len(r[0][2]) > 0, f"msg_len={len(r[0][2]) if r else 0}")
 
@@ -226,19 +239,19 @@ for t, label, pkt, rt in [
     (T_FLUSH, "列他人目录", pdu(T_FLUSH, msg=(f"./filesys/{B}").encode()), T_FLUSH_R),
     (T_DEL, "删他人文件", pdu(T_DEL, msg=secret.encode(), dat=struct.pack("<I", 1)), T_DEL_R),
     (T_DOWN, "下载他人文件", pdu(T_DOWN, msg=secret.encode(), dat=f32("secret.txt")), T_DOWN_R),
-    (T_UPINIT, "传到他人目录", pdu(T_UPINIT, msg=(f"./filesys/{B}").encode(), dat=f32("evil.bin") + struct.pack("<q", 4)), T_UPINIT_R),
+    (T_UPINIT, "传到他人目录", pdu(T_UPINIT, msg=(f"./filesys/{B}").encode(), dat=f32("evil.bin") + struct.pack("<q", 4) + struct.pack("<I", MAGIC) + b"\0" * 4 + struct.pack("<Q", 1)), T_UPINIT_R),
     (T_CHGDIR, "切入他人目录", pdu(T_CHGDIR, msg=(f"./filesys/{B}").encode()), T_CHGDIR_R),
 ]:
     r = ca.ask(pkt)
-    refused = r and r[0][0] == rt and (len(r[0][2]) == 0 or not bf(r[0][1]))
-    check(f"X1-{label}", f"{A} 会话中 {label} 被拒", refused, f"ret={bf(r[0][1]) if r else 'NORESP'} len={len(r[0][2]) if r else '-'}")
+    refused = r and r[0][0] == rt and code_of(r[0]) != 0   # 拒绝=非 0 标准码
+    check(f"X1-{label}", f"{A} 会话中 {label} 被拒", refused, f"code={code_of(r[0]) if r else 'NORESP'} len={len(r[0][2]) if r else '-'}")
 check("X1-victim", "他人文件完好", open(secret).read() == "VICTIM-CONTENT-DO-NOT-TOUCH", "内容一致")
 r = ca.ask(pdu(T_QFL, msg=f32("secret.txt"), dat=f32(B)))
-check("X1-跨查链接", "以他人 owner 字段查链接无效（按 actor 查）", r and r[0][0] == T_QFL_R and not bf(r[0][1]), f"exists={bf(r[0][1]) if r else 'NORESP'}")
+check("X1-跨查链接", "以他人 owner 字段查链接无效（按 actor 查）", r and r[0][0] == T_QFL_R and code_of(r[0]) != 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 
 print("=== X2 伪造发送者字段无效（验收2） ===")
 cb, ret = login_conn(B)
-check("X2a", f"{B} 登录成功", ret == 1, f"ret={ret}")
+check("X2a", f"{B} 登录成功", ret == 0, f"ret={ret}")
 xmsg = b"helloX2\0"
 xtm = time.strftime("%Y-%m-%d %H:%M:%S").encode()[:29].ljust(30, b"\0")
 xbody = struct.pack("<II", 38 + len(xmsg), len(xmsg)) + xtm + xmsg
@@ -249,42 +262,51 @@ sender_ok = got and got[0][1][:31].split(b"\0")[0].decode() == A
 check("X2b", "B 收到的转发报文发送人=服务端actor(非伪造名)", sender_ok, f"sender={got[0][1][:31].split(chr(0).encode())[0] if got else 'NONE'}")
 
 print("=== X3 伪造注销用户名删不掉他人账号（验收2/危险面） ===")
-r = ca.ask(pdu(T_LOGOFF, dat=creds(V, "wrongpwd")))
-check("X3a", "A 会话发注销V：按actor=A校验且密码错→被拒", r and r[0][0] == T_LOGOFF_R and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+# REQ-CLI-MSGSTORE-001 后服务端对 15 会给发送方回一条 16 应答（msghandler 聊天段），
+# X2 发的私聊把 16 留在 ca 缓冲：此处 n=2 取包后按类型取 49、排空残留 16，断言与预期结果不变。
+r_all = ca.ask(pdu(T_LOGOFF, dat=creds(V, "wrongpwd")), n=2, t=1.5)
+r = next((p for p in r_all if p[0] == T_LOGOFF_R), None)
+check("X3a", "A 会话发注销V：按actor=A校验且密码错→被拒", r is not None and code_of(r) != 0, f"code={code_of(r) if r is not None else 'NORESP'}")
 cv, ret = login_conn(V)
-check("X3b", "V 账号仍存活可登录", ret == 1, f"ret={ret}")
+check("X3b", "V 账号仍存活可登录", ret == 0, f"ret={ret}")
 cv.close()
 check("X3c", "V 文件根目录仍在", os.path.isdir(os.path.join(SBX, V)), "存在")
 
 print("=== R1 注销后旧连接业务被拒（验收3） ===")
 cr, ret = login_conn(R)
-check("R1a", f"{R} 登录成功", ret == 1, f"ret={ret}")
+check("R1a", f"{R} 登录成功", ret == 0, f"ret={ret}")
 r = cr.ask(pdu(T_MKDIR, msg=(f"./filesys/{R}").encode(), dat=f32("rdir")))
-check("R1b", "注销前本人 MKDIR 成功", r and bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+check("R1b", "注销前本人 MKDIR 成功", r and code_of(r[0]) == 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 r = cr.ask(pdu(T_LOGOFF, dat=creds(R)))
-check("R1c", "本人正确密码注销成功", r and r[0][0] == T_LOGOFF_R and bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+check("R1c", "本人正确密码注销成功", r and r[0][0] == T_LOGOFF_R and code_of(r[0]) == 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 check("R1d", "注销后本人目录已删（既有行为保留）", not os.path.isdir(os.path.join(SBX, R)), "不存在")
 r = cr.ask(pdu(T_FLUSH, msg=(f"./filesys/{A}").encode()))
 check("R1e", "注销后同连接业务请求被拒（空响应=失败响应）", r and r[0][0] == T_FLUSH_R and len(r[0][2]) == 0, f"len={len(r[0][2]) if r else 'NORESP'}")
-r = cr.ask(pdu(T_DOWN, msg=secret.encode(), dat=f32("secret.txt")))
-check("R1f", "注销后不能继续访问群文件（下载他人被拒）", r and r[0][0] == T_DOWN_R and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+r = cr.ask(pdu(T_DOWN, msg=secret.encode(), dat=f32("secret.txt") + b"\0" * 16 + struct.pack("<Q", 1)))
+check("R1f", "注销后不能继续访问群文件（下载他人被拒）", r and r[0][0] == T_DOWN_R and code_of(r[0]) != 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 cr.close()
 
 print("=== R2 断线后新连接无残留身份（验收3） ===")
 cb.close()
 c2, ret = login_conn(B)
-check("R2a", f"{B} 重新登录成功（账号存活）", ret == 1, f"ret={ret}")
+check("R2a", f"{B} 重新登录成功（账号存活）", ret == 0, f"ret={ret}")
 cv2, retv = login_conn(V)
-def online_names():
+def online_entries():
+    # 7/8 新布局（PAGE-FETCH-001/002）：caMsg 每条 33B=名字[32]+online(u8)；
+    # 含离线、排除自己与双向好友——「在列表中」不再等价于在线，须读 online 标记。
     r = c2.ask(pdu(T_ONLINE))
     blob = r[0][2] if r else b""
-    return [blob[i * 32:i * 32 + 32].split(b"\0")[0].decode() for i in range(len(blob) // 32)]
-n1 = online_names()
-check("R2b1", "V 在线且 B 不在自己的在线列表", retv == 1 and V in n1 and B not in n1, f"online={n1}")
+    out = {}
+    for i in range(len(blob) // 33):
+        e = blob[i * 33:i * 33 + 33]
+        out[e[:32].split(b"\0")[0].decode()] = e[32] != 0
+    return out
+n1 = online_entries()
+check("R2b1", "V 在线且 B 不在自己的在线列表", retv == 0 and n1.get(V) is True and B not in n1, f"online={n1}")
 cv2.close()
 time.sleep(0.4)
-n2 = online_names()
-check("R2b2", "V 断线后从在线列表移除（撤销生效）", V not in n2, f"online={n2}")
+n2 = online_entries()
+check("R2b2", "V 断线后在线状态撤销（在线标记归 0 或条目移除）", not n2.get(V, False), f"online={n2}")
 cn = fresh_conn()
 r = cn.ask(pdu(T_FLUSH, msg=(f"./filesys/{B}").encode()))
 check("R2c", "新连接未登录读他人根被拒", r and len(r[0][2]) == 0, f"len={len(r[0][2]) if r else 'NORESP'}")
@@ -293,30 +315,41 @@ cn.close()
 print("=== K1 上传/下载/分享回归（验收4） ===")
 payload = bytes(range(256)) * 4  # 1KB
 updir = f"./filesys/{A}/workdir"
-r = ca.ask(pdu(T_UPINIT, msg=updir.encode(), dat=f32("up.bin") + struct.pack("<q", len(payload)) + struct.pack("<I", MAGIC)))
-check("K1a", "本人根内上传初始化成功", r and bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+r = ca.ask(pdu(T_UPINIT, msg=updir.encode(), dat=f32("up.bin") + struct.pack("<q", len(payload)) + struct.pack("<I", MAGIC) + b"\0" * 4 + struct.pack("<Q", 1)))
+check("K1a", "本人根内上传初始化成功", r and code_of(r[0]) == 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 ok_acks = True
 for i in range(0, len(payload), 600):
     chunk = payload[i:i + 600]
-    pkt = pdu(T_UPDATA, msg=chunk, dat=struct.pack("<q", i) + b"\0" * 32 + struct.pack("<I", MAGIC))
+    pkt = pdu(T_UPDATA, msg=chunk, dat=struct.pack("<q", i) + b"\0" * 32 + struct.pack("<I", MAGIC) + b"\0" * 4 + struct.pack("<Q", 1))
     a_ = ca.ask(pkt)
-    if not a_ or a_[0][0] != T_UPDATA_R or not bf(a_[0][1]):
+    # 32 同步响应恒 WRITE_FAILED、成功转正由写任务异步补发（PROTO-CODE 后旧 ret 字节判读失效），
+    # 这里只要求每块有 32 响应；完成收口由 K1c 条目轮询承担。
+    if not a_ or a_[0][0] != T_UPDATA_R:
         ok_acks = False
-check("K1b", "上传分块全部 ack 成功", ok_acks, f"chunks={ (len(payload)+599)//600 }")
+check("K1b", "上传分块全部有 ack", ok_acks, f"chunks={ (len(payload)+599)//600 }")
 # D5：上传以内容寻址对象落盘，不再物理写用户树——条目即"落盘"（适配=owner 批准 D5，task.md 记录）
 upsha = hashlib.sha256(payload).hexdigest()
+k1c_ok = False
+for _ in range(50):   # 转正异步（写任务+复算），轮询条目落库 ≤5s
+    if sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
+           f"WHERE uf.owner_name='{A}' AND uf.display_name='up.bin' AND uf.status='active' "
+           f"AND fo.sha256='{upsha}' AND fo.size_bytes={len(payload)}") == "1":
+        k1c_ok = True
+        break
+    time.sleep(0.1)
 check("K1c", "条目落盘+对象摘要一致+用户树无物理写(D5适配)",
-      sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
-          f"WHERE uf.owner_name='{A}' AND uf.display_name='up.bin' AND uf.status='active' "
-          f"AND fo.sha256='{upsha}' AND fo.size_bytes={len(payload)}") == "1"
+      k1c_ok
       and not os.path.isfile(os.path.join(SBX, A, "workdir", "up.bin")),
       f"sha={upsha[:8]}")
-r = ca.ask(pdu(T_DOWN, msg=(updir + "/up.bin").encode(), dat=f32("up.bin")))
+# 41 新布局（TRANSFER-001/002）：40 请求须带有效 transfer id（caData[48,56)），响应
+# caData[0,4)=标准码、[4,12)=文件大小、[16,24)=回带 id；正文仍走 42 流式 caMsg。
+r = ca.ask(pdu(T_DOWN, msg=(updir + "/up.bin").encode(),
+               dat=f32("up.bin") + b"\0" * 16 + struct.pack("<Q", 1)))
 meta = r[0] if r else None
-dl_ok = meta and meta[0] == T_DOWN_R and bf(meta[1])
+dl_ok = meta and meta[0] == T_DOWN_R and code_of(meta) == 0
 data = b"".join(p[2] for p in (r[1:] if r else []) if p[0] == T_DDOWN)
 if dl_ok:
-    size = struct.unpack("<q", meta[1][1:9])[0]
+    size = struct.unpack("<q", meta[1][4:12])[0]
     deadline = time.time() + 8
     while len(data) < size and time.time() < deadline:
         for p in ca.idle(1.0):
@@ -325,6 +358,7 @@ if dl_ok:
 check("K1d", "下载流式回读内容一致", dl_ok and len(data) == len(payload) and data == payload, f"bytes={len(data)}/{len(payload) if payload else 0}")
 
 ca.ask(pdu(T_SHARE, msg=f32(B) + (f"./filesys/{A}/workdir/up.bin").encode(), dat=f32(V) + struct.pack("<i", 1)), n=0, t=0.6)
+ca.idle(0.8)   # 排空 34 应答（n=0 不消费），避免残留包污染后续按类型取包的断言
 time.sleep(0.2)
 fwd = c2.idle(1.5)
 ag = [p for p in fwd if p[0] == T_AGREE]
@@ -337,37 +371,41 @@ if sh_ok:
     # F-3/D5 修复：A 本人根的逻辑键为 '/'（owner 相对，跨树确定）
     entry_a = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{A}' AND parent_path='/' AND display_name='up.bin' AND status='active'")
     check("K1f", "接收者谎报目标名：条目仍只落 B 本人根(D5适配)",
-          fin and bf(fin[0][1]) and entry_b == "1" and entry_a == "0",
-          f"ret={bf(fin[0][1]) if fin else 'NORESP'} inB={entry_b} inA={entry_a}")
+          fin and code_of(fin[0]) == 0 and entry_b == "1" and entry_a == "0",
+          f"code={code_of(fin[0]) if fin else 'NORESP'} inB={entry_b} inA={entry_a}")
 
 r = ca.ask(pdu(T_MKDIR, msg=(f"./filesys/{A}").encode(), dat=f32("evil\\..\\out")))
-check("K1g", "穿越名段仍被拒（FS-003 回归）", r and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+mk = next((p for p in r if p[0] == T_MKDIR_R), None)
+check("K1g", "穿越名段仍被拒（FS-003 回归）", mk is not None and code_of(mk) != 0, f"code={code_of(mk) if mk else 'NORESP'}")
 r = ca.ask(pdu(T_CHGDIR, msg=b"C:/Windows"))
-check("K1h", "沙箱外探测按不存在（回归）", r and not bf(r[0][1]), f"isExist={bf(r[0][1]) if r else 'NORESP'}")
+cd = next((p for p in r if p[0] == T_CHGDIR_R), None)
+check("K1h", "沙箱外探测按不存在（回归）", cd is not None and code_of(cd) != 0, f"code={code_of(cd) if cd else 'NORESP'}")
 r = ca.ask(pdu(T_REN, msg=struct.pack("<I", 1) + updir.encode(), dat=f32("up.bin") + f32("up2.bin")))
-check("K1i", "本人重命名成功", r and bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+rn = next((p for p in r if p[0] == T_REN_R), None)
+check("K1i", "本人重命名成功", rn is not None and code_of(rn) == 0, f"code={code_of(rn) if rn else 'NORESP'}")
 r = ca.ask(pdu(T_REN, msg=struct.pack("<I", 1) + (f"./filesys/{B}").encode(), dat=f32("secret.txt") + f32("hijack.txt")))
-check("K1j", "重命名他人文件被拒", r and not bf(r[0][1]) and os.path.isfile(secret), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+rn2 = next((p for p in r if p[0] == T_REN_R), None)
+check("K1j", "重命名他人文件被拒", rn2 is not None and code_of(rn2) != 0 and os.path.isfile(secret), f"code={code_of(rn2) if rn2 else 'NORESP'}")
 
 print("=== K2 M-1 分享握手登记：伪造/重放同意 ===")
 forged = (f"./filesys/{A}/workdir/up2.bin").encode()
 r = c2.ask(pdu(T_AGREE_R, msg=forged, dat=f32(B)))
 landed_f = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{B}' AND display_name='up2.bin' AND status='active'") != "0"
-check("K2a", "未分享给 B 的源伪造同意被拒且无落地", r and r[0][0] == T_FINISH and not bf(r[0][1]) and not landed_f, f"ret={bf(r[0][1]) if r else 'NORESP'} landed={landed_f}")
+check("K2a", "未分享给 B 的源伪造同意被拒且无落地", r and r[0][0] == T_FINISH and code_of(r[0]) != 0 and not landed_f, f"code={code_of(r[0]) if r else 'NORESP'} landed={landed_f}")
 ca.ask(pdu(T_SHARE, msg=f32(B) + forged, dat=f32(A) + struct.pack("<i", 1)))
 fwd = c2.idle(1.5)
 ag = [p for p in fwd if p[0] == T_AGREE]
 r = c2.ask(pdu(T_AGREE_R, msg=ag[0][2], dat=f32(B))) if ag else []
 landed = sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{B}' AND display_name='up2.bin' AND status='active'") == "1"
-check("K2b", "握手登记后正常同意成功落地(D5适配为条目落地)", bool(ag) and r and bf(r[0][1]) and landed, f"agree={bool(ag)} ret={bf(r[0][1]) if r else 'NORESP'}")
+check("K2b", "握手登记后正常同意成功落地(D5适配为条目落地)", bool(ag) and r and code_of(r[0]) == 0 and landed, f"agree={bool(ag)} code={code_of(r[0]) if r else 'NORESP'}")
 r = c2.ask(pdu(T_AGREE_R, msg=ag[0][2], dat=f32(B)))
-check("K2c", "登记一次性消费：重放同意被拒", r and r[0][0] == T_FINISH and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+check("K2c", "登记一次性消费：重放同意被拒", r and r[0][0] == T_FINISH and code_of(r[0]) != 0, f"code={code_of(r[0]) if r else 'NORESP'}")
 # B-1：A 把 B 的文件"分享给自己"→ 源不属于分享人：不登记不转发；随后 A 自我同意必须失败
 bsecret = (f"./filesys/{B}/secret.txt").encode()
 ca.ask(pdu(T_SHARE, msg=f32(A) + bsecret, dat=f32(A) + struct.pack("<i", 1)))
 r = ca.ask(pdu(T_AGREE_R, msg=bsecret, dat=f32(A)))
 stolen = os.path.exists(os.path.join(SBX, A, "secret.txt"))
-check("K2d", "B-1：自我登记他人源→自我同意链被拒且无复制", r and r[0][0] == T_FINISH and not bf(r[0][1]) and not stolen, f"ret={bf(r[0][1]) if r else 'NORESP'} stolen={stolen}")
+check("K2d", "B-1：自我登记他人源→自我同意链被拒且无复制", r and r[0][0] == T_FINISH and code_of(r[0]) != 0 and not stolen, f"code={code_of(r[0]) if r else 'NORESP'} stolen={stolen}")
 
 ca.close(); c2.close()
 stop_server()
