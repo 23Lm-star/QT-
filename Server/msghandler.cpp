@@ -995,6 +995,18 @@ PDU *MsgHandler::deldir(const QString& loginName)
         if(e.valid()){
             if(e.isDir){
                 ans = FileObjectStore::instance().releaseSubtree(e.fileId, loginName);
+                if(ans){
+                    // 目录壳与条目分离清理：软删成功后同步 removeRecursively 物理目录壳。
+                    // D5 后文件不物理落用户树，壳内无可达数据；不清理则磁盘孤儿目录留存
+                    // （2026-11-22 实证：软删后列表已不显示（墓碑过滤）、用户无入口做第二次删除）。
+                    // 失败不推翻软删结果：告警 + 目录补偿队列重试，「无条目残留回收」分支仍兜底。
+                    QDir shell(delFilePath);
+                    if(shell.exists() && !shell.removeRecursively()){
+                        qCWarning(lcFs)<<"[deldir] 物理目录壳清理失败，交目录补偿 conn="<<m_connId<<":"<<delFilePath;
+                        enqueueDirectoryFailure(QStringLiteral("delete_directory"), loginName,
+                                                delFilePath, QString(), QStringLiteral("删除物理残留目录失败"));
+                    }
+                }
             } else {
                 ans = FileObjectStore::instance().releaseEntry(e.fileId, loginName);
             }
