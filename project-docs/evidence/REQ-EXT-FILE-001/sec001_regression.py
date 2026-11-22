@@ -249,8 +249,11 @@ sender_ok = got and got[0][1][:31].split(b"\0")[0].decode() == A
 check("X2b", "B 收到的转发报文发送人=服务端actor(非伪造名)", sender_ok, f"sender={got[0][1][:31].split(chr(0).encode())[0] if got else 'NONE'}")
 
 print("=== X3 伪造注销用户名删不掉他人账号（验收2/危险面） ===")
-r = ca.ask(pdu(T_LOGOFF, dat=creds(V, "wrongpwd")))
-check("X3a", "A 会话发注销V：按actor=A校验且密码错→被拒", r and r[0][0] == T_LOGOFF_R and not bf(r[0][1]), f"ret={bf(r[0][1]) if r else 'NORESP'}")
+# REQ-CLI-MSGSTORE-001 后服务端对 15 会给发送方回一条 16 应答（msghandler 聊天段），
+# X2 发的私聊把 16 留在 ca 缓冲：此处 n=2 取包后按类型取 49、排空残留 16，断言与预期结果不变。
+r_all = ca.ask(pdu(T_LOGOFF, dat=creds(V, "wrongpwd")), n=2, t=1.5)
+r = next((p for p in r_all if p[0] == T_LOGOFF_R), None)
+check("X3a", "A 会话发注销V：按actor=A校验且密码错→被拒", r and not bf(r[1]), f"ret={bf(r[1]) if r else 'NORESP'}")
 cv, ret = login_conn(V)
 check("X3b", "V 账号仍存活可登录", ret == 1, f"ret={ret}")
 cv.close()
