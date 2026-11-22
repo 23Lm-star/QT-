@@ -178,20 +178,36 @@ class Conn:
             pass
 
 
-def cap_raw(c):
-    return c.ask(pdu(T_CAP), T_CAP_R)
+_CID_SEQ = [0]
+
+
+def next_cid():
+    # 验证码/登录身份（AUTH-CONNECTION-001）：空 cid 的 Redis 键前缀落到连接号，跨运行
+    # 冷却/过期串扰（R8 空载荷即此因）；每请求唯一 cid，与 ENTRYID 套件同型。
+    _CID_SEQ[0] = (_CID_SEQ[0] + 1) & 0xF
+    return '%032x' % (int(time.time() * 1000) * 16 + _CID_SEQ[0])
+
+
+def code_of(r):
+    """响应 caData[0,4) 标准码（PROTO-CODE-001 起）；无响应返回 None。"""
+    return None if r is None else struct.unpack('<i', r[1][:4])[0]
+
+
+def cap_raw(c, cid):
+    return c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b'\0')), T_CAP_R)
 
 
 def cap_login(name):
     c = Conn()
-    r = cap_raw(c)
+    cid = next_cid()
+    r = cap_raw(c, cid)
     if r is None:
         raise RuntimeError('验证码响应缺失')
     code = r[2].split(b'\0')[0]
-    r = c.ask(pdu(T_LOGIN, msg=code + b'\0',
+    r = c.ask(pdu(T_LOGIN, msg=code + b'\0' + cid.encode(),
                   dat=f32(name) + hashlib.md5(PWD.encode()).hexdigest().encode()), T_LOGIN_R)
-    ret = struct.unpack('<i', r[1][:4])[0] if r else -99
-    if ret != 1:
+    ret = code_of(r)
+    if ret != 0:   # PROTO-CODE-001 起登录成功码为标准码 0
         c.close()
         raise RuntimeError('登录失败 ' + name + ' ret=' + str(ret))
     return c
@@ -199,8 +215,9 @@ def cap_login(name):
 
 def ensure_user(name):
     c = Conn()
-    code = cap_raw(c)[2].split(b'\0')[0]
-    c.ask(pdu(T_REG, msg=code + b'\0',
+    cid = next_cid()
+    code = cap_raw(c, cid)[2].split(b'\0')[0]
+    c.ask(pdu(T_REG, msg=code + b'\0' + cid.encode(),
               dat=f32(name) + hashlib.md5(PWD.encode()).hexdigest().encode()), T_REG_R)
     c.close()
     cap_login(name).close()
@@ -214,18 +231,24 @@ def upload(c, tid, rel_dir, name, data):
     dat[40:44] = u32(MAGIC)
     dat[48:56] = u64(tid)
     r = c.ask(pdu(T_UP_INIT, msg=rel_dir.encode(), dat=bytes(dat)), T_UP_INIT_R)
-    if not r or not r[1][0]:
+    if code_of(r) != 0:   # 30 的 caData[0,4) 已是标准码（PROTO-CODE-001）
         raise RuntimeError('29 初始化被拒')
-    # 31：偏移 0 + magic + tid
+    # 31：偏移 0 + magic + tid。32 同步响应恒 WRITE_FAILED，完成转正由写任务异步补发，
+    # 故按条目落库轮询收口（小文件毫秒级，上限 ~5s）。
     d31 = bytearray(64)
     d31[0:8] = struct.pack('<q', 0)
     d31[40:44] = u32(MAGIC)
     d31[48:56] = u64(tid)
-    r = c.ask(pdu(T_UP_DATA, msg=data, dat=bytes(d31)), T_UP_DATA_R, timeout=30)
-    if not r or not r[1][0]:
-        raise RuntimeError('31 上传被拒/未完成')
-    row = q1("SELECT file_id, object_id FROM user_file WHERE owner_name=%s AND display_name=%s "
-             "AND status='active'", (A, name))
+    c.ask(pdu(T_UP_DATA, msg=data, dat=bytes(d31)), T_UP_DATA_R, timeout=30)
+    row = None
+    for _ in range(50):
+        row = q1("SELECT file_id, object_id FROM user_file WHERE owner_name=%s AND display_name=%s "
+                 "AND status='active'", (A, name))
+        if row:
+            break
+        time.sleep(0.1)
+    if not row:
+        raise RuntimeError('31 上传未完成（条目未落库）')
     return row
 
 
@@ -243,7 +266,7 @@ def main():
         return 2
     try:
         c = Conn()
-        r = cap_raw(c)
+        r = cap_raw(c, next_cid())
         c.close()
         payload = r[2] if r else b''
         check('R8-1 载荷是 PNG', payload.startswith(PNG_SIG), payload[:8])
@@ -276,14 +299,14 @@ def main():
         # C 伪造"A 向 C 发过请求"：没有 pending → 拒绝
         r = cc.ask(pdu(T_ADDFRIEND_R, dat=f32(C) + f32(A)), T_ADDFRIEND_R)
         ret = struct.unpack('<i', r[1][:4])[0] if r else -99
-        check('R4-2 无 pending 的接受被拒绝', ret == 0, 'ret=%s' % ret)
+        check('R4-2 无 pending 的接受被拒绝', ret == -2016, 'ret=%s' % ret)  # NO_PENDING_REQUEST（标准码，旧断言 ret==0 为旧 bool 语义）
         check('R4-3 拒绝后没有伪造好友行',
               q1("SELECT COUNT(*) FROM friend WHERE (name=%s AND friendName=%s) OR (name=%s AND friendName=%s)",
                  (A, C, C, A))[0] == 0)
         # B 正常接受 A
         r = cb.ask(pdu(T_ADDFRIEND_R, dat=f32(B) + f32(A)), T_ADDFRIEND_R)
         ret = struct.unpack('<i', r[1][:4])[0] if r else -99
-        check('R4-4 正常接受成功', ret == 1, 'ret=%s' % ret)
+        check('R4-4 正常接受成功', ret == 0, 'ret=%s' % ret)  # 标准码 0=成功（PROTO-CODE-001）
         ab = q1("SELECT COUNT(*) FROM friend WHERE name=%s AND friendName=%s", (A, B))[0]
         ba = q1("SELECT COUNT(*) FROM friend WHERE name=%s AND friendName=%s", (B, A))[0]
         check('R4-5 双向关系同一事务写入', ab == 1 and ba == 1, (ab, ba))
@@ -337,7 +360,7 @@ def main():
         d97[28:32] = u32(len(req))
         body97 = sha + name + ('./filesys/' + A).encode() + req
         r = ca.ask(pdu(T_FASTCHECK, msg=body97, dat=bytes(d97)), T_FASTCHECK_R)
-        hit = r[1][1] if r else 0
+        hit = r[1][4] if r else 0   # 98 布局：[0,4)=标准码，HIT 在 [4]（PROTO-CODE-001）
         check('R9-1 秒传命中', bool(hit))
         sess = qall("SELECT session_id FROM upload_session WHERE client_request_id=%s", (req.decode(),))
         ents = qall("SELECT file_id FROM user_file WHERE owner_name=%s AND display_name=%s AND status='active'",
@@ -357,7 +380,8 @@ def main():
             if action is not None:
                 msg += action.encode() + b'\0' + str(seconds or '').encode()
             r = ca.ask(pdu(T_CREATE_PUB, msg=msg), T_CREATE_PUB_R)
-            return (bool(r[1][0]), r[2].split(b'\0')[0].decode() if r and r[1][0] else '')
+            ok = code_of(r) == 0   # 53 的 caData[0,4)=标准码，token 在 caMsg（PROTO-CODE-001）
+            return (ok, r[2].split(b'\0')[0].decode() if ok else '')
 
         ok1, _ = create_link('../aud2/secret.bin')
         ok2, _ = create_link('no-such-dir/x.bin')
@@ -368,15 +392,15 @@ def main():
 
         tok1 = link1.rsplit('/', 1)[-1]
         r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok1.encode()), T_RESOLVE_PUB_R)
-        check('R6-1 原 token 可解析', bool(r[1][0]))
+        check('R6-1 原 token 可解析', code_of(r) == 0)   # 55 的 caData[0,4)=标准码
 
         ok4, link2 = create_link('auditfile.bin', action='new')
         tok2 = link2.rsplit('/', 1)[-1] if link2 else ''
         check('R6-2 重新生成成功', ok4 and tok2 and tok2 != tok1, (ok4, tok2[:8]))
         r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok1.encode()), T_RESOLVE_PUB_R)
-        check('R6-3 旧 token 立即失效', not r[1][0])
+        check('R6-3 旧 token 立即失效', code_of(r) is not None and code_of(r) != 0)
         r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok2.encode()), T_RESOLVE_PUB_R)
-        check('R6-4 新 token 可解析', bool(r[1][0]))
+        check('R6-4 新 token 可解析', code_of(r) == 0)
         qexec("DELETE FROM user_file WHERE owner_name=%s AND parent_path='/分享链接/'", (C,))
 
         # ---------- R7 文件与链接一致 ----------
@@ -391,18 +415,18 @@ def main():
         d27[32:64] = f32('auditfile-ren.bin')
         abs_dir = ('./filesys/' + A).encode()
         r = ca.ask(pdu(T_RENAME, msg=u32(1) + abs_dir, dat=bytes(d27)), T_RENAME_R)
-        check('R7-1 改名成功', bool(r[1][0]))
+        check('R7-1 改名成功', code_of(r) == 0)   # 28 的 caData[0,4)=标准码（PROTO-CODE-001）
         r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok2.encode()), T_RESOLVE_PUB_R)
-        check('R7-2a 改名后原 token 仍可解析（重命名不联动链接）', r is not None and bool(r[1][0]))
+        check('R7-2a 改名后原 token 仍可解析（重命名不联动链接）', code_of(r) == 0)
         link_after = qall("SELECT file_id FROM share_link WHERE owner_name=%s", (A,))
         check('R7-2b 链接记录未因改名变化',
               fid_before is not None and (fid_before[0],) in link_after, link_after)
         d25 = bytearray(64)
         d25[0:4] = u32(1)
         r = ca.ask(pdu(T_DELFILE, msg=(abs_dir + b'/auditfile-ren.bin'), dat=bytes(d25)), T_DELFILE_R)
-        check('R7-3 删除成功', bool(r[1][0]))
+        check('R7-3 删除成功', code_of(r) == 0)
         r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok2.encode()), T_RESOLVE_PUB_R)
-        check('R7-4a 删除后 token 立即失效', r is not None and not bool(r[1][0]))
+        check('R7-4a 删除后 token 立即失效', code_of(r) is not None and code_of(r) != 0)
         left = qall("SELECT file_id FROM share_link WHERE owner_name=%s AND file_id=%s",
                     (A, fid_before[0] if fid_before else -1))
         check('R7-4b 删除后链接同事务清除', not left, left)
@@ -420,7 +444,7 @@ def main():
         check('R3-1 注销前存在资产', before_files > 0 and before_sess > 0 and before_gm > 0,
               (before_files, before_sess, before_gm))
         r = ca.ask(pdu(T_LOGOFF, dat=f32(A) + hashlib.md5(PWD.encode()).hexdigest().encode()), T_LOGOFF_R)
-        check('R3-2 注销成功', bool(r[1][0]))
+        check('R3-2 注销成功', code_of(r) == 0)   # 49 的 caData[0,4)=标准码（PROTO-CODE-001）
         after_files = q1("SELECT COUNT(*) FROM user_file WHERE owner_name=%s", (A,))[0]
         after_sess = q1("SELECT COUNT(*) FROM upload_session WHERE owner_name=%s", (A,))[0]
         after_gm = q1("SELECT COUNT(*) FROM group_member WHERE user_name=%s AND status='active'", (A,))[0]
