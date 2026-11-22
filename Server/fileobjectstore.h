@@ -128,12 +128,8 @@ public:
     // 条目 → 对象绝对路径（下载/迁移用）；对象不存在或已标回收失败返回空。
     QString objectAbsPath(qint64 objectId) const;
 
-    // 列出 parent 下 active 条目（flushfile/listdir 渲染）；无记录返回空表。
+    // 列出 parent 下 active 条目（flushfile/listdir 渲染，数据库为唯一数据来源）；无记录返回空表。
     QList<EntryInfo> listEntries(const QString& owner, const QString& parentPath) const;
-
-    // parent 下已软删条目名集合（status='deleted'）：目录软删不落盘（D5），物理目录
-    // 在回收调度前仍存在，列目录时按此过滤，避免"删除成功后列表仍显示"（REQ-PAGE-FETCH-001 GUI 实测）。
-    QSet<QString> deletedDisplayNames(const QString& owner, const QString& rawParentPath) const;
 
     // 查询单条目（含目录）；不存在返回 invalid。
     EntryInfo entryByPath(const QString& owner, const QString& parentPath,
