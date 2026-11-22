@@ -68,32 +68,50 @@ def check(sid, desc, cond, detail=""):
     results.append((sid, desc, bool(cond)))
     print(f"[{'PASS' if cond else 'FAIL'}] {sid} {desc} :: {detail}")
 
+_CID = [0]
+def next_cid():
+    # 验证码/登录身份（AUTH-CONNECTION-001）：空 cid 的 Redis 键前缀落到连接号，跨运行
+    # 冷却/过期串扰；每请求唯一 cid，与其它已适配套件同型（REQ-TEST-BASELINE-001）。
+    _CID[0] = (_CID[0] + 1) & 0xF
+    return "%032x" % (int(time.time() * 1000) * 16 + _CID[0])
+
 def login_conn(name):
     c = Conn()
-    r = c.ask(pdu(T_CAP))
+    cid = next_cid()
+    r = c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0")))
     code = r[0][2].split(b"\0")[0]
-    c.ask(pdu(T_REG, msg=code + b"\0", dat=creds(name)))
+    c.ask(pdu(T_REG, msg=code + b"\0" + cid.encode(), dat=creds(name)))
     c.close()
     c = Conn()
-    r = c.ask(pdu(T_CAP)); code = r[0][2].split(b"\0")[0]
-    r = c.ask(pdu(T_LOGIN, msg=code + b"\0", dat=creds(name)))
-    ret = struct.unpack("<i", r[0][1][:4])[0]
+    cid = next_cid()
+    r = c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0"))); code = r[0][2].split(b"\0")[0]
+    r = c.ask(pdu(T_LOGIN, msg=code + b"\0" + cid.encode(), dat=creds(name)))
+    ret = struct.unpack("<i", r[0][1][:4])[0]   # PROTO-CODE-001 起登录成功码为 0
     return c, ret
 
 def upload(c, dirPath, name, payload, chunk=200):
+    # 29/31 现行契约（REQ-TEST-BASELINE-001 批次一同型）：29 需有效 transfer id（tid=0 被拒），
+    # 32 同步响应恒 WRITE_FAILED、转正异步补发——按条目落库轮询收口（≤5s）。
     r = c.ask(pdu(T_UPINIT, msg=dirPath.encode(),
-                   dat=f32(name) + struct.pack("<q", len(payload)) + struct.pack("<I", MAGIC)))
-    if not (r and r[0][1][0] != 0):
+                   dat=f32(name) + struct.pack("<q", len(payload)) + struct.pack("<I", MAGIC)
+                       + b"\0" * 4 + struct.pack("<Q", 1)))
+    if not (r and struct.unpack("<i", r[0][1][:4])[0] == 0):
         return False
     for i in range(0, len(payload), chunk):
         ch = payload[i:i + chunk]
-        pkt = pdu(T_UPDATA, msg=ch, dat=struct.pack("<q", i) + b"\0" * 32 + struct.pack("<I", MAGIC))
-        a = c.ask(pkt)
-        if not a or a[0][0] != T_UPDATA_R or a[0][1][0] == 0: return False
-    return True
+        pkt = pdu(T_UPDATA, msg=ch, dat=struct.pack("<q", i) + b"\0" * 32
+                  + struct.pack("<I", MAGIC) + b"\0" * 4 + struct.pack("<Q", 1))
+        c.ask(pkt)
+    owner = dirPath.split("/")[2]   # './filesys/<owner>' 取第 3 段
+    for _ in range(50):
+        if sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{owner}' "
+               f"AND display_name='{name}' AND status='active'") == "1":
+            return True
+        time.sleep(0.1)
+    return False
 
-def ren_ret(r):   # rename 响应 ret 在 caData 首字节(bool)
-    return r and r[0][0] == T_RENAME_R and r[0][1][0] != 0
+def ren_ret(r):   # rename 响应成功判读：caData[0,4) 标准码（PROTO-CODE-001）
+    return r and r[0][0] == T_RENAME_R and struct.unpack("<i", r[0][1][:4])[0] == 0
 def mv_pkt(r):
     return r and r[0][0] == T_MOVE_R
 
@@ -111,7 +129,7 @@ os.remove(os.path.join(FS, "escape.txt")) if os.path.exists(os.path.join(FS, "es
 check("S1", "Server 启动并监听", _SRV.start())
 os.makedirs(os.path.join(FS, U), exist_ok=True)
 ca, ret = login_conn(U)
-check("L1", f"{U} 登录", ret == 1, f"ret={ret}")
+check("L1", f"{U} 登录", ret == 0, f"ret={ret}")  # PROTO-CODE-001 起成功码为 0
 rootP = f"./filesys/{U}"
 check("U1", "上传 e1.txt(C1) 建条目", upload(ca, rootP, "e1.txt", C1))
 check("U2", "上传 e2.txt(C2) 建条目", upload(ca, rootP, "e2.txt", C2))
@@ -141,7 +159,7 @@ check("A2", "条目同名重命名 → 幂等成功",
 r = ca.ask(pdu(T_RENAME, msg=struct.pack("<I", 1) + rootP.encode(),
                 dat=f32("e2.txt") + f32("ghost.txt")))
 check("A3", "条目改名为物理幽灵占名 → 拒绝且条目未动（改前条目已改、物理撞车留告警）",
-      r and r[0][0] == T_RENAME_R and r[0][1][0] == 0
+      r and r[0][0] == T_RENAME_R and struct.unpack("<i", r[0][1][:4])[0] != 0  # 标准码：拒绝=非 0
       and sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{U}' AND display_name='e2.txt' "
               f"AND status='active'") == "1"
       and os.path.isfile(os.path.join(base, "ghost.txt")))
@@ -162,7 +180,7 @@ check("A4b", "目录条目谎报 fileType=1(文件) → 按 e.isDir 走目录改
 r = ca.ask(pdu(T_MOVE, msg=b"d1ren/m1.txt\0d2\0", dat=f32("evil.txt")))
 echoed = r[0][1][32:64].split(b"\0")[0].decode("utf-8", "replace") if mv_pkt(r) else ""
 check("A5", "move 错位声称名 → 条目按派生名 m1.txt 落 /d2/，无 evil 条目",
-      mv_pkt(r) and r[0][1][0] != 0
+      mv_pkt(r) and struct.unpack("<i", r[0][1][:4])[0] == 0  # 标准码
       and sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{U}' AND display_name='m1.txt' "
               f"AND parent_path='/d2/' AND status='active'") == "1"
       and sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{U}' AND display_name='evil.txt'") == "0",
@@ -171,14 +189,14 @@ check("A5", "move 错位声称名 → 条目按派生名 m1.txt 落 /d2/，无 e
 # ---------- 7. move：A6 声称名 "../" 且未建条目 → 不逃逸（改前 dstPath 逃出 dstDir） ----------
 r = ca.ask(pdu(T_MOVE, msg=b"esc2.txt\0\0", dat=f32("../escape.txt")))
 check("A6", "REQ-MIG-001：move 未建条目文件 → 拒绝且不落任何目标（旧物理文件移动已下线）",
-      mv_pkt(r) and r[0][1][0] == 0
+      mv_pkt(r) and struct.unpack("<i", r[0][1][:4])[0] != 0  # 标准码：拒绝=非 0
       and os.path.isfile(os.path.join(base, "esc2.txt"))
       and not os.path.exists(os.path.join(FS, "escape.txt")))
 
 # ---------- 8. move：A7 caMsg 无 '\0' 分隔 → 显式拒绝（改前靠目标非目录碰巧拒掉） ----------
 r = ca.ask(pdu(T_MOVE, msg=b"esc2.txt", dat=f32("esc2.txt")))
 check("A7", "move caMsg 缺 '\\0' 分隔符 → 显式拒绝",
-      mv_pkt(r) and r[0][1][0] == 0 and os.path.isfile(os.path.join(base, "esc2.txt")))
+      mv_pkt(r) and struct.unpack("<i", r[0][1][:4])[0] != 0 and os.path.isfile(os.path.join(base, "esc2.txt")))  # 标准码
 
 # ---------- 9. 视图自洽：flushfile 与条目一致（派生名没把视图搅乱） ----------
 r = ca.ask(pdu(T_FLUSH, msg=rootP.encode()))

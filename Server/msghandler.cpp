@@ -1101,32 +1101,15 @@ PDU *MsgHandler::flushfile()
         setProtocolCode(respdu, ENUM_PROTOCOL_CODE_NOT_ALLOWED);
         return respdu;
     }
-    // REQ-EXT-FILE-001 D5：逻辑条目为权威；目录物理实体按名并入（残留目录可见性兜底），文件只来自条目。
+    // 目录数据唯一权威=数据库条目树（2026-11-22 用户裁决）：清单仅来自 listEntries，
+    // 物理目录不再并入数据；物理目录仅保留路径校验用途（沙箱/存在性门，与 changedir 同口径）。
     struct Row { QString name; bool isDir; };
     QVector<Row> rows;
-    QSet<QString> seen;
     const QString parent = FileObjectStore::normalizeParent(m_actorName, path);
     const QList<FileObjectStore::EntryInfo> entries =
             FileObjectStore::instance().listEntries(m_actorName, parent);
     for(const FileObjectStore::EntryInfo& e : entries){
-        Row r; r.name=e.displayName; r.isDir=e.isDir; rows.append(r); seen.insert(e.displayName);
-    }
-    QDir dir(path);
-    if(dir.exists()){
-        const QFileInfoList phys = dir.entryInfoList();
-        // 目录软删不落盘（D5）：物理残留目录在回收调度前仍在，按软删条目名过滤，
-        // 避免"删除成功后列表仍显示、再对其操作报源无逻辑条目"（2026-11-14 GUI 实测）
-        const QSet<QString> tombstones =
-                FileObjectStore::instance().deletedDisplayNames(m_actorName, path);
-        for(int i=0;i<phys.size();++i){
-            const QString nm = phys[i].fileName();
-            if(nm=="."||nm==".."||nm==".staging"||nm=="objects") continue;
-            if(seen.contains(nm)) continue;
-            if(tombstones.contains(nm)) continue;
-            // REQ-MIG-001：文件只来自逻辑条目（对象存储）；此处仅保留目录残留的可见性兜底
-            if(!phys[i].isDir()) continue;
-            Row r; r.name=nm; r.isDir=phys[i].isDir(); rows.append(r);
-        }
+        Row r; r.name=e.displayName; r.isDir=e.isDir; rows.append(r);
     }
     // REQ-PAGE-FETCH-001：合并后统一排序（目录在前、名字字典序）保证分页切片稳定；
     // 请求 caData：limit(u32)、offset(u32)；limit=0 视为默认页大小（兼容空请求）。
@@ -1545,25 +1528,23 @@ PDU *MsgHandler::listdir(const QString& loginName)
     QString userRoot=QDir(Server::getinstance().filesPath).filePath(loginName);
     QString absDir=QDir(userRoot).filePath(relPath);
 
-    // 越权校验：浏览目录必须在用户根目录内
-    // REQ-FS-003④: 统一走 isPathInSandbox，根传用户目录（原校验根即 userRoot，隔离级别不变）
-    QFileInfo dirInfo(absDir);
-
-    // 只列子目录（不含文件、"." 与 ".."）；响应载荷为 FileInfo 数组，uiType 恒为 0。
-    // REQ-PAGE-FETCH-001：数量截断，超限置 truncated 标志。
+    // 数据库为唯一数据来源（2026-11-22 用户裁决）：移动目标目录列表改自条目树取子目录
+    //（parent_path=当前目录逻辑键、is_dir=1、status='active'），物理目录仅保留路径校验用途；
+    // 逻辑键归一失败=不在 actor 根内（词法逃逸/跨用户一律拒绝）。
     PDU* respdu=mkPDU();
     respdu->uiType=ENUM_MSG_TYPE_LISTDIR_RESPOND;
-    if(isPathInSandbox(absDir, userRoot) && dirInfo.isDir()){
-        QFileInfoList list=QDir(absDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
-        // 目录软删不落盘（D5）：物理残留目录在回收调度前不外显，与 flushfile 同口径
-        const QSet<QString> tombstones =
-                FileObjectStore::instance().deletedDisplayNames(loginName, absDir);
-        QFileInfoList visible;
-        visible.reserve(list.size());
-        for(int i=0;i<list.size();++i){
-            if(!tombstones.contains(list[i].fileName())) visible.append(list[i]);
+    const QString parentKey = FileObjectStore::normalizeParent(loginName, absDir);
+    if(!parentKey.isEmpty()){
+        struct Row { QString name; };
+        QList<Row> list;
+        const QList<FileObjectStore::EntryInfo> entries =
+                FileObjectStore::instance().listEntries(loginName, parentKey);
+        for(const FileObjectStore::EntryInfo& e : entries){
+            if(e.isDir) list.append({e.displayName});
         }
-        list=visible;
+        std::sort(list.begin(),list.end(),[](const Row&a,const Row&b){
+            return a.name.compare(b.name,Qt::CaseInsensitive)<0;   // 沿用物理 QDir 的名字序
+        });
         bool truncated=list.size()>int(PAGE_MAX_LIMIT);
         if(truncated) list=list.mid(0,int(PAGE_MAX_LIMIT));
         respdu=mkPDU(sizeof(FileInfo)*uint(list.size()));
@@ -1576,7 +1557,7 @@ PDU *MsgHandler::listdir(const QString& loginName)
         memcpy(respdu->caData+LIST_TRUNC_RESP_COUNT_OFFSET,&count,sizeof(count));
         for(int i=0;i<list.size();i++){
             FileInfo* p=(FileInfo*)respdu->caMsg+i;
-            const QByteArray dirBytes=list[i].fileName().toUtf8();   // REQ-AUDIT-FULL-001：按实际长度拷贝
+            const QByteArray dirBytes=list[i].name.toUtf8();   // REQ-AUDIT-FULL-001：按实际长度拷贝
             memcpy(p->caName,dirBytes.constData(),size_t(qMin(dirBytes.size(),31)));
             p->uiType=0;
         }
