@@ -9,7 +9,8 @@
   R9 秒传命中：同请求键两次 97 只产生一条条目 + 一条完成态会话
   R5 外链创建：越界/目录/不存在路径全部拒绝；合法文件放行
   R6 外链重新生成：旧 token 失效、新 token 可解析
-  R7 文件与链接同事务：改名后链接跟到新路径；删除后链接消失
+  R7 文件与链接同事务（REQ-SHARE-ENTRYID-001 新规则）：改名不联动链接（token 仍可解析）；
+      删除后 token 失效且链接行同事务清除
   R3 注销级联：个人文件/上传会话/群成员/所建群/好友邀请全部清理，同名重注册为空
 
 用法：
@@ -379,24 +380,32 @@ def main():
         qexec("DELETE FROM user_file WHERE owner_name=%s AND parent_path='/分享链接/'", (C,))
 
         # ---------- R7 文件与链接一致 ----------
-        print('=== R7 文件/链接同事务 ===')
-        rel_before = q1("SELECT relative_path FROM share_link WHERE owner_name=%s AND token_hash IS NOT NULL ORDER BY id DESC LIMIT 1", (A,))
+        # REQ-SHARE-ENTRYID-001 后（PRD：源定位按 owner+user_file.file_id）：share_link 无
+        # relative_path 列，重命名/移动不联动链接（源条目改名不影响解析），仅条目删除使
+        # 链接失效且删除与链接清理同事务。原「链接平移」断言随旧规则作废，此处按新规则重写。
+        print('=== R7 文件/链接同事务（ENTRYID 新规则口径） ===')
+        fid_before = q1("SELECT file_id FROM share_link WHERE owner_name=%s AND token_hash IS NOT NULL "
+                        "ORDER BY id DESC LIMIT 1", (A,))
         d27 = bytearray(64)
         d27[0:32] = f32('auditfile.bin')
         d27[32:64] = f32('auditfile-ren.bin')
         abs_dir = ('./filesys/' + A).encode()
         r = ca.ask(pdu(T_RENAME, msg=u32(1) + abs_dir, dat=bytes(d27)), T_RENAME_R)
         check('R7-1 改名成功', bool(r[1][0]))
-        rel_after = qall("SELECT relative_path FROM share_link WHERE owner_name=%s", (A,))
-        check('R7-2 链接同事务跟到新路径',
-              ('auditfile-ren.bin',) in rel_after and all('auditfile.bin' != x[0] for x in rel_after),
-              rel_after)
+        r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok2.encode()), T_RESOLVE_PUB_R)
+        check('R7-2a 改名后原 token 仍可解析（重命名不联动链接）', r is not None and bool(r[1][0]))
+        link_after = qall("SELECT file_id FROM share_link WHERE owner_name=%s", (A,))
+        check('R7-2b 链接记录未因改名变化',
+              fid_before is not None and (fid_before[0],) in link_after, link_after)
         d25 = bytearray(64)
         d25[0:4] = u32(1)
         r = ca.ask(pdu(T_DELFILE, msg=(abs_dir + b'/auditfile-ren.bin'), dat=bytes(d25)), T_DELFILE_R)
         check('R7-3 删除成功', bool(r[1][0]))
-        left = qall("SELECT relative_path FROM share_link WHERE owner_name=%s", (A,))
-        check('R7-4 删除后链接同事务清除', not any('auditfile-ren.bin' in x[0] for x in left), left)
+        r = cc.ask(pdu(T_RESOLVE_PUB, msg=tok2.encode()), T_RESOLVE_PUB_R)
+        check('R7-4a 删除后 token 立即失效', r is not None and not bool(r[1][0]))
+        left = qall("SELECT file_id FROM share_link WHERE owner_name=%s AND file_id=%s",
+                    (A, fid_before[0] if fid_before else -1))
+        check('R7-4b 删除后链接同事务清除', not left, left)
 
         # ---------- R3 注销级联 ----------
         print('=== R3 注销级联 ===')
