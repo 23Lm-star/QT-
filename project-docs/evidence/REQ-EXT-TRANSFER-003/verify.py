@@ -330,27 +330,12 @@ check("S-02b", "跨端一致：UPLOAD_CHUNK_MAX ≤ 服务端 MAX_UPLOAD_DATA_CH
 # （文件头契约说明、REQ-CHAT-ACK-001/REQ-PAGE-FETCH-001 块）均非本需求改动，且这些残留
 # 不在任何 `// ===== REQ-EXT-` 块内，剔除规则追不上注释形态演化。护栏职责收敛到
 # S-01a（批准块内逐字）+ S-01b（通用上限未抬高），此处补一条块头唯一性防整块复制。
-# S-03c 对 Client/protocol.h 的「diff master 为空」在合并后同样空转，属同族遗留，另案登记。
+# S-03c（对 Client/protocol.h 的「diff master 为空」断言）已于 2026-11-22 删除：
+# 本需求合并进 master 后该 diff 恒为空，断言空转（与原 S-03a/b 同族病）；改固定基线
+# 两点 diff 会重蹈基线漂移覆辙。本需求的客户端冻结面由 S-02a/b（Client/uploader.h 常量
+# 与跨端一致）守护，Client/protocol.h 的后续改动归属各自需求的护栏，不再在此兜底。
 _n_hdr = srvs.count("// ===== REQ-EXT-TRANSFER-003")
 check("S-03", "批准块头在 Server/protocol.h 中唯一（防整块复制两份）", _n_hdr == 1, f"n={_n_hdr}")
-diff_cli = subprocess.run(["git", "diff", "master", "--", "Client/protocol.h"],
-                          cwd=REPO, capture_output=True, text=True).stdout
-_cli_lines = (diff_cli or "").splitlines()
-_cli_rem = [l for l in _cli_lines if l.startswith("-") and not l.startswith("---") and l[1:].strip()]
-_cli_add = [l[1:] for l in _cli_lines if l.startswith("+") and not l.startswith("+++")]
-_segs, _cur = [], []
-for _l in _cli_add:
-    if _l.strip() == "":
-        continue
-    if _l.startswith("// ===== REQ-EXT-") and _cur:
-        _segs.append(_cur)
-        _cur = []
-    _cur.append(_l)
-if _cur:
-    _segs.append(_cur)
-_cli_unmarked = [s[0][:60] for s in _segs if not s[0].startswith("// ===== REQ-EXT-")]
-check("S-03c", "Client/protocol.h 未被删改；追加行全在 REQ-EXT-* 已批准块内（本需求自身零改动）",
-      (not _cli_rem) and (not _cli_unmarked), f"rem={_cli_rem} unmarked={_cli_unmarked}")
 
 cli = read("Client/client.cpp")
 tt = read("Client/transfertask.cpp")
