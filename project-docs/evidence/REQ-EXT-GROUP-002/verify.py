@@ -22,9 +22,12 @@ T_INVITE, T_INVITE_R = 62, 63
 T_ACCEPT, T_ACCEPT_R = 64, 65
 T_LEAVE, T_LEAVE_R = 68, 69
 T_REMOVE, T_REMOVE_R = 70, 71
+T_SET_ROLE, T_SET_ROLE_R = 72, 73
+T_TRANSFER, T_TRANSFER_R = 74, 75
 T_DISSOLVE, T_DISSOLVE_R = 76, 77
 T_LIST, T_LIST_R = 78, 79
 T_MEMBERS, T_MEMBERS_R = 80, 81
+T_MEM_EVENT, T_INV_EVENT = 84, 85  # 成员变化/邀请到达事件（仅服务端生成）
 # GROUP-002
 T_SEND, T_SEND_R, T_EVENT = 88, 89, 90
 T_PULL, T_PULL_R = 91, 92
@@ -59,6 +62,7 @@ def stop_server():
 # 失败码（服务端为 quint32 负数，客户端按无符号读取）
 N1001, N2001, N2002 = (1 << 32) - 1001, (1 << 32) - 2001, (1 << 32) - 2002
 N2101, N2102, N2103, N2104 = (1 << 32) - 2101, (1 << 32) - 2102, (1 << 32) - 2103, (1 << 32) - 2104
+N1039 = (1 << 32) - 1039  # 移除目标须为普通 member（-1039，GROUP-001 权限段）
 results = []
 notes = []
 
@@ -606,7 +610,8 @@ fsroot = DIST / 'filesys'   # 部署运行形态：服务端 cwd=dist，其 ./fi
 # REQ-AUDIT-001：p8c 自清夹具，避免上一轮残留的过期 share_link 让本用例随运行次数漂移
 with db_conn() as _c:
     with _c.cursor() as _cur:
-        _cur.execute("DELETE FROM share_link WHERE owner_name='g2m1' AND relative_path='g2p8.bin'")
+        # 2026112101 迁移已 DROP share_link.relative_path；g2m1 为本套件专用夹具账号，按 owner 全清
+        _cur.execute("DELETE FROM share_link WHERE owner_name='g2m1'")
         _cur.execute("DELETE FROM user_file WHERE owner_name='g2out'")
 (fsroot / 'g2m1').mkdir(parents=True, exist_ok=True)
 # REQ-AUDIT-001 R5：外链源必须是真实逻辑条目（REQ-MIG-001 后不再有物理文件回退）→ 走真实上传
@@ -639,14 +644,48 @@ landed = db_one("SELECT COUNT(*) FROM user_file WHERE owner_name='g2out' "
                  "AND parent_path='/分享链接/' AND display_name='g2p8.bin' AND status='active'")
 check('p8c_publish_link_flow', bool(link) and bool(link2) and res_ok and landed and landed[0] > 0,
       f'res_ok={res_ok} link={link[-12:]} link2={link2[-12:]} landed_rows={landed[0] if landed else None}')
-# d) GROUP-001 生命周期整链（既有 harness 原样重跑）
-ge = ROOT / 'build' / 'evidence' / 'req-ext-group-001-independent-8757ad6' / 'group_e2e.py'
-if ge.exists():
-    pr = subprocess.run([sys.executable, str(ge)], cwd=ROOT, capture_output=True, text=True, timeout=180)
-    tail = (pr.stdout or '').strip().splitlines()[-1] if pr.stdout else ''
-    check('p8d_group001_lifecycle_regression', pr.returncode == 0 and 'PASS' in tail, f'rc={pr.returncode} tail={tail}')
-else:
-    check('p8d_group001_lifecycle_regression', False, 'harness not found: ' + str(ge))
+# d) GROUP-001 生命周期整链：原依赖的 build/evidence 历史 harness 从未入库、不可恢复，
+#    按其意图内联为 socket 级关键链（建群→邀请→接受→设角色→移除→转让→解散）。
+#    权限事实：移除目标须为普通 member（-1039）；转让后原群主降 admin；解散仅置
+#    group_info.status='dissolved'，成员行保留（后续群业务 -2102）。
+owner.drain(0.3); m1.drain(0.3); out.drain(0.3)
+lc, lb, _ = greq(owner, T_CREATE, 0, string('G2 L'))
+gidL = struct.unpack('<Q', lb[:8])[0] if lc == 0 and len(lb) >= 8 else 0
+check('p8d_l1_create_group', lc == 0 and gidL > 0, f'code={lc} gid={gidL}')
+m1.drain(0.2)
+ic, ib, _ = greq(owner, T_INVITE, gidL, string('g2m1') + string('k-l-m1'))
+iidL = struct.unpack('<Q', ib[:8])[0] if ic == 0 and len(ib) >= 8 else 0
+push85 = len([p for p in m1.drain(0.8) if p[0] == T_INV_EVENT])
+check('p8d_l2_invite_push85', ic == 0 and iidL > 0 and push85 >= 1, f'code={ic} iid={iidL} push85={push85}')
+ac, _, _ = greq(m1, T_ACCEPT, 0, u64(iidL))
+push84 = len([p for p in owner.drain(0.8) if p[0] == T_MEM_EVENT])
+oc, ob, _ = greq(owner, T_INVITE, gidL, string('g2out') + string('k-l-out'))
+iidO = struct.unpack('<Q', ob[:8])[0] if oc == 0 and len(ob) >= 8 else 0
+oac, _, _ = greq(out, T_ACCEPT, 0, u64(iidO))
+mrows = sorted(db_all("SELECT user_name,role FROM group_member WHERE group_id=%s AND status='active'", (gidL,)))
+check('p8d_l3_accept_members', ac == 0 and oc == 0 and oac == 0 and push84 >= 1
+      and mrows == [('g2m1', 'member'), ('g2out', 'member'), ('g2owner', 'owner')],
+      f'accept={ac}/{oac} invite_out={oc} push84={push84} rows={mrows}')
+sc, _, _ = greq(owner, T_SET_ROLE, gidL, string('g2m1') + string('admin'))
+role1 = db_one("SELECT role FROM group_member WHERE group_id=%s AND user_name='g2m1'", (gidL,))
+check('p8d_l4_set_role_admin', sc == 0 and role1 and role1[0] == 'admin', f'code={sc} role={role1[0] if role1 else None}')
+rac, _, _ = greq(owner, T_REMOVE, gidL, string('g2m1'))
+check('p8d_l5_remove_admin_rejected', rac == N1039, f'code={rac}')  # -1039：目标须为普通 member
+rc, _, _ = greq(owner, T_REMOVE, gidL, string('g2out'))
+out.drain(0.3)
+dc, _, _ = greq(out, T_SEND, gidL, string('l-k') + string('x'))
+check('p8d_l6_remove_member_denied', rc == 0 and dc == N2101, f'remove={rc} send={dc}')  # -2101
+m1.drain(0.2)
+tc, _, _ = greq(owner, T_TRANSFER, gidL, string('g2m1'))
+roles = dict(db_all("SELECT user_name,role FROM group_member WHERE group_id=%s AND status='active'", (gidL,)))
+check('p8d_l7_transfer_owner', tc == 0 and roles.get('g2m1') == 'owner' and roles.get('g2owner') == 'admin',
+      f'code={tc} roles={roles}')
+dsc, _, _ = greq(m1, T_DISSOLVE, gidL)
+owner.drain(0.3)
+den, _, _ = greq(owner, T_SEND, gidL, string('l-k2') + string('x'))
+gstatus = db_one("SELECT status FROM group_info WHERE group_id=%s", (gidL,))
+check('p8d_l8_dissolve_denied_after', dsc == 0 and den == N2102 and gstatus and gstatus[0] == 'dissolved',
+      f'dissolve={dsc} send={den} status={gstatus[0] if gstatus else None}')  # -2102
 
 # ---------- 汇总 ----------
 passed = sum(1 for _, ok, _ in results if ok)
