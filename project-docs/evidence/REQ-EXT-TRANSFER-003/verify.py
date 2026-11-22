@@ -121,16 +121,26 @@ def check(sid, desc, cond, detail=""):
     print(f"[{'PASS' if cond else 'FAIL'}] {sid} {desc} :: {detail}")
 
 
+_CID = [0]
+def next_cid():
+    # 验证码/登录身份（AUTH-CONNECTION-001）：空 cid 的 Redis 键前缀落到连接号，跨运行
+    # 冷却/过期串扰；每请求唯一 cid，与 ENTRYID/AUDIT-001/sec001 套件同型。
+    _CID[0] = (_CID[0] + 1) & 0xF
+    return "%032x" % (int(time.time() * 1000) * 16 + _CID[0])
+
+
 def login_conn(name):
     c = Conn()
-    c.send(pdu(T_CAP)); r = c.wait(T_CAP_R)
+    cid = next_cid()
+    c.send(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0"))); r = c.wait(T_CAP_R)
     code = r[2].split(b"\0")[0] if r else b""
-    c.send(pdu(T_REG, msg=code + b"\0", dat=creds(name))); c.wait(T_REG + 1, 4)
+    c.send(pdu(T_REG, msg=code + b"\0" + cid.encode(), dat=creds(name))); c.wait(T_REG + 1, 4)
     c.close()
     c = Conn()
-    c.send(pdu(T_CAP)); r = c.wait(T_CAP_R); code = r[2].split(b"\0")[0] if r else b""
-    c.send(pdu(T_LOGIN, msg=code + b"\0", dat=creds(name))); r = c.wait(T_LOGIN_R, 6)
-    ret = struct.unpack("<i", r[1][:4])[0] if r else -99
+    cid = next_cid()
+    c.send(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0"))); r = c.wait(T_CAP_R); code = r[2].split(b"\0")[0] if r else b""
+    c.send(pdu(T_LOGIN, msg=code + b"\0" + cid.encode(), dat=creds(name))); r = c.wait(T_LOGIN_R, 6)
+    ret = struct.unpack("<i", r[1][:4])[0] if r else -99   # PROTO-CODE-001 起登录成功码为 0
     return c, ret
 
 
@@ -409,8 +419,8 @@ sql(f"DELETE FROM group_info WHERE creator_name='{U}';")
 shutil.rmtree(os.path.join(DIST, "filesys", ".staging"), ignore_errors=True)
 
 c, ret = login_conn(U)
-check("E0", "登录成功", ret == 1, f"ret={ret}")
-if ret != 1: sys.exit(2)
+check("E0", "登录成功", ret == 0, f"ret={ret}")   # PROTO-CODE-001 起登录成功码为 0
+if ret != 0: sys.exit(2)
 # 用户根只在首次注册时由服务端创建；MKDIR 对已存在目录回 ret=false（非幂等），
 # 故本套件自建目录并以"目录存在"为断言口径（见 E2E-RUNFORM.md 的既有约定）。
 os.makedirs(os.path.join(DIST, "filesys", U, "tx3"), exist_ok=True)
