@@ -157,8 +157,17 @@ def up_chunk(c, tid, off, data, wait=True):
     return c.wait(T_UPDATA_R) if wait else None
 
 
+def code_of(r):
+    """响应包 caData[0,4) 标准码（PROTO-CODE-001：0=成功，负数=领域失败）；None=无响应。"""
+    return None if r is None else struct.unpack("<i", r[1][:4])[0]
+
+
 def ack_ok(r):
-    return r is not None and r[1][0] != 0
+    return code_of(r) == 0
+
+
+def ack_fail(r):
+    return code_of(r) is not None and code_of(r) != 0
 
 
 def ack_next(r):
@@ -174,9 +183,14 @@ def init_off(r):
     return i64at(r[1], 32) if r else -1
 
 
+def fc_hit(r):
+    """98 的 HIT 在 caData[4]（FASTCHECK_RESP_HIT_OFFSET；PROTO-CODE 后标准码占 [0,4)）"""
+    return bool(r[1][4]) if r else False
+
+
 def fc_next(r):
-    """98 的 miss 续传起点在 caData[24]（FASTCHECK_RESP_NEXT_OFFSET）"""
-    return i64at(r[1], 24) if r else -1
+    """98 的 miss 续传起点在 caData[32]（FASTCHECK_RESP_NEXT_OFFSET，原 24 已随标准码顺延）"""
+    return i64at(r[1], 32) if r else -1
 
 
 def abort(c, tid):
@@ -204,9 +218,9 @@ def collect(c, ids, timeout=30.0):
         for ty, dat, msg in c.take(0.2):
             tid = eid(dat, DL_ID_OFF if ty == T_DOWN_R else ID_OFF)
             if tid not in got: continue
-            if ty == T_DOWN_R: got[tid]["ok"] = dat[0] != 0
+            if ty == T_DOWN_R: got[tid]["ok"] = struct.unpack("<i", dat[:4])[0] == 0
             elif ty == T_DATA: got[tid]["data"] += msg
-            elif ty == T_FINISH: got[tid]["finish"] = dat[0] != 0
+            elif ty == T_FINISH: got[tid]["finish"] = struct.unpack("<i", dat[:4])[0] == 0
         if all(v["finish"] is not None for v in got.values()): break
     return got
 
@@ -316,27 +330,12 @@ check("S-02b", "跨端一致：UPLOAD_CHUNK_MAX ≤ 服务端 MAX_UPLOAD_DATA_CH
 # （文件头契约说明、REQ-CHAT-ACK-001/REQ-PAGE-FETCH-001 块）均非本需求改动，且这些残留
 # 不在任何 `// ===== REQ-EXT-` 块内，剔除规则追不上注释形态演化。护栏职责收敛到
 # S-01a（批准块内逐字）+ S-01b（通用上限未抬高），此处补一条块头唯一性防整块复制。
-# S-03c 对 Client/protocol.h 的「diff master 为空」在合并后同样空转，属同族遗留，另案登记。
+# S-03c（对 Client/protocol.h 的「diff master 为空」断言）已于 2026-11-22 删除：
+# 本需求合并进 master 后该 diff 恒为空，断言空转（与原 S-03a/b 同族病）；改固定基线
+# 两点 diff 会重蹈基线漂移覆辙。本需求的客户端冻结面由 S-02a/b（Client/uploader.h 常量
+# 与跨端一致）守护，Client/protocol.h 的后续改动归属各自需求的护栏，不再在此兜底。
 _n_hdr = srvs.count("// ===== REQ-EXT-TRANSFER-003")
 check("S-03", "批准块头在 Server/protocol.h 中唯一（防整块复制两份）", _n_hdr == 1, f"n={_n_hdr}")
-diff_cli = subprocess.run(["git", "diff", "master", "--", "Client/protocol.h"],
-                          cwd=REPO, capture_output=True, text=True).stdout
-_cli_lines = (diff_cli or "").splitlines()
-_cli_rem = [l for l in _cli_lines if l.startswith("-") and not l.startswith("---") and l[1:].strip()]
-_cli_add = [l[1:] for l in _cli_lines if l.startswith("+") and not l.startswith("+++")]
-_segs, _cur = [], []
-for _l in _cli_add:
-    if _l.strip() == "":
-        continue
-    if _l.startswith("// ===== REQ-EXT-") and _cur:
-        _segs.append(_cur)
-        _cur = []
-    _cur.append(_l)
-if _cur:
-    _segs.append(_cur)
-_cli_unmarked = [s[0][:60] for s in _segs if not s[0].startswith("// ===== REQ-EXT-")]
-check("S-03c", "Client/protocol.h 未被删改；追加行全在 REQ-EXT-* 已批准块内（本需求自身零改动）",
-      (not _cli_rem) and (not _cli_unmarked), f"rem={_cli_rem} unmarked={_cli_unmarked}")
 
 cli = read("Client/client.cpp")
 tt = read("Client/transfertask.cpp")
@@ -350,8 +349,13 @@ pump = re.search(r"void TransferManager::pump\(\)\s*\{(.{0,200})", tt, re.S)
 check("S-04c", "G7 接线③：pump() 首部有 m_connectionDown 闸",
       pump is not None and "m_connectionDown" in pump.group(1), "")
 lr = re.search(r"case ENUM_MSG_TYPE_LOGIN_RESPOND:\s*\{(.*?)\n\s*break;", cli, re.S)
-check("S-04d", "G7 接线④：LOGIN_RESPOND 分支调用 onConnectionRestored",
-      lr is not None and "onConnectionRestored(" in lr.group(1), "")
+els = re.search(r"void Client::enterLoggedInSession\([^)]*\)\s*\{(.*?)\n\}", cli, re.S)
+elsb = els.group(1) if els else ""
+# AUTH-CONNECTION-001 后接线收口：LOGIN_RESPOND 分支经 enterLoggedInSession（4/122 会话建立
+# 统一入口）调用 onConnectionRestored，不再直接写在分支里——探针按现行两级链路断言。
+check("S-04d", "G7 接线④：LOGIN_RESPOND 经 enterLoggedInSession 调用 onConnectionRestored（4/122 共用）",
+      lr is not None and "enterLoggedInSession(" in lr.group(1)
+      and els is not None and "onConnectionRestored(" in elsb, "")
 sha_cb = re.search(r"QFutureWatcher<QByteArray>::finished.*?\n    \}\);", tt, re.S)
 check("S-05a", "G7 防复活①：群上传 SHA 回调含 state != Hashing 守卫",
       sha_cb is not None and re.search(r"state\s*!=\s*Hashing", sha_cb.group(0)) is not None, "")
@@ -365,10 +369,11 @@ check("S-05c", "C4 摘旧映射：pause/resume 上传分支均 m_idToKey.remove(
 mh = read("Client/msghandler.cpp")
 mhh = read("Client/msghandler.h")
 lr_body = lr.group(1) if lr is not None else ""
-m_assign = re.search(r"m_LoginName\s*=", lr_body)
-i_setuser = lr_body.find("setCurrentUser(")
-check("S-06a", "R-1：LOGIN_RESPOND 分支内登录名赋值先于 setCurrentUser（同步取值，非 1.5 s 后）",
-      m_assign is not None and i_setuser > m_assign.start() and "handllogin()" in lr_body,
+m_assign = re.search(r"m_LoginName\s*=", elsb)
+i_setuser = elsb.find("setCurrentUser(")
+check("S-06a", "R-1：登录名同步赋值先于 setCurrentUser（enterLoggedInSession 内同步完成，分支传 handllogin() 结果）",
+      m_assign is not None and i_setuser > m_assign.start()
+      and "handllogin()" in lr_body and "enterLoggedInSession(" in lr_body,
       f"assign@{m_assign.start() if m_assign else -1} setUser@{i_setuser}")
 hl = re.search(r"QString MsgHandler::handllogin\(\)\s*\{(.*?)\n\}", mh, re.S)
 hlb = hl.group(1) if hl else ""
@@ -459,9 +464,9 @@ up_init(c, 201, DST, name, len(pl))
 up_chunk(c, 201, 0, pl[:CHUNK])
 r = abort(c, 201)
 rw = rows(name)
-check("T3-02a", "107 后：108 ret=true 且该逻辑上传仅 1 行（status=expired）",
-      r is not None and r[1][0] != 0 and len(rw) == 1 and rw[0][1] == "expired",
-      f"108={r[1][0] if r else '?'} rows={len(rw)}")
+check("T3-02a", "107 后：108 成功（标准码 0）且该逻辑上传仅 1 行（status=expired）",
+      ack_ok(r) and len(rw) == 1 and rw[0][1] == "expired",
+      f"108={code_of(r) if r else '?'} rows={len(rw)}")
 r = up_init(c, 202, DST, name, len(pl))
 off = init_off(r)
 for i in range(off, len(pl), CHUNK):
@@ -480,8 +485,8 @@ pl = pl[:2 * 1024 * 1024]
 name = "t303.bin"
 rq1, rq2 = "1a" * 16, "2b" * 16
 r = fc(c, SHA(pl), name, DST, len(pl), rq1)
-check("T3-03-init", "97 miss：98 ret=true/hit=false", ack_ok(r) and r[1][1] == 0,
-      f"hit={r[1][1] if r else '?'}")
+check("T3-03-init", "97 miss：98 成功（标准码 0）/hit=false", ack_ok(r) and not fc_hit(r),
+      f"hit={fc_hit(r)}")
 r = up_init(c, 301, DST, name, len(pl))
 up_chunk(c, 301, 0, pl[:CHUNK])
 r = fc(c, SHA(pl), name, DST, len(pl), rq2)
@@ -534,8 +539,8 @@ up_init(c, 501, DST, name, len(pl))
 a = up_chunk(c, 501, 0, pl[:CHUNK])
 check("T3-05a", "单块 1 MiB 接受（32 ok=true）", ack_ok(a), f"next={ack_next(a)}")
 a = up_chunk(c, 501, CHUNK, pl[CHUNK:CHUNK + CHUNK + 1])
-check("T3-05c", "1 MiB + 1 字节块被 32{ok=false} 明确拒绝",
-      a is not None and a[1][0] == 0, f"ok={a[1][0] if a else '?'}")
+check("T3-05c", "1 MiB + 1 字节块被 32 显式拒绝（标准码非 0）",
+      ack_fail(a), f"code={code_of(a)}")
 a = up_chunk(c, 501, CHUNK, pl[CHUNK:CHUNK + CHUNK])
 check("T3-05d", "拒绝后连接存活且后续合法块被接受", ack_ok(a) and ack_next(a) == 2 * CHUNK,
       f"next={ack_next(a)}")
@@ -640,7 +645,7 @@ for rd in range(6):
     off = init_off(r)
     up_chunk(c, tid, off, pl[off:off + CHUNK], wait=False)   # 31 发出
     r108 = abort(c, tid)                                     # 不等 32 立即 107
-    ok108 = ok108 and r108 is not None and r108[1][0] != 0
+    ok108 = ok108 and ack_ok(r108)
     time.sleep(0.4)                                          # 让在途写与延迟 abort 收尾
     ssz = staging_size(name)
     rw = row0(name)
@@ -663,21 +668,21 @@ alive = p is not None
 check("T3-11a", "17 KB 非 31 报文仍走非法 PDU（无响应）且连接存活",
       r is None and alive, f"resp={r is not None} pong={alive}")
 
-# ================= T3-12：旧客户端（4 KB + id=0）兼容 =================
+# ================= T3-12：旧客户端（4 KB + id=0）兼容口径（P7 修订） =================
 print("=== T3-12 ===")
+# REQ-RESUME-AUDIT-001 P7：新上传不回退到 id=0（id=0 占位仅由 97 预检查建立）——旧单流
+# id=0 的 29 被显式拒绝（-2107），连接存活。原「id=0 全流程可用」为 P7 之前的口径，随修订更新。
 pl = (NONCE + b"T312" + b"J" * (256 * 1024))[:256 * 1024]
 name = "t312.bin"
 r = up_init(c, 0, DST, name, len(pl))
-ok = ack_ok(r)
-for i in range(0, len(pl), LEGACY_CHUNK):
-    a = up_chunk(c, 0, i, pl[i:i + LEGACY_CHUNK])
-    ok = ok and ack_ok(a)
-d = download(c, 1012, f"{DST}/{name}", name)
-check("T3-12a", "id=0 旧单流（4 KB 分片）全流程逐字节不变",
-      ok and d["data"] == pl and ack_complete(a), f"ok={ok} len={len(d['data'])}")
-rw = rows(name)
-check("T3-12b", "旧路径同样单行贯穿（1 行、done）",
-      len(rw) == 1 and rw[0][1] == "done", f"rows={len(rw)}")
+c.send(pdu(T_PING))
+alive = c.wait(T_PONG, 3) is not None
+check("T3-12a", "id=0 旧单流上传被显式拒绝（P7 口径，标准码非 0）且连接存活",
+      ack_fail(r) and alive, f"code={code_of(r)} alive={alive}")
+check("T3-12b", "id=0 拒绝后无会话行、无条目",
+      not rows(name)
+      and sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{U}' "
+              f"AND display_name='{name}' AND status='active'") == "0", f"rows={rows(name)}")
 
 # ================= 汇总 =================
 print("\n=== 汇总 ===")

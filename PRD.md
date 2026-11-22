@@ -522,13 +522,13 @@
 | 基线一 | 串行运行 GROUP-002/verify.py（自管服务端；需文本旁路与 Redis env） | 45/45 PASS（38 项口径经 p8d 展开为 45） |
 | 基线二 | 运行 REQ-AUDIT-001/verify.py | 42/42 PASS，R7 按新规则断言且 R3 恢复执行 |
 | 基线三 | 运行 sec001_regression.py | 48/48 PASS，X3a 断言语义不变 |
-| 基线四 | 运行 TRANSFER-003/verify.py 静态段 | S-01a/S-01b/S-02a/S-02b/S-03/S-03c 全 PASS |
+| 基线四 | 运行 TRANSFER-003/verify.py（批次二起含动态段，无外部 env） | 静态护栏 S-01a/S-01b/S-02a/S-02b/S-03 全 PASS；批次二后动态段+探针 57/57 全绿（T3-06a 真吞吐 ≥8 MiB/s） |
 | 基线五 | 删除 validatePath 后重编译 Server，运行 SHARE-001/verify.py | 编译通过；25/25 PASS |
 | 基线六 | 临时改动批准块一行（不落盘） | S-01a 必红（护栏负例自测通过） |
 
 ### 最终结论
 
-六项全部完成并自动验证（2026-11-22）：GROUP-002 45/45（含内联生命周期链 8 项）、AUDIT-001 42/42、sec001 48/48、TRANSFER-003 静态护栏全绿、SHARE-001 25/25 回归、Server 重编译通过。随带完成同族基线漂移适配（超出原 6 项清单、变更记录单独列支）：直连套件登录 shim 唯一 cid 化与标准码判读（GROUP-002/sec001/AUDIT-001/TRANSFER-003，SHARE-001 原已适配）、p8c 夹具按轮次唯一命名（D-020 预给方向）、存量夹具账号密码链一次性重置（g2*/aud*/sec001*/e2etx3）。残余：TRANSFER-003 T 系列+S-04d/S-06a 客户端探针需按标准码/会话恢复时代适配、S-03c 合并后空转——均已登记 TODO。过程见 [变更记录](docs/changes/REQ-TEST-BASELINE-001/记录.md)。
+六项全部完成并自动验证（2026-11-22）：GROUP-002 45/45（含内联生命周期链 8 项）、AUDIT-001 42/42、sec001 48/48、TRANSFER-003 静态护栏全绿、SHARE-001 25/25 回归、Server 重编译通过。随带完成同族基线漂移适配（超出原 6 项清单、变更记录单独列支）：直连套件登录 shim 唯一 cid 化与标准码判读（GROUP-002/sec001/AUDIT-001/TRANSFER-003，SHARE-001 原已适配）、p8c 夹具按轮次唯一命名（D-020 预给方向）、存量夹具账号密码链一次性重置（g2*/aud*/sec001*/e2etx3）。三项遗留（T3 动态段+S-04d/S-06a 探针时代适配、S-03c 合并后空转、运行前置集中化）已于批次二完成（2026-11-22，`codex/fix-test-baseline-002`）：TRANSFER-003 全套 57/57（T3-06a 真吞吐 24.75 MiB/s）、T3-12 按 REQ-RESUME-AUDIT-001 P7 口径重写为负向兼容断言、S-03c 删除、运行前置集中到 server_ctl 统一注入（无外部 env 实测 TRANSFER-003 57/57、GROUP-002 45/45）。过程见 [变更记录](docs/changes/REQ-TEST-BASELINE-001/记录.md)。
 
 ## 业务变更记录
 
