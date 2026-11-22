@@ -50,6 +50,13 @@ import socket
 import subprocess
 import time
 
+# 直连套件运行前置集中化（REQ-TEST-BASELINE-001 批次二）：验证码文本旁路与 Redis 定位
+# 在本共用孵化点统一 setdefault，所有经 server_ctl 启动的 Server.exe 子进程都继承到，
+# 套件与运行者不再各自背 env。需要图片验证码口径的用例（AUDIT-001 R8）在自家流程里
+# os.environ.pop 后再起服务端——pop 发生在 import 之后，不受本 setdefault 影响。
+os.environ.setdefault("CLOUDDISK_CAPTCHA_TEXT_FOR_TESTS", "1")
+os.environ.setdefault("CLOUDDISK_REDIS_URL", "redis://127.0.0.1:6379")
+
 # 实测固化：Qt 5.14.2 MinGW 工具链。PATH 顺序有意义 —— 必须在最前。
 # 注意用正斜杠：PATH 里已有的段可能是 `C:/Qt/...` 也可能是 `C:\Qt\...`，两者指向同一目录但
 # 字符串不等。用反斜杠硬编码会让"是否已存在"的去重判定失效，于是本函数把 Qt 再加一次到
