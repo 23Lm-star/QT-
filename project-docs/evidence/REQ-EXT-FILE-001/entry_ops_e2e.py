@@ -100,16 +100,25 @@ def check(sid, desc, cond, detail=""):
     results.append((sid, desc, bool(cond)))
     print(f"[{'PASS' if cond else 'FAIL'}] {sid} {desc} :: {detail}")
 
+_CID = [0]
+def next_cid():
+    # 验证码/登录身份（AUTH-CONNECTION-001）：空 cid 的 Redis 键前缀落到连接号，跨运行
+    # 冷却/过期串扰；每请求唯一 cid，与其它已适配套件同型（REQ-TEST-BASELINE-001 批次一）。
+    _CID[0] = (_CID[0] + 1) & 0xF
+    return "%032x" % (int(time.time() * 1000) * 16 + _CID[0])
+
 def login_conn(name):
     c = Conn()
-    r = c.ask(pdu(T_CAP))
+    cid = next_cid()
+    r = c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0")))
     code = r[0][2].split(b"\0")[0]
-    c.ask(pdu(T_REG, msg=code + b"\0", dat=creds(name)))
+    c.ask(pdu(T_REG, msg=code + b"\0" + cid.encode(), dat=creds(name)))
     c.close()
     c = Conn()
-    r = c.ask(pdu(T_CAP)); code = r[0][2].split(b"\0")[0]
-    r = c.ask(pdu(T_LOGIN, msg=code + b"\0", dat=creds(name)))
-    ret = struct.unpack("<i", r[0][1][:4])[0]
+    cid = next_cid()
+    r = c.ask(pdu(T_CAP, dat=cid.encode().ljust(64, b"\0"))); code = r[0][2].split(b"\0")[0]
+    r = c.ask(pdu(T_LOGIN, msg=code + b"\0" + cid.encode(), dat=creds(name)))
+    ret = struct.unpack("<i", r[0][1][:4])[0]   # PROTO-CODE-001 起登录成功码为 0
     return c, ret
 
 def drain(c):
@@ -133,15 +142,22 @@ def recv_until(c, t, timeout=6):
 
 def upload(c, dirPath, name, payload, chunk=200):
     r = c.ask(pdu(T_UPINIT, msg=dirPath.encode(),
-                   dat=f32(name) + struct.pack("<q", len(payload)) + struct.pack("<I", MAGIC)))
-    if not (r and r[0][1][0] != 0):
+                   dat=f32(name) + struct.pack("<q", len(payload)) + struct.pack("<I", MAGIC)
+                       + b"\0" * 4 + struct.pack("<Q", 1)))
+    if not (r and struct.unpack("<i", r[0][1][:4])[0] == 0):
         return False
     for i in range(0, len(payload), chunk):
         ch = payload[i:i + chunk]
-        pkt = pdu(T_UPDATA, msg=ch, dat=struct.pack("<q", i) + b"\0" * 32 + struct.pack("<I", MAGIC))
-        a = c.ask(pkt)
-        if not a or a[0][0] != T_UPDATA_R or a[0][1][0] == 0: return False
-    return True
+        pkt = pdu(T_UPDATA, msg=ch, dat=struct.pack("<q", i) + b"\0" * 32 + struct.pack("<I", MAGIC)
+                  + b"\0" * 4 + struct.pack("<Q", 1))
+        c.ask(pkt)   # 32 同步响应恒 WRITE_FAILED，转正异步补发——完成由下方条目轮询收口
+    owner = dirPath.split("/")[2]   # './filesys/<owner>[/子目录]' 取第 3 段
+    for _ in range(50):
+        if sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{owner}' "
+               f"AND display_name='{name}' AND status='active'") == "1":
+            return True
+        time.sleep(0.1)
+    return False
 
 def flush_names(c, dirPath):
     r = c.ask(pdu(T_FLUSH, msg=dirPath.encode()))
@@ -169,9 +185,9 @@ check("S1", "Server#1 启动并监听", start_server())
 for u in (OP, RC):
     os.makedirs(os.path.join(FS, u), exist_ok=True)
 ca, ret = login_conn(OP)
-check("L1", f"{OP} 登录", ret == 1, f"ret={ret}")
+check("L1", f"{OP} 登录", ret == 0, f"ret={ret}")  # PROTO-CODE-001 起成功码为 0
 cb, ret2 = login_conn(RC)
-check("L2", f"{RC} 登录", ret2 == 1, f"ret={ret2}")
+check("L2", f"{RC} 登录", ret2 == 0, f"ret={ret2}")
 check("U1", "上传 a.txt(C2) 成功", upload(ca, f"./filesys/{OP}", "a.txt", C2))
 check("U2", "条目 a.txt→对象shaC2",
       sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
@@ -206,7 +222,7 @@ cb, ret2 = login_conn(RC)
 rootP = f"./filesys/{OP}"
 ren = struct.pack("<I", 1) + f"{rootP}".encode()
 r = ca.ask(pdu(T_RENAME, msg=ren, dat=f32("legacyL1.txt") + f32("renamed1.txt")))
-check("N1", "rename 条目 legacyL1→renamed1", r and r[0][0] == T_RENAME_R and r[0][1][0] != 0)
+check("N1", "rename 条目 legacyL1→renamed1", r and r[0][0] == T_RENAME_R and struct.unpack("<i", r[0][1][:4])[0] == 0)  # 标准码
 check("N2", "改名后条目同对象 oid 不变",
       sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
           f"WHERE uf.owner_name='{OP}' AND uf.display_name='renamed1.txt' AND fo.sha256='{SHA(C1)}' AND uf.status='active'") == "1")
@@ -217,7 +233,7 @@ check("N4", "flushfile 显示 renamed1.txt", "renamed1.txt" in fl, f"names={fl}"
 mvdat = f32("l2.txt")
 mvmsg = b"legdir/l2.txt\0mvd\0"
 r = ca.ask(pdu(T_MOVE, msg=mvmsg, dat=mvdat))
-check("MV1", "movefile 条目 legdir/l2.txt→mvd", r and r[0][0] == T_MOVE_R and r[0][1][0] != 0)
+check("MV1", "movefile 条目 legdir/l2.txt→mvd", r and r[0][0] == T_MOVE_R and struct.unpack("<i", r[0][1][:4])[0] == 0)  # 标准码
 check("MV2", "条目 parent_path=/mvd/（owner 相对逻辑键，跨树确定）",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='l2.txt' "
           f"AND parent_path='/mvd/' AND status='active'") == "1")
@@ -231,7 +247,7 @@ check("ND0b", "深层条目键 /nd1/nd2/",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='nf.txt' "
           f"AND parent_path='/nd1/nd2/' AND status='active'") == "1")
 r = ca.ask(pdu(T_DEL, msg=f"{rootP}/nd1".encode(), dat=struct.pack("<I", 0)))
-check("ND1", "deldir nd1 条目优先成功", r and r[0][1][0] != 0, f"ret={r[0][1][0] if r else 'NR'}")
+check("ND1", "deldir nd1 条目优先成功", r and struct.unpack("<i", r[0][1][:4])[0] == 0, f"code={struct.unpack('<i', r[0][1][:4])[0] if r else 'NR'}")  # 标准码
 check("ND2", "深度≥2 后代 nf.txt 已软删（旧 LIKE '//%' 漏删回归）",
       sql(f"SELECT COUNT(*) FROM user_file WHERE owner_name='{OP}' AND display_name='nf.txt' "
           f"AND status='deleted'") == "1")
@@ -250,7 +266,7 @@ time.sleep(0.5)
 drain(cb)   # 清掉转发过来的 AGREE_REQUEST(35) 等历史包
 cb.sock.sendall(pdu(T_AGREE_R, msg=f"{rootP}/renamed1.txt".encode(), dat=f32(RC)))
 r = recv_until(cb, T_SHARE_FINISH)
-check("SH1", "接收者同意→完成响应 ret=true", r and r[1][0] != 0, f"pkt={r[:2] if r else None}")
+check("SH1", "接收者同意→完成响应成功（标准码 0）", r and struct.unpack("<i", r[1][:4])[0] == 0, f"code={struct.unpack('<i', r[1][:4])[0] if r else 'NR'}")
 check("SH2", "接收者条目引用同一对象(shaC1)",
       sql(f"SELECT COUNT(*) FROM user_file uf JOIN file_object fo ON fo.object_id=uf.object_id "
           f"WHERE uf.owner_name='{RC}' AND uf.display_name='renamed1.txt' AND fo.sha256='{SHA(C1)}' AND uf.status='active'") == "1")
@@ -258,9 +274,9 @@ check("SH3", "接收者根内无物理复制（D2 红利）",
       not os.path.isfile(os.path.join(FS, RC, "renamed1.txt")))
 check("SH4", "shaC1 refcount=2（个人+接收者引用）",
       wait_sql(f"SELECT refcount FROM file_object WHERE sha256='{SHA(C1)}'", "2"))
-cb.sock.sendall(pdu(T_DOWN, msg=f"./filesys/{RC}/renamed1.txt".encode(), dat=f32("renamed1.txt")))
+cb.sock.sendall(pdu(T_DOWN, msg=f"./filesys/{RC}/renamed1.txt".encode(), dat=f32("renamed1.txt") + b"\0" * 16 + struct.pack("<Q", 301)))  # 41 需有效 transfer id
 r = recv_until(cb, T_DOWN_R)
-check("SH5", "接收者可下载条目", r and r[1][0] != 0, f"pkt={r[:2] if r else None}")
+check("SH5", "接收者可下载条目", r and struct.unpack("<i", r[1][:4])[0] == 0, f"code={struct.unpack('<i', r[1][:4])[0] if r else 'NR'}")
 negmsg = f32(RC) + f"{rootP}/a.txt".encode()
 drain(cb)
 cb.ask(pdu(T_SHARE, msg=negmsg, dat=f32(RC) + struct.pack("<i", 1)))
@@ -269,19 +285,20 @@ drain(cb)
 cb.sock.sendall(pdu(T_AGREE_R, msg=f"{rootP}/a.txt".encode(), dat=f32(RC)))
 r = recv_until(cb, T_SHARE_FINISH)
 check("SH6", "分享他人文件→无登记→同意被拒（B-1 不回退）",
-      r and r[1][0] == 0, f"pkt={r[:2] if r else None}")
+      r and struct.unpack("<i", r[1][:4])[0] != 0, f"pkt={r[:2] if r else None}")  # 标准码：拒绝=非 0
 
 # ---------- 6. 验收4：伪造大小（staging 篡改）→ failed+无条目；跨用户目录上传拒绝 ----------
 r = ca.ask(pdu(T_UPINIT, msg=f"{rootP}/mvd".encode(),
-               dat=f32("forged.bin") + struct.pack("<q", 600) + struct.pack("<I", MAGIC)))
-check("F0", "forged.bin 初始化接受（复算在服务端）", r and r[0][1][0] != 0)
+               dat=f32("forged.bin") + struct.pack("<q", 600) + struct.pack("<I", MAGIC)
+                   + b"\0" * 4 + struct.pack("<Q", 302)))  # 29 需有效 transfer id；后续块同 tid
+check("F0", "forged.bin 初始化接受（复算在服务端）", r and struct.unpack("<i", r[0][1][:4])[0] == 0)  # 标准码
 a = ca.ask(pdu(T_UPDATA, msg=b"A" * 200,
-                dat=struct.pack("<q", 0) + b"\0" * 32 + struct.pack("<I", MAGIC)))
+                dat=struct.pack("<q", 0) + b"\0" * 32 + struct.pack("<I", MAGIC) + b"\0" * 4 + struct.pack("<Q", 302)))
 stag = sql(f"SELECT staging_path FROM upload_session WHERE owner_name='{OP}' AND display_name='forged.bin' ORDER BY session_id DESC LIMIT 1")
 if stag:
     open(stag.replace("/", os.sep), "ab").write(b"T" * 500)   # 中途篡改：staging 超出登记大小
 a = ca.ask(pdu(T_UPDATA, msg=b"B" * 400,
-                dat=struct.pack("<q", 200) + b"\0" * 32 + struct.pack("<I", MAGIC)))
+                dat=struct.pack("<q", 200) + b"\0" * 32 + struct.pack("<I", MAGIC) + b"\0" * 4 + struct.pack("<Q", 302)))
 check("F1", "伪造大小→会话 status=failed（验收4）",
       wait_sql(f"SELECT status FROM upload_session WHERE owner_name='{OP}' AND display_name='forged.bin' "
                "ORDER BY session_id DESC LIMIT 1", "failed"))
@@ -290,10 +307,10 @@ check("F2", "不建条目（无 forged.bin）",
 check("F3", "staging 清理（失败即删暂存）", stag != "" and not os.path.exists(stag.replace("/", os.sep)))
 r = ca.ask(pdu(T_UPINIT, msg=f"./filesys/{RC}".encode(),
                dat=f32("x.bin") + struct.pack("<q", 10) + struct.pack("<I", MAGIC)))
-check("F4", "上传到他人目录→初始化拒绝", r and r[0][1][0] == 0)
+check("F4", "上传到他人目录→初始化拒绝", r and struct.unpack("<i", r[0][1][:4])[0] != 0)  # 标准码：拒绝=非 0
 r = ca.ask(pdu(T_RENAME, msg=struct.pack("<I", 1) + f"./filesys/{RC}".encode(),
                 dat=f32("a.txt") + f32("b.txt")))
-check("F5", "他人目录改名→拒绝", r and r[0][0] == T_RENAME_R and r[0][1][0] == 0)
+check("F5", "他人目录改名→拒绝", r and r[0][0] == T_RENAME_R and struct.unpack("<i", r[0][1][:4])[0] != 0)  # 标准码
 ca.close(); cb.close()
 
 # ---------- 7. 收尾：停止服务器（回归脚本自行再启） ----------
